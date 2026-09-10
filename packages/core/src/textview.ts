@@ -13,8 +13,16 @@
  *   renumbers its terrain still renders the same picture. A tile whose terrain
  *   id is not in the ruleset renders `?` and adds `? unknown` to the legend —
  *   a broken ruleset should be visible, not silently blank.
- * - **Player start markers** number players by index (`0`-`9`, then `*`), which
- *   is the same numbering used by `PlayerState.id`.
+ * - **Goody huts are drawn** (M3, "Goody huts"): a hut is map data the reader has
+ *   to be able to see, because a hut is the one place a unit walks to and gets
+ *   something for free. `%` is the glyph — distinct from every terrain role's
+ *   glyph, from `?`, and from the start-marker digits — and it joins the legend
+ *   exactly when it is drawn, the way `? unknown` and `? unexplored` do. A hut on
+ *   a tile the viewer has not explored is not drawn and adds no legend entry:
+ *   fog hides the feature, not just the terrain under it.
+ * - **Player start markers** number the *civilizations* by player index (`0`-`9`,
+ *   then `*`), which is the same numbering used by `PlayerState.id`. Barbarians
+ *   are a player but have no homeland (see `startsLine`).
  * - **Fog is a viewer question, not a map question.** With no `viewer` the full
  *   map renders — god mode, the debugging view the CLI has always printed. With
  *   a `viewer`, the picture is what *that player* has explored: unexplored tiles
@@ -72,6 +80,15 @@ const UNKNOWN_GLYPH = '?';
  * the legend disambiguates the two cases by naming both.
  */
 const UNEXPLORED_GLYPH = '?';
+
+/**
+ * Glyph for a goody hut (M3, "Goody huts"). It must be readable *as itself*: it
+ * is not one of `ROLE_GLYPHS`' terrain glyphs, not `?` (unknown or unexplored),
+ * and not a start marker (`0`-`9` or `*`), so a reader can never mistake a hut
+ * for terrain, for fog, or for a civilization's home. `%` is chosen because it
+ * appears in none of those sets and stands out in a field of `,`/`-`/`~`.
+ */
+const HUT_GLYPH = '%';
 
 /**
  * The row a viewer sees when the state has no explored row for it — a player id
@@ -166,8 +183,13 @@ const unitsRuler = (view: Window): string => {
   return out;
 };
 
-const legendLine = (sawUnknown: boolean, sawUnexplored: boolean): string => {
+const legendLine = (sawUnknown: boolean, sawUnexplored: boolean, sawHut: boolean): string => {
   const parts = TERRAIN_ROLES.map((role) => `${ROLE_GLYPHS[role]} ${role}`);
+  // Only when one was drawn, like `? unknown` below: a legend entry is a claim
+  // that the glyph is on the map. In viewer mode this also keeps a hut the viewer
+  // has not explored out of the legend entirely, which is what "nothing about an
+  // unexplored tile leaks" means for a feature that is not terrain.
+  if (sawHut) parts.push(`${HUT_GLYPH} hut`);
   if (sawUnknown) parts.push(`${UNKNOWN_GLYPH} unknown`);
   // Only in viewer mode, and only when a `?` actually came from fog: god mode
   // must keep the legend it has always printed.
@@ -176,18 +198,23 @@ const legendLine = (sawUnknown: boolean, sawUnexplored: boolean): string => {
 };
 
 /**
- * One line naming every player and its start tile, marking starts outside the
- * rendered window so a cropped view never looks like a player has vanished.
+ * One line naming every **civilization** and its start tile, marking starts
+ * outside the rendered window so a cropped view never looks like a player has
+ * vanished.
  *
- * This line names **every** player, barbarians included, while the header's
- * `civs=` counts only civilizations — the asymmetry is deliberate, not an
- * oversight. `civPlayers` answers "how many civilizations are there?", which is
- * exactly what the header asks; `starts:` is the legend for the digits painted
- * on the map, and those markers are drawn for every player's `startingTile`
- * (M1: "starting tiles marked with the player number"), the barbarian player's
- * included — M3 gives it the map's first hut as its anchor. A digit with no
- * entry here would be a marker the reader cannot name, so the two sets are kept
- * equal rather than filtered to civilizations.
+ * **Civilizations only — the ruling on starts.** `starts:` is the legend for the
+ * digits painted on the map, and the digits are for civilizations. Barbarians are
+ * a player (M3, "State shape": `PlayerId` is the index into `players`, and
+ * `explored` is row-indexed by it), but they have no homeland: `newGame` gives
+ * them no settler and points their `startingTile` at the map's first goody hut as
+ * a required-field convention. Painting a start digit there and naming it here
+ * would tell the reader something false — that a civilization begins where a
+ * barbarian band will come from — and it would hide a *hut*, the one feature a
+ * unit wants to walk to, behind a marker that means "home". So this line iterates
+ * `civPlayers(state)`, exactly like the header's `civs=` count and for the same
+ * reason: it answers a question about civilizations. The barbarians stay a player
+ * in `state.players`, with an id, a colour, a fog row and (later) units — which
+ * is all a band from a hut needs.
  *
  * `explored` (present only in viewer mode) is the viewer's fog row, and a start
  * the viewer has not explored is omitted entirely — a `starts:` line that
@@ -204,14 +231,18 @@ const startsLine = (
   const parts: string[] = [];
   let hidden = 0;
 
-  for (const [index, player] of state.players.entries()) {
+  for (const player of civPlayers(state)) {
     const tile = player.startingTile;
     if (explored !== undefined && explored[tile] !== true) {
       hidden += 1;
       continue;
     }
+    // The marker is the player's own `id`, which *is* its index in `players`
+    // (M3) — the same numbering `startMarker` paints on the map. Deriving it from
+    // the player rather than from a loop counter means the digit and the player
+    // cannot drift apart if the array ever stops being "civilizations first".
     if (tile < 0 || tile >= map.terrain.length) {
-      parts.push(`${startMarker(index)}=${player.name}(invalid)`);
+      parts.push(`${startMarker(Number(player.id))}=${player.name}(invalid)`);
       continue;
     }
     const x = indexToX(map, tile);
@@ -219,7 +250,7 @@ const startsLine = (
     const visible =
       x >= view.x0 && x < view.x0 + view.width && y >= view.y0 && y < view.y0 + view.height;
     parts.push(
-      `${startMarker(index)}=${player.name}@${String(x)},${String(y)}${
+      `${startMarker(Number(player.id))}=${player.name}@${String(x)},${String(y)}${
         visible ? '' : ' (off-view)'
       }`,
     );
@@ -245,15 +276,24 @@ const startsLine = (
  * starts: 0=Player 1@12,8 (off-view)  1=Player 2@25,33 (off-view)
  * ```
  *
+ * A map with a visible goody hut adds one legend field, `% hut`, and draws `%`
+ * on the hut's tile — which is why the legend is composed from what was actually
+ * drawn rather than being a constant string:
+ *
+ * ```
+ * legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains  % hut
+ * ```
+ *
  * The gutter is sized to the widest row number, the tens ruler writes a digit
  * only above every tenth column, and every line is right-stripped — output is
  * stable for a given `(state, ruleset, options)` and safe to snapshot.
  *
  * With `options.viewer`, the same geometry is drawn from that player's explored
- * row: unexplored tiles become `?` (including their start markers), the legend
- * gains `? unexplored`, and the header names the viewer. Nothing else changes,
- * and with no `viewer` the output is exactly what it was before the option
- * existed (PLAN.md 8.1: the agent's primary eyes, in both modes).
+ * row: unexplored tiles become `?` (including their start markers and their
+ * huts), the legend gains `? unexplored`, and the header names the viewer.
+ * Nothing else changes, and with no `viewer` the output is exactly what it was
+ * before the option existed (PLAN.md 8.1: the agent's primary eyes, in both
+ * modes).
  */
 export const describe = (
   state: GameState,
@@ -273,29 +313,47 @@ export const describe = (
   const roleById = new Map<TerrainId, TerrainRole>();
   for (const def of ruleset.terrains) roleById.set(def.id, def.role);
 
-  // Start markers keyed by flat tile index; the first player on a tile wins, so
-  // a (malformed) shared start does not make the output order-dependent. In
+  // Huts, as a set of flat tile indices. Built once per call so a hut lookup is
+  // not a scan of `map.huts` per rendered tile.
+  const hutTiles = new Set<number>(map.huts.map(Number));
+
+  // Start markers keyed by flat tile index; the first *civilization* on a tile
+  // wins, so a (malformed) shared start does not make the output order-dependent.
+  // `civPlayers`, never `players`: a digit means "a civilization begins here", and
+  // the barbarians have no homeland (see `startsLine` — the ruling on starts). In
   // viewer mode a marker is only painted where the viewer has explored — a start
   // tile is knowledge, and knowledge the fog has not granted must not be drawn.
+  const civs = civPlayers(state);
   const markerByTile = new Map<number, string>();
   if (showStarts) {
-    for (const [index, player] of state.players.entries()) {
+    for (const player of civs) {
       const tile = player.startingTile;
       if (tile < 0 || tile >= map.terrain.length) continue;
       if (viewerRow !== undefined && viewerRow[tile] !== true) continue;
-      if (!markerByTile.has(tile)) markerByTile.set(tile, startMarker(index));
+      const marker = startMarker(Number(player.id));
+      if (!markerByTile.has(tile)) markerByTile.set(tile, marker);
     }
   }
 
   let sawUnknown = false;
   let sawUnexplored = false;
+  let sawHut = false;
   const glyphAt = (x: number, y: number): string => {
     const slot = y * map.width + x;
-    // Fog first: an unexplored tile's terrain is not read at all, so it cannot
-    // influence the output even indirectly (via `sawUnknown`, say).
+    // Fog first: an unexplored tile's terrain — and any hut on it — is not read
+    // at all, so it cannot influence the output even indirectly (via `sawUnknown`
+    // or `sawHut`, say). `?` is returned before the hut check below, which is what
+    // "a hut on an unexplored tile must not be revealed" means in code.
     if (viewerRow !== undefined && viewerRow[slot] !== true) {
       sawUnexplored = true;
       return UNEXPLORED_GLYPH;
+    }
+    // A hut is drawn over the terrain it sits on: it is the more useful fact
+    // about the tile, and its glyph is not a terrain glyph, so nothing is lost —
+    // the legend still spells out the terrain roles the rest of the map uses.
+    if (hutTiles.has(slot)) {
+      sawHut = true;
+      return HUT_GLYPH;
     }
     const id = map.terrain[slot];
     if (id === undefined) {
@@ -320,17 +378,20 @@ export const describe = (
   for (let y = view.y0; y < view.y0 + view.height; y++) {
     let row = '';
     for (let x = view.x0; x < view.x0 + view.width; x++) {
+      // A start marker wins over the hut under it: `generateWorld` never places a
+      // hut on a start tile, so the two collide only on a hand-built map, and "a
+      // civilization is here" is the stronger fact when they do.
       const marker = markerByTile.get(y * map.width + x);
       row += marker ?? glyphAt(x, y);
     }
     lines.push(stripEnd(`${String(y).padStart(labelWidth)} |${row}`));
   }
 
-  lines.push(legendLine(sawUnknown, sawUnexplored));
-  // Any player with a start tile gets a `starts:` line, so the digits on the map
-  // always have a legend (see `startsLine` on why this is `players` and not
-  // `civPlayers`, unlike the `civs=` count in the header).
-  if (showStarts && state.players.length > 0) {
+  lines.push(legendLine(sawUnknown, sawUnexplored, sawHut));
+  // Any *civilization* with a start tile gets a `starts:` line, so the digits on
+  // the map always have a legend (see `startsLine` on why this is `civPlayers`,
+  // exactly like the `civs=` count in the header).
+  if (showStarts && civs.length > 0) {
     lines.push(startsLine(state, map, view, viewerRow));
   }
 

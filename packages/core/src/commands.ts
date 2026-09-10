@@ -84,10 +84,15 @@
  * - **The turn is not this file's idea.** `EndTurn` checks the actor, calls
  *   `advanceTurn` in `turn.ts`, and appends its own `TurnEnded` event. Growth, production, the refill and `turn += 1` happen in that order
  *   because `turn.ts` says so, in one place, for every caller.
- * - **Goody huts are not implemented here.** A land unit entering a hut consumes
- *   it and draws a reward from the state RNG; that is M3's hut workstream, and
- *   nothing in this file draws from the RNG. The seam is the `MoveUnit` case
- *   below, marked where the reward would resolve.
+ * - **Goody huts hang off `MoveUnit`, and their rule lives in `hut.ts`.** A land
+ *   unit entering a hut consumes it and draws a reward from the state RNG (a free
+ *   unit, a band of barbarians near the hut, or nothing). This file states *when*
+ *   that happens — the moment a successful step has put the mover on the
+ *   destination tile — and `hut.ts` states *what* it does, so the reward table,
+ *   the band size and the barbarian placement have one home rather than a second
+ *   copy here. The result is one applied command bumping `revision` exactly once
+ *   while emitting up to three events: `UnitMoved`, `HutEntered`, and
+ *   `BarbariansSpawned` when the draw produced a band.
  */
 
 import {
@@ -99,6 +104,7 @@ import {
   type ProductionItem,
 } from './cities.js';
 import { visibleTiles, withExplored } from './fog.js';
+import { resolveHutEntry, type HutRewardKind } from './hut.js';
 import {
   asCityId,
   asPlayerId,
@@ -225,10 +231,11 @@ export type GameError =
  * is as hashable as the state it came from.
  *
  * M3's two hut events (`HutEntered`, `BarbariansSpawned` — INTERFACES.md M3,
- * "Commands (added to the frozen union)") belong to the hut workstream that emits
- * them and are deliberately **not** declared here: their payload is that
- * workstream's design decision, and this file should not guess a shape it does
- * not produce. See the note at the end of the `MoveUnit` case.
+ * "Commands (added to the frozen union)") are declared here, with the payload this
+ * workstream produced, and they are emitted by the `MoveUnit` case below through
+ * `hut.ts`. `HutEntered` is emitted **whenever a hut is consumed**, including for
+ * the `nothing` reward: "nothing" is a reward, and a consumer that had to infer
+ * consumption from the absence of an event would be reading a diff.
  */
 export type GameEvent =
   | {
@@ -278,6 +285,50 @@ export type GameEvent =
       readonly shields: number;
       readonly unitId?: UnitId;
       readonly tile?: TileIndex;
+    }
+  /**
+   * A goody hut was consumed: `unitId` (owned by `owner`) stepped onto it at
+   * `tile`, and `reward` says what the player got. The hut is gone from
+   * `state.map.huts` and `state.rng` has advanced by one draw — for `nothing` too,
+   * because a spent hut is spent whatever it held.
+   *
+   * `unitGiven` is present only for the `unit` reward, and names the free unit
+   * that appeared on `tile`; the other two rewards have no unit to name, so the
+   * key is **absent** rather than present-and-`undefined` (`exactOptionalPropertyTypes`,
+   * and a present-but-`undefined` key cannot survive canonical JSON — the same
+   * trap `City.production` documents).
+   *
+   * `reward` is one of `HUT_REWARD_KINDS` (`hut.ts`), which is exhaustive-for-M3:
+   * it has no `gold` member because M3 has no treasury and M4 owns one, and the
+   * reward reports what the player actually received, so a branch this ruleset
+   * cannot honour (no `military` land unit to give away, or nowhere for a band to
+   * stand) arrives here as `nothing`.
+   */
+  | {
+      readonly type: 'HutEntered';
+      readonly unitId: UnitId;
+      readonly owner: PlayerId;
+      readonly tile: TileIndex;
+      readonly reward: HutRewardKind;
+      readonly unitGiven?: UnitId;
+    }
+  /**
+   * A hut's band appeared: `owner` is the barbarian player, `tile` is the hut the
+   * band came out of, and `unitIds`/`tiles` are parallel lists (ascending tile
+   * order) saying which unit stands where. Never empty — a band the map has no
+   * room for is reported as `reward: 'nothing'` on the `HutEntered` event instead,
+   * because a spawn event naming no units would be a written-down non-event.
+   *
+   * The units it names are ordinary `Unit`s owned by an ordinary player
+   * (`PlayerState.kind === 'barbarian'`), so nothing downstream needs a barbarian
+   * special case to move them.
+   */
+  | {
+      readonly type: 'BarbariansSpawned';
+      readonly owner: PlayerId;
+      readonly tile: TileIndex;
+      readonly unitIds: readonly UnitId[];
+      readonly tiles: readonly TileIndex[];
     };
 
 /**
@@ -843,7 +894,8 @@ export const applyCommand = (
       const plan = planMove(state, ruleset, playerId, cmd.unitId, cmd.to);
       if (!plan.ok) return err(plan.error);
 
-      const events: readonly GameEvent[] = [
+      const moved = movedState(state, plan.value);
+      const events: GameEvent[] = [
         {
           type: 'UnitMoved',
           unitId: plan.value.unit.id,
@@ -853,15 +905,25 @@ export const applyCommand = (
           movementLeft: plan.value.movementLeft,
         },
       ];
-      // M3 seam, deliberately not implemented here: a land unit entering a goody
-      // hut consumes it and draws a reward from the state RNG (a free unit, a band
-      // of barbarians, or nothing), which is the hut workstream's code. It hangs
-      // off this line — the move has succeeded and the mover is now standing on
-      // `plan.value.to` — and it is the only place in `core` that would draw from
-      // `state.rng` on this path. Emitting `HutEntered`/`BarbariansSpawned` also
-      // means adding those members to the `GameEvent` union above, which this file
-      // owns.
-      return ok({ state: movedState(state, plan.value), events });
+
+      // M3 goody huts. The move has succeeded and the mover is standing on
+      // `plan.value.to`, so *this* is where a hut on that tile resolves — and the
+      // resolver is handed the post-move state, never the plan's `unit` value,
+      // which still stands on the tile it stepped from. `hut.ts` decides what a
+      // hut does: consume the hut, draw one reward from `state.rng`, and maybe put
+      // a free unit or a barbarian band on the map. `undefined` means there was no
+      // hut to enter (or the unit is a sea unit, or a city stands there), and then
+      // nothing at all happened beyond the move.
+      //
+      // Everything the command layer owns stays here: one `revision` bump for the
+      // one applied command (the resolver never touches it), the fog fold that
+      // `movedState` performed, and the event order — the move first, then the hut
+      // it entered, then the band it produced, because that is the order in which
+      // they happened.
+      const entry = resolveHutEntry(moved, ruleset, plan.value.unit.id);
+      if (entry !== undefined) events.push(...entry.events);
+
+      return ok({ state: entry?.state ?? moved, events });
     }
 
     case 'EndTurn': {

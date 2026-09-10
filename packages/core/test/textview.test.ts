@@ -16,6 +16,13 @@
  * that is the point of stating them explicitly: a fixture that omitted them
  * would only typecheck through a cast, and a cast would hide the next shape
  * change instead of failing on it.
+ *
+ * **M3 rulings pinned here.** `starts:` and the digits on the map are for
+ * *civilizations only*: the barbarians are a player with no homeland, whose
+ * `startingTile` is a hut, so presenting it as a start would tell the reader
+ * something false (see the ruling test at the bottom). And a goody hut is drawn
+ * as `%` with a legend entry, under the same fog rule as everything else: a hut
+ * on a tile the viewer has not explored is not revealed, not even in the legend.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -139,8 +146,9 @@ const fogRow = (seen: readonly number[]): readonly boolean[] =>
  * and M3's `nextCityId`/`cities`, because a partial literal would only typecheck
  * through a cast. The default fog row is blank: no player has explored anything
  * until a test says so, which makes the viewer tests state their fog explicitly
- * instead of inheriting it. M3's map carries `huts`; this board has none,
- * because `describe` draws terrain, starts and fog and a hut is none of those.
+ * instead of inheriting it. M3's map carries `huts`; this board has none, so its
+ * picture is terrain, starts and fog, and the hut tests below put one on the map
+ * where they want it.
  */
 const syntheticState = (
   players: readonly PlayerState[],
@@ -163,12 +171,51 @@ const syntheticState = (
 
 const STATE_4x4: GameState = syntheticState([player(0, 5), player(1, 10)]);
 
+/**
+ * `state` with goody huts on the map (M3: `GameMap.huts`, ascending tile index).
+ * The glyph they are drawn as, `%`, is pinned in the tests below rather than
+ * imported: it is part of the picture a reader sees, not an internal detail.
+ */
+const withHuts = (state: GameState, huts: readonly number[]): GameState => ({
+  ...state,
+  map: { ...state.map, huts: huts.map((tile) => asTileIndex(tile)) },
+});
+
+/**
+ * The barbarian player M3 appends to `players` (`newGame` does it after the
+ * civilizations): a player *identity* whose `startingTile` is a convention
+ * pointing at a hut, not a homeland. Its id is the next player index, which is
+ * exactly the digit it must **not** be painted as — see the ruling test at the
+ * bottom of this file.
+ */
+const barbarianPlayer = (index: number, tile: number): PlayerState => ({
+  id: asPlayerId(index),
+  name: 'Barbarians',
+  color: '#3f3f46',
+  startingTile: asTileIndex(tile),
+  kind: 'barbarian',
+});
+
 /** The glyph columns of every grid row, without the row-number gutter. */
 const glyphRows = (view: string): readonly string[] =>
   view
     .split('\n')
     .filter((line) => /^ *\d+ \|/.test(line))
     .map((line) => line.slice(line.indexOf('|') + 1));
+
+/** How many goody huts a rendered grid draws, counted as the picture shows them. */
+const hutGlyphs = (grid: string): number => grid.split('%').length - 1;
+
+/**
+ * The players the `starts:` line names, as `marker=Name@x,y` entries — read off
+ * the rendered line rather than from the state, so a test can assert what a
+ * reader is told. The `(+N unexplored)` note carries no `=` and is filtered out.
+ */
+const namedStarts = (view: string): readonly string[] =>
+  (view.split('\n').find((line) => line.startsWith('starts: ')) ?? '')
+    .slice('starts: '.length)
+    .split('  ')
+    .filter((entry) => entry.includes('='));
 
 /** A ruleset built from any terrain list, for the malformed-input cases. */
 const withTerrains = (terrains: readonly TerrainDef[]): RulesetView => ({
@@ -341,15 +388,92 @@ describe('describe', () => {
     expect(describeState(state.value, RULESET)).toBe(first);
     expect(rows).toHaveLength(state.value.map.height);
     for (const row of rows) expect(row).toHaveLength(state.value.map.width);
-    // Every player is named, the barbarian one included: `PlayerId` is the index
-    // into `players` (M3, "State shape"), and M3 gives the barbarian player the
-    // map's first hut as its `startingTile`, so it is a player with a start like
-    // any other and the `starts:` line reports it as such.
-    for (const [index, player_] of state.value.players.entries()) {
-      expect(first).toContain(`${String(index)}=${player_.name}@`);
+    // CIVILIZATIONS ONLY — the ruling on starts. `starts:` is the legend for the
+    // digits painted on the map, and both are for civilizations: barbarians are a
+    // player (M3, "State shape") but have no homeland, so `newGame` points their
+    // `startingTile` at the map's first hut as a field convention. Naming that
+    // here as a start would tell the reader that a civilization begins where a
+    // barbarian band will come from — and would hide the hut behind a digit.
+    // `civPlayers`, never `players`, exactly like the header's `civs=` count.
+    for (const player_ of civPlayers(state.value)) {
+      expect(first).toContain(`${String(player_.id)}=${player_.name}@`);
     }
+    // The barbarian player is still a player, and still not a start.
     expect(state.value.players.some((player_) => player_.kind === 'barbarian')).toBe(true);
     expect(civPlayers(state.value)).toHaveLength(SETTINGS.civCount);
+    expect(first).not.toContain('Barbarians');
+    expect(namedStarts(first)).toHaveLength(civPlayers(state.value).length);
+  });
+
+  it('shows the goody huts an agent has to find, and explains the glyph', () => {
+    const state = newGame(42, SETTINGS, RULESET);
+    if (!state.ok) throw new Error('expected a state');
+    const huts = state.value.map.huts;
+    expect(huts.length).toBeGreaterThan(0);
+
+    // God mode draws every hut and nothing else as `%`: `generateWorld` keeps
+    // huts off start tiles, so no marker can hide one, and the count is exact.
+    const god = glyphRows(describeState(state.value, RULESET)).join('');
+    expect(hutGlyphs(god)).toBe(huts.length);
+    expect(describeState(state.value, RULESET)).toContain('% hut');
+
+    // The barbarian player's `startingTile` is one of those huts (M3's convention
+    // for a required field), so the tile a "start" reading would put a digit on
+    // shows the hut instead — the feature an agent wants to walk to.
+    const barbarian = state.value.players.find((candidate) => candidate.kind === 'barbarian');
+    expect(barbarian === undefined ? 'no barbarian player' : String(barbarian.startingTile)).toBe(
+      String(huts[0]),
+    );
+
+    // Through the fog, exactly the huts the viewer has explored are drawn — the
+    // positive half, so the count below cannot pass by both sides being zero.
+    const seeing: GameState = {
+      ...state.value,
+      explored: state.value.explored.map((row) => row.map(() => true)),
+    };
+    const all = glyphRows(describeState(seeing, RULESET, { viewer: asPlayerId(0) })).join('');
+    expect(hutGlyphs(all)).toBe(huts.length);
+
+    // …and a fresh viewer draws only what its own start has revealed.
+    const fresh = describeState(state.value, RULESET, { viewer: asPlayerId(0) });
+    const revealed = huts.filter((hut) => state.value.explored[0]?.[hut] === true).length;
+    expect(hutGlyphs(glyphRows(fresh).join(''))).toBe(revealed);
+  });
+
+  it('draws a hut as %, with a legend field, over the terrain it sits on', () => {
+    const view = describeState(withHuts(STATE_4x4, [13]), RULESET);
+
+    // Tile 13 is (1,3), the west tile of the bottom row: the hut replaces the
+    // `-` it sat on rather than being drawn beside it, and `%` is not a terrain
+    // glyph (`GRID_4x4[13]` is plains, and the hills tile at 14 is untouched).
+    expect(glyphRows(view)).toEqual(['~~::', '~0,-', ':,1^', '-%h^']);
+    expect(view).toContain(
+      'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains  % hut',
+    );
+
+    // A map with no hut adds no legend field and never draws the glyph: the entry
+    // is a claim that the glyph is on the map, so it is made only when it is.
+    const bare = describeState(STATE_4x4, RULESET);
+    expect(glyphRows(bare).join('')).not.toContain('%');
+    expect(bare).not.toContain('hut');
+  });
+
+  it('lets a start marker win over a hut on the same tile', () => {
+    // Unreachable from `generateWorld` (it never puts a hut on a start tile), so
+    // the collision is hand-built. A marker wins, and the legend does not claim a
+    // hut glyph that was never drawn.
+    const view = describeState(withHuts(STATE_4x4, [5]), RULESET);
+
+    expect(glyphRows(view)).toEqual(['~~::', '~0,-', ':,1^', '--h^']);
+    expect(view).not.toContain('% hut');
+  });
+
+  it('still draws huts when the start legend is switched off', () => {
+    const view = describeState(withHuts(STATE_4x4, [9]), RULESET, { showStarts: false });
+
+    expect(view).not.toContain('starts:');
+    expect(glyphRows(view)).toEqual(['~~::', '~,,-', ':%h^', '--h^']);
+    expect(view).toContain('% hut');
   });
 
   it('accepts a start tile outside the map without crashing', () => {
@@ -554,5 +678,75 @@ describe('describe with a viewer', () => {
     expect(describeState(FOGGED, NO_UNITS, { viewer: asPlayerId(0) })).toBe(
       describeState(FOGGED, RULESET, { viewer: asPlayerId(0) }),
     );
+  });
+
+  it('draws a hut the viewer has explored, and adds its legend field', () => {
+    // Tile 9 is one of the four player 0 has explored (4, 5, 6, 9).
+    const view = describeState(withHuts(FOGGED, [9]), RULESET, { viewer: asPlayerId(0) });
+
+    expect(glyphRows(view)[2]).toBe('?%??');
+    expect(view).toContain('% hut');
+  });
+
+  it('does not reveal a hut on a tile the viewer has not explored', () => {
+    // Tile 13 is unexplored, so the fog hides the feature as well as the terrain
+    // under it — including from the legend, which would otherwise announce that
+    // the glyph is somewhere on the map.
+    const hutInTheFog = withHuts(FOGGED, [13]);
+    const view = describeState(hutInTheFog, RULESET, { viewer: asPlayerId(0) });
+
+    expect(glyphRows(view)[3]).toBe('????');
+    expect(view).not.toContain('%');
+    // The strongest form of "does not leak": the whole view is byte-identical to
+    // the same board with no hut at all.
+    expect(view).toBe(describeState(FOGGED, RULESET, { viewer: asPlayerId(0) }));
+    // …while god mode, which is allowed to know, shows it.
+    expect(glyphRows(describeState(hutInTheFog, RULESET))[3]).toBe('-%h^');
+  });
+
+  it('never presents the barbarians as a start, in god mode or through the fog', () => {
+    // The barbarian player M3 appends: id 2, no units, and a `startingTile` that
+    // is really the map's first hut. Player 0 has explored 4, 5, 6 and 9.
+    const barbarians = barbarianPlayer(2, 13);
+    const base = syntheticState(
+      [player(0, 5), player(1, 10), barbarians],
+      [fogRow([4, 5, 6, 9]), fogRow([]), fogRow([])],
+    );
+    const state: GameState = {
+      ...base,
+      // `newGame` places one settler per *civilization*, so the barbarians own
+      // nothing: they are an identity for the band a hut will spawn.
+      units: base.units.filter((unit) => unit.owner !== barbarians.id),
+      nextUnitId: 2,
+      map: { ...base.map, huts: [asTileIndex(13)] },
+    };
+
+    // It *is* still a player — an id, a name and a fog row of its own — and it
+    // owns nothing: `newGame` places one settler per civilization, so the only
+    // units the barbarians ever have are the band a hut spawns for them. That is
+    // what "a player without a homeland" means, and it is why the two readings
+    // below are about *presentation*, not about the player existing.
+    const inGame = state.players.find((player_) => player_.kind === 'barbarian');
+    expect(inGame?.id).toBe(barbarians.id);
+    expect(inGame?.name).toBe('Barbarians');
+    expect(state.explored[Number(barbarians.id)]).toHaveLength(GRID_4x4.length);
+    expect(state.units.filter((candidate) => candidate.owner === barbarians.id)).toEqual([]);
+
+    // God mode: the civs are named, the barbarians are not, and their tile is
+    // drawn as the hut it is rather than as the digit `2`.
+    const god = describeState(state, RULESET);
+    expect(namedStarts(god)).toEqual(['0=Player 1@1,1', '1=Player 2@2,2']);
+    expect(god).not.toContain(barbarians.name);
+    expect(god).not.toContain('2=');
+    expect(glyphRows(god)[3]).toBe('-%h^');
+
+    // Through the fog, the count of hidden starts counts *civilization* starts:
+    // player 1's is unexplored, the barbarians' hut is not a start at all and is
+    // therefore neither drawn nor counted.
+    const seen = describeState(state, RULESET, { viewer: asPlayerId(0) });
+    expect(namedStarts(seen)).toEqual(['0=Player 1@1,1']);
+    expect(seen).toContain('starts: 0=Player 1@1,1  (+1 unexplored)');
+    expect(seen).not.toContain(barbarians.name);
+    expect(glyphRows(seen)[3]).toBe('????');
   });
 });

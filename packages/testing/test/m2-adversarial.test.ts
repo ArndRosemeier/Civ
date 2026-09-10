@@ -39,10 +39,15 @@
  *   generator is neither unsound nor incomplete);
  * - purity: nothing mutates a deep-frozen state or a deep-frozen ruleset,
  *   including `EndTurn` and refused commands;
- * - conservation: a legal move changes exactly one unit, preserves the unit id
- *   sequence, keeps `movementLeft` inside `[0, movement]` and equal to
+ * - conservation: a legal move changes exactly one **pre-existing** unit, keeps
+ *   every pre-existing unit alive at the same id and
+ *   `movementLeft` inside `[0, movement]` and equal to
  *   `old - destinationCost`, and never lands on a tile the unit could not
- *   afford;
+ *   afford. Since M3 a move can also consume a hut and add units, so the old
+ *   "the unit count and the id sequence are unchanged" equality was replaced by
+ *   a hut-aware property — the same equality wherever no hut is entered, plus
+ *   "every unit that appears is claimed by a `HutEntered`/`BarbariansSpawned`
+ *   event, with the claimed owner and tile" (see `conserveMove` below);
  * - fog: `newGame` marks exactly what its unit sees; `explored` only grows;
  *   every visible tile is explored after every applied command; `visibleTiles`
  *   is in-bounds for hostile radii; `describe(..., { viewer })` leaks no
@@ -70,6 +75,20 @@
  * the regenerated M3 file, and `EndTurn` for a player that owns no unit is swept
  * as well.
  *
+ * **The M3 hut escalation is closed here too** (F5). The conservation sweep above
+ * still asserted "a legal move moves one unit and nothing else" *after* the hut
+ * contract deliberately broke it, so it failed on the one move the hut workstream
+ * reproduced — `seed 3, unit 1 -> 2951` (a hut: `UnitMoved`, `HutEntered`,
+ * `BarbariansSpawned`, unit count 2 -> 4). The fix is not to skip hut moves and
+ * not to relax the count: it is the hut-aware property in `conserveMove`, which
+ * re-derives the pre-M3 equality exactly where no hut is involved and otherwise
+ * requires every added unit to be named — with its owner and tile — by the events
+ * the command emitted. The three reward branches are swept separately, including
+ * the free-unit branch that `SWEEP_SEEDS` never draws. `index.ts` now also exports
+ * `./hut.js`, and a test pins that `hutAt`, `resolveHutEntry`, `HUT_REWARD_KINDS`,
+ * `BARBARIAN_BAND_SIZE` and `HUT_REWARD_PROVENANCE` are reachable from
+ * `@civts/core` rather than only from the module path.
+ *
  * Findings that could NOT be turned into a test are reported in prose with the
  * review (cast/`any`/non-null audit, the `rehash:` commit note, the golden
  * harness's refusal to auto-write, CLI transcript hashes).
@@ -85,7 +104,10 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import {
+  BARBARIAN_BAND_SIZE,
   DEFAULT_SETTINGS,
+  HUT_REWARD_KINDS,
+  HUT_REWARD_PROVENANCE,
   applyCommand,
   asPlayerId,
   asTileIndex,
@@ -94,12 +116,15 @@ import {
   civPlayers,
   describe as renderState,
   distance8,
+  hutAt,
   indexToX,
   indexToY,
   isExplored,
+  isPlaceholder,
   legalActions,
   neighbors8,
   newGame,
+  resolveHutEntry,
   terrainAtIndex,
   unitActions,
   unitDef,
@@ -107,12 +132,14 @@ import {
   visibleTiles,
   withExplored,
   type Command,
+  type GameEvent,
   type GameError,
   type GameState,
   type PlayerId,
   type RulesetView,
   type Settings,
   type TileIndex,
+  type Unit,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 
@@ -742,54 +769,320 @@ describe('purity — a command never writes to what it was given', () => {
  * 3. Conservation
  * ------------------------------------------------------------------ */
 
-describe('conservation — a legal move moves one unit and nothing else', () => {
-  it('never duplicates, loses or teleports a unit, and keeps the id order', () => {
+/** One hut event's claim on a unit that did not exist before the move. */
+interface UnitClaim {
+  readonly id: number;
+  readonly owner: number;
+  readonly tile: number;
+  /** The event that declared it, for the failure message. */
+  readonly source: string;
+}
+
+/** What one applied move did to the unit set and to the map's huts. */
+interface MoveDelta {
+  readonly grantedUnits: number;
+  readonly barbarianUnits: number;
+  readonly hutsConsumed: number;
+}
+
+/**
+ * Conservation for ONE applied `MoveUnit`: the move changes exactly one
+ * *pre-existing* unit's position, keeps every pre-existing unit (and its id)
+ * alive and unchanged, and **accounts for every unit that appears** out of the
+ * events the command emitted.
+ *
+ * MIGRATED for M3 (docs/INTERFACES.md M3, "Goody huts"). The pre-M3 assertion was
+ * "a legal move moves one unit and nothing else", with the unit count and the whole
+ * id sequence pinned to equality. Entering a hut deliberately breaks both: the hut
+ * is consumed and may hand the mover a free unit or drop a barbarian band onto the
+ * map — reproduced here at `seed 3, unit 1 -> tile 2951`, which emits `UnitMoved`,
+ * `HutEntered` and `BarbariansSpawned` and takes the unit count from 2 to 4. So the
+ * old equality had to change; the two dishonest ways out were to skip hut-entering
+ * moves (leaving conservation unverified for exactly the moves that can violate it)
+ * or to keep the equality and let the sweep fail. This states the property that is
+ * actually load-bearing instead, and it is **at least as strong** as what it
+ * replaces wherever no hut is involved:
+ *
+ * - every pre-existing unit is still in the state, exactly once, at the same id,
+ *   and every pre-existing unit other than the mover is **byte-identical**
+ *   (`JSON.stringify` equality, as before);
+ * - the pre-existing id sequence is a **prefix** of the new one and the whole
+ *   sequence stays strictly ascending, so nothing was renumbered or reordered —
+ *   with no event emitted this degenerates to the old "the id sequence is
+ *   unchanged" assertion, since no new unit is allowed to appear;
+ * - the mover is on `to` (that the step was one tile is checked by the caller,
+ *   which also owns the "offered move was refused" case);
+ * - **every unit that appears is claimed by an event**: `HutEntered` with
+ *   `reward: 'unit'` names its `unitGiven`, and `BarbariansSpawned` names a declared
+ *   list of ids with parallel tiles. The claim must match the unit's owner and tile
+ *   exactly. A unit nobody declared is a failure, a claim naming a unit that did not
+ *   appear is a failure, two events claiming one id is a failure, and a claim on an
+ *   id that already existed is a failure — that last one is how a "grant" that
+ *   silently *relabelled* an existing unit would be caught;
+ * - a hut is consumed exactly when a `HutEntered` says so, and then the state RNG
+ *   must have advanced (the reward is drawn from it, and an unadvanced RNG would
+ *   make the same reward repeat); a move that emits no `HutEntered` may not remove
+ *   a hut, add a unit or move the RNG at all;
+ * - a `MoveUnit` emits no city event.
+ *
+ * Failures accumulate in the shared `failures` array rather than throwing, so one
+ * sweep reports every violation it found; the caller asserts the array is empty.
+ */
+const conserveMove = (
+  before: GameState,
+  after: GameState,
+  events: readonly GameEvent[],
+  mover: Unit,
+  to: TileIndex,
+  label: string,
+): MoveDelta => {
+  const idsBefore = before.units.map((unit) => Number(unit.id));
+  const known = new Set(idsBefore);
+  const hutsBefore = before.map.huts.map(Number);
+
+  const first = events[0];
+  check(
+    first !== undefined && first.type === 'UnitMoved' && first.unitId === mover.id,
+    `${label}: the first event is not the moving unit's UnitMoved`,
+  );
+  check(
+    first === undefined ||
+      first.type !== 'UnitMoved' ||
+      (first.from === mover.tile && first.to === to),
+    `${label}: UnitMoved does not describe this step`,
+  );
+
+  const claims: UnitClaim[] = [];
+  let hutsConsumed = 0;
+
+  for (const event of events) {
+    switch (event.type) {
+      case 'UnitMoved':
+        break;
+      case 'HutEntered': {
+        hutsConsumed += 1;
+        check(event.unitId === mover.id, `${label}: HutEntered names another unit`);
+        check(event.owner === mover.owner, `${label}: HutEntered names another owner`);
+        check(event.tile === to, `${label}: HutEntered is for a tile the mover is not on`);
+        if (event.reward === 'unit') {
+          check(event.unitGiven !== undefined, `${label}: reward 'unit' without a unitGiven`);
+          if (event.unitGiven !== undefined) {
+            claims.push({
+              id: Number(event.unitGiven),
+              owner: Number(event.owner),
+              tile: Number(event.tile),
+              source: 'HutEntered',
+            });
+          }
+        } else {
+          check(
+            event.unitGiven === undefined,
+            `${label}: reward ${event.reward} carries a unitGiven`,
+          );
+        }
+        break;
+      }
+      case 'BarbariansSpawned': {
+        check(
+          event.unitIds.length === event.tiles.length,
+          `${label}: BarbariansSpawned has parallel lists of different length`,
+        );
+        check(event.unitIds.length > 0, `${label}: BarbariansSpawned names no unit`);
+        check(
+          event.unitIds.length <= BARBARIAN_BAND_SIZE,
+          `${label}: a band of ${String(event.unitIds.length)} exceeds the declared BARBARIAN_BAND_SIZE of ${String(BARBARIAN_BAND_SIZE)}`,
+        );
+        check(
+          before.players.find((player) => player.id === event.owner)?.kind === 'barbarian',
+          `${label}: BarbariansSpawned names an owner that is not the barbarian player`,
+        );
+        for (let index = 0; index < event.unitIds.length; index += 1) {
+          const claimedId = event.unitIds[index];
+          const claimedTile = event.tiles[index];
+          if (claimedId === undefined || claimedTile === undefined) {
+            failures.push(`${label}: BarbariansSpawned lists disagree at index ${String(index)}`);
+            continue;
+          }
+          claims.push({
+            id: Number(claimedId),
+            owner: Number(event.owner),
+            tile: Number(claimedTile),
+            source: 'BarbariansSpawned',
+          });
+        }
+        break;
+      }
+      default:
+        failures.push(`${label}: a MoveUnit emitted a ${event.type} event`);
+        break;
+    }
+  }
+
+  // --- the units that were already there ---------------------------------
+  const idsAfter = after.units.map((unit) => Number(unit.id));
+  const duplicated = idsAfter.filter((id, index) => idsAfter.indexOf(id) !== index);
+  check(
+    duplicated.length === 0,
+    `${label}: unit id ${String(duplicated[0])} appears twice after the move`,
+  );
+  check(
+    idsAfter.every((id, index) => index === 0 || (idsAfter[index - 1] ?? -1) < id),
+    `${label}: the unit array is no longer sorted by id`,
+  );
+
+  const newIds = idsAfter.filter((id) => !known.has(id));
+  check(
+    JSON.stringify(idsAfter) ===
+      JSON.stringify([...idsBefore, ...newIds.slice().sort((a, b) => a - b)]),
+    `${label}: the pre-existing unit id sequence is not a prefix of the new one`,
+  );
+
+  const othersAfter = after.units.filter(
+    (candidate) => candidate.id !== mover.id && known.has(Number(candidate.id)),
+  );
+  const othersBefore = before.units.filter((candidate) => candidate.id !== mover.id);
+  check(
+    JSON.stringify(othersAfter) === JSON.stringify(othersBefore),
+    `${label}: a pre-existing unit that did not move changed`,
+  );
+
+  const moved = after.units.find((candidate) => candidate.id === mover.id);
+  check(moved !== undefined, `${label}: the mover disappeared`);
+  check(
+    moved === undefined || moved.tile === to,
+    `${label}: the mover is not on the destination tile`,
+  );
+
+  // --- and the units the events are allowed to have added ----------------
+  const claimById = new Map<number, UnitClaim>();
+  for (const claim of claims) {
+    check(!claimById.has(claim.id), `${label}: two events claim unit ${String(claim.id)}`);
+    check(
+      !known.has(claim.id),
+      `${label}: ${claim.source} claims unit ${String(claim.id)}, which existed before the move`,
+    );
+    claimById.set(claim.id, claim);
+  }
+
+  const newIdSet = new Set(newIds);
+  for (const id of newIds) {
+    const claim = claimById.get(id);
+    if (claim === undefined) {
+      failures.push(`${label}: unit ${String(id)} appeared without any event accounting for it`);
+      continue;
+    }
+    const appeared = after.units.find((candidate) => Number(candidate.id) === id);
+    check(
+      appeared !== undefined,
+      `${label}: ${claim.source} claims unit ${String(id)} but no such unit is in the state`,
+    );
+    check(
+      appeared === undefined || Number(appeared.owner) === claim.owner,
+      `${label}: unit ${String(id)} has owner ${String(appeared?.owner)} but ${claim.source} declared ${String(claim.owner)}`,
+    );
+    check(
+      appeared === undefined || Number(appeared.tile) === claim.tile,
+      `${label}: unit ${String(id)} stands on ${String(appeared?.tile)} but ${claim.source} declared ${String(claim.tile)}`,
+    );
+  }
+
+  for (const [id, claim] of claimById) {
+    check(
+      newIdSet.has(id),
+      `${label}: ${claim.source} claims unit ${String(id)} but no such unit appeared`,
+    );
+  }
+
+  // --- the hut, and the draw it cost -------------------------------------
+  const hutsAfter = after.map.huts.map(Number);
+  if (hutsConsumed > 0) {
+    check(hutsConsumed === 1, `${label}: one move consumed ${String(hutsConsumed)} huts`);
+    check(hutsBefore.includes(Number(to)), `${label}: a hut was entered on a tile that had none`);
+    check(
+      JSON.stringify(hutsAfter) === JSON.stringify(hutsBefore.filter((hut) => hut !== Number(to))),
+      `${label}: the hut on the destination tile was not consumed exactly once`,
+    );
+    check(
+      JSON.stringify(after.rng) !== JSON.stringify(before.rng),
+      `${label}: a hut was entered but the state RNG did not advance`,
+    );
+  } else {
+    check(
+      JSON.stringify(hutsAfter) === JSON.stringify(hutsBefore),
+      `${label}: a hut vanished without a HutEntered event`,
+    );
+    check(
+      JSON.stringify(after.rng) === JSON.stringify(before.rng),
+      `${label}: the RNG advanced with no hut to draw from`,
+    );
+  }
+
+  return {
+    grantedUnits: claims.filter((claim) => claim.source === 'HutEntered').length,
+    barbarianUnits: claims.filter((claim) => claim.source === 'BarbariansSpawned').length,
+    hutsConsumed,
+  };
+};
+
+describe('conservation — a legal move moves one unit, and every unit that appears is accounted for', () => {
+  it('never duplicates, loses or teleports a pre-existing unit, and accounts for every hut unit', () => {
     failures.length = 0;
+    let moves = 0;
+    let hutsConsumed = 0;
+    let grantedUnits = 0;
+    let barbarianUnits = 0;
+
     for (const seed of SWEEP_SEEDS) {
       const state = generated(seed);
-      const idsBefore = state.units.map((unit) => Number(unit.id));
 
       for (const unit of state.units) {
         for (const to of unitMoveOptions(state, RULESET, unit.id)) {
-          const outcome = applyCommand(
-            state,
-            unit.owner,
-            { type: 'MoveUnit', unitId: unit.id, to },
-            RULESET,
-          );
+          const cmd: Command = { type: 'MoveUnit', unitId: unit.id, to };
+          const outcome = applyCommand(state, unit.owner, cmd, RULESET);
           if (!outcome.ok) {
             failures.push(
-              `seed ${String(seed)}: offered move ${cmdKey({ type: 'MoveUnit', unitId: unit.id, to })} was refused`,
+              `seed ${String(seed)}: offered move ${cmdKey(cmd)} was refused: ${errorText(outcome.error)}`,
             );
             continue;
           }
+
           const after = outcome.value.state;
           const label = `seed ${String(seed)} unit ${String(unit.id)} -> ${String(to)}`;
+          moves += 1;
 
-          check(after.units.length === state.units.length, `${label}: unit count changed`);
-          check(
-            JSON.stringify(after.units.map((candidate) => Number(candidate.id))) ===
-              JSON.stringify(idsBefore),
-            `${label}: the unit id sequence changed`,
-          );
           check(
             distance8(after.map, unit.tile, to) === 1,
             `${label}: the unit moved more than one tile`,
           );
 
-          const moved = after.units.find((candidate) => candidate.id === unit.id);
-          check(moved?.tile === to, `${label}: the mover is not on the destination tile`);
-
-          const others = after.units.filter((candidate) => candidate.id !== unit.id);
-          const othersBefore = state.units.filter((candidate) => candidate.id !== unit.id);
-          check(
-            JSON.stringify(others) === JSON.stringify(othersBefore),
-            `${label}: a unit that did not move changed`,
-          );
+          const delta = conserveMove(state, after, outcome.value.events, unit, to, label);
+          hutsConsumed += delta.hutsConsumed;
+          grantedUnits += delta.grantedUnits;
+          barbarianUnits += delta.barbarianUnits;
         }
       }
+
+      // The sweep reads one state for every unit and every offered tile; a state
+      // that drifted under it would make every later label a lie.
+      check(
+        JSON.stringify(state.units) === JSON.stringify(generated(seed).units),
+        `seed ${String(seed)}: the conservation sweep mutated the state it was reading`,
+      );
     }
+
+    const totals = { seeds: SWEEP_SEEDS.length, moves, hutsConsumed, grantedUnits, barbarianUnits };
+    console.log('conservation sweep totals:', JSON.stringify(totals));
+
     expect(failures).toEqual([]);
+
+    // Non-vacuity, so "every added unit is accounted for" is not a claim about a
+    // command that never added one: the sweep must have walked real moves, and the
+    // seeds it uses must really have entered huts and really have spawned a band.
+    // (`grantedUnits` is 0 on this seed set by design — the free-unit branch is
+    // covered by its own test below, which does not lean on these seeds.)
+    expect(moves).toBeGreaterThan(150);
+    expect(hutsConsumed).toBeGreaterThan(0);
+    expect(barbarianUnits).toBeGreaterThan(0);
   });
 
   it('keeps movementLeft within [0, movement] and equal to old minus destination cost', () => {
@@ -918,6 +1211,142 @@ describe('conservation — a legal move moves one unit and nothing else', () => 
       turns += 1;
     }
     expect(turns).toBe(SWEEP_SEEDS.length);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 3b. Huts — every reward branch, and the surface itself
+ * ------------------------------------------------------------------ */
+
+/**
+ * Seeds whose first steps enter a hut, chosen for **branch coverage** rather than
+ * for looks: on this seed set the three reward kinds all occur (probed, and
+ * asserted below, so a branch that drifts away fails loudly instead of silently
+ * leaving a branch untested).
+ *
+ * A separate list on purpose. `SWEEP_SEEDS` drives the keystone sweep as well, and
+ * the counts that test pins (`legalActions`, `enumerated`, `accepted` …) are part
+ * of its evidence — quietly appending a seed there to reach the free-unit branch
+ * would move another test's totals as a side effect.
+ */
+const HUT_BRANCH_SEEDS: readonly number[] = [3, 5, 57];
+
+describe('hut rewards — conservation holds on every branch, not only where no hut is entered', () => {
+  it('accounts for the units the free-unit branch adds, and for the band, and for nothing', () => {
+    failures.length = 0;
+    const rewards: string[] = [];
+    let hutMoves = 0;
+
+    for (const seed of HUT_BRANCH_SEEDS) {
+      const state = generated(seed);
+
+      for (const unit of state.units) {
+        for (const to of unitMoveOptions(state, RULESET, unit.id)) {
+          // `hutAt` is the public read of the map's hut list (`@civts/core`); the
+          // sweep asks it rather than re-deriving "is this a hut tile?" from
+          // `map.huts`, so the predicate the engine uses is the one under test.
+          if (!hutAt(state, Number(to))) continue;
+
+          const cmd: Command = { type: 'MoveUnit', unitId: unit.id, to };
+          const outcome = applyCommand(state, unit.owner, cmd, RULESET);
+          if (!outcome.ok) {
+            failures.push(
+              `seed ${String(seed)}: offered hut move ${cmdKey(cmd)} was refused: ${errorText(outcome.error)}`,
+            );
+            continue;
+          }
+
+          hutMoves += 1;
+          const label = `seed ${String(seed)} unit ${String(unit.id)} -> hut ${String(to)}`;
+          const delta = conserveMove(
+            state,
+            outcome.value.state,
+            outcome.value.events,
+            unit,
+            to,
+            label,
+          );
+          check(delta.hutsConsumed === 1, `${label}: the hut was not consumed`);
+
+          for (const event of outcome.value.events) {
+            if (event.type === 'HutEntered') rewards.push(event.reward);
+          }
+        }
+      }
+    }
+
+    const observed = [...new Set(rewards)].sort();
+    console.log(
+      'hut branch sweep:',
+      JSON.stringify({ seeds: HUT_BRANCH_SEEDS.length, hutMoves, rewards: observed }),
+    );
+
+    expect(failures).toEqual([]);
+    expect(hutMoves).toBeGreaterThanOrEqual(HUT_BRANCH_SEEDS.length);
+    // All three branches — including the free-unit one, which `SWEEP_SEEDS` never
+    // draws — so the "every added unit is claimed by an event" half of
+    // `conserveMove` is exercised on a branch that really does add a unit.
+    expect(observed).toEqual([...HUT_REWARD_KINDS].sort());
+  });
+
+  it('is a non-event away from a hut: no consumption, no event, no draw', () => {
+    const state = generated(57);
+    const unit = state.units.find((candidate) => !hutAt(state, Number(candidate.tile)));
+    if (unit === undefined) throw new Error('every unit starts on a hut — the fixture is broken');
+
+    // No hut under the unit ⇒ `undefined`: no consumption, no event, no draw.
+    expect(resolveHutEntry(state, RULESET, unit.id)).toBeUndefined();
+
+    // An id that resolves to nothing is the same non-event, not a throw.
+    const absent = Math.max(...state.units.map((candidate) => Number(candidate.id))) + 1;
+    expect(resolveHutEntry(state, RULESET, asUnitId(absent))).toBeUndefined();
+  });
+
+  it('surfaces the hut surface from @civts/core, with the provenance it claims', () => {
+    // The five names the M3 hut workstream owes its consumers, reached through the
+    // package entry point rather than the module path — a missing `export * from
+    // './hut.js'` in `index.ts` is exactly the integration gap this pins.
+    expect(typeof hutAt).toBe('function');
+    expect(typeof resolveHutEntry).toBe('function');
+    expect([...HUT_REWARD_KINDS]).toEqual(['unit', 'barbarians', 'nothing']);
+    expect(Number.isInteger(BARBARIAN_BAND_SIZE)).toBe(true);
+    expect(BARBARIAN_BAND_SIZE).toBeGreaterThan(0);
+
+    // PROVENANCE (docs/INTERFACES.md M3, "Provenance warning"): the hut numbers are
+    // ours, chosen to be playable, and the row says so. `cited-only` fidelity must
+    // keep refusing while this is a placeholder, so a `cited` spelling here would
+    // be a false claim about Civ 3 rather than a typo.
+    const provenance = HUT_REWARD_PROVENANCE;
+    expect(isPlaceholder(provenance)).toBe(true);
+    expect(provenance.kind).toBe('placeholder');
+    if (isPlaceholder(provenance)) {
+      // "Plainly unsourced and chosen to be playable", in the row's own words.
+      expect(provenance.note).toMatch(/unsourced/i);
+      expect(provenance.note).toMatch(/playable/i);
+      // …and explicitly *not* an accuracy claim, with the deliberate absence of
+      // `gold` named rather than silently omitted (INTERFACES.md M3, "Goody huts").
+      expect(provenance.note).toMatch(/not traced to civ 3/i);
+      expect(provenance.note).toMatch(/gold/i);
+    }
+
+    // And the read itself, against a real generated map: every declared hut is a
+    // hut, and a tile that is not one is not one.
+    const state = generated(42);
+    expect(state.map.huts.length).toBeGreaterThan(0);
+    const huts = new Set(state.map.huts.map(Number));
+    for (const hut of state.map.huts) {
+      expect(hutAt(state, Number(hut)), `declared hut ${String(hut)}`).toBe(true);
+    }
+    const notAHut = Array.from(
+      { length: state.map.width * state.map.height },
+      (_, index) => index,
+    ).find((tile) => !huts.has(tile));
+    expect(notAHut).toBeDefined();
+    if (notAHut !== undefined) expect(hutAt(state, notAHut)).toBe(false);
+
+    // Out of bounds is "no hut", not an error: the predicate is total.
+    expect(hutAt(state, -1)).toBe(false);
+    expect(hutAt(state, state.map.width * state.map.height)).toBe(false);
   });
 });
 

@@ -76,7 +76,13 @@ play options:
   --map-size <size>   ${MAP_SIZES.join('|')}  (default: tiny)
   --civs <int>        number of civilizations, 2..16       (default: 2)
   --player <int>      which civilization you play, 0-based (default: 0)
+  --god               render the whole map and ignore fog  (default: off)
   --script <file>     run a command file, print the transcript, exit 0
+
+play commands (inside a session; "help" prints the same list with detail):
+  move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
+  work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
+  end   units   state   save <path>   help   quit
 
 Examples:
   pnpm map --seed 42

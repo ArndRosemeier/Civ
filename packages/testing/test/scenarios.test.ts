@@ -23,27 +23,42 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  HUT_REWARD_KINDS,
+  HUT_REWARD_PROVENANCE,
   MAP_DIMENSIONS,
   SCHEMA_VERSION,
   TERRAIN_BY_ROLE,
   VISIBILITY_RADIUS,
   applyCommand,
+  asBuildingId,
+  asCityId,
   asPlayerId,
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  cityAt,
+  cityById,
+  cityYields,
   civPlayers,
+  foodBoxSize,
+  hutAt,
   isExplored,
+  isPlaceholder,
+  nextBelow,
+  seedRng,
   tileIndex,
   unitById,
   unitDef,
   unitsOnTile,
   visibleTiles,
+  type City,
   type Command,
   type CommandOutcome,
   type GameError,
   type GameState,
+  type HutRewardKind,
   type PlayerId,
+  type ProductionItem,
   type Result,
   type RulesetView,
   type TileIndex,
@@ -849,5 +864,1428 @@ describe('the scenario assertions discriminate (they are not decoration)', () =>
     expect(result.passed).toBe(false);
     expect(exploredCount(after, ROME)).toBe(30);
     expect(failures(result.assertions).join('\n')).toMatch(/explored holds exactly those 35 tiles/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M3 acceptance evidence — growth timing, starvation, production, huts
+ * ------------------------------------------------------------------ */
+
+/**
+ * M3's commands, spelled the way the REPL spells them, so a scenario's `run`
+ * reads like a transcript rather than like a construction site.
+ */
+const endTurn = (): Command => ({ type: 'EndTurn' });
+const endTurns = (count: number): readonly Command[] =>
+  Array.from({ length: count }, () => endTurn());
+const foundCity = (unitId: number): Command => ({ type: 'FoundCity', unitId: asUnitId(unitId) });
+const setWorkedTiles = (cityId: number, tiles: readonly TileIndex[]): Command => ({
+  type: 'SetWorkedTiles',
+  cityId: asCityId(cityId),
+  tiles,
+});
+const setProduction = (cityId: number, item: ProductionItem): Command => ({
+  type: 'SetProduction',
+  cityId: asCityId(cityId),
+  item,
+});
+
+const SETTLER = asUnitTypeId('settler');
+const GRANARY = asBuildingId('granary');
+const NOT_A_BUILDING = asBuildingId('nope');
+
+/** Player 2 in every M3 scenario that has a hut: the barbarian identity. */
+const BARBARIANS = asPlayerId(2);
+
+/**
+ * Apply one command as Rome (player 0) and hand back the outcome, or `undefined`
+ * when it was refused. These scenarios probe *inside* their `assert` callbacks —
+ * "and then exactly one more turn does this" — the way the M2 movement scenario
+ * probes its second and third steps, and a refusal there is a failure the
+ * assertion messages report rather than a thrown error.
+ */
+const romeApply = (
+  state: GameState,
+  ruleset: RulesetView,
+  command: Command,
+): CommandOutcome | undefined => {
+  const result = applyCommand(state, ROME, command, ruleset);
+  return result.ok ? result.value : undefined;
+};
+
+/** `count` EndTurns as Rome, or `undefined` as soon as one is refused. */
+const endTurnsFrom = (
+  state: GameState,
+  ruleset: RulesetView,
+  count: number,
+): GameState | undefined => {
+  let current: GameState | undefined = state;
+  for (let index = 0; index < count && current !== undefined; index += 1) {
+    current = romeApply(current, ruleset, endTurn())?.state;
+  }
+  return current;
+};
+
+/** The position of the hut in the hut scenarios: one step east of the mover. */
+const HUT_TILE = at(6, 5);
+
+/* ------------------------------------------------------------------ *
+ * 4. Growth timing and carry-over
+ * ------------------------------------------------------------------ */
+
+/**
+ * GROWTH TIMING. A settler founds a city on open grassland and four turns later
+ * the scenario stops: the box holds 8 of the 10 food a second citizen costs, so
+ * every number below is *exactly one turn away* from a growth that has not
+ * happened yet, and the growth turn itself is then probed.
+ *
+ * The arithmetic, all of it the engine's, from the shipped catalog's placeholder
+ * yields (grassland 2 food / 1 shield, `FOOD_BOX_BASE` 10, `FOOD_BOX_PER_CITIZEN`
+ * 5, `FOOD_PER_CITIZEN` 2):
+ *
+ * - the centre is always worked and free, and the auto-assigned citizen takes the
+ *   lowest-index grassland in the 21-tile radius, so a one-citizen city makes
+ *   2 + 2 = 4 food, eats 2, and carries a surplus of **2**;
+ * - `foodBoxSize(1)` is 10, so the box reaches 10 on the **fifth** turn — the
+ *   growth turn — and carries 10 - 10 = **0** over;
+ * - at two citizens the city makes 6 food, eats 4, keeps a surplus of 2, and
+ *   `foodBoxSize(2)` is 15, so the third citizen arrives on the **eighth** turn of
+ *   that population (2 × 8 = 16) and the box carries **1** over. That 1 is the
+ *   carry-over this scenario exists to pin: an implementation that reset the box
+ *   on growth would leave 0 there, and one that reset it *after* the surplus
+ *   would leave 2.
+ *
+ * Growth runs before production (`turn.ts`), so the growth turn's shields are
+ * counted at the *new* population: 8 banked over four turns, then 1 + 1 + 1 = 3
+ * on the fifth = **11**. An implementation that produced first would leave 10.
+ */
+const growthScenario = defineScenario({
+  name: 'city-growth-timing-and-carry-over',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland') // 2 food, 1 shield a tile
+      .addUnit(0, SETTLER, [5, 5])
+      .addUnit(1, WARRIOR, [20, 20]),
+  run: [foundCity(0), ...endTurns(4)],
+  assert: (after, ruleset) => {
+    const cityId = asCityId(0);
+    const city = cityById(after, cityId);
+    if (city === undefined) return [check(false, 'FoundCity left no city on the map')];
+
+    const yields = cityYields(after, ruleset, cityId);
+    const cityTile = at(5, 5);
+
+    // The fifth turn: the growth turn.
+    const fifth = romeApply(after, ruleset, endTurn());
+    const grown = fifth?.state;
+    const grownCity = grown === undefined ? undefined : cityById(grown, cityId);
+    const grownEvent = fifth?.events.find((event) => event.type === 'CityGrew');
+
+    // Seven more turns stop one food short (box 14 of 15) …
+    const almost = grown === undefined ? undefined : endTurnsFrom(grown, ruleset, 7);
+    const almostCity = almost === undefined ? undefined : cityById(almost, cityId);
+
+    // … and the eighth grows again, this time with a remainder.
+    const eighth = almost === undefined ? undefined : romeApply(almost, ruleset, endTurn());
+    const third = eighth?.state;
+    const thirdCity = third === undefined ? undefined : cityById(third, cityId);
+    const thirdEvent = eighth?.events.find((event) => event.type === 'CityGrew');
+
+    return [
+      check(
+        city.population === 1 && city.workedTiles.length === 1,
+        `the young city has 1 citizen working 1 tile (got ${String(city.population)} citizen(s) and ${String(city.workedTiles.length)} worked tile(s))`,
+      ),
+      check(
+        after.turn === 5 && city.foodBox === 8,
+        `after four turns the box holds 8 of the 10 food a second citizen costs, so the next turn is the growth turn (turn ${String(after.turn)}, box ${String(city.foodBox)})`,
+      ),
+      check(
+        foodBoxSize(1) === 10 && yields.food === 4 && yields.foodSurplus === 2,
+        `the growth arithmetic: a grassland centre plus one grassland tile is 4 food, 2 citizens' worth is eaten, so the surplus is 2 and the box is 10 long (got food ${String(yields.food)}, surplus ${String(yields.foodSurplus)}, box size ${String(foodBoxSize(1))})`,
+      ),
+      check(
+        cityAt(after, cityTile)?.id === cityId && after.cities.length === 1,
+        `the city stands on ${label(5, 5)} and it is the only one (cities: ${String(after.cities.length)})`,
+      ),
+      check(
+        grownCity !== undefined && grown !== undefined && grown.turn === 6,
+        `the city grew on the fifth turn: the state is at turn 6 (got ${String(grown?.turn)})`,
+      ),
+      check(
+        grownCity !== undefined && grownCity.population === 2 && grownCity.workedTiles.length === 2,
+        `population 1 -> 2, and the second citizen was assigned a tile (got ${String(grownCity?.population)} citizen(s) and ${String(grownCity?.workedTiles.length)} worked tile(s))`,
+      ),
+      check(
+        grownCity !== undefined && grownCity.foodBox === 0,
+        `the box carries 10 - 10 = 0 over, so nothing is lost and nothing is invented (got ${String(grownCity?.foodBox)})`,
+      ),
+      check(
+        grownEvent !== undefined &&
+          grownEvent.cityId === cityId &&
+          grownEvent.owner === ROME &&
+          grownEvent.population === 2 &&
+          grownEvent.foodBox === 0,
+        `the engine's own account of the growth: CityGrew(city 0, Rome, population 2, foodBox 0) (got ${JSON.stringify(grownEvent)})`,
+      ),
+      check(
+        grownCity !== undefined && grownCity.shields === 11,
+        `growth ran before production: 8 shields banked at one citizen, then 3 at two = 11 (got ${String(grownCity?.shields)}; producing first would leave 10)`,
+      ),
+      check(
+        almostCity !== undefined && almost !== undefined && almost.turn === 13,
+        `seven turns later the state is at turn 13 (got ${String(almost?.turn)})`,
+      ),
+      check(
+        almostCity !== undefined && almostCity.population === 2 && almostCity.foodBox === 14,
+        `the box holds 14 of the 15 food a third citizen costs, so it has NOT grown yet (population ${String(almostCity?.population)}, box ${String(almostCity?.foodBox)})`,
+      ),
+      check(
+        thirdCity !== undefined && third !== undefined && third.turn === 14,
+        `the third citizen arrived on the eighth turn of that population: the state is at turn 14 (got ${String(third?.turn)})`,
+      ),
+      check(
+        thirdCity !== undefined && thirdCity.population === 3 && thirdCity.workedTiles.length === 3,
+        `population 2 -> 3, with a third tile assigned (got ${String(thirdCity?.population)} citizen(s) and ${String(thirdCity?.workedTiles.length)} worked tile(s))`,
+      ),
+      check(
+        thirdCity !== undefined && thirdCity.foodBox === 1,
+        `the box carries the leftover over: 16 - 15 = 1, and 1 is not 0 (got ${String(thirdCity?.foodBox)})`,
+      ),
+      check(
+        thirdEvent !== undefined && thirdEvent.population === 3 && thirdEvent.foodBox === 1,
+        `CityGrew(city 0, population 3, foodBox 1) is the engine's account of it (got ${JSON.stringify(thirdEvent)})`,
+      ),
+      check(
+        thirdCity !== undefined && thirdCity.shields === 36,
+        `shields at turn 14: 32 banked by then plus 4 at three citizens = 36 (got ${String(thirdCity?.shields)})`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 5. Starvation
+ * ------------------------------------------------------------------ */
+
+/**
+ * STARVATION. A city is founded on **plains** (1 food, 2 shields at the centre)
+ * so that once its citizens are unassigned it cannot feed them: the centre's
+ * 1 food against 2 food per citizen is a deficit of 3 at two citizens and 1 at
+ * one, and the box can never climb out of it.
+ *
+ * The timeline, exactly:
+ *
+ * 1. at one citizen, with the auto-assigned grassland tile, the city makes
+ *    1 + 2 = 3 food and eats 2, so it grows by 1 a turn and reaches
+ *    `foodBoxSize(1) = 10` on the **tenth** turn — turn 11, box 0, population 2;
+ * 2. `SetWorkedTiles(city, [])` then unassigns both citizens: the city makes the
+ *    centre's 1 food, needs 4, and runs a deficit of 3 with an empty box;
+ * 3. the **eleventh** turn therefore takes a citizen (population 2 -> 1, box
+ *    restarts at 0) — the turn this scenario pins;
+ * 4. at one citizen the deficit is still 1 a turn, so every later turn takes
+ *    another citizen *if it could*: the population stays at 1 for ever and the
+ *    box restarts at 0 each time. That is the floor, and it is asserted on five
+ *    consecutive turns rather than once.
+ */
+const starvationScenario = defineScenario({
+  name: 'city-starvation-takes-a-citizen-and-never-falls-below-one',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(5, 5, 'plains') // the city site: 1 food, 2 shields
+      .addUnit(0, SETTLER, [5, 5])
+      .addUnit(1, WARRIOR, [20, 20]),
+  run: [foundCity(0), ...endTurns(10), setWorkedTiles(0, [])],
+  assert: (after, ruleset) => {
+    const cityId = asCityId(0);
+    const city = cityById(after, cityId);
+    if (city === undefined) return [check(false, 'FoundCity left no city on the map')];
+
+    const yields = cityYields(after, ruleset, cityId);
+
+    // The starvation turn: the eleventh.
+    const starved = romeApply(after, ruleset, endTurn());
+    const afterStarve = starved?.state;
+    const starvedCity = afterStarve === undefined ? undefined : cityById(afterStarve, cityId);
+    const starveEvent = starved?.events.find((event) => event.type === 'CityStarved');
+
+    // Five more deficit turns: the population must not fall any further.
+    const later: (City | undefined)[] = [];
+    let cursor = afterStarve;
+    let starveEvents = 0;
+    let floorHeld = true;
+    for (let index = 0; index < 5 && cursor !== undefined; index += 1) {
+      const turn = romeApply(cursor, ruleset, endTurn());
+      const city2 = turn === undefined ? undefined : cityById(turn.state, cityId);
+      later.push(city2);
+      starveEvents += turn?.events.filter((event) => event.type === 'CityStarved').length ?? 0;
+      if (city2 !== undefined && (city2.population < 1 || city2.foodBox !== 0)) floorHeld = false;
+      cursor = turn?.state;
+    }
+
+    return [
+      check(
+        after.turn === 11 && city.population === 2 && city.foodBox === 0,
+        `the city reached 2 citizens on the tenth turn (turn ${String(after.turn)}, population ${String(city.population)}, box ${String(city.foodBox)})`,
+      ),
+      check(
+        city.workedTiles.length === 0,
+        `SetWorkedTiles left it working no tiles at all, so its 2 citizens produce nothing (worked ${String(city.workedTiles.length)} tile(s))`,
+      ),
+      check(
+        yields.food === 1 && yields.foodSurplus === -3,
+        `a plains centre alone is 1 food against 2 per citizen, so the surplus is -3 and the empty box goes below zero (got food ${String(yields.food)}, surplus ${String(yields.foodSurplus)})`,
+      ),
+      check(
+        starvedCity !== undefined && afterStarve !== undefined && afterStarve.turn === 12,
+        `the citizen is lost on the eleventh turn: the state is at turn 12 (got ${String(afterStarve?.turn)})`,
+      ),
+      check(
+        starvedCity !== undefined && starvedCity.population === 1,
+        `population 2 -> 1: exactly one citizen went, because one deficit turn costs one citizen (got ${String(starvedCity?.population)})`,
+      ),
+      check(
+        starvedCity !== undefined && starvedCity.foodBox === 0,
+        `the food box restarts at 0 rather than going on at -3 (got ${String(starvedCity?.foodBox)})`,
+      ),
+      check(
+        starveEvent !== undefined &&
+          starveEvent.cityId === cityId &&
+          starveEvent.owner === ROME &&
+          starveEvent.population === 1 &&
+          starveEvent.foodBox === 0,
+        `the engine's own account: CityStarved(city 0, Rome, population 1, foodBox 0) (got ${JSON.stringify(starveEvent)})`,
+      ),
+      check(
+        starvedCity !== undefined && starvedCity.workedTiles.length === 0,
+        `the assignment was trimmed with the citizen: 0 worked tiles for 1 citizen (got ${String(starvedCity?.workedTiles.length)})`,
+      ),
+      check(
+        later.length === 5 && later.every((entry) => entry !== undefined && entry.population === 1),
+        `five further deficit turns leave the population at 1 — it never falls below 1 (populations: ${later.map((entry) => String(entry?.population)).join(', ')})`,
+      ),
+      check(
+        floorHeld,
+        `every one of those turns restarts the box at 0 and none of them reaches population 0 (boxes: ${later.map((entry) => String(entry?.foodBox)).join(', ')})`,
+      ),
+      check(
+        starveEvents === 5,
+        `each of those five turns starved again, so the floor is being tested by a continuing deficit and not by a city that recovered (CityStarved events: ${String(starveEvents)})`,
+      ),
+      check(
+        afterStarve !== undefined &&
+          cityYields(afterStarve, ruleset, cityId).foodSurplus === -1 &&
+          afterStarve.cities.length === 1,
+        `at one citizen the deficit is still 1 (1 food against 2), and the city is still Rome's only one (surplus ${String(afterStarve === undefined ? 'no state' : cityYields(afterStarve, ruleset, cityId).foodSurplus)})`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 6. Production
+ * ------------------------------------------------------------------ */
+
+/**
+ * PRODUCTION. A hand-built city (the queue is what the DSL had to learn: M3
+ * ships no command that appends to one) is building a **settler** (3 shields)
+ * with a **warrior** (1 shield) queued behind it, and works one grassland tile,
+ * so it banks exactly 2 shields a turn.
+ *
+ * The timeline, exactly:
+ *
+ * 1. turn 2: 2 shields, one short of the settler's 3, so nothing is finished;
+ * 2. turn 3: 2 + 2 = 4 >= 3 — the settler completes, 1 shield is carried over,
+ *    the unit appears on the city centre at full movement (2), and the **queue**
+ *    promotes the warrior to the head;
+ * 3. turn 4: 1 + 2 = 3 >= 1 — the warrior completes, 2 shields are carried over,
+ *    and with the queue empty the city is building nothing at all: `production`
+ *    is *absent* from the city, never present-and-`undefined` (a present
+ *    `undefined` cannot survive canonical JSON, so the state would be
+ *    unhashable — the trap `City.production` documents);
+ * 4. turn 5: 2 + 2 = 4 shields are simply stored, because an empty queue with
+ *    shields banked is legal and completing nothing is not an error.
+ */
+const PRODUCTION_CITY = at(5, 5);
+
+const productionScenario = defineScenario({
+  name: 'city-production-completes-a-unit-and-promotes-the-queue',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, WARRIOR, [30, 30]) // Rome's starting tile, far from the city
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], {
+        population: 1,
+        // A grassland centre plus one grassland tile: 4 food (a surplus of 2, so
+        // growth is 10 turns away) and 2 shields.
+        workedTiles: [at(4, 3)],
+        production: { kind: 'unit', id: SETTLER }, // 3 shields
+        queue: [{ kind: 'unit', id: WARRIOR }], // 1 shield
+      }),
+  run: [endTurn(), endTurn()],
+  assert: (after, ruleset) => {
+    const cityId = asCityId(0);
+    const city = cityById(after, cityId);
+    if (city === undefined) return [check(false, 'addCity left no city on the map')];
+
+    const settlerDef = unitDef(ruleset, SETTLER);
+    const warriorDef = unitDef(ruleset, WARRIOR);
+    const spawned = after.units[2];
+    const yields = cityYields(after, ruleset, cityId);
+
+    // The third turn: the queued warrior is now the head, and it finishes too.
+    const third = romeApply(after, ruleset, endTurn());
+    const afterThird = third?.state;
+    const thirdCity = afterThird === undefined ? undefined : cityById(afterThird, cityId);
+    const thirdEvent = third?.events.find((event) => event.type === 'CityProduced');
+
+    // The fourth turn: an empty queue simply banks its shields.
+    const fourth = afterThird === undefined ? undefined : romeApply(afterThird, ruleset, endTurn());
+    const afterFourth = fourth?.state;
+    const fourthCity = afterFourth === undefined ? undefined : cityById(afterFourth, cityId);
+
+    return [
+      check(
+        settlerDef !== undefined &&
+          warriorDef !== undefined &&
+          settlerDef.cost === 3 &&
+          warriorDef.cost === 1,
+        `the catalog prices the settler at 3 shields and the queued warrior at 1 (got ${String(settlerDef?.cost)} and ${String(warriorDef?.cost)})`,
+      ),
+      check(
+        yields.shields === 2 && yields.foodSurplus === 2,
+        `the city banks 2 shields a turn on one worked grassland tile, and eats its food surplus (got ${String(yields.shields)} shields, surplus ${String(yields.foodSurplus)})`,
+      ),
+      check(
+        after.turn === 3 && city.shields === 1,
+        `the settler completed on the second turn — the state is at turn 3 — and 4 - 3 = 1 shield was carried over (turn ${String(after.turn)}, shields ${String(city.shields)})`,
+      ),
+      check(
+        after.units.length === 3 && spawned !== undefined && spawned.type === SETTLER,
+        `the completed unit exists (units: ${after.units.map((unit) => `${String(unit.id)}:${unit.type}`).join(', ')})`,
+      ),
+      check(
+        spawned !== undefined &&
+          spawned.owner === ROME &&
+          spawned.tile === PRODUCTION_CITY &&
+          spawned.movementLeft === (settlerDef?.movement ?? -1),
+        `it is Rome's, it stands on the city centre ${label(5, 5)}, and it has full movement (${String(settlerDef?.movement)}) (owner ${String(spawned?.owner)}, tile ${String(spawned?.tile)}, movement ${String(spawned?.movementLeft)})`,
+      ),
+      check(
+        spawned !== undefined && spawned.id === asUnitId(2) && after.nextUnitId === 3,
+        `ids are dense creation order: the new unit is 2 and nextUnitId is 3 (id ${String(spawned?.id)}, next ${String(after.nextUnitId)})`,
+      ),
+      check(
+        city.production !== undefined &&
+          city.production.kind === 'unit' &&
+          city.production.id === WARRIOR,
+        `the next queue entry became the city's current item: it is building the warrior now (got ${JSON.stringify(city.production)})`,
+      ),
+      check(
+        city.queue.length === 0,
+        `the built item left the queue and the promoted one was not also left in it (queue: ${JSON.stringify(city.queue)})`,
+      ),
+      check(
+        after.revision === 2 && after.cities.length === 1,
+        `two applied commands, one city (revision ${String(after.revision)}, cities ${String(after.cities.length)})`,
+      ),
+      check(
+        thirdCity !== undefined && afterThird !== undefined && afterThird.turn === 4,
+        `the third turn is the state at turn 4 (got ${String(afterThird?.turn)})`,
+      ),
+      check(
+        thirdCity !== undefined && thirdCity.shields === 2,
+        `1 banked + 2 earned - 1 for the warrior = 2 shields carried over (got ${String(thirdCity?.shields)})`,
+      ),
+      check(
+        thirdCity !== undefined &&
+          !Object.hasOwn(thirdCity, 'production') &&
+          thirdCity.queue.length === 0,
+        `with the queue empty the city is building nothing, and the key is ABSENT rather than holding undefined (keys: ${thirdCity === undefined ? 'no city' : Object.keys(thirdCity).join(', ')})`,
+      ),
+      check(
+        afterThird !== undefined &&
+          afterThird.units.length === 4 &&
+          afterThird.units[3]?.type === WARRIOR,
+        `the warrior also appeared on the centre, with dense id 3 (units: ${afterThird === undefined ? 'no state' : afterThird.units.map((unit) => `${String(unit.id)}:${unit.type}`).join(', ')})`,
+      ),
+      check(
+        thirdEvent !== undefined &&
+          thirdEvent.item.kind === 'unit' &&
+          thirdEvent.item.id === WARRIOR &&
+          thirdEvent.shields === 2,
+        `CityProduced(warrior, shields 2) is the engine's account of the second completion (got ${JSON.stringify(thirdEvent)})`,
+      ),
+      check(
+        fourthCity !== undefined &&
+          afterFourth !== undefined &&
+          afterFourth.turn === 5 &&
+          fourthCity.shields === 4,
+        `an empty queue with shields banked is legal: the fourth turn just stores 2 + 2 = 4 (turn ${String(afterFourth?.turn)}, shields ${String(fourthCity?.shields)})`,
+      ),
+      check(
+        fourth !== undefined && fourth.events.every((event) => event.type !== 'CityProduced'),
+        `and it completed nothing, because there is nothing to complete (events: ${JSON.stringify(fourth?.events)})`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 7. Goody huts — one branch per fixed seed
+ * ------------------------------------------------------------------ */
+
+/**
+ * The reward a hut on a fixed seed must give. One seed exercises one branch, so
+ * the branch is not something a scenario can choose: it is
+ * `nextBelow(state.rng, HUT_REWARD_KINDS.length)` on the state's own RNG, which
+ * `build()` seeds from `settings.seed` and nothing else touches before the step.
+ * The three named seeds below were read off that draw (0 -> nothing,
+ * 1 -> unit, 11 -> barbarians) and the sweep test pins the whole table for seeds
+ * 0..11, so a change to the reward table or to the RNG cannot pass unnoticed.
+ */
+interface HutCase {
+  readonly seed: number;
+  readonly reward: HutRewardKind;
+}
+
+const HUT_UNIT_CASE: HutCase = { seed: 1, reward: 'unit' };
+const HUT_BARBARIAN_CASE: HutCase = { seed: 11, reward: 'barbarians' };
+const HUT_NOTHING_CASE: HutCase = { seed: 0, reward: 'nothing' };
+const HUT_CASES: readonly HutCase[] = [HUT_UNIT_CASE, HUT_BARBARIAN_CASE, HUT_NOTHING_CASE];
+
+/**
+ * Where a hut's band lands: the two lowest-index tiles adjacent to the hut that
+ * a land unit may stand on and that hold no unit of another player. The mover
+ * itself rules out `(5, 5)`, which is what makes the band's positions (5, 4) and
+ * (6, 4) rather than the first two neighbours by index.
+ */
+const BAND_TILES: readonly TileIndex[] = [at(5, 4), at(6, 4)];
+
+/** The branch the state's own RNG selects on `seed` — computed, never guessed. */
+const drawnReward = (seed: number): HutRewardKind =>
+  HUT_REWARD_KINDS[nextBelow(seedRng(seed), HUT_REWARD_KINDS.length)[0]] ?? 'nothing';
+
+/**
+ * HUTS. Rome's warrior stands one step west of a goody hut and steps onto it;
+ * the branch is the seed's, and each branch's effect is asserted exactly:
+ * a free unit with its owner and tile, a band with its count and positions, or
+ * nothing granted *while the hut is consumed anyway*.
+ *
+ * The world is otherwise inert: grassland everywhere (cost 1, so the step is
+ * affordable and nothing about terrain enters the assertion), Carthage's warrior
+ * far away, and a barbarian player with no units of its own.
+ */
+const hutScenario = (testCase: HutCase): Scenario =>
+  defineScenario({
+    name: `hut-reward-${testCase.reward}-on-seed-${String(testCase.seed)}`,
+    settings: { mapSize: 'duel', seed: testCase.seed },
+    setup: (b) =>
+      b
+        .addPlayer('Rome')
+        .addPlayer('Carthage')
+        .addBarbarianPlayer()
+        .fillTerrain('grassland')
+        .addHut(6, 5)
+        .addUnit(0, WARRIOR, [5, 5])
+        .addUnit(1, WARRIOR, [20, 20]),
+    run: [move(0, HUT_TILE)],
+    assert: (after, ruleset) => {
+      const warriorDef = unitDef(ruleset, WARRIOR);
+      const mover = unitById(after, asUnitId(0));
+      const carthage = unitById(after, asUnitId(1));
+      const barbarians = after.units.filter((unit) => unit.owner === BARBARIANS);
+      const ids = after.units.map((unit) => unit.id);
+      const owners = after.units.map((unit) => unit.owner);
+      const tiles = after.units.map((unit) => unit.tile);
+      const expectedRng = nextBelow(seedRng(testCase.seed), HUT_REWARD_KINDS.length)[1];
+
+      const common: readonly ScenarioAssertion[] = [
+        check(
+          mover !== undefined && mover.tile === HUT_TILE && mover.movementLeft === 0,
+          `the warrior stepped onto the hut at ${label(6, 5)} and spent its movement (tile ${String(mover?.tile)}, movement ${String(mover?.movementLeft)})`,
+        ),
+        check(
+          !hutAt(after, HUT_TILE) && after.map.huts.length === 0,
+          `the hut is gone from the map whatever the reward was — a hut is consumed by being entered (huts left: ${String(after.map.huts.length)})`,
+        ),
+        check(
+          after.rng.a === expectedRng.a &&
+            after.rng.b === expectedRng.b &&
+            after.rng.c === expectedRng.c &&
+            after.rng.d === expectedRng.d,
+          `exactly one draw came off the state RNG: ${JSON.stringify(after.rng)} is seed ${String(testCase.seed)}'s stream after one draw (${JSON.stringify(expectedRng)})`,
+        ),
+        check(
+          after.revision === 1 && after.turn === 1,
+          `one command was applied and no turn passed (revision ${String(after.revision)}, turn ${String(after.turn)})`,
+        ),
+        check(
+          carthage !== undefined && carthage.tile === at(20, 20) && carthage.owner === CARTHAGE,
+          `Carthage's warrior did not stir (tile ${String(carthage?.tile)})`,
+        ),
+        check(
+          after.players.filter((player) => player.kind === 'barbarian').length === 1,
+          `the world still has exactly one barbarian player, and it is a player rather than a special case (${JSON.stringify(after.players.map((player) => player.kind))})`,
+        ),
+      ];
+
+      if (testCase.reward === 'unit') {
+        const free = after.units[2];
+        return [
+          ...common,
+          check(
+            after.units.length === 3 && free !== undefined,
+            `a free unit was granted: 2 units became 3 (units: ${after.units.map((unit) => `${String(unit.id)}:${unit.type}`).join(', ')})`,
+          ),
+          check(
+            free !== undefined &&
+              free.id === asUnitId(2) &&
+              free.type === WARRIOR &&
+              free.owner === ROME &&
+              free.tile === HUT_TILE &&
+              free.movementLeft === (warriorDef?.movement ?? -1),
+            `it is Rome's (the *finder's* owner, not the barbarians'), it stands on the hut tile beside the mover, and it has full movement (${JSON.stringify(free)})`,
+          ),
+          check(
+            after.nextUnitId === 3 && barbarians.length === 0,
+            `the id counter moved past it and no barbarian appeared (nextUnitId ${String(after.nextUnitId)}, barbarian units ${String(barbarians.length)})`,
+          ),
+        ];
+      }
+
+      if (testCase.reward === 'barbarians') {
+        const walk = warriorDef?.movement ?? -1;
+        return [
+          ...common,
+          check(
+            after.units.length === 4 && barbarians.length === 2,
+            `a band of 2 barbarians was spawned (units ${String(after.units.length)}, barbarian units ${String(barbarians.length)})`,
+          ),
+          check(
+            ids.length === 4 &&
+              ids[0] === asUnitId(0) &&
+              ids[1] === asUnitId(1) &&
+              ids[2] === asUnitId(2) &&
+              ids[3] === asUnitId(3),
+            `the band's units took the next free ids, 2 and 3, in creation order (ids: ${ids.map(String).join(', ')})`,
+          ),
+          check(
+            owners.length === 4 &&
+              owners[0] === ROME &&
+              owners[1] === CARTHAGE &&
+              owners[2] === BARBARIANS &&
+              owners[3] === BARBARIANS,
+            `both are the barbarian player's, and nobody else's (owners: ${owners.map(String).join(', ')})`,
+          ),
+          check(
+            barbarians.length === 2 &&
+              tiles[2] === BAND_TILES[0] &&
+              tiles[3] === BAND_TILES[1] &&
+              barbarians[0]?.tile === BAND_TILES[0] &&
+              barbarians[1]?.tile === BAND_TILES[1],
+            `the band stands on the two lowest-index standable neighbours of the hut, ${label(5, 4)} and ${label(6, 4)} (tiles: ${tiles.map(String).join(', ')})`,
+          ),
+          check(
+            barbarians.every((unit) => unit.type === WARRIOR && unit.movementLeft === walk),
+            `they are ordinary units of the catalog's first military land type at full movement (${String(walk)}), so movement and M6's combat need no special case (${JSON.stringify(barbarians)})`,
+          ),
+          check(
+            barbarians.every((unit) => unit.tile !== HUT_TILE) && after.nextUnitId === 4,
+            `none of them was placed on the hut tile the finder is standing on, and the id counter is 4 (nextUnitId ${String(after.nextUnitId)})`,
+          ),
+        ];
+      }
+
+      return [
+        ...common,
+        check(
+          after.units.length === 2 && barbarians.length === 0,
+          `nothing was granted: the world still holds the two starting units (units ${String(after.units.length)}, barbarian units ${String(barbarians.length)})`,
+        ),
+        check(
+          tiles[0] === HUT_TILE &&
+            tiles[1] === at(20, 20) &&
+            owners[0] === ROME &&
+            owners[1] === CARTHAGE,
+          `the two units are exactly where they were, apart from the step onto the hut (tiles ${tiles.map(String).join(', ')})`,
+        ),
+        check(
+          after.nextUnitId === 2,
+          `no unit was created, so the id counter did not move (nextUnitId ${String(after.nextUnitId)})`,
+        ),
+        check(
+          after.map.huts.length === 0,
+          'and the hut is spent all the same: "nothing" is a reward, not a non-event',
+        ),
+      ];
+    },
+  });
+
+/* ------------------------------------------------------------------ *
+ * M3 scenarios, as tests
+ * ------------------------------------------------------------------ */
+
+describe('M3 scenario: growth timing and carry-over', () => {
+  it('grows on the exact turn the box fills, and carries the remainder into the next one', () => {
+    const result = runScenario(growthScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the growth scenario must build a state');
+
+    // Four turns of the scripted run, and nothing in them grew the city.
+    expect(after.turn).toBe(5);
+    expect(cityById(after, asCityId(0))?.population).toBe(1);
+    expect(cityById(after, asCityId(0))?.foodBox).toBe(8);
+    // `FoundCity` is the run's first command, so its own event leads the list.
+    expect(result.events.map((event) => event.type)).toEqual([
+      'CityFounded',
+      'TurnEnded',
+      'TurnEnded',
+      'TurnEnded',
+      'TurnEnded',
+    ]);
+    expect(result.events).toEqual([
+      {
+        type: 'CityFounded',
+        cityId: asCityId(0),
+        owner: ROME,
+        name: 'City 1',
+        tile: at(5, 5),
+      },
+      { type: 'TurnEnded', playerId: ROME, turn: 2 },
+      { type: 'TurnEnded', playerId: ROME, turn: 3 },
+      { type: 'TurnEnded', playerId: ROME, turn: 4 },
+      { type: 'TurnEnded', playerId: ROME, turn: 5 },
+    ]);
+  });
+
+  it('walks every turn outside the runner and shows the whole box sequence', () => {
+    // The same world, stepped by hand: the point is the box *at each turn*, so a
+    // growth that happened one turn early (or a box that reset when it should
+    // have carried over) has nowhere to hide.
+    const built = createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, SETTLER, [5, 5])
+      .addUnit(1, WARRIOR, [20, 20])
+      .build();
+    if (!built.ok) throw new Error(`the growth fixture must build: ${JSON.stringify(built.error)}`);
+
+    const founded = romeApply(built.value, RULESET, foundCity(0));
+    if (founded === undefined) throw new Error('FoundCity must apply to the growth fixture');
+    expect(founded.state.turn).toBe(1);
+
+    const boxes: number[] = [];
+    const populations: number[] = [];
+    let state = founded.state;
+    for (let turn = 0; turn < 14; turn += 1) {
+      state = endTurnsFrom(state, RULESET, 1) ?? state;
+      const city = cityById(state, asCityId(0));
+      boxes.push(city?.foodBox ?? -1);
+      populations.push(city?.population ?? -1);
+    }
+
+    // Turn by turn: five turns to the second citizen, eight more to the third,
+    // and every value in between exactly as the surplus arithmetic says.
+    expect(populations).toEqual([1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3]);
+    expect(boxes).toEqual([2, 4, 6, 8, 0, 2, 4, 6, 8, 10, 12, 14, 1, 3]);
+    expect(state.turn).toBe(15);
+  });
+});
+
+describe('M3 scenario: starvation', () => {
+  it('takes exactly one citizen on the exact turn the box would go negative, and stops at 1', () => {
+    const result = runScenario(starvationScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the starvation scenario must build a state');
+
+    // Ten turns of feeding, then the unassignment: the city is at its peak here.
+    expect(after.turn).toBe(11);
+    expect(result.events.filter((event) => event.type === 'CityGrew')).toEqual([
+      { type: 'CityGrew', cityId: asCityId(0), owner: ROME, population: 2, foodBox: 0 },
+    ]);
+    expect(after.cities).toHaveLength(1);
+    expect(cityById(after, asCityId(0))?.population).toBe(2);
+
+    // Outside the runner: one turn takes a citizen, and the floor holds after it.
+    const starved = romeApply(after, RULESET, endTurn());
+    if (starved === undefined) throw new Error('EndTurn must apply');
+    expect(starved.state.turn).toBe(12);
+    expect(starved.events).toEqual([
+      { type: 'CityStarved', cityId: asCityId(0), owner: ROME, population: 1, foodBox: 0 },
+      { type: 'TurnEnded', playerId: ROME, turn: 12 },
+    ]);
+    expect(cityById(starved.state, asCityId(0))).toMatchObject({
+      population: 1,
+      foodBox: 0,
+      workedTiles: [],
+    });
+
+    let state = starved.state;
+    for (let turn = 0; turn < 10; turn += 1) {
+      const next = romeApply(state, RULESET, endTurn());
+      if (next === undefined) throw new Error('EndTurn must apply to a starving city too');
+      const city = cityById(next.state, asCityId(0));
+      expect(city?.population).toBe(1);
+      expect(city?.foodBox).toBe(0);
+      state = next.state;
+    }
+    expect(state.turn).toBe(22);
+  });
+});
+
+describe('M3 scenario: production', () => {
+  it('completes a unit on the exact turn it is paid for, carries shields over, and promotes the queue', () => {
+    const result = runScenario(productionScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the production scenario must build a state');
+
+    expect(after.turn).toBe(3);
+    // Only the second turn produced anything, and the pipeline's own order shows:
+    // the world's events first, then the command layer's `TurnEnded`.
+    expect(result.events).toEqual([
+      { type: 'TurnEnded', playerId: ROME, turn: 2 },
+      {
+        type: 'CityProduced',
+        cityId: asCityId(0),
+        owner: ROME,
+        item: { kind: 'unit', id: SETTLER },
+        shields: 1,
+        unitId: asUnitId(2),
+        tile: PRODUCTION_CITY,
+      },
+      { type: 'TurnEnded', playerId: ROME, turn: 3 },
+    ]);
+
+    // The queue promotion and the carried-over shield, on the state itself.
+    expect(cityById(after, asCityId(0))?.production).toEqual({ kind: 'unit', id: WARRIOR });
+    expect(cityById(after, asCityId(0))?.shields).toBe(1);
+    expect(after.units.map((unit) => unit.type)).toEqual([WARRIOR, WARRIOR, SETTLER]);
+  });
+
+  it('leaves no `production` key behind when the queue runs dry, so the state stays hashable', () => {
+    const result = runScenario(productionScenario);
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the production scenario must build a state');
+
+    const third = romeApply(after, RULESET, endTurn());
+    if (third === undefined) throw new Error('EndTurn must apply');
+    const city = cityById(third.state, asCityId(0));
+    if (city === undefined) throw new Error('the city must still exist');
+
+    // The trap this pins: `{ production: undefined }` is unhashable, so the key
+    // must be absent — and the absent spelling must survive a JSON round trip.
+    expect('production' in city).toBe(false);
+    expect(Object.keys(city)).not.toContain('production');
+    expect(result.hash).toMatch(/^[0-9a-f]{16}$/);
+    expect(hashValue(third.state)).toMatch(/^[0-9a-f]{16}$/);
+
+    const roundTripped: unknown = JSON.parse(JSON.stringify(third.state));
+    expect(hashValue(roundTripped)).toBe(hashValue(third.state));
+  });
+
+  it('is driven by SetProduction too, and a redirect keeps the shields already banked', () => {
+    // The command path rather than the builder: a city that has banked 3 shields
+    // is switched to a building it does not have. The pool is the city's, not the
+    // item's, so the redirect must leave those 3 shields exactly where they were,
+    // and asking for something already built is a typed refusal, not a no-op.
+    const built = createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, WARRIOR, [30, 30])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], { population: 1, shields: 3, workedTiles: [at(4, 3)] })
+      .build();
+    if (!built.ok)
+      throw new Error(`the production fixture must build: ${JSON.stringify(built.error)}`);
+
+    const armed = romeApply(
+      built.value,
+      RULESET,
+      setProduction(0, { kind: 'building', id: GRANARY }),
+    );
+    if (armed === undefined) throw new Error('SetProduction must apply');
+    expect(armed.state.revision).toBe(1);
+    expect(armed.events).toEqual([]); // M3's setters emit no event: the command is the record
+    expect(cityById(armed.state, asCityId(0))?.production).toEqual({
+      kind: 'building',
+      id: GRANARY,
+    });
+    // The redirect cost the city nothing: its 3 banked shields are untouched.
+    expect(cityById(armed.state, asCityId(0))?.shields).toBe(3);
+
+    // Two shields a turn against a granary's 10: 3 + 2 + 2 + 2 = 9 after three
+    // turns, one short of the price …
+    const thirdTurn = endTurnsFrom(armed.state, RULESET, 3);
+    expect(thirdTurn?.turn).toBe(4);
+    expect(cityById(thirdTurn ?? armed.state, asCityId(0))?.shields).toBe(9);
+    expect(cityById(thirdTurn ?? armed.state, asCityId(0))?.buildings).toEqual([]);
+    expect(cityById(thirdTurn ?? armed.state, asCityId(0))?.production).toEqual({
+      kind: 'building',
+      id: GRANARY,
+    });
+
+    // … and the fourth turn pays for it: 9 + 2 = 11 >= 10, with 1 shield carried
+    // over and an empty queue, so the city is building nothing again.
+    const fourthTurn = thirdTurn === undefined ? undefined : endTurnsFrom(thirdTurn, RULESET, 1);
+    expect(fourthTurn?.turn).toBe(5);
+    expect(cityById(fourthTurn ?? armed.state, asCityId(0))?.buildings).toEqual([GRANARY]);
+    expect(cityById(fourthTurn ?? armed.state, asCityId(0))?.shields).toBe(1);
+    expect(cityById(fourthTurn ?? armed.state, asCityId(0))?.production).toBeUndefined();
+
+    if (fourthTurn === undefined) throw new Error('the fourth turn must apply');
+    const again = applyCommand(
+      fourthTurn,
+      ROME,
+      setProduction(0, { kind: 'building', id: GRANARY }),
+      RULESET,
+    );
+    expect(again.ok).toBe(false);
+    expect(again.ok ? undefined : again.error).toEqual({
+      kind: 'already-built',
+      cityId: asCityId(0),
+      building: GRANARY,
+    });
+
+    // A city that banked shields with nothing to build is not an error: one more
+    // turn stores them. That turn is also the growth turn (the box reaches 10), so
+    // the city earns at two citizens — 1 + 3 = 4 — because growth runs first.
+    const idle = endTurnsFrom(fourthTurn, RULESET, 1);
+    expect(idle?.turn).toBe(6);
+    expect(cityById(idle ?? fourthTurn, asCityId(0))?.shields).toBe(4);
+  });
+});
+describe('M3 scenario: goody huts', () => {
+  it('declares its reward table and says plainly that it is unsourced', () => {
+    // `gold` is deliberately absent in M3 (there is no treasury until M4), and the
+    // split itself is ours — not a Civ 3 number anyone verified.
+    expect(HUT_REWARD_KINDS).toEqual(['unit', 'barbarians', 'nothing']);
+    expect(isPlaceholder(HUT_REWARD_PROVENANCE)).toBe(true);
+  });
+
+  it(`seed ${String(HUT_UNIT_CASE.seed)} grants a free unit`, () => {
+    const result = runScenario(hutScenario(HUT_UNIT_CASE));
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the hut scenario must build a state');
+    expect(
+      after.units.map((unit) => `${String(unit.id)}:${unit.type}:${String(unit.owner)}`),
+    ).toEqual(['0:warrior:0', '1:warrior:1', '2:warrior:0']);
+    expect(result.events).toEqual([
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(0),
+        from: at(5, 5),
+        to: HUT_TILE,
+        cost: 1,
+        movementLeft: 0,
+      },
+      {
+        type: 'HutEntered',
+        unitId: asUnitId(0),
+        owner: ROME,
+        tile: HUT_TILE,
+        reward: 'unit',
+        unitGiven: asUnitId(2),
+      },
+    ]);
+  });
+
+  it(`seed ${String(HUT_BARBARIAN_CASE.seed)} spawns a barbarian band`, () => {
+    const result = runScenario(hutScenario(HUT_BARBARIAN_CASE));
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the hut scenario must build a state');
+    const band = after.units.filter((unit) => unit.owner === BARBARIANS);
+    expect(band.map((unit) => [Number(unit.id), Number(unit.tile)])).toEqual([
+      [2, Number(BAND_TILES[0])],
+      [3, Number(BAND_TILES[1])],
+    ]);
+    expect(band.every((unit) => unit.type === WARRIOR && unit.movementLeft === 1)).toBe(true);
+    expect(result.events).toEqual([
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(0),
+        from: at(5, 5),
+        to: HUT_TILE,
+        cost: 1,
+        movementLeft: 0,
+      },
+      {
+        type: 'HutEntered',
+        unitId: asUnitId(0),
+        owner: ROME,
+        tile: HUT_TILE,
+        reward: 'barbarians',
+      },
+      {
+        type: 'BarbariansSpawned',
+        owner: BARBARIANS,
+        tile: HUT_TILE,
+        unitIds: [asUnitId(2), asUnitId(3)],
+        tiles: [BAND_TILES[0], BAND_TILES[1]],
+      },
+    ]);
+  });
+
+  it(`seed ${String(HUT_NOTHING_CASE.seed)} grants nothing and still spends the hut`, () => {
+    const result = runScenario(hutScenario(HUT_NOTHING_CASE));
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the hut scenario must build a state');
+    expect(after.units.map((unit) => unit.id)).toEqual([asUnitId(0), asUnitId(1)]);
+    expect(after.nextUnitId).toBe(2);
+    expect(after.map.huts).toEqual([]);
+    expect(result.events).toEqual([
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(0),
+        from: at(5, 5),
+        to: HUT_TILE,
+        cost: 1,
+        movementLeft: 0,
+      },
+      {
+        type: 'HutEntered',
+        unitId: asUnitId(0),
+        owner: ROME,
+        tile: HUT_TILE,
+        reward: 'nothing',
+      },
+    ]);
+    // No `unitGiven` key at all: the reward gave no unit, and a present-but-
+    // undefined key would not survive canonical JSON.
+    const entered = result.events[1];
+    expect(entered === undefined ? undefined : Object.hasOwn(entered, 'unitGiven')).toBe(false);
+  });
+
+  it('sweeps twelve seeds and covers every reward branch at least once', () => {
+    // One seed exercises one branch, so no single scenario can be the evidence
+    // for all three: the sweep is. Each run's *expectation* is the branch the
+    // state RNG's first draw selects, so a run whose branch differs from the
+    // draw fails its assertions rather than being quietly recorded.
+    const observed: { readonly seed: number; readonly reward: HutRewardKind }[] = [];
+
+    for (let seed = 0; seed <= 11; seed += 1) {
+      const expected = drawnReward(seed);
+      const result = runScenario(hutScenario({ seed, reward: expected }));
+      expect(failures(result.assertions)).toEqual([]);
+
+      const entered = result.events.find((event) => event.type === 'HutEntered');
+      observed.push({
+        seed,
+        reward: entered?.type === 'HutEntered' ? entered.reward : 'nothing',
+      });
+    }
+
+    // The whole table, pinned: a change to `HUT_REWARD_KINDS`, to its order, or to
+    // the RNG must show up here.
+    expect(observed).toEqual([
+      { seed: 0, reward: 'nothing' },
+      { seed: 1, reward: 'unit' },
+      { seed: 2, reward: 'nothing' },
+      { seed: 3, reward: 'nothing' },
+      { seed: 4, reward: 'nothing' },
+      { seed: 5, reward: 'unit' },
+      { seed: 6, reward: 'unit' },
+      { seed: 7, reward: 'nothing' },
+      { seed: 8, reward: 'nothing' },
+      { seed: 9, reward: 'nothing' },
+      { seed: 10, reward: 'unit' },
+      { seed: 11, reward: 'barbarians' },
+    ]);
+
+    const covered = new Set(observed.map((entry) => entry.reward));
+    expect([...covered].sort()).toEqual(['barbarians', 'nothing', 'unit']);
+    for (const reward of HUT_REWARD_KINDS) expect(covered.has(reward)).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The builder's M3 additions, and what they refuse
+ * ------------------------------------------------------------------ */
+
+describe('the scenario builder states M3 worlds', () => {
+  /** A world that is ready to build: two civilizations, grassland, two warriors. */
+  const m3World = (): ScenarioBuilder =>
+    createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, WARRIOR, [30, 30])
+      .addUnit(1, WARRIOR, [20, 20]);
+
+  it('places huts on the map, ascending, whatever order they were written in', () => {
+    const built = m3World().addHut(7, 5).addHut(9, 4).addHut(6, 5).build();
+    if (!built.ok) throw new Error(`the hut fixture must build: ${JSON.stringify(built.error)}`);
+
+    // `GameMap.huts` is ascending by contract, and the builder sorts rather than
+    // trusting the author's order.
+    expect(built.value.map.huts).toEqual([at(9, 4), at(6, 5), at(7, 5)]);
+    expect(hutAt(built.value, Number(at(7, 5)))).toBe(true);
+    expect(hutAt(built.value, Number(at(8, 8)))).toBe(false);
+  });
+
+  it('refuses a hut it cannot place honestly', () => {
+    expect(() => m3World().addHut(DUEL.width, 0)).toThrow(/outside this world's 40x40 map/);
+    expect(() => m3World().addHut(6, 5).addHut(6, 5)).toThrow(/called twice for one tile/);
+    // The terrain under a hut is only final once every setTile has run, so the
+    // "land only" rule is enforced at build().
+    expect(() => m3World().addHut(6, 5).setTile(6, 5, 'ocean').build()).toThrow(
+      /huts sit on land only/,
+    );
+    expect(() => m3World().addHut(6, 5).setTile(6, 5, 'coast').build()).toThrow(
+      /huts sit on land only/,
+    );
+    expect(() => m3World().addHut(6, 5).setTile(6, 5, 'mountains').build()).toThrow(
+      /no unit could ever enter it/,
+    );
+    // Control: exactly the same calls on ordinary land build.
+    expect(m3World().addHut(6, 5).setTile(6, 5, 'hills').build().ok).toBe(true);
+  });
+
+  it('adds the barbarian player as an identity, not as a civilization', () => {
+    const built = m3World().addBarbarianPlayer().addHut(6, 5).build();
+    if (!built.ok)
+      throw new Error(`the barbarian fixture must build: ${JSON.stringify(built.error)}`);
+    const state = built.value;
+
+    expect(state.players.map((player) => player.kind)).toEqual(['civ', 'civ', 'barbarian']);
+    expect(state.players[2]?.name).toBe('Barbarians');
+    expect(state.players[2]?.color).toBe('#3f3f46');
+    // A barbarian player owns no unit and needs none; its starting tile is the
+    // map's first hut, exactly as `newGame` leaves it.
+    expect(state.players[2]?.startingTile).toBe(at(6, 5));
+    expect(state.units.map((unit) => unit.owner)).toEqual([ROME, CARTHAGE]);
+    expect(state.explored).toHaveLength(3);
+
+    // The civilizations still decide `civCount`, and `players.length` is
+    // `civCount + 1` as it is after `newGame`.
+    expect(state.settings.civCount).toBe(2);
+    expect(civPlayers(state)).toHaveLength(2);
+    expect(state.players).toHaveLength(state.settings.civCount + 1);
+
+    // A world with no hut falls back to tile 0, again as `newGame` does.
+    const noHut = m3World().addBarbarianPlayer().build();
+    expect(noHut.ok ? noHut.value.players[2]?.startingTile : undefined).toBe(asTileIndex(0));
+
+    // It does not count toward the two civilizations a game needs …
+    expect(() =>
+      createScenarioBuilder(RULESET, DUEL_SETTINGS)
+        .addPlayer('Rome')
+        .addBarbarianPlayer()
+        .fillTerrain('grassland')
+        .addUnit(0, WARRIOR, [5, 5])
+        .build(),
+    ).toThrow(/at least 2 players/);
+
+    // … and there is exactly one of it.
+    expect(() => m3World().addBarbarianPlayer().addBarbarianPlayer()).toThrow(
+      /already has a barbarian player/,
+    );
+    expect(() => m3World().addBarbarianPlayer('   ')).toThrow(/non-empty name/);
+  });
+
+  it('states a city outright, including the queue no M3 command can build', () => {
+    const built = m3World()
+      .addCity(0, [5, 5], {
+        population: 2,
+        foodBox: 4,
+        shields: 7,
+        production: { kind: 'unit', id: WARRIOR },
+        queue: [{ kind: 'building', id: GRANARY }],
+        workedTiles: [at(4, 3)],
+      })
+      .build();
+    if (!built.ok) throw new Error(`the city fixture must build: ${JSON.stringify(built.error)}`);
+    const state = built.value;
+    const city = cityById(state, asCityId(0));
+
+    expect(city?.id).toBe(asCityId(0));
+    expect(city?.owner).toBe(ROME);
+    expect(city?.name).toBe('City 1');
+    expect(city?.tile).toBe(at(5, 5));
+    expect(city?.population).toBe(2);
+    expect(city?.foodBox).toBe(4);
+    expect(city?.shields).toBe(7);
+    expect(city?.production).toEqual({ kind: 'unit', id: WARRIOR });
+    expect(city?.queue).toEqual([{ kind: 'building', id: GRANARY }]);
+    expect(city?.workedTiles).toEqual([at(4, 3)]);
+    expect(city?.buildings).toEqual([]);
+    expect(cityAt(state, at(5, 5))?.id).toBe(asCityId(0));
+    expect(state.nextCityId).toBe(1);
+
+    // The hand-built city's yields are the engine's own: a grassland centre plus
+    // one grassland tile is 4 food against 2 citizens' 4, and 2 shields.
+    expect(cityYields(state, RULESET, asCityId(0))).toEqual({
+      food: 4,
+      shields: 2,
+      commerce: 2,
+      foodSurplus: 0,
+    });
+
+    // An omitted `workedTiles` is `autoAssignWorkedTiles`, which is what
+    // `FoundCity` writes: best tile first, lowest index to break a tie.
+    const auto = m3World().addCity(0, [5, 5], { population: 2 }).build();
+    expect(auto.ok ? cityById(auto.value, asCityId(0))?.workedTiles : undefined).toEqual([
+      at(4, 3),
+      at(5, 3),
+    ]);
+  });
+
+  it('refuses cities and queues the command layer could not produce', () => {
+    expect(() => createScenarioBuilder(RULESET, DUEL_SETTINGS).addCity(0, [5, 5])).toThrow(
+      /needs a player index/,
+    );
+    expect(() => m3World().addCity(2, [5, 5])).toThrow(/needs a player index/);
+    expect(() => m3World().addCity(0, [DUEL.width, 0])).toThrow(/outside this world's 40x40 map/);
+    expect(() => m3World().addCity(0, [5, 5], { population: 0 })).toThrow(
+      /integer population >= 1/,
+    );
+    expect(() => m3World().addCity(0, [5, 5], { foodBox: -1 })).toThrow(/integer foodBox >= 0/);
+    expect(() => m3World().addCity(0, [5, 5], { shields: 1.5 })).toThrow(/integer shields >= 0/);
+
+    // Things this ruleset cannot build: an unknown unit, an unknown building, and
+    // a building the city already has (the engine refuses that too).
+    expect(() =>
+      m3World().addCity(0, [5, 5], { production: { kind: 'unit', id: NOT_A_UNIT } }),
+    ).toThrow(/cannot price it/);
+    expect(() =>
+      m3World().addCity(0, [5, 5], { queue: [{ kind: 'unit', id: NOT_A_UNIT }] }),
+    ).toThrow(/cannot price it/);
+    expect(() => m3World().addCity(0, [5, 5], { buildings: [NOT_A_BUILDING] })).toThrow(
+      /defines no building "nope"/,
+    );
+    expect(() =>
+      m3World().addCity(0, [5, 5], {
+        buildings: [GRANARY],
+        queue: [{ kind: 'building', id: GRANARY }],
+      }),
+    ).toThrow(/which the city already has/);
+
+    // Worked tiles: one citizen works one tile, no tile twice, none outside the
+    // radius, and never the centre (always worked, costs no citizen).
+    expect(() =>
+      m3World().addCity(0, [5, 5], { population: 1, workedTiles: [at(4, 3), at(5, 3)] }),
+    ).toThrow(/one citizen works one tile/);
+    expect(() =>
+      m3World().addCity(0, [5, 5], { population: 2, workedTiles: [at(4, 3), at(4, 3)] }),
+    ).toThrow(/twice in workedTiles/);
+    expect(() =>
+      m3World()
+        .addCity(0, [5, 5], { workedTiles: [at(20, 20)] })
+        .build(),
+    ).toThrow(/outside the 21-tile radius/);
+    expect(() =>
+      m3World()
+        .addCity(0, [5, 5], { workedTiles: [at(5, 5)] })
+        .build(),
+    ).toThrow(/lists the city centre/);
+    expect(() => m3World().addCity(0, [5, 5], { population: 1.5 }).build()).toThrow(
+      /integer population >= 1/,
+    );
+
+    // Two cities: `FoundCity` refuses a site closer than `MIN_CITY_DISTANCE`, so a
+    // hand-built world may not contain one either …
+    expect(() => m3World().addCity(0, [5, 5]).addCity(1, [6, 6])).toThrow(
+      /closer than MIN_CITY_DISTANCE = 2/,
+    );
+    // … and a tile one city works may not be claimed by another.
+    expect(() =>
+      m3World()
+        .addCity(0, [5, 5], { workedTiles: [at(6, 5)] })
+        .addCity(1, [7, 5], { workedTiles: [at(6, 5)] })
+        .build(),
+    ).toThrow(/already works/);
+  });
+
+  it('reports M3 refusals by name, so a refused run command is readable', () => {
+    const illegal: Scenario = {
+      name: 'found-a-city-with-a-warrior',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .addUnit(0, WARRIOR, [5, 5])
+          .addUnit(1, WARRIOR, [6, 6]),
+      run: [foundCity(0)],
+      assert: () => [check(true, 'the assert callback still runs after a refused command')],
+    };
+
+    const result = runScenario(illegal);
+
+    expect(result.passed).toBe(false);
+    expect(result.assertions[0]?.message).toBe(
+      'run[0] FoundCity by unit 0 was refused: not-a-settler (unit 0 is not an unused settler)',
+    );
+    expect(result.finalState?.revision).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Falsification: the M3 scenarios' assertions must be able to fail
+ * ------------------------------------------------------------------ */
+
+describe('the M3 scenario assertions discriminate (they are not decoration)', () => {
+  it('the growth-timing assertions fail when the city earns one food less a turn', () => {
+    // A plains city site: 1 food at the centre instead of 2, so the box holds 4
+    // after four turns rather than 8, and every timing assertion after that is
+    // wrong. The same `run` and the same `assert` as the real scenario.
+    const variant: Scenario = {
+      name: 'growth-timing-on-plains',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTile(5, 5, 'plains')
+          .addUnit(0, SETTLER, [5, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [foundCity(0), ...endTurns(4)],
+      assert: assertOf(growthScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/8 of the 10 food/);
+  });
+
+  it('the starvation assertions fail when the citizens keep their tiles', () => {
+    // The same city, but nothing unassigns its citizens: a grassland tile is 2
+    // food, so the two citizens eat exactly what they grow — a surplus of 1, not
+    // -3 — and no citizen is ever lost.
+    const variant: Scenario = {
+      name: 'starvation-without-the-unassignment',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTile(5, 5, 'plains')
+          .addUnit(0, SETTLER, [5, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [foundCity(0), ...endTurns(10)],
+      assert: assertOf(starvationScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/surplus is -3/);
+  });
+
+  it('the production assertions fail when the queue does not promote the next item', () => {
+    // No queue at all: the settler still completes with 1 shield carried over,
+    // but nothing becomes the head, so the promotion and the second completion
+    // must both break.
+    const variant: Scenario = {
+      name: 'production-with-an-empty-queue',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .addUnit(0, WARRIOR, [30, 30])
+          .addUnit(1, WARRIOR, [20, 20])
+          .addCity(0, [5, 5], {
+            population: 1,
+            workedTiles: [at(4, 3)],
+            production: { kind: 'unit', id: SETTLER },
+          }),
+      run: [endTurn(), endTurn()],
+      assert: assertOf(productionScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/next queue entry became/);
+  });
+
+  it('the hut assertions fail when the hut is not where the scenario says it is', () => {
+    // The hut is placed one tile further east, so the warrior's step lands on
+    // empty grassland: the map must still show the hut and no branch may fire.
+    const variant: Scenario = {
+      name: 'hut-reward-unit-with-no-hut-on-the-tile',
+      settings: { mapSize: 'duel', seed: HUT_UNIT_CASE.seed },
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .addBarbarianPlayer()
+          .fillTerrain('grassland')
+          .addHut(8, 5)
+          .addUnit(0, WARRIOR, [5, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [move(0, HUT_TILE)],
+      assert: assertOf(hutScenario(HUT_UNIT_CASE)),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/hut is gone from the map/);
+  });
+
+  it('the hut assertions fail when the seed draws a different branch than expected', () => {
+    // Seed 11 draws the barbarian band, and the scenario is written to expect the
+    // free unit: the RNG check, the unit count and the band's absence must all
+    // disagree. This is what makes "one seed exercises one branch" a real claim.
+    const result = runScenario(hutScenario({ seed: 11, reward: 'unit' }));
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/a free unit was granted/);
+  });
+
+  it('its own sweep would catch a reward table that stopped covering every branch', () => {
+    // The sweep's coverage claim, checked in the small: a seed list that never
+    // draws a band cannot cover every branch, which is exactly the failure the
+    // sweep test exists to prevent.
+    const branchless = [0, 1, 2, 5].map((seed) => drawnReward(seed));
+    expect(new Set(branchless)).toEqual(new Set(['nothing', 'unit']));
+    expect(branchless).not.toContain('barbarians');
+    expect(new Set(HUT_CASES.map((testCase) => testCase.reward))).toEqual(
+      new Set(['unit', 'barbarians', 'nothing']),
+    );
   });
 });

@@ -31,14 +31,23 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_SETTINGS,
   SCHEMA_VERSION,
+  asBuildingId,
+  asCityId,
   asPlayerId,
   asTerrainId,
   asUnitId,
   asUnitTypeId,
+  cityById,
+  cityRadius,
+  foodBoxSize,
+  indexToX,
+  indexToY,
   newGame,
   seedRng,
   tileIndex,
+  type City,
   type GameError,
+  type GameEvent,
   type GameState,
   type RulesetView,
   type TerrainId,
@@ -48,6 +57,7 @@ import { canonicalize, hashValue } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
+  COMMAND_SUMMARY,
   createSession,
   parsePlayArgs,
   runScript,
@@ -174,11 +184,13 @@ const open = (options?: {
   readonly state?: GameState;
   readonly playerIndex?: number;
   readonly god?: boolean;
+  /** A view other than the shipped catalog's, for the ambiguity a kind must break. */
+  readonly ruleset?: RulesetView;
 }): Capture => {
   const chunks: string[] = [];
   const session = createSession({
     state: options?.state ?? syntheticState(),
-    ruleset: RULESET,
+    ruleset: options?.ruleset ?? RULESET,
     playerId: asPlayerId(options?.playerIndex ?? 0),
     god: options?.god ?? false,
     write: (text: string) => {
@@ -205,6 +217,86 @@ const refusal = (outcome: LineOutcome): GameError => {
   return outcome.error;
 };
 
+/** The events of an applied command, or a thrown error — for assertions on what happened. */
+const appliedEvents = (outcome: LineOutcome): readonly GameEvent[] => {
+  if (outcome.kind !== 'applied') {
+    throw new Error(`expected an applied command, got outcome "${outcome.kind}"`);
+  }
+  return outcome.outcome.events;
+};
+
+/**
+ * The regression this whole file exists to keep: rendering an applied command must
+ * be **complete**.
+ *
+ * A `GameEvent` member the renderer does not handle falls through its `switch` and
+ * maps to `undefined`, which throws nothing and prints no error — it joins into a
+ * silently **blank line** inside the `ok:` block, and a transcript with a missing
+ * case in it reads like a formatting choice. So the assertion is exact: one
+ * non-empty `ok: ` line per event, no blank line among them, and the revision line
+ * after them. A missing case fails the count; a case that renders as `''` fails
+ * the "has content" check.
+ */
+const expectEveryEventRendered = (outcome: LineOutcome, text: string): readonly string[] => {
+  const events = appliedEvents(outcome);
+  if (events.length === 0) {
+    throw new Error('expectEveryEventRendered wants a command that emitted events');
+  }
+  const lines = text.split('\n');
+  const start = lines.findIndex((line) => line.startsWith('ok: '));
+  const revision = lines.findIndex((line) => line.startsWith('  revision '));
+
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(revision).toBeGreaterThan(start);
+
+  const block = lines.slice(start, revision);
+  expect(block).toHaveLength(events.length);
+  for (const line of block) {
+    expect(line.startsWith('ok: ')).toBe(true);
+    expect(line.length).toBeGreaterThan('ok: '.length);
+  }
+  expect(text).not.toMatch(/undefined|NaN/);
+  return block;
+};
+
+/**
+ * The synthetic board plus a goody hut at (1,1) and a chosen RNG state: the unit
+ * at (0,0) can step onto the hut, so one `move` reaches the whole hut rule —
+ * including which of the three rewards the draw gives, which is `rngSeed`'s job.
+ *
+ * Unlike `syntheticState`, this board carries the **barbarian player** `newGame`
+ * appends (with a blank explored row, since `PlayerId` indexes that array).
+ * `hut.ts` degenerates a band to `reward: 'nothing'` when no player could own it,
+ * so without one the barbarian third of the reward table is unreachable — and the
+ * rendering of `BarbariansSpawned` would go untested.
+ */
+const hutState = (rngSeed: number): GameState => {
+  const base = syntheticState();
+  return {
+    ...base,
+    rng: seedRng(rngSeed),
+    map: { ...base.map, huts: [tileIndex(WIDTH, 1, 1)] },
+    players: [
+      ...base.players,
+      {
+        id: asPlayerId(2),
+        name: 'Barbarians',
+        color: '#3f3f46',
+        startingTile: tileIndex(WIDTH, 1, 1),
+        kind: 'barbarian',
+      },
+    ],
+    explored: [...base.explored, new Array<boolean>(WIDTH * HEIGHT).fill(false)],
+  };
+};
+
+/** The city with this id, or a thrown error: the tests below founded it first. */
+const cityOf = (state: GameState, id = 0): City => {
+  const city = cityById(state, asCityId(id));
+  if (city === undefined) throw new Error(`the session has no city ${String(id)}`);
+  return city;
+};
+
 /* ------------------------------------------------------------------ *
  * The transcript: a play session as a regression test
  * ------------------------------------------------------------------ */
@@ -217,11 +309,18 @@ const SCRIPT = ['units', 'move 0 1 1', 'move 0 2 2', 'move 0 9 9', 'wibble', 'en
  * by running the same state and script through `createSession` + `runScript` and
  * pasting the result — that is the point of the fixture: the transcript may only
  * change on purpose.
+ *
+ * Regenerated once for M3, deliberately, for two reasons that are visible in the
+ * text below: the command summary (printed in the banner and under an unknown
+ * command) now names the city verbs, and every view now carries a `cities:` line
+ * under its `units:` line. The view had to grow that line: `describe` draws
+ * terrain and goody huts, not cities, so a session that founded one would else
+ * show a map with no unit on it and no sign of the city it had just built.
  */
 const EXPECTED_TRANSCRIPT = [
   'CivTS play - seed 7, tiny map 4x4, 2 civs',
   'you are Player 1 (p0); every view below is drawn from your fog of war',
-  'commands: move <unitId> <x> <y> | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | end | units | state | save <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -234,6 +333,7 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> units',
   'units: 2 of 2 visible for Player 1 (p0)',
   'm  id  type        owner        at        move     terrain      legal',
@@ -250,6 +350,7 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> move 0 1 1',
   'ok: unit 0 moved to (1,1), cost 1, 1 movement left',
   '  revision 1',
@@ -264,6 +365,7 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> move 0 2 2',
   'error: not-enough-movement - unit 0 (Settler at 1,1, 1/2 per turn movement left) needs 2 movement for the step onto that tile, but only 1 is left. "end" refills movement.',
   '  legal: unit 0 (Settler at 1,1, 1/2 per turn movement left) can move to (0,0) (2,0) (2,1) (0,2) (1,2).',
@@ -278,6 +380,7 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> move 0 9 9',
   'error: malformed command - (9,9) is outside the map (4x4): x must be 0..3 and y must be 0..3.',
   '  the ruler above the map lists the valid columns and rows',
@@ -292,9 +395,10 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> wibble',
   'error: unknown command "wibble" - no such command.',
-  '  commands: move <unitId> <x> <y> | end | units | state | save <path> | help | quit',
+  '  commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | end | units | state | save <path> | help | quit',
   '  type "help" for what each one does.',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -307,6 +411,7 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> end',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
@@ -321,6 +426,7 @@ const EXPECTED_TRANSCRIPT = [
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'cities: none',
   'p0> quit',
   'bye - the state lives in memory only unless you ran "save <path>".',
 ].join('\n');
@@ -394,6 +500,28 @@ describe('a command that does not apply', () => {
       'units 2', // an argument units does not take
       'state now', // an argument state does not take
       'save', // a path save needs
+      // The M3 city verbs, same rule: a bad argument or a refusal never moves the
+      // game on. ('found 0' is deliberately absent — on this board the settler at
+      // (0,0) *can* found a city, which is the point of the verb.)
+      'found', // needs a unit id
+      'found 0 extra', // and only one
+      'found x', // not a number
+      'found 9', // no such unit
+      'cities 1', // an argument cities does not take
+      'city', // needs a city id
+      'city x', // not a number
+      'city 0', // no such city yet: an inspector, not a command
+      'work', // needs a city id
+      'work 0 1', // a pair needs two coordinates
+      'work 0 x 1', // not a number
+      'work 0 9 9', // off the map
+      'work 9 1 1', // no such city
+      'build', // needs a city and an item
+      'build 0', // needs an item
+      'build 0 unit:', // an empty id after the kind
+      'build 0 tile:scout', // not a kind of thing to build
+      'build 0 unit:wibble', // no such item, and no city either
+      'build 9 unit:scout', // no such city
     ];
 
     for (const line of lines) {
@@ -531,6 +659,466 @@ describe('commands', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * M3 — the city verbs: found, show, work, build, and the turn that grows
+ * ------------------------------------------------------------------ */
+
+describe('the city verbs', () => {
+  it('founds a city with "found <unitId>" and consumes the settler', () => {
+    const capture = open();
+    capture.clear();
+
+    const outcome = capture.session.run('found 0');
+    expect(outcome).toMatchObject({ kind: 'applied', command: { type: 'FoundCity', unitId: 0 } });
+    expectEveryEventRendered(outcome, capture.text());
+
+    const city = cityOf(capture.session.state);
+    expect(city.owner).toBe(asPlayerId(0));
+    expect(city.name).toBe('City 1');
+    expect(city.tile).toBe(tileIndex(WIDTH, 0, 0));
+    expect(city.population).toBe(1);
+    expect(city.foodBox).toBe(0);
+    expect(city.shields).toBe(0);
+    // Nothing is being built yet, and the key is *absent* — a present-but-undefined
+    // `production` cannot survive canonical JSON, so `hashValue` would throw on the
+    // city the engine had just founded (see `City.production`).
+    expect(city.production).toBeUndefined();
+    expect('production' in city).toBe(false);
+    expect(city.queue).toEqual([]);
+    expect(city.buildings).toEqual([]);
+    expect(city.workedTiles).toHaveLength(1);
+    expect(hashValue(capture.session.state)).toMatch(/^[0-9a-f]{16}$/);
+
+    // The settler is the price, and its id no longer resolves to anything.
+    expect(capture.session.state.units.some((unit) => Number(unit.id) === 0)).toBe(false);
+    expect(capture.text()).toContain('City 1 founded at (0,0)');
+    expect(capture.text()).toContain('the settler is consumed');
+    // …and the view under it shows the city, since `describe` draws no cities.
+    expect(capture.text()).toContain('cities: *0 City 1 p0 @0,0 pop 1 food 0/10 shields 0 (idle)');
+  });
+
+  it('shows one city in full: population, food box and threshold, shields, item, queue, buildings, tiles', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    capture.clear();
+    capture.session.run('city 0');
+
+    const state = capture.session.state;
+    const city = cityOf(state);
+    const box = foodBoxSize(city.population);
+    const text = capture.text();
+
+    expect(text).toContain('city 0 "City 1" (Player 1 (p0) at 0,0)');
+    expect(text).toContain(`population 1; food box 0/${String(box)} (${String(box)} more to grow)`);
+    expect(text).toContain('food 4 per turn, 2 eaten, surplus +2');
+    expect(text).toContain('shields 0; building nothing');
+    expect(text).toContain('queue: (empty)');
+    expect(text).toContain('buildings: (none)');
+    expect(text).toContain('works 1 of 1 citizen(s)');
+
+    // The worked tile is the engine's own auto-assignment, printed with its terrain
+    // and its coordinates — the numbers a reader assigns from.
+    const worked = city.workedTiles[0];
+    expect(worked).toBeDefined();
+    if (worked !== undefined) {
+      expect(text).toContain(
+        `(${String(indexToX(state.map, worked))},${String(indexToY(state.map, worked))}) Grassland`,
+      );
+    }
+  });
+
+  it('lists your cities, and says so plainly when you have none', () => {
+    const empty = open();
+    empty.clear();
+    empty.session.run('cities');
+    expect(empty.text()).toContain('cities: 0 for Player 1 (p0)');
+    expect(empty.text()).toContain('found <unitId>');
+
+    const capture = open();
+    capture.session.run('found 0');
+    capture.clear();
+    capture.session.run('cities');
+
+    const text = capture.text();
+    expect(text).toContain('cities: 1 for Player 1 (p0)');
+    expect(text).toContain('id  name');
+    expect(text).toContain('0   City 1');
+    expect(text).toContain('0/10');
+    expect(text).toContain('(idle)');
+  });
+
+  it('sets production from an explicit unit or building id, and from an unambiguous one', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    capture.clear();
+
+    const unit = capture.session.run('build 0 unit:scout');
+    expect(unit).toMatchObject({
+      kind: 'applied',
+      command: { type: 'SetProduction', cityId: 0, item: { kind: 'unit', id: 'scout' } },
+    });
+    expect(cityOf(capture.session.state).production).toEqual({ kind: 'unit', id: 'scout' });
+    expect(capture.text()).toContain('production set to unit "Scout" (cost 1 shield)');
+
+    const building = capture.session.run('build 0 building:granary');
+    expect(building).toMatchObject({
+      kind: 'applied',
+      command: { type: 'SetProduction', cityId: 0, item: { kind: 'building', id: 'granary' } },
+    });
+    expect(cityOf(capture.session.state).production).toEqual({ kind: 'building', id: 'granary' });
+
+    // A bare id means the kind that holds it: no unit in this ruleset is a
+    // "barracks", so "build 0 barracks" is the building. The kind is still spelled
+    // out in the confirmation, so the reading is never left to the reader.
+    capture.clear();
+    expect(capture.session.run('build 0 barracks').kind).toBe('applied');
+    expect(cityOf(capture.session.state).production).toEqual({ kind: 'building', id: 'barracks' });
+    expect(capture.text()).toContain('production set to building "Barracks" (cost 12 shields)');
+
+    // …and the city view agrees with the state.
+    capture.clear();
+    capture.session.run('city 0');
+    expect(capture.text()).toContain('building building "Barracks" (cost 12; 12 more to go)');
+  });
+
+  it('insists on the kind when a unit and a building share an id', () => {
+    // The two id spaces really are different (the note on `ProductionItem` says so),
+    // so a bare id both catalogs hold cannot be resolved — and guessing would build
+    // the wrong thing. The rule is refused with both spellings offered.
+    const shared: RulesetView = {
+      ...RULESET,
+      buildings: [
+        ...(RULESET.buildings ?? []),
+        { id: asBuildingId('scout'), name: 'Scout Lodge', cost: 5 },
+      ],
+    };
+    const capture = open({ ruleset: shared });
+    capture.session.run('found 0');
+    capture.clear();
+
+    const before = hashValue(capture.session.state);
+    const ambiguous = capture.session.run('build 0 scout');
+    expect(ambiguous.kind).toBe('malformed');
+    expect(capture.text()).toContain('is both a unit and a building');
+    expect(capture.text()).toContain('unit:scout');
+    expect(capture.text()).toContain('building:scout');
+    // Refusing the ambiguous spelling changed nothing at all.
+    expect(hashValue(capture.session.state)).toBe(before);
+
+    // Both spellings work, and each sets the item it names.
+    expect(capture.session.run('build 0 unit:scout').kind).toBe('applied');
+    expect(cityOf(capture.session.state).production).toEqual({ kind: 'unit', id: 'scout' });
+    expect(capture.session.run('build 0 building:scout').kind).toBe('applied');
+    expect(cityOf(capture.session.state).production).toEqual({ kind: 'building', id: 'scout' });
+  });
+
+  it('sets which tiles a city works, and clears the assignment with no pairs', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    capture.clear();
+
+    const set = capture.session.run('work 0 1 1');
+    expect(set).toMatchObject({
+      kind: 'applied',
+      command: { type: 'SetWorkedTiles', cityId: 0, tiles: [tileIndex(WIDTH, 1, 1)] },
+    });
+    expect(cityOf(capture.session.state).workedTiles).toEqual([tileIndex(WIDTH, 1, 1)]);
+    expect(capture.text()).toContain('now works (1,1) with 1 of 1 citizen(s)');
+
+    capture.clear();
+    expect(capture.session.run('work 0').kind).toBe('applied');
+    expect(cityOf(capture.session.state).workedTiles).toEqual([]);
+    expect(capture.text()).toContain('now works no tiles');
+  });
+
+  it('ends turns until the city grows, and carries the food box over', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    capture.session.run('work 0 1 1');
+    capture.clear();
+
+    // One turn at a time, so the exact turn the city grows is asserted, not just
+    // that it grew: 4 food a turn, 2 eaten, +2 into a box of 10.
+    for (const turn of [1, 2, 3, 4]) {
+      const outcome = capture.session.run('end');
+      expectEveryEventRendered(outcome, capture.text());
+      expect(cityOf(capture.session.state).population).toBe(1);
+      expect(cityOf(capture.session.state).foodBox).toBe(2 * turn);
+    }
+
+    capture.clear();
+    const grew = capture.session.run('end');
+    expectEveryEventRendered(grew, capture.text());
+    expect(capture.text()).toContain('grew to 2 citizen(s)');
+    expect(capture.text()).toContain('food box 0/15 carried over');
+    expect(appliedEvents(grew).map((event) => event.type)).toContain('CityGrew');
+
+    const city = cityOf(capture.session.state);
+    expect(city.population).toBe(2);
+    expect(city.foodBox).toBe(0);
+    expect(foodBoxSize(city.population)).toBe(15);
+    // The new citizen was assigned a tile by growth, so the city produces what its
+    // two citizens can work rather than starving on the next turn.
+    expect(city.workedTiles).toHaveLength(2);
+    // Shields accumulated for the whole five turns, nothing being built: 2 a turn,
+    // plus 1 more on the turn the city grew. That last point is the turn pipeline's
+    // order made visible — growth runs *before* production (`turn.ts`), so the new
+    // citizen's tile is already being worked when the shields are counted.
+    expect(city.shields).toBe(11);
+
+    capture.clear();
+    capture.session.run('city 0');
+    expect(capture.text()).toContain('population 2; food box 0/15 (15 more to grow)');
+    expect(capture.text()).toContain('works 2 of 2 citizen(s)');
+  });
+
+  it('leaves revision and the state hash untouched when a city verb is refused', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    const before = hashValue(capture.session.state);
+    const revision = capture.session.state.revision;
+
+    const cases: readonly (readonly [string, string])[] = [
+      ['work 0 0 0', 'tile-not-workable'], // the centre: always worked, never listed
+      ['work 0 3 3', 'tile-not-workable'], // outside the 2-tile radius
+      ['work 0 1 1 2 0', 'too-many-worked-tiles'], // two tiles, one citizen
+      ['work 9 1 1', 'unknown-city'],
+      ['build 0 unit:wibble', 'unknown-production-item'],
+      ['build 9 unit:scout', 'unknown-city'],
+      ['found 0', 'unknown-unit'], // the settler founded the city and is gone
+    ];
+
+    for (const [line, kind] of cases) {
+      capture.clear();
+      const error = refusal(capture.session.run(line));
+      expect(error.kind).toBe(kind);
+      // The prose names the typed reason first, so text and type stay in step…
+      expect(capture.text()).toContain(`error: ${kind}`);
+      // …and nothing moved: not the revision, not one byte of the state.
+      expect(capture.session.state.revision).toBe(revision);
+      expect(hashValue(capture.session.state)).toBe(before);
+    }
+  });
+
+  it('teaches what was legal, from the engine’s own evaluators', () => {
+    const capture = open();
+    capture.session.run('found 0');
+
+    // A tile the city may not work: the lesson is the tiles it *may* work, which
+    // is `planSetWorkedTiles` answering one tile at a time.
+    capture.clear();
+    refusal(capture.session.run('work 0 0 0'));
+    expect(capture.text()).toContain('is the centre of');
+    expect(capture.text()).toContain('legal:');
+    expect(capture.text()).toContain('has 1 citizen(s)');
+    expect(capture.text()).toContain('(1,1)');
+
+    // An item this ruleset cannot build: the lesson is everything it can, which is
+    // `planSetProduction` answering for every catalog row.
+    capture.clear();
+    refusal(capture.session.run('build 0 unit:wibble'));
+    expect(capture.text()).toContain('cannot build unit "wibble"');
+    expect(capture.text()).toContain('may be set to build units: unit "Settler"');
+    expect(capture.text()).toContain('unit "Worker" (cost 2 shields), unit "Scout"');
+    expect(capture.text()).toContain('buildings: building "Granary"');
+    expect(capture.text()).toContain('build 0 building:<id>');
+
+    // An unknown city: the lesson is the cities the session does have.
+    capture.clear();
+    refusal(capture.session.run('build 9 unit:scout'));
+    expect(capture.text()).toContain('your cities: 0 City 1 at 0,0');
+  });
+
+  it('refuses to found a city next to one, and says how far apart they must be', () => {
+    const first = open();
+    first.session.run('found 0');
+    const withCity = first.session.state;
+
+    // Player 1's settler at (0,1) is one tile from the city at (0,0).
+    const second = open({ state: withCity, playerIndex: 1 });
+    const before = hashValue(second.session.state);
+    second.clear();
+
+    const error = refusal(second.session.run('found 1'));
+    expect(error.kind).toBe('city-too-close');
+    expect(second.text()).toContain('error: city-too-close');
+    expect(second.text()).toContain('at least 2 apart');
+    expect(second.text()).toContain('legal:');
+    expect(second.session.state.revision).toBe(withCity.revision);
+    expect(hashValue(second.session.state)).toBe(before);
+  });
+
+  it('shows a city only where the player can see it', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    const withCity = capture.session.state;
+
+    // Player 2 has explored nothing here, so city 0 is not theirs to look at: it is
+    // not theirs, and it does not stand in what they have seen.
+    const hidden: GameState = {
+      ...withCity,
+      explored: withCity.explored.map(() => new Array<boolean>(WIDTH * HEIGHT).fill(false)),
+    };
+    const blind = open({ state: hidden, playerIndex: 1 });
+    blind.clear();
+    expect(blind.session.run('city 0').kind).toBe('unknown-city');
+    expect(blind.text()).toContain('error: unknown-city');
+    expect(blind.text()).toContain('not one you can see');
+    // Not a leak either way: the fogged city is absent from the view line too.
+    expect(blind.text()).toContain('cities: none');
+
+    // …but the god view is the debugging view, and shows everything.
+    const god = open({ state: withCity, playerIndex: 1, god: true });
+    god.clear();
+    expect(god.session.run('city 0').kind).toBe('inspected');
+    expect(god.text()).toContain('city 0 "City 1"');
+    expect(god.session.state.cities).toHaveLength(1);
+
+    // `cities` lists *your* cities — but it names another player's visible city
+    // under the table rather than pretending it is not there.
+    god.clear();
+    god.session.run('cities');
+    expect(god.text()).toContain('cities: 0 for Player 2 (p1)');
+    expect(god.text()).toContain('not yours, but visible to you:  0 City 1 p0 @0,0');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Event rendering: one non-empty line per event, whatever the event is
+ * ------------------------------------------------------------------ */
+
+describe('event rendering', () => {
+  it('prints a line for every event a turn emits, completion included', () => {
+    const capture = open();
+    capture.session.run('found 0');
+    capture.session.run('build 0 unit:scout');
+    capture.clear();
+
+    const outcome = capture.session.run('end');
+    const block = expectEveryEventRendered(outcome, capture.text());
+    expect(appliedEvents(outcome).map((event) => event.type)).toEqual([
+      'CityProduced',
+      'TurnEnded',
+    ]);
+    expect(block[0]).toBe(
+      'ok: city 0 "City 1" (Player 1 (p0) at 0,0) finished unit "Scout" (unit 2 at (0,0)); ' +
+        '1 shields left',
+    );
+    expect(block[1]).toBe('ok: turn 2 begins; every unit refilled its movement');
+  });
+
+  it('prints a line for a starving city', () => {
+    // A city whose centre is mountains still eats: 1 food floored at the centre
+    // against 2 a citizen, so it loses the box and then a citizen. Hand-built
+    // because the engine cannot found a city on mountains — and this is a
+    // rendering test, not a founding one.
+    const starving: GameState = {
+      ...syntheticState(),
+      nextCityId: 1,
+      cities: [
+        {
+          id: asCityId(0),
+          owner: asPlayerId(0),
+          name: 'City 1',
+          tile: tileIndex(WIDTH, 1, 0),
+          population: 1,
+          foodBox: 0,
+          shields: 0,
+          queue: [],
+          buildings: [],
+          workedTiles: [],
+        },
+      ],
+    };
+
+    const capture = open({ state: starving });
+    capture.clear();
+    const outcome = capture.session.run('end');
+    const block = expectEveryEventRendered(outcome, capture.text());
+
+    expect(appliedEvents(outcome).map((event) => event.type)).toEqual(['CityStarved', 'TurnEnded']);
+    expect(block[0]).toContain('starved down to 1 citizen(s)');
+    expect(block[0]).toContain('food box restarted at 0');
+  });
+
+  it('prints a real line for a hut entry, whichever of the three rewards it held', () => {
+    const rewards = new Set<string>();
+
+    for (let rngSeed = 0; rngSeed < 64 && rewards.size < 3; rngSeed += 1) {
+      const capture = open({ state: hutState(rngSeed) });
+      capture.clear();
+      const outcome = capture.session.run('move 0 1 1');
+      const block = expectEveryEventRendered(outcome, capture.text());
+
+      const hut = appliedEvents(outcome).find((event) => event.type === 'HutEntered');
+      if (hut === undefined) {
+        throw new Error(
+          `the move onto the hut emitted no HutEntered event (seed ${String(rngSeed)})`,
+        );
+      }
+      rewards.add(hut.reward);
+
+      // The move and the hut entry at least: a hut that pays nothing still printed
+      // a line, which is exactly the case that used to print a blank one.
+      expect(block.length).toBeGreaterThanOrEqual(2);
+      expect(capture.text()).toContain('entered a goody hut at (1,1)');
+
+      if (hut.reward === 'unit') {
+        expect(block[1]).toContain('found a free unit');
+        expect(block[1]).toContain('unit 2');
+      }
+
+      if (hut.reward === 'barbarians') {
+        // The band is a second event, so it is a second line — and the line says
+        // whose units they are and where they stand.
+        expect(block).toHaveLength(3);
+        expect(appliedEvents(outcome).map((event) => event.type)).toEqual([
+          'UnitMoved',
+          'HutEntered',
+          'BarbariansSpawned',
+        ]);
+        expect(block[2]).toContain('2 barbarian unit(s) (2, 3)');
+        expect(block[2]).toContain('owned by Barbarians');
+        expect(capture.text()).toContain('barbarian unit(s)');
+      }
+
+      if (hut.reward === 'nothing') {
+        expect(block[1]).toContain('found nothing (the hut is spent)');
+      }
+    }
+
+    // All three branches reached, so no reward can fall through unrendered.
+    expect([...rewards].sort()).toEqual(['barbarians', 'nothing', 'unit']);
+  });
+
+  it('never leaves an empty line where an event should be', () => {
+    // The failure mode itself: a `switch` case that returns `undefined` prints a
+    // blank line rather than failing. Sweeping every line of a session that founds,
+    // builds, works, grows and enters a hut is a cheap way to say "none of them".
+    const capture = open({ state: hutState(0) });
+    const lines = [
+      'move 0 1 1', // UnitMoved + HutEntered (+ BarbariansSpawned, for this seed)
+      'found 0',
+      'build 0 unit:scout',
+      'work 0 2 0',
+      'city 0',
+      'cities',
+      'end',
+      'end',
+    ];
+    for (const line of lines) {
+      // One command per assertion: the helper looks for the first `ok:` block in
+      // the text, so accumulated output from earlier lines would be read as one.
+      capture.clear();
+      const outcome = capture.session.run(line);
+      if (outcome.kind === 'applied' && outcome.outcome.events.length > 0) {
+        expectEveryEventRendered(outcome, capture.text());
+      }
+      expect(capture.text()).not.toMatch(/\n\n {2}revision /);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * Inspectors — the agent's eyes
  * ------------------------------------------------------------------ */
 
@@ -578,11 +1166,35 @@ describe('inspectors', () => {
     capture.session.run('help');
 
     const text = capture.text();
-    for (const command of ['move', 'end', 'units', 'state', 'save', 'help', 'quit']) {
+    for (const command of [
+      'move',
+      'found',
+      'cities',
+      'city',
+      'work',
+      'build',
+      'end',
+      'units',
+      'state',
+      'save',
+      'help',
+      'quit',
+    ]) {
       expect(text).toContain(command);
     }
     expect(text).toContain('move <unitId> <x> <y>');
+    expect(text).toContain('found <unitId>');
+    expect(text).toContain('city <cityId>');
+    expect(text).toContain('work <cityId> <x> <y> ...');
+    expect(text).toContain('build <cityId> <item>');
+    expect(text).toContain('unit:<id>');
+    expect(text).toContain('building:<id>');
     expect(text).toContain('legal');
+
+    // The summary line is what an unknown command prints, so it has to name them too.
+    expect(COMMAND_SUMMARY).toContain('found <unitId>');
+    expect(COMMAND_SUMMARY).toContain('work <cityId> <x> <y> ...');
+    expect(COMMAND_SUMMARY).toContain('build <cityId> <unit|building>:<id>');
   });
 
   it('saves a state that loads back to the same hash, byte for byte', () => {
@@ -735,11 +1347,17 @@ describe('the play command', () => {
     expect(run.stdout).toContain('CivTS play - seed 42, duel map 40x40, 2 civs');
     expect(run.stdout).toContain('you are Player 1 (p0)');
     expect(run.stdout).toContain('CivTS state: seed=42 turn=1 revision=0');
-    // One start marker per player, the barbarian one included: the barbarian is
-    // a player, and its `startingTile` is the map's first goody hut (M3). This is
-    // the `starts:` legend for the digits drawn on the map, so it stays keyed to
-    // `players` and not to `civPlayers` — unlike the `civs=` count above.
+    // One start marker per **civilization**, and never one for the barbarians —
+    // the same reading as the `civs=` count above, for the same reason. Barbarians
+    // are a player (M3, "State shape"), but their `startingTile` is a convention
+    // pointing at the map's first goody hut, not a homeland, so `starts:` (the
+    // legend for the digits drawn on the map) is keyed to `civPlayers` and this
+    // world's barbarian player is neither named nor drawn. The assertion is
+    // unchanged — `--civs 2` names exactly two starts — but the reading it records
+    // is the corrected one; the old note here claimed the barbarian's hut was
+    // presented as a third start, which is exactly what the ruling forbids.
     expect(run.stdout).toContain('starts: 0=Player 1@');
+    expect(run.stdout).not.toContain('Barbarians@');
     expect(run.stdout).not.toContain('civs=3');
   }, 120_000);
 
@@ -786,6 +1404,122 @@ describe('the play command', () => {
 
     expect(run.status).toBe(2);
     expect(run.stderr).toContain('--player 3 is not a player in this game');
+  }, 120_000);
+
+  it('founds a city, works it, builds in it and ends turns — byte-identically in two fresh processes', () => {
+    // M3's acceptance line, verbatim: "the REPL can found a city and show it".
+    // The script is derived from the engine's own state (the settler's id and tile,
+    // a tile inside the new city's radius), never from coordinates typed in by
+    // hand, so it stays a session on *this* world rather than on a remembered one.
+    const setup = newGame(
+      42,
+      { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2, seed: 42 },
+      RULESET,
+    );
+    if (!setup.ok) throw new Error(`newGame failed: ${setup.error.kind}`);
+
+    const state = setup.value;
+    const settler = state.units.find((unit) => unit.owner === asPlayerId(0));
+    if (settler === undefined) throw new Error('player 0 has no settler');
+    const home = settler.tile;
+    const work = cityRadius(state, home).find((tile) => Number(tile) !== Number(home));
+    if (work === undefined) throw new Error('the start tile has no neighbouring radius tile');
+
+    const lines = [
+      'units',
+      `found ${String(settler.id)}`,
+      'cities',
+      'city 0',
+      `work 0 ${String(indexToX(state.map, work))} ${String(indexToY(state.map, work))}`,
+      'build 0 unit:warrior',
+      'city 0',
+      'end',
+      'end',
+      'end',
+      'city 0',
+      'cities',
+      'state',
+      'quit',
+    ];
+
+    const dir = mkdtempSync(join(tmpdir(), 'civts-repl-city-'));
+    try {
+      const script = join(dir, 'session.txt');
+      writeFileSync(script, `${lines.join('\n')}\n`, 'utf8');
+      const args = [
+        'play',
+        '--seed',
+        '42',
+        '--map-size',
+        'duel',
+        '--civs',
+        '2',
+        '--script',
+        script,
+      ];
+
+      const first = runCli(args, '');
+      const second = runCli(args, '');
+
+      expect(first.status).toBe(0);
+      expect(first.stderr).not.toContain('fatal');
+      // The fixture assertion, kept exactly as it was: two fresh node processes,
+      // one transcript, byte for byte — not a substring match, not a hash of the
+      // interesting parts.
+      expect(first.stdout).toBe(second.stdout);
+
+      // The city really was founded, worked, given something to build and grown —
+      // and each of those steps is visible in the transcript.
+      expect(first.stdout).toContain(
+        `ok: City 1 founded at (${String(indexToX(state.map, home))},${String(indexToY(state.map, home))})`,
+      );
+      expect(first.stdout).toContain('units: none visible'); // the settler was consumed
+      expect(first.stdout).toContain('cities: 1 for Player 1 (p0)');
+      expect(first.stdout).toContain('id  name');
+      expect(first.stdout).toContain(
+        `now works (${String(indexToX(state.map, work))},${String(indexToY(state.map, work))})`,
+      );
+      expect(first.stdout).toContain('production set to unit "Warrior" (cost 1 shield)');
+      expect(first.stdout).toContain('population 1; food box');
+      expect(first.stdout).toContain('works 1 of 1 citizen(s)');
+      expect(first.stdout).toContain('ok: turn 2 begins');
+      expect(first.stdout).toContain('p0> quit');
+      expect(first.stdout).toContain('bye');
+
+      // The quiet failure mode, at the level of the whole transcript: an event the
+      // renderer does not handle used to join into a *blank* line, which shows up
+      // here as an `ok:` block with an empty line in it.
+      expect(first.stdout).not.toMatch(/\n\n {2}revision /);
+      expect(first.stdout).not.toMatch(/\nok: \n/);
+      expect(first.stdout).not.toMatch(/undefined|NaN/);
+
+      // …and the same session, run in this process against the same engine, prints
+      // the same transcript and reaches the hash the CLI printed.
+      const chunks: string[] = [];
+      const session = createSession({
+        state,
+        ruleset: RULESET,
+        playerId: asPlayerId(0),
+        god: false,
+        write: (text: string) => {
+          chunks.push(text);
+        },
+      });
+      const code = runScript(session, `${lines.join('\n')}\n`, (text: string) => {
+        chunks.push(text);
+      });
+      expect(code).toBe(0);
+      expect(chunks.join('')).toBe(first.stdout);
+      expect(first.stdout).toContain(`hash: ${hashValue(session.state)}`);
+      // The literal pin, in the spirit of the transcript fixture above: this exact
+      // script on this exact world ends on this exact state. A change to the city
+      // rules, the turn pipeline or the generator moves it, and moving it has to be
+      // deliberate — `hashValue(session.state)` alone would only prove the CLI and
+      // this process agreed, not that either still plays the same game.
+      expect(first.stdout).toContain('hash: 3d72c9af7146e389');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 120_000);
 });
 

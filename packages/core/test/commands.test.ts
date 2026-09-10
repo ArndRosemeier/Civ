@@ -21,7 +21,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { hashValue } from '@civts/testing';
+import { canonicalize, hashValue } from '@civts/testing';
 import { MIN_CITY_DISTANCE, cityById, type City, type ProductionItem } from '../src/cities.js';
 import {
   applyCommand,
@@ -36,6 +36,7 @@ import {
 } from '../src/commands.js';
 import { isExplored } from '../src/fog.js';
 import { FOOD_BOX_BASE, FOOD_BOX_PER_CITIZEN, applyGrowth, foodBoxSize } from '../src/growth.js';
+import { HUT_REWARD_KINDS } from '../src/hut.js';
 import {
   asBuildingId,
   asCityId,
@@ -49,6 +50,7 @@ import {
 import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { applyProduction, itemCost, itemCostOf } from '../src/production.js';
 import { isOk, type Result } from '../src/result.js';
+import { nextBelow, seedRng } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
 import { advanceTurn } from '../src/turn.js';
@@ -294,12 +296,13 @@ const buildingItem = (id: string): ProductionItem => ({ kind: 'building', id: as
 
 const END_TURN: Command = { type: 'EndTurn' };
 
-/** `applyCommand` with the ruleset the engine is evaluated against. */
+/** `applyCommand` with the ruleset the engine is evaluated against by default. */
 const apply = (
   state: GameState,
   playerId: PlayerId,
   cmd: Command,
-): Result<CommandOutcome, GameError> => applyCommand(state, playerId, cmd, RULESET);
+  ruleset: RulesetView = RULESET,
+): Result<CommandOutcome, GameError> => applyCommand(state, playerId, cmd, ruleset);
 
 const mustOk = (result: Result<CommandOutcome, GameError>): CommandOutcome => {
   if (!result.ok) throw new Error(`expected success, got ${JSON.stringify(result.error)}`);
@@ -1924,6 +1927,208 @@ describe('units.ts — spawnUnit', () => {
 
     expect(() => spawnUnit(frozen, SCOUT, P0, asTileIndex(8))).not.toThrow();
     expect(frozen).toEqual(snapshot);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M3 — hut.ts through the command layer: MoveUnit consumes a hut
+ * ------------------------------------------------------------------ */
+
+/**
+ * `state` with goody huts on the map (M3's `GameMap.huts`, ascending tile index).
+ * `MAP` itself carries none, so every other test in this file is unchanged by the
+ * hut rule — which is worth stating: a move onto a hut-free tile emits exactly the
+ * events it always did.
+ */
+const withHuts = (state: GameState, huts: readonly number[]): GameState => ({
+  ...state,
+  map: { ...state.map, huts: huts.map((tile) => asTileIndex(tile)) },
+});
+
+/**
+ * The board the hut tests move on: `STATE` plus the barbarian player `newGame`
+ * appends (M3 — a player identity whose `startingTile` is the hut the band comes
+ * out of), with a hut on tile 4, the grassland west of the settler's tile 5.
+ *
+ * The band's tiles are therefore 1 and 5 (`1, 5, 8, 9` minus tile 5, which the
+ * settler has just left): 0 is ocean, 2 is mountains, and 6 and 10 hold another
+ * player's units.
+ */
+const HUT_TILE = 4;
+const HUT_STATE: GameState = withHuts(
+  {
+    ...STATE,
+    players: [player(0, 5), player(1, 6), player(2, HUT_TILE, 'barbarian')],
+    explored: [UNSEEN, UNSEEN, UNSEEN],
+  },
+  [HUT_TILE],
+);
+
+/**
+ * An RNG state whose first hut draw selects `unit` rather than `barbarians`:
+ * `seedRng(1)`'s first `nextBelow(rng, 3)` is 0. Spelled out as a helper with the
+ * assertion in the test below, so the fixture cannot quietly stop meaning that.
+ */
+const HUT_UNIT_RNG = seedRng(1);
+
+/** The barbarian player on the hut board. */
+const BARBARIANS = asPlayerId(2);
+
+describe('applyCommand — M3 goody huts', () => {
+  it('consumes a hut the mover enters, and says so in the move’s own events', () => {
+    const outcome = mustOk(apply(HUT_STATE, P0, move(0, HUT_TILE)));
+
+    // The move first, then the hut it entered, then the band that came out of it:
+    // the order in which they happened. The draw from `STATE.rng` (a=1,b=2,c=3,d=4)
+    // is 1, and `HUT_REWARD_KINDS[1]` is `barbarians`.
+    expect(outcome.events).toStrictEqual([
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(0),
+        from: asTileIndex(5),
+        to: asTileIndex(HUT_TILE),
+        cost: 1,
+        movementLeft: 1,
+      },
+      {
+        type: 'HutEntered',
+        unitId: asUnitId(0),
+        owner: P0,
+        tile: asTileIndex(HUT_TILE),
+        reward: 'barbarians',
+      },
+      {
+        type: 'BarbariansSpawned',
+        owner: BARBARIANS,
+        tile: asTileIndex(HUT_TILE),
+        unitIds: [asUnitId(3), asUnitId(4)],
+        tiles: [asTileIndex(1), asTileIndex(5)],
+      },
+    ]);
+
+    // The hut is off the map and the mover is on the tile it stood on.
+    expect(outcome.state.map.huts).toEqual([]);
+    expect(tileOf(outcome.state, 0)).toBe(HUT_TILE);
+    // The band are ordinary units of an ordinary player: barbarians, on land tiles
+    // next to the hut, at full movement, and the ids continue the state's sequence.
+    expect(outcome.state.nextUnitId).toBe(5);
+    expect(outcome.state.units.slice(3)).toStrictEqual([
+      unit(3, WARRIOR, 2, 1, WARRIOR.movement),
+      unit(4, WARRIOR, 2, 5, WARRIOR.movement),
+    ]);
+
+    // The input is untouched — map, RNG and unit list alike.
+    expect(HUT_STATE.map.huts).toEqual([asTileIndex(HUT_TILE)]);
+    expect(HUT_STATE.rng).toStrictEqual({ a: 1, b: 2, c: 3, d: 4 });
+    expect(HUT_STATE.units).toHaveLength(3);
+  });
+
+  it('gives a free unit on the draw that says unit, beside the mover on the hut tile', () => {
+    const state: GameState = { ...HUT_STATE, rng: HUT_UNIT_RNG };
+    expect(nextBelow(HUT_UNIT_RNG, HUT_REWARD_KINDS.length)[0]).toBe(0);
+    expect(HUT_REWARD_KINDS[0]).toBe('unit');
+
+    const outcome = mustOk(apply(state, P0, move(0, HUT_TILE)));
+
+    expect(outcome.events).toStrictEqual([
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(0),
+        from: asTileIndex(5),
+        to: asTileIndex(HUT_TILE),
+        cost: 1,
+        movementLeft: 1,
+      },
+      {
+        type: 'HutEntered',
+        unitId: asUnitId(0),
+        owner: P0,
+        tile: asTileIndex(HUT_TILE),
+        reward: 'unit',
+        unitGiven: asUnitId(3),
+      },
+    ]);
+
+    // The first `military`-role land row of the catalog is the free unit, and it
+    // stands on the hut tile with the mover: M2 lets one player's units stack.
+    expect(outcome.state.units.slice(2)).toStrictEqual([
+      unit(2, WARRIOR, 1, 6, 0),
+      unit(3, WARRIOR, 0, HUT_TILE, WARRIOR.movement),
+    ]);
+    expect(
+      outcome.state.units.filter((candidate) => candidate.tile === asTileIndex(HUT_TILE)),
+    ).toHaveLength(2);
+  });
+
+  it('leaves a hut the mover does not enter alone, and draws nothing for it', () => {
+    const state = withHuts(HUT_STATE, [9]);
+
+    const outcome = mustOk(apply(state, P0, move(0, HUT_TILE)));
+
+    // Only the move: the hut on 9 is not on the path, and nothing drew from the RNG.
+    expect(outcome.events.map((event) => event.type)).toEqual(['UnitMoved']);
+    expect(outcome.state.map.huts).toEqual([asTileIndex(9)]);
+    expect(outcome.state.rng).toStrictEqual(state.rng);
+    expect(outcome.state.units).toHaveLength(3);
+  });
+
+  it('never lets a sea unit or a city consume a hut', () => {
+    // A galley is a unit the ruleset describes, with a domain of its own: M2's
+    // movement rule does not look at domains (M4 owns them), so the step onto the
+    // hut tile is legal and the *hut* is what must refuse.
+    const GALLEY: UnitDef = { ...makeDef('galley', 'military', 3, 2), domain: 'sea' };
+    const NAVAL: RulesetView = { ...RULESET, units: [...RULESET.units, GALLEY] };
+    const atSea: GameState = {
+      ...HUT_STATE,
+      units: [unit(0, GALLEY, 0, 5, GALLEY.movement), ...HUT_STATE.units.slice(1)],
+    };
+
+    const sailed = mustOk(apply(atSea, P0, move(0, HUT_TILE), NAVAL));
+    expect(sailed.events.map((event) => event.type)).toEqual(['UnitMoved']);
+    expect(sailed.state.map.huts).toEqual([asTileIndex(HUT_TILE)]);
+    expect(sailed.state.rng).toStrictEqual(HUT_STATE.rng);
+
+    // A city on the hut tile consumes it permanently instead: the tile can still
+    // be walked into, and still gives nothing.
+    const capitalised = withCities(HUT_STATE, [
+      city(0, 0, HUT_TILE, { population: 2, workedTiles: [asTileIndex(5)] }),
+    ]);
+    const arrived = mustOk(apply(capitalised, P0, move(0, HUT_TILE)));
+
+    expect(arrived.events.map((event) => event.type)).toEqual(['UnitMoved']);
+    expect(arrived.state.map.huts).toEqual([asTileIndex(HUT_TILE)]);
+    expect(arrived.state.rng).toStrictEqual(HUT_STATE.rng);
+    // The move itself still folded the mover's sight into its explored row.
+    expect(exploredIndices(arrived.state.explored[0])).toContain(HUT_TILE);
+  });
+
+  it('is one applied command that is reproducible and stays hashable', () => {
+    const first = mustOk(apply(HUT_STATE, P0, move(0, HUT_TILE)));
+    const second = mustOk(apply(HUT_STATE, P0, move(0, HUT_TILE)));
+
+    // One bump for one command, even though it emitted three events and changed
+    // the map, the RNG and the unit list: `revision` counts applied commands.
+    expect(first.state.revision).toBe(HUT_STATE.revision + 1);
+    expect(first.state.turn).toBe(HUT_STATE.turn);
+    // Same state in, same state out — including the reward the RNG chose.
+    expect(second.state).toStrictEqual(first.state);
+    expect(second.events).toStrictEqual(first.events);
+    expect(hashValue(first.state)).toBe(hashValue(second.state));
+    // A consumed hut, a spawned band and an advanced RNG are all part of the
+    // persisted shape, so the hash must move and the state must still canonicalize.
+    expect(hashValue(first.state)).not.toBe(hashValue(HUT_STATE));
+    expect(() => canonicalize(first.state)).not.toThrow();
+  });
+
+  it('never mutates a deeply frozen hut board', () => {
+    const board: GameState = structuredClone(HUT_STATE);
+    const snapshot = structuredClone(board);
+    deepFreeze(board);
+
+    const outcome = mustOk(apply(board, P0, move(0, HUT_TILE)));
+
+    expect(outcome.state.map.huts).toEqual([]);
+    expect(board).toEqual(snapshot);
   });
 });
 

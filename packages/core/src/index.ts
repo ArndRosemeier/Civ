@@ -18,6 +18,7 @@ export * from './cities.js';
 export * from './growth.js';
 export * from './production.js';
 export * from './turn.js';
+export * from './hut.js';
 export * from './units.js';
 export * from './commands.js';
 export * from './actions.js';

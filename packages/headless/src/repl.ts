@@ -19,6 +19,23 @@
  *   carrying the `Command` it built and, on refusal, the engine's typed error —
  *   so tests assert on reasons instead of scraping text, while a human reads the
  *   same information as prose.
+ * - **The city surface (M3) is the same arrangement as the movement one.**
+ *   `found`, `city`, `cities`, `work` and `build` are thin: each parses text,
+ *   builds exactly one `Command`, and hands it to `applyCommand`. Every refusal is
+ *   the engine's own typed `GameError`, and every "legal:" line under it comes
+ *   from an engine *evaluator* — `planFoundCity`, `planSetWorkedTiles`,
+ *   `planSetProduction`, `itemCostOf`, `cityRadius`, `foodBoxSize` — the same
+ *   functions the applier decides with. So the REPL cannot advertise a city site,
+ *   an assignment or a build order the engine would refuse, and there is no second
+ *   copy of the city rules here to drift out of step with it.
+ * - **Event rendering is exhaustive, not defaulted.** `outcomeText` switches over
+ *   *every* `GameEvent` member with no `default` clause and an `assertNever` tail,
+ *   so the next event member is a compile error. A `switch` that simply falls
+ *   through returns `undefined` for the unhandled member, and `undefined` inside a
+ *   joined line is not a loud failure — it is a silently *blank* line in a
+ *   transcript, which is exactly how the M3 city and goody-hut events would have
+ *   arrived: `CityFounded`, `CityGrew`, `CityStarved`, `CityProduced`,
+ *   `HutEntered` and `BarbariansSpawned` all hit no case and printed nothing.
  * - **The transcript is a pure function of (state, lines, flags).** Numbers are
  *   the only variable content and they come from the state; nothing reads the
  *   clock, and the prompt/echo are written for every line whether the input
@@ -39,22 +56,35 @@ import { createInterface } from 'node:readline';
 
 import {
   MAP_SIZES,
+  MIN_CITY_DISTANCE,
   applyCommand,
+  asBuildingId,
+  asCityId,
   asUnitId,
+  asUnitTypeId,
+  buildingCatalog,
   buildingDef,
   citiesOf,
   cityById,
+  cityRadius,
+  cityYields,
   civPlayers,
   describe,
   err,
+  foodBoxSize,
   inBounds,
   indexToX,
   indexToY,
   isExplored,
+  itemCostOf,
   ok,
+  planFoundCity,
+  planSetProduction,
+  planSetWorkedTiles,
   terrainAtIndex,
   tileIndex,
   unitById,
+  unitCatalog,
   unitDef,
   unitMoveOptions,
   unitsOnTile,
@@ -62,7 +92,9 @@ import {
   type Command,
   type CommandOutcome,
   type BuildingId,
+  type City,
   type CityId,
+  type CityYields,
   type GameError,
   type GameMap,
   type GameState,
@@ -128,7 +160,9 @@ export const PLAY_USAGE = `usage: civts play [--seed <int>] [--map-size <size>] 
   --god               render the whole map, ignoring fog (debugging only)
 
 Commands inside a session (also documented by "help"):
-  move <unitId> <x> <y>   end   units   state   save <path>   help   quit
+  move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
+  work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
+  end   units   state   save <path>   help   quit
 `;
 
 export const parsePlayArgs = (args: readonly string[]): Result<PlayFlags, string> => {
@@ -199,6 +233,13 @@ export interface ErrorContext {
   readonly playerId: PlayerId;
   /** The unit the refused command named, when it named one (`undefined` otherwise). */
   readonly unitId: UnitId | undefined;
+  /**
+   * The city the refused command named, when it named one (`undefined`
+   * otherwise). Not part of any game state, so a present-and-`undefined` field is
+   * harmless here — `City.production`'s canonical-JSON trap applies to state,
+   * not to this prose-only context.
+   */
+  readonly cityId: CityId | undefined;
 }
 
 const coordOf = (map: GameMap, tile: TileIndex): string =>
@@ -300,6 +341,213 @@ const itemLabel = (ruleset: RulesetView, item: ProductionItem): string =>
 const buildingLabel = (ruleset: RulesetView, id: BuildingId): string =>
   `building "${buildingDef(ruleset, id)?.name ?? id}"`;
 
+/* ------------------------------------------------------------------ *
+ * M3 - the legal alternatives for a refused city command.
+ *
+ * Every list below is an answer the engine gives, not a restatement of
+ * the city rules: `planFoundCity`, `planSetWorkedTiles` and
+ * `planSetProduction` are the *same* evaluators `applyCommand` refuses
+ * with, and `cityRadius`/`foodBoxSize`/`itemCostOf` are the engine's own
+ * statements of the radius, the next-citizen threshold and an item's
+ * cost. That is the point: the prose under a refusal cannot drift from
+ * the engine, because there is only one implementation of each rule.
+ * ------------------------------------------------------------------ */
+
+/** The city a context names, when the state has one with that id. */
+const contextCity = (context: ErrorContext): City | undefined =>
+  context.cityId === undefined ? undefined : cityById(context.state, context.cityId);
+
+/** `(x,y) (x,y) ...`, or `fallback` for an empty list. The one tile-list renderer. */
+const tileList = (map: GameMap, tiles: readonly TileIndex[], fallback: string): string =>
+  tiles.length === 0 ? fallback : tiles.map((tile) => `(${coordOf(map, tile)})`).join(' ');
+
+/** `(x,y) (x,y) ...`, or `(none)` for an empty list. */
+const coordList = (context: ErrorContext, tiles: readonly TileIndex[]): string =>
+  tileList(context.state.map, tiles, '(none)');
+
+/**
+ * The tiles `cityId` may be assigned right now, asked one tile at a time of
+ * `planSetWorkedTiles` — so a tile another city works, a tile outside the radius,
+ * the centre itself and an off-map tile are all excluded by the engine's answer
+ * rather than by a second opinion here.
+ */
+const workableTiles = (state: GameState, playerId: PlayerId, city: City): readonly TileIndex[] =>
+  cityRadius(state, city.tile).filter(
+    (tile) =>
+      Number(tile) !== Number(city.tile) && planSetWorkedTiles(state, playerId, city.id, [tile]).ok,
+  );
+
+/**
+ * The lesson behind a refused `work`: the city's citizen count (which bounds the
+ * assignment), what it works now, and the tiles it may work instead.
+ */
+const legalWorkLines = (context: ErrorContext): readonly string[] => {
+  const city = contextCity(context);
+  if (city === undefined) return yourCitiesLines(context);
+
+  const free = workableTiles(context.state, context.playerId, city);
+  return [
+    `  legal: ${cityLabel(context.state, city.id)} has ${String(city.population)} citizen(s), so at`,
+    `    most ${String(city.population)} worked tile(s); it works ` +
+      `${coordList(context, city.workedTiles)} now.`,
+    `  legal: tiles free for it to work: ${coordList(context, free)}.`,
+  ];
+};
+
+/**
+ * Every item `cityId` may be set to build, as `planSetProduction` answers it —
+ * so an id no catalog defines and a building the city already has are excluded by
+ * the engine, not by the REPL.
+ */
+const buildableItems = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  cityId: CityId,
+): readonly ProductionItem[] => {
+  const items: readonly ProductionItem[] = [
+    ...unitCatalog(ruleset).map((def): ProductionItem => ({ kind: 'unit', id: def.id })),
+    ...buildingCatalog(ruleset).map((def): ProductionItem => ({ kind: 'building', id: def.id })),
+  ];
+  return items.filter((item) => planSetProduction(state, ruleset, playerId, cityId, item).ok);
+};
+
+/** An item as prose with its cost: `unit "Settler" (cost 3 shields)`. */
+const pricedItemLabel = (ruleset: RulesetView, item: ProductionItem): string => {
+  const cost = itemCostOf(ruleset, item);
+  return (
+    `${itemLabel(ruleset, item)} ` +
+    (cost === undefined ? '(unpriceable)' : `(cost ${String(cost)} shield${cost === 1 ? '' : 's'})`)
+  );
+};
+
+/** The lesson behind a refused `build`: what this city may build instead. */
+const legalBuildLines = (context: ErrorContext): readonly string[] => {
+  const city = contextCity(context);
+  if (city === undefined) return yourCitiesLines(context);
+
+  const items = buildableItems(context.state, context.ruleset, context.playerId, city.id);
+  // Units and buildings on their own lines: ten items on one line is a wall, and
+  // the split is the same distinction `build` asks the player to spell out.
+  const labels = (kind: ProductionItem['kind']): string =>
+    items
+      .filter((item) => item.kind === kind)
+      .map((item) => pricedItemLabel(context.ruleset, item))
+      .join(', ');
+
+  const units = labels('unit');
+  const buildings = labels('building');
+  const inventory =
+    units === '' && buildings === ''
+      ? 'nothing this ruleset can price.'
+      : [
+          units === '' ? undefined : `units: ${units}`,
+          buildings === '' ? undefined : `buildings: ${buildings}`,
+        ]
+          .filter((line): line is string => line !== undefined)
+          .join('; ') + '.';
+
+  return [
+    `  legal: ${cityLabel(context.state, city.id)} may be set to build ${inventory}`,
+    `  legal: "build ${String(city.id)} unit:<id>" or "build ${String(city.id)} building:<id>".`,
+  ];
+};
+
+/**
+ * The lesson behind a refused `found`: the units of yours that *could* found a
+ * city where they stand, asked of `planFoundCity` — the evaluator that refused
+ * the command.
+ */
+const legalFoundLines = (context: ErrorContext): readonly string[] => {
+  const ready = context.state.units.filter(
+    (unit) =>
+      unit.owner === context.playerId &&
+      planFoundCity(context.state, context.ruleset, context.playerId, unit.id).ok,
+  );
+
+  if (ready.length === 0) {
+    return [
+      '  legal: none of your units can found a city where it stands: a settler must be on land',
+      `  and at least ${String(MIN_CITY_DISTANCE)} tiles (counting diagonals) from every city.`,
+    ];
+  }
+  const labels = ready.map((unit) => unitLabel(context.state, context.ruleset, unit.id));
+  return [`  legal: these can found a city now: ${labels.join('; ')}.`];
+};
+
+/* ------------------------------------------------------------------ *
+ * M3 - what the two setter verbs accept.
+ * ------------------------------------------------------------------ */
+
+/** The unit a command names, when it names one (`move` and `found` do). */
+const unitIdOf = (command: Command): UnitId | undefined =>
+  command.type === 'MoveUnit' || command.type === 'FoundCity' ? command.unitId : undefined;
+
+/** The city a command names, when it names one (`work` and `build` do). */
+const cityIdOf = (command: Command): CityId | undefined =>
+  command.type === 'SetWorkedTiles' || command.type === 'SetProduction'
+    ? command.cityId
+    : undefined;
+
+/**
+ * The `ProductionItem` a `build` argument means.
+ *
+ * `unit:<id>` and `building:<id>` are the explicit spellings, and they are always
+ * taken at their word: the two id spaces are different (a unit and a building may
+ * share an id — `cities.ts` says so where `ProductionItem` is declared), and an
+ * explicit kind is how the REPL is told *which* is meant. A bare id is accepted
+ * when exactly one catalog holds it, refused when both do (spell the kind out) and
+ * refused when neither does — with a hint that lists what this ruleset can
+ * actually price, taken from `itemCostOf`, the engine's own answer.
+ */
+const productionItemOf = (ruleset: RulesetView, spec: string): Result<ProductionItem, string> => {
+  const colon = spec.indexOf(':');
+  if (colon >= 0) {
+    const kind = spec.slice(0, colon).toLowerCase();
+    const id = spec.slice(colon + 1);
+    if (id === '') return err(`"${spec}" names no id after the ":"`);
+    if (kind === 'unit') return ok({ kind: 'unit', id: asUnitTypeId(id) });
+    if (kind === 'building') return ok({ kind: 'building', id: asBuildingId(id) });
+    return err(
+      `"${kind}" is not a kind of thing to build: use "unit:<id>" or "building:<id>" ` +
+        `(got "${spec}")`,
+    );
+  }
+
+  const inUnits = unitCatalog(ruleset).some((def) => def.id === spec);
+  const inBuildings = buildingCatalog(ruleset).some((def) => def.id === spec);
+
+  if (inUnits && inBuildings) {
+    return err(
+      `"${spec}" is both a unit and a building in this ruleset, so the kind has to be spelled ` +
+        `out: "unit:${spec}" or "building:${spec}"`,
+    );
+  }
+  if (inUnits) return ok({ kind: 'unit', id: asUnitTypeId(spec) });
+  if (inBuildings) return ok({ kind: 'building', id: asBuildingId(spec) });
+
+  return err(`this ruleset has no unit and no building with the id "${spec}"`);
+};
+
+/**
+ * What a ruleset can build at all, as prose for a hint — every catalog row whose
+ * cost `itemCostOf` accepts. That is the engine's own "can this be priced?"
+ * evaluator, so the hint cannot advertise an item `build` would refuse.
+ */
+const buildCatalogueHint = (ruleset: RulesetView): string => {
+  const units = unitCatalog(ruleset)
+    .filter((def) => itemCostOf(ruleset, { kind: 'unit', id: def.id }) !== undefined)
+    .map((def) => `unit "${def.id}" (${String(def.cost)} shields)`);
+  const buildings = buildingCatalog(ruleset)
+    .filter((def) => itemCostOf(ruleset, { kind: 'building', id: def.id }) !== undefined)
+    .map((def) => `building "${def.id}" (${String(def.cost)} shields)`);
+
+  if (units.length === 0 && buildings.length === 0) {
+    return 'this ruleset can build nothing: no catalog row carries a usable shield cost';
+  }
+  return `buildable here: ${[...units, ...buildings].join('; ')}`;
+};
+
 /**
  * Render a `GameError` as an explanation plus, where it can be derived, the
  * moves that were legal.
@@ -375,6 +623,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
       return [
         `error: not-a-settler - ${unitLabel(context.state, context.ruleset, error.unitId)} is not a`,
         '  settler, and only a settler can found a city (founding consumes it).',
+        ...legalFoundLines(context),
         ...legalMovesLines(context),
       ].join('\n');
 
@@ -384,6 +633,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
       return [
         `error: not-on-land - a city can only be founded on land, and ` +
           `(${coordOf(context.state.map, error.tile)}) is ${what}.`,
+        ...legalFoundLines(context),
         ...legalMovesLines(context),
       ].join('\n');
     }
@@ -393,6 +643,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         `error: city-too-close - (${coordOf(context.state.map, error.tile)}) is ` +
           `${String(error.distance)} tile(s) from ${cityLabel(context.state, error.cityId)}, and ` +
           `cities must be at least ${String(error.minDistance)} apart (counting diagonals).`,
+        ...legalFoundLines(context),
         ...legalMovesLines(context),
       ].join('\n');
 
@@ -418,6 +669,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
           `error: tile-not-workable - ${where} is the centre of ` +
             `${cityLabel(context.state, error.cityId)}, and the centre is always`,
           '  worked for free: it costs no citizen, so it is never listed as a worked tile.',
+          ...legalWorkLines(context),
         ].join('\n');
       }
       return [
@@ -425,6 +677,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
           `${cityLabel(context.state, error.cityId)}.`,
         '  a city works the tiles within two of its centre (the four corners excepted), and only',
         '  tiles that are on the map: a tile at or past an edge has no yields to assign.',
+        ...legalWorkLines(context),
       ].join('\n');
     }
 
@@ -434,6 +687,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
           `(${coordOf(context.state.map, error.tile)}) is already worked by ` +
           `${cityLabel(context.state, error.byCityId)}.`,
         '  a tile may be worked by only one city, of any owner, at a time.',
+        ...legalWorkLines(context),
       ].join('\n');
 
     case 'duplicate-worked-tile':
@@ -441,6 +695,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         `error: duplicate-worked-tile - (${coordOf(context.state.map, error.tile)}) is listed ` +
           `twice for ${cityLabel(context.state, error.cityId)}.`,
         '  one citizen works one tile, so a repeated tile would spend two citizens on one job.',
+        ...legalWorkLines(context),
       ].join('\n');
 
     case 'too-many-worked-tiles':
@@ -450,6 +705,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
           `tile(s), but ${String(error.requested)} were given.`,
         '  the whole request is refused rather than truncated: an assignment longer than the',
         '  citizen count is a mistake, and a shorter one is what you meant to send.',
+        ...legalWorkLines(context),
       ].join('\n');
 
     case 'unknown-production-item':
@@ -458,6 +714,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
           `${itemLabel(context.ruleset, error.item)}.`,
         '  an item is buildable when its catalog row exists and its cost is a whole number of',
         '  shields greater than zero. "state" shows the hash; the ruleset is @civts/rules.',
+        ...legalBuildLines(context),
       ].join('\n');
 
     case 'already-built':
@@ -466,6 +723,7 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
           `${buildingLabel(context.ruleset, error.building)}.`,
         '  each building is built once per city; building it again is refused rather than',
         '  quietly ignored, so a queue cannot silently waste shields on a duplicate.',
+        ...legalBuildLines(context),
       ].join('\n');
 
     case 'invalid-argument':
@@ -487,6 +745,170 @@ export const formatSetupError = (error: SetupError): string => {
 };
 
 /* ------------------------------------------------------------------ *
+ * M3 - one city in full, and the list of them.
+ *
+ * Numbers here are read, never derived: the growth threshold comes from
+ * `foodBoxSize`, an item's price from `itemCostOf`, the yields from
+ * `cityYields`. "How much more food does this city need?" is a
+ * subtraction of two numbers the engine published, not a second
+ * statement of the growth rule.
+ * ------------------------------------------------------------------ */
+
+/** `+2` / `-1` / `0`: a surplus with its sign, for a reader skimming the line. */
+const signed = (value: number): string => (value > 0 ? `+${String(value)}` : String(value));
+
+/** The terrain under a tile, or `?` when the ruleset cannot name it. */
+const terrainNameAt = (state: GameState, ruleset: RulesetView, tile: TileIndex): string =>
+  terrainDefAt(state, ruleset, tile)?.name ?? '?';
+
+/**
+ * One city in full: population, the food box **and the threshold it is filling
+ * toward**, the stored shields, the item being built **and what it costs**, the
+ * queue behind that item, the buildings, and the tiles its citizens work.
+ *
+ * The yields line states what `cityYields` computed — food, shields, commerce,
+ * how much the citizens eat, and the surplus — because "why is this city not
+ * growing?" is a question about integers the engine already has, and a reader
+ * should not have to add them up.
+ */
+const cityDetailText = (state: GameState, ruleset: RulesetView, city: City): string => {
+  const yields: CityYields = cityYields(state, ruleset, city.id);
+  const box = foodBoxSize(city.population);
+  const eaten = yields.food - yields.foodSurplus;
+  const item = city.production;
+
+  const lines = [
+    cityLabel(state, city.id),
+    `  population ${String(city.population)}; food box ${String(city.foodBox)}/${String(box)} ` +
+      `(${String(Math.max(0, box - city.foodBox))} more to grow); food ${String(yields.food)} per ` +
+      `turn, ${String(eaten)} eaten, surplus ${signed(yields.foodSurplus)}`,
+  ];
+
+  if (item === undefined) {
+    lines.push(
+      `  shields ${String(city.shields)}; building nothing (idle: ` +
+        `"build ${String(city.id)} unit:<id>" or "build ${String(city.id)} building:<id>")`,
+    );
+  } else {
+    const cost = itemCostOf(ruleset, item);
+    lines.push(
+      `  shields ${String(city.shields)}; building ${itemLabel(ruleset, item)} ` +
+        `(cost ${cost === undefined ? '? (unpriceable)' : String(cost)}; ` +
+        `${cost === undefined ? '?' : String(Math.max(0, cost - city.shields))} more to go)`,
+    );
+  }
+
+  lines.push(
+    city.queue.length === 0
+      ? '  queue: (empty)'
+      : `  queue: ${city.queue
+          .map((entry, index) => `${String(index + 1)}. ${pricedItemLabel(ruleset, entry)}`)
+          .join(', ')}`,
+  );
+
+  lines.push(
+    city.buildings.length === 0
+      ? '  buildings: (none)'
+      : `  buildings: ${city.buildings
+          .map((id) => buildingDef(ruleset, id)?.name ?? id)
+          .join(', ')}`,
+  );
+
+  lines.push(
+    city.workedTiles.length === 0
+      ? `  works 0 of ${String(city.population)} citizen(s): (nothing assigned - an unassigned ` +
+          'citizen works nothing)'
+      : `  works ${String(city.workedTiles.length)} of ${String(city.population)} citizen(s): ` +
+          city.workedTiles
+            .map((tile) => `(${coordOf(state.map, tile)}) ${terrainNameAt(state, ruleset, tile)}`)
+            .join(', '),
+  );
+
+  if (city.workedTiles.length > city.population) {
+    lines.push(
+      `  note: only the first ${String(city.population)} of those tile(s) count - one citizen ` +
+        'works one tile (see "work <cityId> <x> <y>").',
+    );
+  }
+
+  return `${lines.join('\n')}\n`;
+};
+
+/** Column widths for the `cities` table: id, name, at, pop, food, shields, production. */
+const CITY_WIDTHS: readonly number[] = [2, 10, 6, 3, 8, 7];
+
+/**
+ * The player's own cities, one row each: id, name, where it is, its citizens, the
+ * food box against its next-citizen threshold, the stored shields, and what it is
+ * building. The `city <cityId>` view is the one that goes into detail.
+ *
+ * `visible` is the fog-filtered list the view line uses, so a city of another
+ * player the session *can* see is named here too — under the table, never in it.
+ * Without that line `cities` would answer "you have none" while the `cities:` line
+ * above it listed somebody else's, which reads like a bug rather than like a rule.
+ */
+const citiesTableText = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  visible: readonly City[],
+): string => {
+  const mine = citiesOf(state, playerId);
+  const others = visible.filter((city) => city.owner !== playerId);
+  const lines = [`cities: ${String(mine.length)} for ${playerLabel(state, playerId)}`];
+
+  if (mine.length === 0) {
+    lines.push('  you have founded none yet: "found <unitId>" turns one of your settlers into a');
+    lines.push('  city where it stands ("units" lists your unit ids).');
+  } else {
+    lines.push(tableRow(CITY_WIDTHS, ['id', 'name', 'at', 'pop', 'food', 'shields', 'production']));
+    for (const city of mine) {
+      const item = city.production;
+      lines.push(
+        tableRow(CITY_WIDTHS, [
+          String(city.id),
+          city.name,
+          coordOf(state.map, city.tile),
+          String(city.population),
+          `${String(city.foodBox)}/${String(foodBoxSize(city.population))}`,
+          String(city.shields),
+          item === undefined ? '(idle)' : itemLabel(ruleset, item),
+        ]),
+      );
+    }
+    lines.push('  "city <cityId>" shows one in full: yields, queue, buildings and worked tiles.');
+  }
+
+  if (others.length > 0) {
+    lines.push(
+      `  not yours, but visible to you: ${others
+        .map((city) => citySummary(state, ruleset, city, false))
+        .join('  ')}`,
+    );
+  }
+
+  return `${lines.join('\n')}\n`;
+};
+
+/**
+ * One compact line per city you can see, printed under every view — the city
+ * counterpart of the `units:` line, and for the same reason: `describe` draws
+ * terrain and huts, so without this the agent would have to ask "cities" after
+ * every command to notice the city it just founded. Compact on purpose: it is
+ * printed after *every* command, and `city <cityId>` is where the detail lives.
+ */
+const citySummary = (state: GameState, ruleset: RulesetView, city: City, mine: boolean): string => {
+  const item = city.production;
+  return (
+    `${mine ? '*' : ' '}${String(city.id)} ${city.name} p${String(city.owner)} ` +
+    `@${coordOf(state.map, city.tile)} pop ${String(city.population)} ` +
+    `food ${String(city.foodBox)}/${String(foodBoxSize(city.population))} ` +
+    `shields ${String(city.shields)} ` +
+    (item === undefined ? '(idle)' : `building ${itemLabel(ruleset, item)}`)
+  );
+};
+
+/* ------------------------------------------------------------------ *
  * The session.
  * ------------------------------------------------------------------ */
 
@@ -495,6 +917,12 @@ export type LineOutcome =
   | { readonly kind: 'applied'; readonly command: Command; readonly outcome: CommandOutcome }
   | { readonly kind: 'refused'; readonly command: Command; readonly error: GameError }
   | { readonly kind: 'inspected'; readonly command: string }
+  /**
+   * An inspector named a city this session cannot show — one the state does not
+   * have, or one the player can neither own nor see. Not a `refused`: nothing was
+   * sent to the engine, because inspecting is not a `Command`.
+   */
+  | { readonly kind: 'unknown-city'; readonly cityId: CityId }
   | { readonly kind: 'malformed'; readonly detail: string }
   | { readonly kind: 'io-error'; readonly detail: string }
   | { readonly kind: 'ignored' }
@@ -522,12 +950,39 @@ export interface ReplSession {
   readonly run: (line: string) => LineOutcome;
 }
 
-const COMMAND_SUMMARY = 'move <unitId> <x> <y> | end | units | state | save <path> | help | quit';
+/**
+ * Every verb, for the banner and for the "unknown command" reply — so a mistyped
+ * word is answered with the list it should have come from. Exported because the
+ * transcript fixture prints it: a new verb has to show up here as well as in
+ * `HELP`.
+ */
+export const COMMAND_SUMMARY =
+  'move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | ' +
+  'work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | ' +
+  'end | units | state | save <path> | help | quit';
 
 const HELP = `commands:
   move <unitId> <x> <y>   step one unit onto an adjacent tile (8-way). The cost is the
                           destination tile's move cost, paid from that unit's movement.
-  end                     end the turn: every unit refills its movement, turn advances.
+  found <unitId>          found a city with that unit, which must be a settler standing on
+                          land at least 2 tiles (counting diagonals) from every city. The
+                          settler is consumed. New cities start at population 1 and work
+                          the best tiles they can reach.
+  cities                  list your cities: where each is, its citizens, its food box
+                          against the threshold for the next citizen, its stored shields
+                          and what it is building.
+  city <cityId>           show one city in full: population, the food box and its
+                          threshold, stored shields, the current item and its cost, the
+                          queue behind it, its buildings and the tiles it works.
+  work <cityId> <x> <y> ...   set which tiles that city's citizens work, one x y pair per
+                          citizen (at most "population" pairs; an unassigned citizen works
+                          nothing). With no pairs the assignment is cleared.
+  build <cityId> <item>   set what that city builds. <item> is "unit:<id>" or
+                          "building:<id>"; a bare id is accepted when only one catalog has
+                          it ("build 0 granary" means building "Granary", because no unit
+                          is called that). Stored shields are kept.
+  end                     end the turn: every city grows and produces, every unit refills
+                          its movement, turn advances.
   units                   list the units you can see, with position and movement left.
   state                   print seed, turn, revision, map size, RNG and the state hash.
   save <path>             write the state to <path> as canonical JSON (parent
@@ -539,8 +994,9 @@ const HELP = `commands:
 notes:
   - coordinates are x,y as ruled above the map: x is the column, y is the row.
   - a digit drawn on the map is that player's STARTING tile. Live unit positions are the
-    "units:" line printed under every view ("*" marks a unit of yours).
-  - a refused command prints the typed reason and the moves that were legal, and never
+    "units:" line printed under every view ("*" marks a unit of yours), and your cities are
+    the "cities:" line under it.
+  - a refused command prints the typed reason and the choices that were legal, and never
     changes the state.
   - every command goes through the engine's command API; the REPL never edits state.
 `;
@@ -560,43 +1016,201 @@ const bannerText = (state: GameState, playerId: PlayerId, god: boolean): string 
     : 'every view below is drawn from your fog of war\n') +
   `commands: ${COMMAND_SUMMARY}\n\n`;
 
-/** One-line reaction to an applied command, derived from its events. */
-const outcomeText = (outcome: CommandOutcome): string => {
-  const lines = outcome.events.map((event) => {
+/**
+ * Compile-time exhaustiveness, made visible.
+ *
+ * A `switch` over a union that lacks a case does not fail loudly: the mapping
+ * function simply returns `undefined`, and a line built from `undefined` is a
+ * **blank line** in a transcript that looks like a rendering choice rather than a
+ * bug. That is exactly how M3's city and goody-hut events were being dropped —
+ * `CityFounded`, `CityGrew`, `CityStarved`, `CityProduced`, `HutEntered` and
+ * `BarbariansSpawned` hit no case in `outcomeText` and printed nothing at all.
+ *
+ * So every event switch below is exhaustive *without* a `default` clause and ends
+ * here: `value` is narrowed to `never` only when every member was handled, and
+ * adding a `GameEvent` member therefore stops the build instead of quietly
+ * producing that blank line. The throw is unreachable by construction; it exists
+ * so the function has a total return type the compiler can check.
+ */
+const assertNever = (value: never): never => {
+  throw new Error(`unhandled union member: ${JSON.stringify(value)}`);
+};
+
+/** `(x,y)` of the tile an event names. */
+const eventPlace = (outcome: CommandOutcome, tile: TileIndex): string =>
+  `(${coordOf(outcome.state.map, tile)})`;
+
+/** `3, 4` — a list of unit ids for a reader, or `none`. */
+const idList = (ids: readonly UnitId[]): string =>
+  ids.length === 0 ? 'none' : ids.map((id) => String(id)).join(', ');
+
+/**
+ * One `ok:` line per event, in the order the events happened, followed by the new
+ * revision.
+ *
+ * Every `GameEvent` member is rendered, and each line says something a reader can
+ * act on: a hut that paid nothing says so, a city that starved names the citizen
+ * it lost, a produced unit names the id and tile it appeared on. `outcomeText`
+ * is the only place events become prose, so a caller that wants them as data
+ * reads `CommandOutcome.events` instead.
+ */
+const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: RulesetView): string => {
+  const lines = outcome.events.map((event): string => {
     switch (event.type) {
       case 'UnitMoved':
         return (
-          `ok: unit ${String(event.unitId)} moved to ` +
-          `(${coordOf(outcome.state.map, event.to)}), cost ${String(event.cost)}, ` +
-          `${String(event.movementLeft)} movement left`
+          `ok: unit ${String(event.unitId)} moved to ${eventPlace(outcome, event.to)}, ` +
+          `cost ${String(event.cost)}, ${String(event.movementLeft)} movement left`
         );
+
       case 'TurnEnded':
         return `ok: turn ${String(event.turn)} begins; every unit refilled its movement`;
+
+      case 'CityFounded':
+        return (
+          `ok: ${event.name} founded at ${eventPlace(outcome, event.tile)} for ` +
+          `${playerLabel(outcome.state, event.owner)} (city ${String(event.cityId)}); the ` +
+          'settler is consumed'
+        );
+
+      case 'CityGrew':
+        return (
+          `ok: ${cityLabel(outcome.state, event.cityId)} grew to ` +
+          `${String(event.population)} citizen(s); food box ${String(event.foodBox)}/` +
+          `${String(foodBoxSize(event.population))} carried over`
+        );
+
+      case 'CityStarved':
+        return (
+          `ok: ${cityLabel(outcome.state, event.cityId)} starved down to ` +
+          `${String(event.population)} citizen(s); food box restarted at ` +
+          String(event.foodBox)
+        );
+
+      case 'CityProduced': {
+        const where =
+          event.unitId === undefined || event.tile === undefined
+            ? ''
+            : ` (unit ${String(event.unitId)} at ${eventPlace(outcome, event.tile)})`;
+        return (
+          `ok: ${cityLabel(outcome.state, event.cityId)} finished ` +
+          `${itemLabel(ruleset, event.item)}${where}; ${String(event.shields)} shields left`
+        );
+      }
+
+      case 'HutEntered': {
+        const found =
+          event.reward === 'unit'
+            ? `a free unit${event.unitGiven === undefined ? '' : ` (unit ${String(event.unitGiven)})`}`
+            : event.reward === 'barbarians'
+              ? 'barbarians'
+              : 'nothing (the hut is spent)';
+        return (
+          `ok: unit ${String(event.unitId)} entered a goody hut at ` +
+          `${eventPlace(outcome, event.tile)} and found ${found}`
+        );
+      }
+
+      case 'BarbariansSpawned':
+        return event.unitIds.length === 0
+          ? // Never emitted this way (`hut.ts` reports a band with nowhere to stand
+            // as `reward: 'nothing'`), but the line must be true for any event the
+            // state can carry rather than claiming a band that is not there.
+            `ok: the hut at ${eventPlace(outcome, event.tile)} roused no band: the map had ` +
+              'nowhere for one to stand'
+          : `ok: ${String(event.unitIds.length)} barbarian unit(s) (${idList(event.unitIds)}) ` +
+              `appeared on ${tileList(outcome.state.map, event.tiles, 'nowhere')} near the hut ` +
+              `at ${eventPlace(outcome, event.tile)}, owned by ` +
+              playerLabel(outcome.state, event.owner);
     }
+
+    return assertNever(event);
   });
+
+  // Two commands emit no event, by the frozen contract: `SetWorkedTiles` and
+  // `SetProduction` change only what the command's own payload names, and M3's
+  // event list has no member for "the assignment changed" or "the queue changed".
+  // Rendering the command that was applied is therefore the only honest report of
+  // what happened — otherwise the session would answer a `build` with nothing but
+  // "revision 5", and the player would have to guess whether it took.
+  const effect = appliedCommandText(command, outcome, ruleset);
+  const all = effect === undefined ? lines : [...lines, effect];
+
   const revision = `revision ${String(outcome.state.revision)}`;
-  return lines.length === 0 ? `ok: ${revision}` : `${lines.join('\n')}\n  ${revision}`;
+  return all.length === 0 ? `ok: ${revision}` : `${all.join('\n')}\n  ${revision}`;
+};
+
+/**
+ * What a command did when it emitted no event, or `undefined` for the commands
+ * whose events already say it. Exhaustive over `Command` for the same reason
+ * `outcomeText` is exhaustive over `GameEvent`: a new command must be considered
+ * here rather than inherit a silent "nothing to report".
+ */
+const appliedCommandText = (
+  command: Command,
+  outcome: CommandOutcome,
+  ruleset: RulesetView,
+): string | undefined => {
+  switch (command.type) {
+    case 'MoveUnit':
+    case 'EndTurn':
+    case 'FoundCity':
+      return undefined;
+
+    case 'SetWorkedTiles': {
+      const city = cityById(outcome.state, command.cityId);
+      const citizens = city === undefined ? undefined : city.population;
+      if (command.tiles.length === 0) {
+        return (
+          `ok: ${cityLabel(outcome.state, command.cityId)} now works no tiles` +
+          (citizens === undefined
+            ? ' (the assignment is cleared)'
+            : ` (its ${String(citizens)} citizen(s) work nothing, which is a legal choice)`)
+        );
+      }
+      return (
+        `ok: ${cityLabel(outcome.state, command.cityId)} now works ` +
+        tileList(outcome.state.map, command.tiles, '(none)') +
+        (citizens === undefined
+          ? ''
+          : ` with ${String(command.tiles.length)} of ${String(citizens)} citizen(s)`)
+      );
+    }
+
+    case 'SetProduction': {
+      const city = cityById(outcome.state, command.cityId);
+      const stored = city === undefined ? 0 : city.shields;
+      return (
+        `ok: ${cityLabel(outcome.state, command.cityId)} production set to ` +
+        `${pricedItemLabel(ruleset, command.item)}; ${String(stored)} shields stored`
+      );
+    }
+  }
+
+  // Reached only when every member above was handled, which is what makes the tail
+  // a compile error rather than a silent "nothing to report" for a new command.
+  return assertNever(command);
 };
 
 /** Column widths for the `units` table: marker, id, type, owner, at, move, terrain. */
 const UNIT_WIDTHS: readonly number[] = [1, 2, 10, 11, 8, 7, 11];
 
-const tableRow = (cells: readonly string[]): string =>
+/** A padded row: every cell but the last is padded to its column's width. */
+const tableRow = (widths: readonly number[], cells: readonly string[]): string =>
   cells
-    .map((cell, index) =>
-      index === cells.length - 1 ? cell : cell.padEnd(UNIT_WIDTHS[index] ?? 0),
-    )
+    .map((cell, index) => (index === cells.length - 1 ? cell : cell.padEnd(widths[index] ?? 0)))
     .join('  ');
 
 export const createSession = (options: SessionOptions): ReplSession => {
   const { ruleset, playerId, god, write } = options;
   let state = options.state;
 
-  const context = (unitId: UnitId | undefined): ErrorContext => ({
+  const context = (unitId: UnitId | undefined, cityId: CityId | undefined): ErrorContext => ({
     state,
     ruleset,
     playerId,
     unitId,
+    cityId,
   });
 
   /**
@@ -610,6 +1224,22 @@ export const createSession = (options: SessionOptions): ReplSession => {
       (unit) => unit.owner === playerId || isExplored(state, playerId, unit.tile),
     );
   };
+
+  /**
+   * The cities this session may show: its own always, another player's only where
+   * it has explored that city's tile — the same fog rule as `visibleUnits`, so
+   * `city <id>` and the `cities:` line cannot become a way to scout for free.
+   */
+  const visibleCities = (): readonly City[] => {
+    if (god) return state.cities;
+    return state.cities.filter(
+      (city) => city.owner === playerId || isExplored(state, playerId, city.tile),
+    );
+  };
+
+  /** May this session show this city at all? (`city <cityId>`'s visibility half.) */
+  const cityVisible = (city: City): boolean =>
+    god || city.owner === playerId || isExplored(state, playerId, city.tile);
 
   /**
    * One compact line naming every visible unit, printed after each view.
@@ -635,9 +1265,24 @@ export const createSession = (options: SessionOptions): ReplSession => {
     return `units: ${parts.join('  ')}\n`;
   };
 
+  /**
+   * One compact line naming every city you can see, printed after each view.
+   *
+   * `describe` draws terrain and goody huts, not cities, so this is the only place
+   * a founded city shows up without asking for it — and a session that founded one
+   * would otherwise show a map with no unit and no sign of the city it made.
+   */
+  const citiesLine = (): string => {
+    const rows = visibleCities();
+    if (rows.length === 0) return 'cities: none\n';
+    const parts = rows.map((city) => citySummary(state, ruleset, city, city.owner === playerId));
+    return `cities: ${parts.join('  ')}\n`;
+  };
+
   const view = (): void => {
     write(god ? describe(state, ruleset) : describe(state, ruleset, { viewer: playerId }));
     write(unitsLine());
+    write(citiesLine());
   };
 
   const malformed = (detail: string, hint: string): LineOutcome => {
@@ -655,11 +1300,13 @@ export const createSession = (options: SessionOptions): ReplSession => {
     if (rows.length === 0) {
       lines.push('  you have no units, and none of another player is inside what you explored');
     } else {
-      lines.push(tableRow(['m', 'id', 'type', 'owner', 'at', 'move', 'terrain', 'legal']));
+      lines.push(
+        tableRow(UNIT_WIDTHS, ['m', 'id', 'type', 'owner', 'at', 'move', 'terrain', 'legal']),
+      );
       for (const unit of rows) {
         const def = unitDef(ruleset, unit.type);
         lines.push(
-          tableRow([
+          tableRow(UNIT_WIDTHS, [
             unit.owner === playerId ? '*' : ' ',
             String(unit.id),
             def === undefined ? unit.type : def.name,
@@ -738,13 +1385,12 @@ export const createSession = (options: SessionOptions): ReplSession => {
   const applied = (command: Command): LineOutcome => {
     const result = applyCommand(state, playerId, command, ruleset);
     if (!result.ok) {
-      const unitId = command.type === 'MoveUnit' ? command.unitId : undefined;
-      write(`${formatGameError(result.error, context(unitId))}\n`);
+      write(`${formatGameError(result.error, context(unitIdOf(command), cityIdOf(command)))}\n`);
       return { kind: 'refused', command, error: result.error };
     }
 
     state = result.value.state;
-    write(`${outcomeText(result.value)}\n`);
+    write(`${outcomeText(result.value, command, ruleset)}\n`);
     return { kind: 'applied', command, outcome: result.value };
   };
 
@@ -785,6 +1431,163 @@ export const createSession = (options: SessionOptions): ReplSession => {
           return malformed(`"end" takes no arguments (got "${args.join(' ')}")`, 'usage: end');
         }
         return applied({ type: 'EndTurn' });
+
+      /* ---------------- M3: founding, one city, the list ---------------- */
+
+      case 'found': {
+        if (args.length !== 1) {
+          return malformed(
+            `"found" needs 1 argument: found <unitId> (got ${String(args.length)})`,
+            'example: found 0  ("units" lists your unit ids; founding consumes the settler)',
+          );
+        }
+        const unitId = intOf(args[0]);
+        if (unitId === undefined) {
+          return malformed(
+            `unit id must be a whole number (got "${args[0] ?? ''}")`,
+            'example: found 0  ("units" lists your unit ids)',
+          );
+        }
+        return applied({ type: 'FoundCity', unitId: asUnitId(unitId) });
+      }
+
+      case 'cities':
+        if (args.length > 0) {
+          return malformed(
+            `"cities" takes no arguments (got "${args.join(' ')}")`,
+            'usage: cities  (then "city <cityId>" shows one in full)',
+          );
+        }
+        write(citiesTableText(state, ruleset, playerId, visibleCities()));
+        return { kind: 'inspected', command: word };
+
+      case 'city': {
+        if (args.length !== 1) {
+          return malformed(
+            `"city" needs 1 argument: city <cityId> (got ${String(args.length)})`,
+            'usage: city <cityId>  ("cities" lists your city ids)',
+          );
+        }
+        const raw = args[0];
+        const id = intOf(raw);
+        if (id === undefined) {
+          return malformed(
+            `city id must be a whole number (got "${raw ?? ''}")`,
+            'usage: city <cityId>  ("cities" lists your city ids)',
+          );
+        }
+
+        const cityId = asCityId(id);
+        const city = cityById(state, cityId);
+
+        // An inspector is not a `Command`, so a city this session cannot show is
+        // not a refusal by the engine — but it is still reported in the engine's
+        // own vocabulary (`unknown-city`), with the same "your cities:" lesson,
+        // so the prose and the typed error a `work`/`build` would give agree.
+        if (city === undefined) {
+          write(
+            `${formatGameError({ kind: 'unknown-city', cityId }, context(undefined, cityId))}\n`,
+          );
+          return { kind: 'unknown-city', cityId };
+        }
+        if (!cityVisible(city)) {
+          write(
+            `error: unknown-city - city ${String(cityId)} is not one you can see: it is not ` +
+              'yours, and it does not stand in what you have explored.\n' +
+              `${yourCitiesLines(context(undefined, cityId)).join('\n')}\n`,
+          );
+          return { kind: 'unknown-city', cityId };
+        }
+
+        write(cityDetailText(state, ruleset, city));
+        return { kind: 'inspected', command: word };
+      }
+
+      /* ---------------- M3: the two setters ---------------- */
+
+      case 'work': {
+        const cityRaw = args[0];
+        if (cityRaw === undefined) {
+          return malformed(
+            '"work" needs a city id, then one x y pair per citizen (got none)',
+            'usage: work <cityId> [<x> <y>]...  - with no pairs the assignment is cleared',
+          );
+        }
+        const cityId = intOf(cityRaw);
+        if (cityId === undefined) {
+          return malformed(
+            `city id must be a whole number (got "${cityRaw}")`,
+            'usage: work <cityId> [<x> <y>]...  ("cities" lists your city ids)',
+          );
+        }
+
+        const rest = args.slice(1);
+        if (rest.length % 2 !== 0) {
+          return malformed(
+            `"work" takes whole x y pairs after the city id (got ${String(rest.length)} ` +
+              'coordinate(s), which is not a whole number of pairs)',
+            'usage: work <cityId> [<x> <y>]...  example: work 0 12 9 13 9',
+          );
+        }
+
+        const tiles: TileIndex[] = [];
+        for (let i = 0; i < rest.length; i += 2) {
+          const x = intOf(rest[i]);
+          const y = intOf(rest[i + 1]);
+          if (x === undefined || y === undefined) {
+            return malformed(
+              `x and y must be whole numbers (got "${rest[i] ?? ''}" and "${rest[i + 1] ?? ''}")`,
+              'the ruler above the map lists the valid columns and rows',
+            );
+          }
+          // Same reason `move` checks bounds here: `tileIndex` does not validate,
+          // so an off-map coordinate would silently wrap onto another tile.
+          if (!inBounds(state.map, x, y)) {
+            return malformed(
+              `(${String(x)},${String(y)}) is outside the map (` +
+                `${String(state.map.width)}x${String(state.map.height)}): x must be ` +
+                `0..${String(state.map.width - 1)} and y must be ` +
+                `0..${String(state.map.height - 1)}`,
+              'the ruler above the map lists the valid columns and rows',
+            );
+          }
+          tiles.push(tileIndex(state.map.width, x, y));
+        }
+
+        return applied({ type: 'SetWorkedTiles', cityId: asCityId(cityId), tiles });
+      }
+
+      case 'build': {
+        if (args.length !== 2) {
+          return malformed(
+            `"build" needs 2 arguments: build <cityId> <item> (got ${String(args.length)})`,
+            'example: build 0 unit:warrior   or   build 0 building:granary',
+          );
+        }
+
+        const cityRaw = args[0];
+        const spec = args[1];
+        const cityId = cityRaw === undefined ? undefined : intOf(cityRaw);
+        if (cityId === undefined) {
+          return malformed(
+            `city id must be a whole number (got "${cityRaw ?? ''}")`,
+            'usage: build <cityId> <unit|building>:<id>  ("cities" lists your city ids)',
+          );
+        }
+        if (spec === undefined) {
+          return malformed(
+            '"build" needs an item after the city id',
+            'example: build 0 unit:warrior   or   build 0 building:granary',
+          );
+        }
+
+        const item = productionItemOf(ruleset, spec);
+        if (!item.ok) {
+          return malformed(item.error, buildCatalogueHint(ruleset));
+        }
+
+        return applied({ type: 'SetProduction', cityId: asCityId(cityId), item: item.value });
+      }
 
       case 'save': {
         const path = args[0];
