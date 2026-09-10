@@ -79,9 +79,34 @@ const deepMerge = (
 ): Record<string, unknown> => {
   const out: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(patch)) {
+    // An explicit `undefined` means "not set", not "set to undefined": a layer
+    // must not be able to stub a key out. `undefined` is not representable in
+    // canonical JSON, so a settings value carrying it cannot be hashed at all.
+    if (value === undefined) continue;
     const prev = out[key];
     out[key] = isPlainObject(prev) && isPlainObject(value) ? deepMerge(prev, value) : value;
   }
+  return out;
+};
+
+/**
+ * `v.optional` accepts an explicit `undefined` and then *keeps the key*, so
+ * parsing `{ ruleset: undefined }` would yield `{ ruleset: undefined }`. That
+ * is not the correct representation of "not set" (`exactOptionalPropertyTypes`:
+ * for `ruleset?: string`, absent is the only encoding of unset), and it is not
+ * representable in canonical JSON either — a state built from such settings
+ * throws in `hashValue`, which would take down the golden/replay path. The
+ * natural CLI wiring `loadSettings(config, { ruleset: flag.ruleset })` hits
+ * this whenever the flag is absent, so the parsed output is normalized here.
+ *
+ * `ruleset` is the schema's only optional key; `deepMerge` above already drops
+ * undefined-valued entries from every layer, and this is the second belt for
+ * the direct-`parseSettings` path. If another optional key is ever added to
+ * `SettingsSchema`, normalize it here too.
+ */
+const withoutUndefinedOptionalKeys = (parsed: Settings): Settings => {
+  const out: Settings = { ...parsed };
+  if (out.ruleset === undefined) delete out.ruleset;
   return out;
 };
 
@@ -113,7 +138,7 @@ export const parseSettings = (input: unknown): Result<Settings, readonly Setting
   if (!parsed.success) {
     return err(parsed.issues.map((i) => ({ path: issuePath(i), message: i.message })));
   }
-  return refineSettings(parsed.output);
+  return refineSettings(withoutUndefinedOptionalKeys(parsed.output));
 };
 
 /**

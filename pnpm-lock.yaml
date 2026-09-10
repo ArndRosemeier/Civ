@@ -65,6 +65,9 @@ importers:
       '@civts/core':
         specifier: workspace:*
         version: link:../core
+      '@civts/rules':
+        specifier: workspace:*
+        version: link:../rules
 
 packages:
 

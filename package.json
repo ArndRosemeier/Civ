@@ -13,6 +13,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run --reporter=dot",
     "rules:provenance": "tsx packages/headless/src/cli.ts provenance",
+    "map": "tsx packages/headless/src/cli.ts map",
     "play": "tsx packages/headless/src/cli.ts play",
     "verify": "pnpm typecheck && pnpm lint && pnpm test",
     "verify:full": "pnpm verify"

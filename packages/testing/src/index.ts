@@ -5,7 +5,12 @@
  * Invariants are plain predicate functions over game state. The self-play
  * harness runs them every turn; a violation is a bug, and any seed that
  * triggers one is captured as a regression fixture.
+ *
+ * Also re-exports canonical JSON + FNV-1a 64 hashing (PLAN.md 5.3).
  */
+
+export { canonicalize } from './canonical.js';
+export { fnv1a64, hashValue } from './hash.js';
 
 export interface InvariantViolation {
   /** Stable machine-readable code, e.g. `negative-stockpile`. */

@@ -41,6 +41,10 @@ a number belongs to, not just the number.
 These are intentionally empty rather than filled with guesses. Each must be
 either cited or explicitly marked placeholder when its milestone lands.
 
+- **Map dimensions per size** — the width × height and max-civ table above is a
+  placeholder (tuned for playability, `packages/core/src/settings.ts`); Civ 3's
+  actual map sizes are unverified. Golden state hashes depend on these numbers,
+  so changing one is an intentional rehash.
 - **City growth** — food box formula *unverified*; the Civ IV formula must not be reused.
 - **Combat** — attack/defense resolution and hit-point tiers by experience.
 - **Culture** — border expansion thresholds.

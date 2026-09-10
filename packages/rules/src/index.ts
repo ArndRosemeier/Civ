@@ -9,6 +9,7 @@
  */
 
 import {
+  TERRAIN_ROLES,
   asTerrainId,
   err,
   isPlaceholder,
@@ -19,6 +20,7 @@ import {
   type Provenance,
   type Result,
   type TerrainId,
+  type TerrainRole,
 } from '@civts/core';
 
 export interface Yields {
@@ -29,6 +31,13 @@ export interface Yields {
 
 export interface TerrainSpec {
   readonly id: TerrainId;
+  /**
+   * The engine role this terrain fills. Generation asks the ruleset for terrain
+   * *by role* (`TERRAIN_BY_ROLE`), so the role is data the ruleset must carry —
+   * not something derivable from the id at the call site. With it, a validated
+   * `Ruleset` is structurally a `RulesetView`.
+   */
+  readonly role: TerrainRole;
   readonly name: string;
   /** Movement points consumed when entering. Ignored when `impassable`. */
   readonly moveCost: number;
@@ -47,7 +56,9 @@ export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
   | { readonly kind: 'placeholder-in-cited-only'; readonly catalog: string; readonly id: string; readonly note: string }
-  | { readonly kind: 'invalid-value'; readonly catalog: string; readonly id: string; readonly field: string; readonly detail: string };
+  | { readonly kind: 'invalid-value'; readonly catalog: string; readonly id: string; readonly field: string; readonly detail: string }
+  /** No terrain in the catalog fills this role, so generation cannot run. */
+  | { readonly kind: 'missing-role'; readonly role: TerrainRole };
 
 export interface Ruleset {
   readonly terrains: readonly TerrainSpec[];
@@ -59,6 +70,7 @@ export const CATALOG: Catalog = {
   terrains: [
     {
       id: asTerrainId('grassland'),
+      role: 'grassland',
       name: 'Grassland',
       moveCost: 1,
       defenseBonusPct: 10,
@@ -68,6 +80,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asTerrainId('plains'),
+      role: 'plains',
       name: 'Plains',
       moveCost: 1,
       defenseBonusPct: 10,
@@ -77,6 +90,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asTerrainId('hills'),
+      role: 'hills',
       name: 'Hills',
       moveCost: 2,
       defenseBonusPct: 50,
@@ -86,6 +100,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asTerrainId('mountains'),
+      role: 'mountains',
       name: 'Mountains',
       moveCost: 3,
       defenseBonusPct: 100,
@@ -95,6 +110,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asTerrainId('ocean'),
+      role: 'ocean',
       name: 'Ocean',
       moveCost: 1,
       defenseBonusPct: 0,
@@ -104,6 +120,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asTerrainId('coast'),
+      role: 'coast',
       name: 'Coast',
       moveCost: 1,
       defenseBonusPct: 0,
@@ -163,6 +180,22 @@ const checkTerrain = (t: TerrainSpec): readonly RulesetError[] => {
 };
 
 /**
+ * Every role the engine can ask for must be filled by at least one terrain:
+ * generation resolves terrain through `TERRAIN_BY_ROLE`, so a catalog with a
+ * hole in it makes `newGame` fail with `missing-terrain-role` at the far end of
+ * the pipeline. Reporting it here — once, at load time, naming the role — keeps
+ * that failure from surfacing as a runtime surprise, and one error per missing
+ * role means a partially-filled catalog is fixed in a single pass.
+ *
+ * Reported in `TERRAIN_ROLES` order so the message is stable across runs.
+ */
+const checkRoles = (rows: readonly { readonly role: TerrainRole }[]): readonly RulesetError[] =>
+  TERRAIN_ROLES.filter((role) => !rows.some((row) => row.role === role)).map((role) => ({
+    kind: 'missing-role',
+    role,
+  }));
+
+/**
  * Validate a catalog. In `cited-only` mode any placeholder row is a hard error,
  * which is what makes "is this Civ 3-shaped or Civ 3-exact?" checkable.
  */
@@ -173,6 +206,7 @@ export const validateRuleset = (
   const errors: RulesetError[] = [
     ...checkRows('terrains', catalog.terrains),
     ...catalog.terrains.flatMap(checkTerrain),
+    ...checkRoles(catalog.terrains),
   ];
 
   if (fidelity === 'cited-only') {
