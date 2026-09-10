@@ -94,12 +94,50 @@ correctly is not the same as having an owner.
 - The interactive-TTY branch of the REPL cannot be exercised here (no TTY); pipes, EOF and
   `--script` are covered. A human should run `pnpm play` once in a real terminal.
 
-## M3 — Cities, production, goody huts — **NEXT**
+## M3 — Cities v1 + goody huts — **DONE** (commits `c4f9e9c`, `274032b`)
 
-- [ ] city founding from a settler, city radius and worked-tile assignment
-- [ ] production queues and unit/building completion
-- [ ] goody huts, and the first genuinely *strategic* decisions for the AI
-- [ ] `rehash:` note expected only if the persisted state shape changes again
+Delivered by 8 delegated agents in four waves (foundation → gate-closing → features →
+integration), against the frozen M3 contract.
+
+- [x] `City` entity: population, food box, shields, queue, buildings, worked tiles
+- [x] the exact 21-tile city radius, integer-only `cityYields`, `MIN_CITY_DISTANCE`
+- [x] `FoundCity` / `SetWorkedTiles` / `SetProduction`, and `advanceTurn` as the single
+      definition of a turn (growth → production → refill → `turn++`)
+- [x] food-box growth with observable carry-over, and starvation
+- [x] production queue with shield carry-over and completion
+- [x] barbarians as a real `PlayerState` (`kind`), so `PlayerId` stays the index into `players`
+- [x] huts placed on the map, rendered as `%`, consumed on entry, drawing from the state RNG
+- [x] the REPL city surface (`found`/`city`/`cities`/`work`/`build`) — M3's acceptance line
+- [x] growth-timing, starvation, production and hut scenarios with **meta-tests** proving
+      the assertions fail when the input is wrong
+
+### M3 review findings
+
+| # | Finding | Severity | Resolution |
+|---|---|---|---|
+| F1 | `City.production` was required-but-`undefined`, so **every state containing a city was unhashable** — goldens, `save` and all determinism checks. Third occurrence of this bug class | **high** | field made optional; `exactOptionalPropertyTypes` now makes the unhashable spelling unrepresentable. Fix belongs in the producer and the type, never the hasher |
+| F2 | `players.length` now includes the barbarian, so `play --civs 2` printed "3 civs" | medium (visible) | `civPlayers()` everywhere the question is "how many civilizations", plus a regression assertion that `civs=3` cannot return |
+| F3 | `outcomeText` switched on two event kinds and returned `undefined` for the rest, which joins into a **silently blank line** — a quiet failure, not a visible one | medium | exhaustive over `GameEvent` with an `assertNever` tail and no `default`; a regression test asserts one non-empty line per event |
+| F4 | The conservation sweep still asserted "a legal move moves one unit and nothing else", which the hut contract deliberately breaks | medium | made **hut-aware** rather than skipping hut moves — any unit that appears must be claimed by an emitted event. I reproduced the counterexample myself before authorising the change |
+| F5 | My workflow abort guard treated an out-of-scope blocker as fatal and skipped two phases | **process** | the guard must key on *who owns the blocker*, not on a `blocked` status. Same lesson as F6: escalate correctly ≠ have an owner |
+
+### M3 accepted debt
+
+- **The multi-growth path is unreachable with the shipped catalog.** Terrain food never
+  exceeds the 2 a citizen eats, so the only possible surplus is a city centre's floor; a
+  mutation probe that turns growth's `while` into an `if` passes every test in the repo that
+  plays real games. It becomes live the moment anyone sources a 3+ food terrain — pin it then.
+- **Long-run invariants are one-off checks, not permanent ones.** The 110-turn economy
+  conservation checks live in `m3-adversarial.test.ts` only; they should be lifted into
+  exported `Invariant<GameState>` values so M7's self-play harness runs them every turn.
+- A hut founded *on* by a city stays on the map forever and is inert; god-mode renders a hut
+  glyph on a tile that can never produce. Legibility only.
+- Hut rewards defer `gold` to M4 (no treasury yet) — stated in the provenance detail rather
+  than silently omitted.
+- Barbarian `startingTile` is a convention pointing at a hut, not a real start; rendering
+  now excludes them, but the field is still required and meaningless for barbarians.
+
+## M4 — Economy & improvements — **NEXT**
 
 ## Later milestones
 
