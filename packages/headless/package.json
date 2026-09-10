@@ -1,0 +1,14 @@
+{
+  "name": "@civts/headless",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/cli.ts"
+  },
+  "dependencies": {
+    "@civts/core": "workspace:*",
+    "@civts/rules": "workspace:*",
+    "@civts/testing": "workspace:*"
+  }
+}

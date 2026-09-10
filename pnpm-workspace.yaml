@@ -1,0 +1,8 @@
+packages:
+  - "packages/*"
+
+# pnpm 11 blocks postinstall scripts by default. esbuild (used by vitest and
+# tsx) needs its build step to place its native binary. Declared explicitly so
+# installs stay non-interactive — required, since approval prompts are disabled.
+allowBuilds:
+  esbuild: true

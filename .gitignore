@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.vite/
+.cache/
+
+# Local settings layers (never committed)
+settings.local.json
+*.local.json
+
+# Playwright artifacts (screenshots are evidence, not source)
+artifacts/
+test-results/
