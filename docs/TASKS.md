@@ -48,12 +48,58 @@ delegation-first). The main agent wrote no implementation code for this mileston
 
 F5 was a documentation defect, not a code one: ECMA-262 fully specifies number→string and IEEE-754 arithmetic, so configuration floats are deterministic. The plan's rule is now stated as "integer-only *simulation* math; transcendentals banned".
 
-## M2 — Units, movement, fog, text REPL + scenario DSL — **NEXT**
+## M2 — Units, movement, fog, text REPL + scenario DSL — **DONE** (commit `578282d`)
 
-- [ ] unit catalog, movement points, terrain costs, stacking rules
-- [ ] per-player fog: `explored` bits + derived visibility
-- [ ] `play` REPL — first point where the agent genuinely plays
-- [ ] scenario DSL (`defineScenario`) + 3 passing scenarios
+Delivered by 9 delegated agents (6 feature + 3 integration) against the frozen M2
+contract in `INTERFACES.md`. This is the milestone where the agent genuinely plays.
+
+- [x] unit catalog with mandatory provenance; `cited-only` rejects unit placeholders
+- [x] units in state, one settler per player, `SCHEMA_VERSION` 1 → 2
+- [x] terrain-cost single-step movement with typed `GameError`s
+- [x] legal-action generator (`unitMoveOptions` / `unitActions` / `legalActions`)
+- [x] per-player fog: derived visibility, persisted `explored`, one writer
+- [x] `play` REPL — transcripts are hash-pinned regression fixtures
+- [x] scenario DSL + 3 acceptance scenarios asserting exact costs, tiles and errors
+- [x] golden rehash, intentional, recorded in the commit message
+
+### M2 review findings
+
+| # | Finding | Severity | Resolution |
+|---|---|---|---|
+| F1 | The frozen `applyCommand(state, playerId, cmd)` was **unusable**: applying a command needs the destination's `moveCost` and each unit type's `movement`, neither of which `GameState` carries. The interim workaround made the ruleset an *optional* 4th parameter — so it compiled and then refused every command at runtime, invisible to the typechecker | **high (silent)** | ruleset is now a required 4th parameter; a 3-argument call is unrepresentable, pinned by a `@ts-expect-error` assertion that was proven live |
+| F2 | The keystone invariant was documented one-directionally. Sweeping the other direction found `EndTurn` was *yielded* but *refused* when a unit's type was absent from the ruleset | medium | `EndTurn` made total; the doc now states both directions; the counterexample test was **inverted, not deleted**, so it is evidence for the property |
+| F3 | `RulesetView` did not carry `units`, so the engine's view of the rules could not run a game; an interim alias papered over it | medium | `units` is required; the alias and its structural guard are gone |
+| F4 | Provenance half-truth: `summarizeProvenance` counted 11 rows (terrains + units) while the `provenance` CLI printed 6 | medium | fixed at the root — one function yields both the sections and the totals, so they cannot disagree |
+| F5 | Two writers of the explored layer: `state.ts` kept `START_EXPLORED_RADIUS`, duplicating `fog.VISIBILITY_RADIUS`, and walked its own box | low | `newGame` folds `withExplored(visibleTiles(...))`; one radius, one writer; proven hash-neutral across 6 seeds |
+| F6 | A contract amendment **orphaned test files whose authors had finished and been cleaned up**, so no agent owned the migration and the gate sat red | **process** | recorded below as a standing rule |
+
+**Standing rule from F6:** when the frozen contract changes, the amendment must name a
+migration owner for *every* existing consumer before agents are launched. Escalating
+correctly is not the same as having an owner.
+
+### M2 accepted debt
+
+- Scenario `run` commands apply as player 0 — M2 has no active-player field; per-player
+  turn order is M5.
+- No stacking limit beyond "no stacking on an enemy" — M3+.
+- Scenarios live in `packages/testing/test/`, so `pnpm scenario <name>` (PLAN.md §8) is
+  not wired; moving them into `src/` is a one-file change.
+- `SetupError` cannot express scenario-authoring failures (off-map `setTile`, unknown unit
+  type), so `build()` throws a descriptive `Error` for those rather than mislabelling them
+  as an existing variant. A `bad-scenario-setup` variant is wanted before scenarios are
+  built from untrusted data.
+- `unitCatalog` reads `ruleset.units` directly, so an untyped/JSON-loaded view missing that
+  field now throws instead of behaving as an empty catalog. A defensive guard belongs with
+  save-loading in M11.
+- The interactive-TTY branch of the REPL cannot be exercised here (no TTY); pipes, EOF and
+  `--script` are covered. A human should run `pnpm play` once in a real terminal.
+
+## M3 — Cities, production, goody huts — **NEXT**
+
+- [ ] city founding from a settler, city radius and worked-tile assignment
+- [ ] production queues and unit/building completion
+- [ ] goody huts, and the first genuinely *strategic* decisions for the AI
+- [ ] `rehash:` note expected only if the persisted state shape changes again
 
 ## Later milestones
 
