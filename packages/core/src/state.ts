@@ -119,7 +119,9 @@ const FOUND_COUNT = /found (\d+)/;
  */
 const classifyGenerationFailure = (cause: unknown, civCount: number): SetupError => {
   const found = cause instanceof Error ? FOUND_COUNT.exec(cause.message)?.[1] : undefined;
-  return found === '0' ? { kind: 'no-valid-starts', civCount } : { kind: 'too-few-start-candidates' };
+  return found === '0'
+    ? { kind: 'no-valid-starts', civCount }
+    : { kind: 'too-few-start-candidates' };
 };
 
 /**

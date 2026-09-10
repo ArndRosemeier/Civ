@@ -162,9 +162,7 @@ const at = <T>(arr: readonly T[], i: number): T => {
 };
 
 /** Resolve every terrain role generation can emit, or fail with the role name. */
-const resolveRoleIds = (
-  ruleset: RulesetView,
-): { readonly [R in TerrainRole]: TerrainId } => {
+const resolveRoleIds = (ruleset: RulesetView): { readonly [R in TerrainRole]: TerrainId } => {
   const pick = (role: TerrainRole): TerrainId => {
     const def = TERRAIN_BY_ROLE(ruleset, role);
     if (def === undefined) {
@@ -260,7 +258,9 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
     throw new RangeError(`generateWorld: seed must be an integer, got ${String(seed)}`);
   }
   if (!Number.isInteger(civCount) || civCount <= 0) {
-    throw new RangeError(`generateWorld: civCount must be a positive integer, got ${String(civCount)}`);
+    throw new RangeError(
+      `generateWorld: civCount must be a positive integer, got ${String(civCount)}`,
+    );
   }
 
   const roleIds = resolveRoleIds(ruleset); // throws early on a missing role
@@ -331,8 +331,11 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
     const y = Math.floor(index / width);
     lowlands.push({ index, moisture: fbm(x, y, seedSalt, SALT_MOISTURE) });
   }
-  lowlands.sort((a, b) => (a.moisture === b.moisture ? a.index - b.index : a.moisture - b.moisture));
-  const plainsCount = lowlands.length - Math.floor((lowlands.length * GRASSLAND_LOWLAND_PERMILLE) / 1000);
+  lowlands.sort((a, b) =>
+    a.moisture === b.moisture ? a.index - b.index : a.moisture - b.moisture,
+  );
+  const plainsCount =
+    lowlands.length - Math.floor((lowlands.length * GRASSLAND_LOWLAND_PERMILLE) / 1000);
   for (const [rank, tile] of lowlands.entries()) {
     roleByIndex[tile.index] = rank < plainsCount ? 'plains' : 'grassland';
   }

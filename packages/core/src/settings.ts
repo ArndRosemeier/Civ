@@ -27,7 +27,10 @@ export const FIDELITY_MODES = ['tuned', 'cited-only'] as const;
 export type Fidelity = (typeof FIDELITY_MODES)[number];
 
 /** Map dimensions per size. PLACEHOLDER values (see PLAN.md 6.2), tuned by play. */
-export const MAP_DIMENSIONS: Record<MapSize, { readonly width: number; readonly height: number; readonly maxCivs: number }> = {
+export const MAP_DIMENSIONS: Record<
+  MapSize,
+  { readonly width: number; readonly height: number; readonly maxCivs: number }
+> = {
   duel: { width: 40, height: 40, maxCivs: 2 },
   tiny: { width: 60, height: 60, maxCivs: 4 },
   small: { width: 80, height: 80, maxCivs: 6 },

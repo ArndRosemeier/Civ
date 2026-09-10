@@ -57,9 +57,13 @@ describe('ruleset validation', () => {
     expect(first).toBeDefined();
     if (first === undefined) return;
 
-    const r = validateRuleset({ terrains: [{ ...first, moveCost: 0, impassable: false }] }, 'tuned');
+    const r = validateRuleset(
+      { terrains: [{ ...first, moveCost: 0, impassable: false }] },
+      'tuned',
+    );
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.some((e) => e.kind === 'invalid-value' && e.field === 'moveCost')).toBe(true);
+    if (!r.ok)
+      expect(r.error.some((e) => e.kind === 'invalid-value' && e.field === 'moveCost')).toBe(true);
   });
 });
 
@@ -106,7 +110,9 @@ describe('terrain role coverage', () => {
     // placeholder ids happen to be the role names. Coverage is by `role`, so an
     // id that names something else is still a valid provider.
     const savanna = asTerrainId('savanna');
-    const renamed = CATALOG.terrains.map((t) => (t.role === 'grassland' ? { ...t, id: savanna } : t));
+    const renamed = CATALOG.terrains.map((t) =>
+      t.role === 'grassland' ? { ...t, id: savanna } : t,
+    );
 
     const r = validateRuleset({ terrains: renamed }, 'tuned');
     expect(r.ok).toBe(true);

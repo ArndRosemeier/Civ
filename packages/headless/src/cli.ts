@@ -32,12 +32,7 @@ import {
   type SettingsIssue,
   type SetupError,
 } from '@civts/core';
-import {
-  CATALOG,
-  summarizeProvenance,
-  validateRuleset,
-  type RulesetError,
-} from '@civts/rules';
+import { CATALOG, summarizeProvenance, validateRuleset, type RulesetError } from '@civts/rules';
 import { hashValue } from '@civts/testing';
 
 const USAGE = `civts — headless tooling
@@ -94,7 +89,9 @@ const commandProvenance = (): number => {
 
   const summary = summarizeProvenance(CATALOG);
   const pct = summary.total === 0 ? 0 : Math.round((summary.cited / summary.total) * 100);
-  console.log(`ruleset provenance — ${String(summary.cited)}/${String(summary.total)} cited (${String(pct)}%), ${String(summary.placeholder)} placeholder`);
+  console.log(
+    `ruleset provenance — ${String(summary.cited)}/${String(summary.total)} cited (${String(pct)}%), ${String(summary.placeholder)} placeholder`,
+  );
   console.log('');
 
   const width = Math.max(...CATALOG.terrains.map((t) => t.id.length));
@@ -209,7 +206,8 @@ const commandMap = (args: readonly string[]): number => {
 
   const settings = loadSettings(layer);
   if (!settings.ok) {
-    for (const issue of settings.error) console.error(`settings error: ${formatSettingsIssue(issue)}`);
+    for (const issue of settings.error)
+      console.error(`settings error: ${formatSettingsIssue(issue)}`);
     return 2;
   }
 

@@ -21,7 +21,7 @@ Milestone definitions and acceptance criteria live in `../PLAN.md` §12.
 - [x] `@civts/headless`: CLI with `provenance` subcommand
 - [x] 27 tests green; typecheck + lint clean
 
-## M1 — Core types, RNG, map gen, text renderer, hashing — **DONE** (delegated)
+## M1 — Core types, RNG, map gen, text renderer, hashing — **DONE** (commit `03d2064`)
 
 Delivered by 5 agents against the frozen contracts in `INTERFACES.md` (§11 rev 3:
 delegation-first). The main agent wrote no implementation code for this milestone.
@@ -96,4 +96,17 @@ See `../PLAN.md` §12 for M3–M11 and the stretch list.
   designed control.
 - **`Math` aliasing is not lint-enforceable** (`const M = Math; M.random()`), nor is
   `globalThis.Math.random()`. Recorded in the eslint config comment so the guardrail's
-  limits are explicit rather than implied.
+  limits are explicit rather than implied. The `Date` half of the aliasing gap *is*
+  closed (`no-restricted-globals`). For those spellings the determinism claim now rests
+  on review plus the golden-hash gate, not on lint.
+- **A core test imports from `@civts/testing`.** `packages/core/test/settings.test.ts`
+  imports `canonicalize`/`hashValue` to assert that settings survive hashing, but
+  `@civts/testing` already depends on `@civts/core`, so this inverts the dependency
+  direction for that test (a test-level cycle; `core/src` itself is unaffected and the
+  build graph is still acyclic). Resolve in M2 by moving the "settings are hashable"
+  assertion up into an integration test in `packages/testing`, which is where state
+  hashing is exercised anyway.
+- **`pnpm format:check` was decorative** until M1's follow-up: the repo had a Prettier
+  script but no config, so it failed repo-wide against defaults that contradicted the
+  codebase's actual style. Being fixed with a config inferred from the existing code
+  and a real gate in `verify`, so style cannot drift as more agents author code.

@@ -27,10 +27,7 @@ export const runInvariants = <S>(
 
 export const violation = (code: string, detail: string): InvariantViolation => ({ code, detail });
 
-export const assertInvariants = <S>(
-  state: S,
-  invariants: readonly Invariant<S>[],
-): void => {
+export const assertInvariants = <S>(state: S, invariants: readonly Invariant<S>[]): void => {
   const violations = runInvariants(state, invariants);
   if (violations.length > 0) {
     throw new Error(

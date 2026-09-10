@@ -93,11 +93,7 @@ export const neighbors8 = (map: GameMap, index: number): readonly TileIndex[] =>
 };
 
 /** Chebyshev distance — "how many tiles away" on a square grid. */
-export const distance8 = (
-  map: Pick<GameMap, 'width'>,
-  a: number,
-  b: number,
-): number => {
+export const distance8 = (map: Pick<GameMap, 'width'>, a: number, b: number): number => {
   const ax = indexToX(map, a);
   const ay = indexToY(map, a);
   const bx = indexToX(map, b);

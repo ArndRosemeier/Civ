@@ -66,7 +66,9 @@ describe('canonicalize', () => {
   });
 
   it('is independent of insertion order at every level', () => {
-    expect(canonicalize({ a: 1, b: { c: 2, d: 3 } })).toBe(canonicalize({ b: { d: 3, c: 2 }, a: 1 }));
+    expect(canonicalize({ a: 1, b: { c: 2, d: 3 } })).toBe(
+      canonicalize({ b: { d: 3, c: 2 }, a: 1 }),
+    );
   });
 
   it('preserves array order', () => {
@@ -222,7 +224,15 @@ describe('canonicalize accessor rejection', () => {
   });
 
   it('rejects a getter nested inside an array element', () => {
-    const value = { list: [{ get x(): number { return 1; } }] };
+    const value = {
+      list: [
+        {
+          get x(): number {
+            return 1;
+          },
+        },
+      ],
+    };
     expect(() => canonicalize(value)).toThrow(/\$\.list\[0\]\.x/);
   });
 

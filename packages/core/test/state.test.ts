@@ -175,7 +175,11 @@ describe('newGame', () => {
     const setups: readonly (readonly [number, Settings, RulesetView])[] = [
       [42, SETTINGS, { terrains: [], fidelity: 'tuned' }],
       [42, SETTINGS, { terrains: TERRAINS.filter((t) => t.role !== 'hills'), fidelity: 'tuned' }],
-      [42, SETTINGS, { terrains: TERRAINS.map((t) => ({ ...t, impassable: true })), fidelity: 'tuned' }],
+      [
+        42,
+        SETTINGS,
+        { terrains: TERRAINS.map((t) => ({ ...t, impassable: true })), fidelity: 'tuned' },
+      ],
       [42, { ...SETTINGS, civCount: 500 }, RULESET],
       [-7, SETTINGS, RULESET],
     ];

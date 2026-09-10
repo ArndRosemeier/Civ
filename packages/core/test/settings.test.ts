@@ -21,7 +21,10 @@ describe('settings parsing', () => {
   });
 
   it('rejects unknown nested keys', () => {
-    const r = parseSettings({ ...DEFAULT_SETTINGS, ai: { aggression: 0.5, expandFast: false, bogus: true } });
+    const r = parseSettings({
+      ...DEFAULT_SETTINGS,
+      ai: { aggression: 0.5, expandFast: false, bogus: true },
+    });
     expect(r.ok).toBe(false);
   });
 
@@ -52,7 +55,11 @@ describe('settings cross-field refinement', () => {
   });
 
   it('accepts civCount exactly at capacity', () => {
-    const r = parseSettings({ ...DEFAULT_SETTINGS, mapSize: 'small', civCount: MAP_DIMENSIONS.small.maxCivs });
+    const r = parseSettings({
+      ...DEFAULT_SETTINGS,
+      mapSize: 'small',
+      civCount: MAP_DIMENSIONS.small.maxCivs,
+    });
     expect(r.ok).toBe(true);
   });
 
@@ -240,11 +247,16 @@ describe('settings: explicit undefined through parseSettings', () => {
     expect(parseSettings({ ...DEFAULT_SETTINGS, bogus: undefined }).ok).toBe(false);
     expect(parseSettings({ ...DEFAULT_SETTINGS, nope: 1 }).ok).toBe(false);
     expect(
-      parseSettings({ ...DEFAULT_SETTINGS, ai: { aggression: 0.5, expandFast: false, bogus: undefined } })
-        .ok,
+      parseSettings({
+        ...DEFAULT_SETTINGS,
+        ai: { aggression: 0.5, expandFast: false, bogus: undefined },
+      }).ok,
     ).toBe(false);
     expect(
-      parseSettings({ ...DEFAULT_SETTINGS, debug: { cheats: false, revealMap: false, bogus: true } }).ok,
+      parseSettings({
+        ...DEFAULT_SETTINGS,
+        debug: { cheats: false, revealMap: false, bogus: true },
+      }).ok,
     ).toBe(false);
   });
 
@@ -271,13 +283,22 @@ describe('settings: explicit undefined through parseSettings', () => {
     // rather than a blanket refusal.
     expect(parseSettings({ ...DEFAULT_SETTINGS, civCount: 2 }).ok).toBe(true);
     expect(parseSettings({ ...DEFAULT_SETTINGS, mapSize: 'huge', civCount: 16 }).ok).toBe(true);
-    expect(parseSettings({ ...DEFAULT_SETTINGS, ai: { aggression: 0, expandFast: true } }).ok).toBe(true);
-    expect(parseSettings({ ...DEFAULT_SETTINGS, ai: { aggression: 1, expandFast: true } }).ok).toBe(true);
+    expect(parseSettings({ ...DEFAULT_SETTINGS, ai: { aggression: 0, expandFast: true } }).ok).toBe(
+      true,
+    );
+    expect(parseSettings({ ...DEFAULT_SETTINGS, ai: { aggression: 1, expandFast: true } }).ok).toBe(
+      true,
+    );
     expect(parseSettings({ ...DEFAULT_SETTINGS, ruleset: '' }).ok).toBe(true);
   });
 
   it('still enforces the cross-field map capacity rule after normalization', () => {
-    const r = parseSettings({ ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 8, ruleset: undefined });
+    const r = parseSettings({
+      ...DEFAULT_SETTINGS,
+      mapSize: 'duel',
+      civCount: 8,
+      ruleset: undefined,
+    });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error[0]?.path).toBe('civCount');
   });

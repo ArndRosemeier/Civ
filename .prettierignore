@@ -1,0 +1,25 @@
+# Dependencies and build output. Prettier also honours .gitignore, which already
+# lists these; they are repeated here so that `prettier --check .` does not depend
+# on .gitignore being present or unchanged.
+node_modules/
+dist/
+coverage/
+
+# Lockfile: machine-generated, never hand-formatted.
+pnpm-lock.yaml
+
+# Generated golden data (state hashes and the map fixture). The bytes are the
+# assertion — reformatting it would register as a golden diff, so it is excluded
+# rather than "formatted".
+packages/testing/goldens/
+
+# ESLint flat config: it is hand-laid-out one object per line and is *only*
+# Prettier-clean at printWidth >= 160, so formatting it at this repo's width
+# would rewrite ~165 lines of the lint gate itself. Excluded deliberately.
+eslint.config.js
+
+# Prose documentation. Prettier rewrites `*emphasis*` to `_emphasis_` and pads
+# every Markdown table column, and no option turns either off — that is a new
+# style imposed on hand-authored design docs (PLAN.md, docs/*.md), not the
+# codebase's own style. Excluded so the formatting gate covers code.
+*.md

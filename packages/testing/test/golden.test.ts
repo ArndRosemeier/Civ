@@ -64,7 +64,8 @@ const GOLDEN_NOTE =
 /** Set only by an explicit regeneration run; never by a normal test run. */
 const WRITE_MODE = process.env['CIVTS_WRITE_GOLDENS'] === '1';
 
-const REGENERATE_COMMAND = 'CIVTS_WRITE_GOLDENS=1 npx vitest run packages/testing/test/golden.test.ts';
+const REGENERATE_COMMAND =
+  'CIVTS_WRITE_GOLDENS=1 npx vitest run packages/testing/test/golden.test.ts';
 const REHASH_INSTRUCTION = 'and record a "rehash: <reason>" note in the commit message.';
 
 /* ------------------------------------------------------------------ *
@@ -131,7 +132,9 @@ const formatSetupError = (error: SetupError): string => {
 const mustState = (seed: number): GameState => {
   const result = newGame(seed, settingsFor(seed), RULESET);
   if (!result.ok) {
-    throw new Error(`golden scenario seed=${String(seed)}: newGame failed — ${formatSetupError(result.error)}`);
+    throw new Error(
+      `golden scenario seed=${String(seed)}: newGame failed — ${formatSetupError(result.error)}`,
+    );
   }
   return result.value;
 };

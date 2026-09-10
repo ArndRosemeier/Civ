@@ -55,8 +55,19 @@ export interface Catalog {
 export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
-  | { readonly kind: 'placeholder-in-cited-only'; readonly catalog: string; readonly id: string; readonly note: string }
-  | { readonly kind: 'invalid-value'; readonly catalog: string; readonly id: string; readonly field: string; readonly detail: string }
+  | {
+      readonly kind: 'placeholder-in-cited-only';
+      readonly catalog: string;
+      readonly id: string;
+      readonly note: string;
+    }
+  | {
+      readonly kind: 'invalid-value';
+      readonly catalog: string;
+      readonly id: string;
+      readonly field: string;
+      readonly detail: string;
+    }
   /** No terrain in the catalog fills this role, so generation cannot run. */
   | { readonly kind: 'missing-role'; readonly role: TerrainRole };
 
@@ -167,7 +178,8 @@ const checkTerrain = (t: TerrainSpec): readonly RulesetError[] => {
     detail,
   });
 
-  if (!t.impassable && t.moveCost < 1) errors.push(bad('moveCost', 'must be >= 1 for passable terrain'));
+  if (!t.impassable && t.moveCost < 1)
+    errors.push(bad('moveCost', 'must be >= 1 for passable terrain'));
   if (!Number.isInteger(t.moveCost)) errors.push(bad('moveCost', 'must be an integer'));
   for (const [field, value] of Object.entries(t.yields)) {
     if (!Number.isInteger(value)) errors.push(bad(`yields.${field}`, 'must be an integer'));

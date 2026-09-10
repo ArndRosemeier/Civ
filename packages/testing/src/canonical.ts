@@ -59,7 +59,10 @@ const encodeNumber = (value: number, path: string): string => {
     return fail(path, 'NaN is not representable in canonical JSON');
   }
   if (!Number.isFinite(value)) {
-    return fail(path, `${value > 0 ? 'Infinity' : '-Infinity'} is not representable in canonical JSON`);
+    return fail(
+      path,
+      `${value > 0 ? 'Infinity' : '-Infinity'} is not representable in canonical JSON`,
+    );
   }
   // `String(-0)` is '0', matching JSON and folding -0 and 0 onto one form.
   return String(value);
@@ -91,11 +94,7 @@ const numericView = (value: object): ArrayLike<number> | undefined =>
     ? value
     : undefined;
 
-const encodeArrayLike = (
-  items: ArrayLike<unknown>,
-  path: string,
-  stack: Set<object>,
-): string => {
+const encodeArrayLike = (items: ArrayLike<unknown>, path: string, stack: Set<object>): string => {
   const parts: string[] = [];
   for (let i = 0; i < items.length; i += 1) {
     parts.push(encodeValue(items[i], `${path}[${String(i)}]`, stack));
@@ -132,7 +131,11 @@ const encodeProperty = (
   return `${quote(key)}:${encodeValue(record[key], childPath, stack)}`;
 };
 
-const encodeRecord = (record: Record<string, unknown>, path: string, stack: Set<object>): string => {
+const encodeRecord = (
+  record: Record<string, unknown>,
+  path: string,
+  stack: Set<object>,
+): string => {
   const symbols = Object.getOwnPropertySymbols(record);
   if (symbols.length > 0) {
     return fail(path, 'symbol-keyed properties are not plain data');

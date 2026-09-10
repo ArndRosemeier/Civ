@@ -133,9 +133,7 @@ describe('describe', () => {
     const view = describeState(STATE_4x4, RULESET, { showStarts: false });
 
     expect(glyphRows(view)).toEqual(['~~::', '~,,-', ':,h^', '--h^']);
-    expect(view).toContain(
-      'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
-    );
+    expect(view).toContain('legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains');
   });
 
   it('numeral-rules the columns and numbers the rows', () => {

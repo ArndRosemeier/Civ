@@ -151,7 +151,9 @@ describe('generateWorld — determinism', () => {
 
 describe('generateWorld — terrain structure', () => {
   it('floods a stable ~62% of tiles whatever the seed (quantile sea level)', () => {
-    const counts = [1, 42, 1337, 90210].map((seed) => waterCount(generateWorld({ ...BASE, seed }, RULESET)));
+    const counts = [1, 42, 1337, 90210].map((seed) =>
+      waterCount(generateWorld({ ...BASE, seed }, RULESET)),
+    );
     for (const count of counts) expect(count).toBe(pick(counts, 0));
 
     const fraction = pick(counts, 0) / (BASE.width * BASE.height);
@@ -183,7 +185,9 @@ describe('generateWorld — terrain structure', () => {
 
       const touchesLand = neighbors8(world.map, i).some((n) => {
         const neighbourRole = roleAt(world.map, n);
-        return neighbourRole !== undefined && neighbourRole !== 'ocean' && neighbourRole !== 'coast';
+        return (
+          neighbourRole !== undefined && neighbourRole !== 'ocean' && neighbourRole !== 'coast'
+        );
       });
       expect(role).toBe(touchesLand ? 'coast' : 'ocean');
       if (role === 'coast') coast += 1;
@@ -207,8 +211,13 @@ describe('generateWorld — terrain structure', () => {
     for (const role of ['ocean', 'coast', 'grassland', 'plains', 'hills', 'mountains'] as const) {
       expect(counts.get(role) ?? 0).toBeGreaterThan(0);
     }
-    expect((counts.get('ocean') ?? 0) + (counts.get('coast') ?? 0) + (counts.get('grassland') ?? 0) +
-      (counts.get('plains') ?? 0) + (counts.get('hills') ?? 0) + (counts.get('mountains') ?? 0),
+    expect(
+      (counts.get('ocean') ?? 0) +
+        (counts.get('coast') ?? 0) +
+        (counts.get('grassland') ?? 0) +
+        (counts.get('plains') ?? 0) +
+        (counts.get('hills') ?? 0) +
+        (counts.get('mountains') ?? 0),
     ).toBe(world.map.terrain.length);
   });
 });

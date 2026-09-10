@@ -434,7 +434,10 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
       ['settings.civCount + 1', { ...state, settings: { ...state.settings, civCount: 3 } }],
       [
         'settings.ai.aggression 0.5 -> 0.51',
-        { ...state, settings: { ...state.settings, ai: { ...state.settings.ai, aggression: 0.51 } } },
+        {
+          ...state,
+          settings: { ...state.settings, ai: { ...state.settings.ai, aggression: 0.51 } },
+        },
       ],
       [
         'settings.mapSize tiny -> duel (map unchanged)',
@@ -444,7 +447,10 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
       ['map.height + 1 (terrain unchanged)', { ...state, map: { ...state.map, height: 61 } }],
       [
         'terrain array rotated by one',
-        { ...state, map: { ...state.map, terrain: [...state.map.terrain.slice(1), tileAt(state, 0)] } },
+        {
+          ...state,
+          map: { ...state.map, terrain: [...state.map.terrain.slice(1), tileAt(state, 0)] },
+        },
       ],
       [
         'players[0].name changed',
@@ -457,10 +463,7 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
         'players[0].color changed',
         { ...state, players: [{ ...first, color: '#ffffff' }, ...state.players.slice(1)] },
       ],
-      [
-        'players swapped',
-        { ...state, players: [...state.players].reverse() },
-      ],
+      ['players swapped', { ...state, players: [...state.players].reverse() }],
     ];
 
     for (const [label, mutated] of mutations) {
@@ -505,7 +508,11 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
       ...state,
       map: { ...state.map, terrain: [...state.map.terrain] },
       players: state.players.map((player) => ({ ...player })),
-      settings: { ...state.settings, ai: { ...state.settings.ai }, debug: { ...state.settings.debug } },
+      settings: {
+        ...state.settings,
+        ai: { ...state.settings.ai },
+        debug: { ...state.settings.debug },
+      },
       rng: { ...state.rng },
     };
     expect(hashValue(clone)).toBe(hashValue(state));
@@ -602,8 +609,13 @@ describe('adversarial: terrain sanity', () => {
       for (const start of starts) {
         const role = roleAt(state.map, start);
         expect(role, `start ${String(start)} is not on the map`).toBeDefined();
-        expect(role !== undefined && LAND_ROLES.has(role), `start ${String(start)} role ${String(role)}`).toBe(true);
-        expect(PASSABLE_BY_ID.get(tileAt(state, start)), `start ${String(start)} passability`).toBe(true);
+        expect(
+          role !== undefined && LAND_ROLES.has(role),
+          `start ${String(start)} role ${String(role)}`,
+        ).toBe(true);
+        expect(PASSABLE_BY_ID.get(tileAt(state, start)), `start ${String(start)} passability`).toBe(
+          true,
+        );
       }
     }
   });
@@ -871,9 +883,13 @@ describe('adversarial: canonical JSON + FNV-1a 64', () => {
     expect(() => canonicalize({ a: Symbol('x') })).toThrow(/symbol/);
     expect(() => canonicalize({ a: 1n })).toThrow(/bigint/);
     expect(() => canonicalize(new Date(0))).toThrow(/unsupported object type/);
-    expect(() => canonicalize(new (class Foo { readonly a = 1; })())).toThrow(
-      /unsupported object type/,
-    );
+    expect(() =>
+      canonicalize(
+        new (class Foo {
+          readonly a = 1;
+        })(),
+      ),
+    ).toThrow(/unsupported object type/);
     expect(() => canonicalize(Object.create({ inherited: 1 }))).toThrow(/unsupported object type/);
     expect(() => canonicalize([1, undefined, 3])).toThrow(/undefined/);
 
@@ -1035,7 +1051,12 @@ describe('adversarial: settings boundary', () => {
 
     // A ruleset that is really set must still reach the state: the
     // normalization drops "unset", never a value.
-    const withRuleset = loadSettings({ mapSize: 'tiny', civCount: 2, seed: 42, ruleset: 'standard' });
+    const withRuleset = loadSettings({
+      mapSize: 'tiny',
+      civCount: 2,
+      seed: 42,
+      ruleset: 'standard',
+    });
     expect(withRuleset.ok).toBe(true);
     if (withRuleset.ok) {
       expect(withRuleset.value.ruleset).toBe('standard');
@@ -1109,9 +1130,7 @@ describe('adversarial: text renderer', () => {
     // throw or silently render nothing).
     const state = mustState('tiny', 2, 42);
     const crop = describeState(state, RULESET, { viewport: { x: 10, y: 20, width: 8, height: 4 } });
-    const rows = crop
-      .split('\n')
-      .filter((line) => /^\s*\d+ \|/.test(line));
+    const rows = crop.split('\n').filter((line) => /^\s*\d+ \|/.test(line));
     expect(rows).toHaveLength(4);
     for (const row of rows) {
       expect(row.replace(/^\s*\d+ \|/, '')).toHaveLength(8);
