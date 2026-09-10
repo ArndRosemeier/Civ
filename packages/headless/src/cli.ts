@@ -5,7 +5,7 @@
  * This is the agent's primary interface to the game: text in, text out, no
  * browser and no eyes required. Subcommands land as milestones land — M0 ships
  * `provenance`, M1 ships `map` (a rendered world plus its state hash), M2 ships
- * `play` (the REPL).
+ * `play` (the REPL, implemented in `repl.ts`).
  *
  * Two properties the `map` command is expected to hold, because everything else
  * is built on them:
@@ -30,19 +30,37 @@ import {
   type Result,
   type RulesetView,
   type SettingsIssue,
-  type SetupError,
 } from '@civts/core';
-import { CATALOG, summarizeProvenance, validateRuleset, type RulesetError } from '@civts/rules';
+import {
+  CATALOG,
+  provenanceSections,
+  summarizeProvenance,
+  validateRuleset,
+  type ProvenanceRow,
+  type ProvenanceSection,
+  type RulesetError,
+} from '@civts/rules';
 import { hashValue } from '@civts/testing';
+
+import {
+  PLAY_USAGE,
+  createSession,
+  formatSetupError,
+  parseIntFlag,
+  parsePlayArgs,
+  readScript,
+  runInteractive,
+  runScript,
+} from './repl.js';
 
 const USAGE = `civts — headless tooling
 
 Usage: civts <command> [options]
 
 Commands:
-  provenance   print the rules-data provenance table (cited vs placeholder)
+  provenance   print every rules-data row's provenance (terrains and units)
   map          generate a world, render it as ASCII, print its state hash
-  play         interactive text REPL                      (arrives in M2)
+  play         interactive text REPL: play the game from a terminal or a script
   run          headless AI-vs-AI game                     (arrives in M7)
 
 Options:
@@ -53,9 +71,17 @@ map options:
   --map-size <size>   ${MAP_SIZES.join('|')}  (default: tiny)
   --civs <int>        number of civilizations, 2..16       (default: 2)
 
+play options:
+  --seed <int>        world seed                          (default: 1)
+  --map-size <size>   ${MAP_SIZES.join('|')}  (default: tiny)
+  --civs <int>        number of civilizations, 2..16       (default: 2)
+  --player <int>      which civilization you play, 0-based (default: 0)
+  --script <file>     run a command file, print the transcript, exit 0
+
 Examples:
   pnpm map --seed 42
-  pnpm map --seed 42 --map-size tiny --civs 2
+  pnpm play --seed 42 --map-size tiny --civs 2 --player 0
+  pnpm play --seed 42 --script session.txt
 `;
 
 const MAP_USAGE = `usage: civts map [--seed <int>] [--map-size <size>] [--civs <int>]
@@ -80,6 +106,42 @@ const formatError = (e: RulesetError): string => {
   }
 };
 
+/** Width of the provenance kind column: `placeholder` is the longest kind. */
+const PROVENANCE_KIND_WIDTH = 11;
+
+/**
+ * One section's rows as table lines: `id`, the provenance kind, then the claim
+ * itself — a cited row's source, or a placeholder row's note, exactly as before.
+ * The detail is the last cell, so it is never padded and never truncated.
+ */
+const provenanceRowLines = (rows: readonly ProvenanceRow[], idWidth: number): readonly string[] =>
+  rows.map((row) => {
+    const p = row.provenance;
+    const detail = p.kind === 'cited' ? p.source : p.note;
+    return `  ${row.id.padEnd(idWidth)}  ${p.kind.padEnd(PROVENANCE_KIND_WIDTH)}  ${detail}`;
+  });
+
+/** A section's heading, stating the counts of the rows printed under it. */
+const provenanceSectionLines = (section: ProvenanceSection, idWidth: number): readonly string[] => [
+  `${section.name} — ${String(section.summary.total)} ` +
+    `${section.summary.total === 1 ? 'row' : 'rows'}, ` +
+    `${String(section.summary.cited)} cited, ` +
+    `${String(section.summary.placeholder)} placeholder`,
+  ...provenanceRowLines(section.rows, idWidth),
+];
+
+/**
+ * The provenance report: the cited-vs-placeholder ratio (PLAN.md §6.2) followed
+ * by every row the ratio was counted over.
+ *
+ * The table iterates `provenanceSections` and the header total is the sum of
+ * those same sections (`summarizeProvenance` adds up nothing else), so the rows
+ * printed *are* the rows counted — there is no second list that could fall out
+ * of step. That is not decoration: when this command printed only the terrain
+ * table under a total that already included the unit rows, it reported
+ * "0/11 cited" above six rows, and a provenance report that overstates its own
+ * coverage is the precise half-truth PLAN.md §6.2 exists to prevent.
+ */
 const commandProvenance = (): number => {
   const validated = validateRuleset(CATALOG, 'tuned');
   if (!validated.ok) {
@@ -94,11 +156,16 @@ const commandProvenance = (): number => {
   );
   console.log('');
 
-  const width = Math.max(...CATALOG.terrains.map((t) => t.id.length));
-  for (const t of CATALOG.terrains) {
-    const p = t.provenance;
-    const detail = p.kind === 'cited' ? p.source : p.note;
-    console.log(`  ${t.id.padEnd(width)}  ${p.kind.padEnd(11)}  ${detail}`);
+  const sections = provenanceSections(CATALOG);
+  // One width for every id in every section, so the kinds and the claims line up
+  // across the whole report rather than jumping between tables.
+  const idWidth = sections
+    .flatMap((section) => section.rows)
+    .reduce((width, row) => Math.max(width, row.id.length), 0);
+
+  for (const [index, section] of sections.entries()) {
+    if (index > 0) console.log('');
+    for (const line of provenanceSectionLines(section, idWidth)) console.log(line);
   }
 
   console.log('');
@@ -116,22 +183,6 @@ interface MapFlags {
   readonly mapSize: MapSize | undefined;
   readonly civCount: number | undefined;
 }
-
-const INTEGER = /^[+-]?\d+$/;
-
-/**
- * Strict integer parsing: `"abc"`, `"NaN"`, `""`, `"1.5"`, `"0x10"` and `"1e3"`
- * are all errors, so a mistyped flag can never be interpreted as a different
- * world than the one that was asked for.
- */
-const parseIntFlag = (flag: string, raw: string): Result<number, string> => {
-  const text = raw.trim();
-  if (!INTEGER.test(text)) return err(`${flag} expects an integer, got "${raw}"`);
-
-  const value = Number.parseInt(text, 10);
-  if (!Number.isSafeInteger(value)) return err(`${flag} is out of range: "${raw}"`);
-  return ok(value);
-};
 
 const parseMapArgs = (args: readonly string[]): Result<MapFlags, string> => {
   let seed: number | undefined;
@@ -171,15 +222,13 @@ const parseMapArgs = (args: readonly string[]): Result<MapFlags, string> => {
 const formatSettingsIssue = (issue: SettingsIssue): string =>
   `${issue.path === '' ? '<root>' : issue.path}: ${issue.message}`;
 
-const formatSetupError = (error: SetupError): string => {
-  switch (error.kind) {
-    case 'missing-terrain-role':
-      return `ruleset is missing terrain role "${error.role}"`;
-    case 'no-valid-starts':
-      return `no valid starting tile for ${String(error.civCount)} civilizations`;
-    case 'too-few-start-candidates':
-      return 'too few starting-tile candidates for the requested civilizations';
-  }
+/**
+ * The one place output goes. `process.exitCode` (never `process.exit`) is used by
+ * `main`'s caller so that stdout is fully flushed before the process ends —
+ * a truncated transcript would be worse than no transcript for a regression test.
+ */
+const writeOut = (text: string): void => {
+  process.stdout.write(text);
 };
 
 const commandMap = (args: readonly string[]): number => {
@@ -218,9 +267,12 @@ const commandMap = (args: readonly string[]): number => {
   }
 
   // `validated.value` is a `Ruleset`, and a `Ruleset` *is* the engine's
-  // structural `RulesetView` — every terrain carries the `role` generation
-  // resolves terrain by — so the catalog is passed through with no adapter and
-  // no id-to-role guessing.
+  // structural `RulesetView`: every terrain carries the `role` generation
+  // resolves terrain by, and every unit carries the `movement` `EndTurn` refills
+  // from. Both catalogs are required by the view (INTERFACES.md M2's amendment),
+  // and validation has already produced both, so the ruleset is passed straight
+  // through — no adapter, no id-to-role guessing, and nothing the engine needs
+  // can be missing from it.
   const view: RulesetView = validated.value;
   const state = newGame(settings.value.seed, settings.value, view);
   if (!state.ok) {
@@ -235,7 +287,97 @@ const commandMap = (args: readonly string[]): number => {
   return 0;
 };
 
-const main = (argv: readonly string[]): number => {
+/* ------------------------------------------------------------------ *
+ * `play` — the text REPL (the agent's hands). All of the session logic
+ * lives in `repl.ts`; this function is only wiring: flags, settings,
+ * ruleset, `newGame`, then hand a session either a command file or the
+ * terminal.
+ * ------------------------------------------------------------------ */
+
+const commandPlay = async (args: readonly string[]): Promise<number> => {
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(PLAY_USAGE);
+    return 0;
+  }
+
+  const flags = parsePlayArgs(args);
+  if (!flags.ok) {
+    console.error(`error: ${flags.error}`);
+    console.error('');
+    console.error(PLAY_USAGE);
+    return 2;
+  }
+
+  // The command file is read *before* a game is built: an unreadable script
+  // should fail fast and print nothing, rather than generate a world and start a
+  // transcript that is about to be abandoned.
+  const script =
+    flags.value.scriptPath === undefined ? undefined : readScript(flags.value.scriptPath);
+  if (script !== undefined && !script.ok) {
+    console.error(`error: ${script.error}`);
+    return 2;
+  }
+
+  const layer: Record<string, unknown> = {};
+  if (flags.value.seed !== undefined) layer['seed'] = flags.value.seed;
+  if (flags.value.mapSize !== undefined) layer['mapSize'] = flags.value.mapSize;
+  if (flags.value.civCount !== undefined) layer['civCount'] = flags.value.civCount;
+
+  const settings = loadSettings(layer);
+  if (!settings.ok) {
+    for (const issue of settings.error)
+      console.error(`settings error: ${formatSettingsIssue(issue)}`);
+    return 2;
+  }
+
+  const validated = validateRuleset(CATALOG, settings.value.fidelity);
+  if (!validated.ok) {
+    for (const e of validated.error) console.error(`ruleset error: ${formatError(e)}`);
+    return 1;
+  }
+
+  // The validated ruleset *is* the engine's `RulesetView` — terrains with the
+  // roles generation resolves, and units with the movement `EndTurn` refills —
+  // so the session gets the whole view, unit catalog included. The REPL applies
+  // every command through `applyCommand(state, playerId, cmd, ruleset)`, whose
+  // fourth argument is required (INTERFACES.md M2's amendment), so a session
+  // built without a view the engine can read would not compile at all.
+  const view: RulesetView = validated.value;
+  const state = newGame(settings.value.seed, settings.value, view);
+  if (!state.ok) {
+    console.error(`setup failed: ${formatSetupError(state.error)}`);
+    return 1;
+  }
+
+  // The acting player must be a player the state actually has: a session whose
+  // commands could only ever come back `unknown-player` is not a game, it is a
+  // typo, and it is cheaper to say so than to make the agent guess.
+  const playerIndex = flags.value.playerIndex ?? 0;
+  const player = state.value.players[playerIndex];
+  if (player === undefined) {
+    console.error(
+      `error: --player ${String(playerIndex)} is not a player in this game: it has ` +
+        `${String(state.value.players.length)} (0..${String(state.value.players.length - 1)})`,
+    );
+    return 2;
+  }
+
+  const session = createSession({
+    state: state.value,
+    ruleset: view,
+    playerId: player.id,
+    god: flags.value.god,
+    write: writeOut,
+  });
+
+  if (script !== undefined) {
+    return runScript(session, script.value, writeOut);
+  }
+
+  return runInteractive(session, writeOut);
+};
+
+const main = async (argv: readonly string[]): Promise<number> => {
   const [command, ...rest] = argv;
 
   if (command === undefined || command === '-h' || command === '--help') {
@@ -249,8 +391,7 @@ const main = (argv: readonly string[]): number => {
     case 'map':
       return commandMap(rest);
     case 'play':
-      console.log('play: the interactive text REPL arrives in M2.');
-      return 0;
+      return commandPlay(rest);
     case 'run':
       console.log('run: the headless self-play harness arrives in M7.');
       return 0;
@@ -261,4 +402,10 @@ const main = (argv: readonly string[]): number => {
   }
 };
 
-process.exit(main(process.argv.slice(2)));
+try {
+  process.exitCode = await main(process.argv.slice(2));
+} catch (cause) {
+  const detail = cause instanceof Error ? cause.message : 'unknown error';
+  console.error(`fatal: ${detail}`);
+  process.exitCode = 1;
+}

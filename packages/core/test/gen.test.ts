@@ -70,7 +70,22 @@ const TERRAINS: readonly TerrainDef[] = [
   },
 ];
 
-const RULESET: RulesetView = { terrains: TERRAINS, fidelity: 'tuned' };
+/**
+ * A `RulesetView` around a terrain catalog, with no units.
+ *
+ * `RulesetView.units` is required (M2's post-review amendment), and an empty
+ * catalog is how a view says "no units" — which is exactly what generation needs:
+ * it resolves terrain roles and never looks at a unit. Spelling the construction
+ * once keeps every view in this file honest instead of three copies of a literal
+ * that could drift apart.
+ */
+const view = (terrains: readonly TerrainDef[]): RulesetView => ({
+  terrains,
+  units: [],
+  fidelity: 'tuned',
+});
+
+const RULESET: RulesetView = view(TERRAINS);
 const KNOWN_IDS = new Set<TerrainId>(TERRAINS.map((t) => t.id));
 const DEF_BY_ID = new Map<TerrainId, TerrainDef>(TERRAINS.map((t) => [t.id, t]));
 
@@ -296,18 +311,12 @@ describe('generateWorld — rng state', () => {
 
 describe('generateWorld — failure modes', () => {
   it('throws when a required terrain role is missing from the ruleset', () => {
-    const withoutMountains: RulesetView = {
-      terrains: TERRAINS.filter((t) => t.role !== 'mountains'),
-      fidelity: 'tuned',
-    };
+    const withoutMountains: RulesetView = view(TERRAINS.filter((t) => t.role !== 'mountains'));
     expect(() => generateWorld(BASE, withoutMountains)).toThrow(/missing terrain role "mountains"/);
   });
 
   it('throws when no tile can host a start', () => {
-    const allImpassable: RulesetView = {
-      terrains: TERRAINS.map((t) => ({ ...t, impassable: true })),
-      fidelity: 'tuned',
-    };
+    const allImpassable: RulesetView = view(TERRAINS.map((t) => ({ ...t, impassable: true })));
     expect(() => generateWorld(BASE, allImpassable)).toThrow(/too few valid start candidates/);
   });
 

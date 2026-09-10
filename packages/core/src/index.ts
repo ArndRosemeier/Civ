@@ -14,4 +14,8 @@ export * from './rng.js';
 export * from './map.js';
 export * from './gen.js';
 export * from './state.js';
+export * from './units.js';
+export * from './commands.js';
+export * from './actions.js';
+export * from './fog.js';
 export * from './textview.js';

@@ -1,7 +1,8 @@
 /**
  * Game state assembly — the one place a `GameState` comes into existence.
- * See docs/INTERFACES.md (W3), PLAN.md 5.3 (determinism) / 5.4 (data layout)
- * and docs/ENGINE.md (state layout, determinism).
+ * See docs/INTERFACES.md (W3, and M2's "Core — units, movement, fog"),
+ * PLAN.md 5.3 (determinism) / 5.4 (data layout) and docs/ENGINE.md (state
+ * layout, determinism).
  *
  * Design notes:
  *
@@ -13,11 +14,21 @@
  * - **Failure is typed, never thrown.** Map generation signals a bad ruleset or
  *   an unhostable map by throwing; `newGame` is the boundary that converts those
  *   into `SetupError` values so callers (CLI, UI, goldens) react to a reason
- *   rather than to a stack trace.
+ *   rather than to a stack trace. The unit-role check runs *before* generation
+ *   for the same reason.
+ * - **A new game is populated, not empty.** Every player gets one settler on its
+ *   starting tile and an `explored` row covering what that settler can see, so
+ *   M2's first legal action is available immediately and the starting position is
+ *   never "somewhere in the fog".
  */
 
 import { generateWorld, type GeneratedWorld } from './gen.js';
-import { asPlayerId, type PlayerId, type TileIndex } from './ids.js';
+// Value imports, not type-only: `newGame` folds each player's sight into its
+// explored row through these, so `fog.ts` stays the single owner of the radius and
+// the single writer of the explored layer. There is no runtime cycle — `fog.ts`
+// imports `GameState` from here with `import type`, which erases.
+import { visibleTiles, withExplored } from './fog.js';
+import { asPlayerId, asUnitId, type PlayerId, type TileIndex } from './ids.js';
 import {
   TERRAIN_BY_ROLE,
   TERRAIN_ROLES,
@@ -28,9 +39,17 @@ import {
 import { err, ok, type Result } from './result.js';
 import type { RngState } from './rng.js';
 import { MAP_DIMENSIONS, type Settings } from './settings.js';
+import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js';
 
-/** Bumped whenever the persisted shape of `GameState` changes incompatibly. */
-export const SCHEMA_VERSION = 1;
+/**
+ * Bumped whenever the persisted shape of `GameState` changes incompatibly.
+ *
+ * - 1 — M1: terrain, players, RNG.
+ * - 2 — M2: adds `nextUnitId`, `units` and `explored`. Additive fields still
+ *   change *every* state hash, which is why the goldens were regenerated in the
+ *   same commit (INTERFACES.md, "Core — units, movement, fog").
+ */
+export const SCHEMA_VERSION = 2;
 
 export interface PlayerState {
   readonly id: PlayerId;
@@ -48,10 +67,24 @@ export interface GameState {
   readonly rng: RngState;
   readonly map: GameMap;
   readonly players: readonly PlayerState[];
+  /**
+   * The id the next created unit will take. Monotonic, never reused, and part of
+   * the state so that id assignment is a function of creation order alone.
+   */
+  readonly nextUnitId: number;
+  /** Every unit in the world, sorted by `id` (see `units.ts`). */
+  readonly units: readonly Unit[];
+  /**
+   * The explored layer, one row per player indexed by `PlayerId`, each of length
+   * `width * height`. *Visible* tiles are derived from unit positions on demand
+   * and never stored — this is the memory of what a player has seen (M2 "Fog").
+   */
+  readonly explored: readonly (readonly boolean[])[];
 }
 
 export type SetupError =
   | { readonly kind: 'missing-terrain-role'; readonly role: TerrainRole }
+  | { readonly kind: 'missing-unit-role'; readonly role: UnitRole }
   | { readonly kind: 'no-valid-starts'; readonly civCount: number }
   | { readonly kind: 'too-few-start-candidates' };
 
@@ -100,6 +133,57 @@ const firstMissingRole = (ruleset: RulesetView): TerrainRole | undefined => {
   return undefined;
 };
 
+/**
+ * The role every player starts with. `newGame` places exactly one of these on
+ * each player's starting tile, so a ruleset that cannot supply one cannot start
+ * a game — which is a setup failure, not a crash.
+ */
+const STARTING_UNIT_ROLE: UnitRole = 'settler';
+
+/**
+ * The first unit of `role` in the ruleset's catalog, or `undefined` when the
+ * ruleset provides none. Catalog order is data order, never RNG order, so which
+ * unit type becomes the starting unit is deterministic.
+ */
+const firstUnitOfRole = (ruleset: RulesetView, role: UnitRole): UnitDef | undefined =>
+  unitCatalog(ruleset).find((unit) => unit.role === role);
+
+/**
+ * A fresh, entirely unexplored fog layer: one row per player, each of length
+ * `width * height` so every row is directly indexable by tile.
+ *
+ * This only allocates the rows. *What gets marked on them* is decided by
+ * `fog.ts` alone — see `initialFog` below.
+ */
+const blankFog = (map: GameMap, players: readonly PlayerState[]): readonly (readonly boolean[])[] =>
+  players.map(() => new Array<boolean>(map.width * map.height).fill(false));
+
+/**
+ * The fog layer a new game starts with: each player's row is exactly what that
+ * player's own units can see, and no more.
+ *
+ * `fog.ts` owns both halves of this rule — `VISIBILITY_RADIUS` is the only
+ * statement of how far a unit sees, and `withExplored` is the only writer of the
+ * explored layer — so this *asks* those functions instead of re-deriving a
+ * neighbourhood box here. An earlier version kept a second constant
+ * (`START_EXPLORED_RADIUS`) and walked the box itself, which made `state.ts` a
+ * second writer of the explored layer: two statements of one rule, free to drift
+ * apart, and a mismatch would start a game with fog inside a unit's own sight or
+ * with memory of tiles it never saw. Now the radius cannot drift, because there is
+ * only one of it.
+ *
+ * Folding `visibleTiles` into `withExplored` is also exactly what the command
+ * layer does when a unit moves (`movedState` in `commands.ts`), so a new game and
+ * a played turn grow memory by the same mechanism.
+ */
+const initialFog = (state: GameState): GameState => {
+  let current = state;
+  for (const player of state.players) {
+    current = withExplored(current, player.id, visibleTiles(current, player.id));
+  }
+  return current;
+};
+
 /** `generateWorld` reports how many candidate tiles it found in this shape. */
 const FOUND_COUNT = /found (\d+)/;
 
@@ -145,6 +229,15 @@ export const newGame = (
   const missingRole = firstMissingRole(ruleset);
   if (missingRole !== undefined) return err({ kind: 'missing-terrain-role', role: missingRole });
 
+  // The unit every player starts with is resolved *before* generation, for the
+  // same reason the terrain roles are: a ruleset that cannot populate the board
+  // should be reported as a typed setup failure, not discovered halfway through
+  // assembling a state.
+  const startingUnit = firstUnitOfRole(ruleset, STARTING_UNIT_ROLE);
+  if (startingUnit === undefined) {
+    return err({ kind: 'missing-unit-role', role: STARTING_UNIT_ROLE });
+  }
+
   const dimensions = MAP_DIMENSIONS[settings.mapSize];
   const civCount = settings.civCount;
 
@@ -173,7 +266,23 @@ export const newGame = (
     startingTile,
   }));
 
-  return ok({
+  // One starting unit per player, on its own start tile. Ids are handed out in
+  // player order (`0..civCount-1`), so the array is sorted by id by
+  // construction and `nextUnitId` is simply how many units exist — no counter to
+  // keep in sync and nothing ambient to store.
+  const units: readonly Unit[] = players.map((player, index) => ({
+    id: asUnitId(index),
+    type: startingUnit.id,
+    owner: player.id,
+    tile: player.startingTile,
+    movementLeft: startingUnit.movement,
+  }));
+
+  // Fog: one row per player, indexed by `PlayerId`. Each start sees its
+  // surroundings; what a unit sees later is derived from its position and folded
+  // into these rows by movement (M2 "Fog"). Both the blank rows and the folding
+  // go through `fog.ts`, which owns the rule.
+  const seeded: GameState = {
     schemaVersion: SCHEMA_VERSION,
     revision: 0,
     turn: 1,
@@ -182,5 +291,10 @@ export const newGame = (
     rng: world.rng,
     map: world.map,
     players,
-  });
+    nextUnitId: units.length,
+    units,
+    explored: blankFog(world.map, players),
+  };
+
+  return ok(initialFog(seeded));
 };

@@ -247,11 +247,11 @@ finding is worse than an empty report.
 
 ---
 
-# M2 contracts — DRAFT (freeze before M2 agents start)
+# M2 contracts — FROZEN
 
-Status: drafted by the chief of staff as M2 planning. **Not yet frozen.** M1 fixes
-are landing concurrently; re-read the M1 modules before implementing, and treat the
-frozen M1 signatures as authoritative where they differ from anything here.
+Status: frozen by the chief of staff. M1 shipped in `03d2064`; the signatures below
+were checked against the code that actually landed (`packages/core/src/state.ts` and
+friends) and are authoritative. Escalate rather than silently diverge.
 
 Goal of M2: the first point where the agent genuinely *plays* — units that move
 under terrain rules, per-player fog, and an interactive text REPL.
@@ -319,13 +319,31 @@ export function unitDef(ruleset: RulesetView, type: UnitTypeId): UnitDef | undef
 `GameState` gains (additive — every existing field keeps its meaning):
 
 ```ts
-readonly nextUnitId: number;                  // monotonic, so ids are deterministic
+readonly nextUnitId: number;                  // 0 at newGame, monotonic, so ids are deterministic
 readonly units: readonly Unit[];              // sorted by id
 readonly explored: readonly (readonly boolean[])[];  // per player, indexed by PlayerId
 ```
 
-`newGame` places one starting unit per player on its `startingTile` (a
-`settler`-role unit), and marks the tiles around each start as explored.
+**This changes the persisted shape, so `SCHEMA_VERSION` goes 1 → 2.** Adding those
+three fields changes *every* existing state hash, so the three goldens must be
+regenerated **intentionally**, in the same commit, with a `rehash:` line in the
+commit message explaining why. That is expected exactly once here — it is not a
+determinism regression, and the golden harness must still refuse to auto-write on a
+normal test run.
+
+`SetupError` gains a variant, because `newGame` now needs a unit to place:
+
+```ts
+| { readonly kind: 'missing-unit-role'; readonly role: UnitRole }
+```
+
+Return it (never throw) when the ruleset provides no unit of the role `newGame`
+places — mirroring how `missing-terrain-role` is handled today, and checked *before*
+generation so the failure stays typed.
+
+`newGame` places one starting unit per player on its `startingTile` (a unit whose
+role is `settler`), marks the tiles around each start explored, and sets
+`nextUnitId` past the units it created.
 
 ## Core — commands, errors, legal actions
 
@@ -346,9 +364,38 @@ export type GameError =
   | { readonly kind: 'invalid-argument'; readonly detail: string };
 
 export function applyCommand(
-  state: GameState, playerId: PlayerId, cmd: Command,
-): Result<{ state: GameState; events: readonly GameEvent[] }, GameError>;
+  state: GameState, playerId: PlayerId, cmd: Command, ruleset: RulesetView,
+): Result<CommandOutcome, GameError>;   // CommandOutcome = { state, events }
+
+export type GameEvent =
+  | { readonly type: 'UnitMoved'; readonly unitId: UnitId; readonly from: TileIndex;
+      readonly to: TileIndex; readonly cost: number; readonly movementLeft: number }
+  | { readonly type: 'TurnEnded'; readonly playerId: PlayerId; readonly turn: number };
+
+/** The single evaluator of "may this unit step here, and at what cost?" */
+export function planMove(
+  state: GameState, ruleset: RulesetView, unitId: UnitId, to: TileIndex,
+): Result<{ readonly cost: number; readonly movementLeft: number }, GameError>;
 ```
+
+**Amendment (post-review, binding).** `ruleset` is a **required** fourth parameter.
+The original three-argument form was wrong: applying a command needs the destination
+tile's `moveCost`/`impassable` and each unit type's `movement`, and `GameState` carries
+terrain *ids* and no max-movement field, so a three-argument call cannot decide anything.
+An interim implementation made the parameter optional and refused at runtime, which is
+the worst outcome: it compiles, the typechecker cannot catch it, and every command
+silently fails. Required means the compiler enforces what the runtime needs.
+
+Correspondingly, **`RulesetView` carries the unit catalog** (`units: readonly UnitDef[]`,
+required, mirroring `@civts/rules`' `UnitSpec`). A view without units is not a view the
+engine can run a game from.
+
+`CommandOutcome` and `GameEvent` are part of the contract, not incidental: the REPL, the
+UI and the scenario DSL all consume the event list rather than re-deriving what happened.
+
+**Note (legality vs. application).** `actor` semantics are pinned: `EndTurn` is a
+world-turn advance (it refills every unit and increments `turn` once), because M2 has no
+active-player field. Per-player turn order is an M5 concern.
 
 ```ts
 // actions.ts  — ONE source of truth for legality, shared by the AI, the UI and tests
@@ -362,6 +409,15 @@ Invariants that MUST be tested:
 1. **Every yielded action applies successfully.** For each action from
    `unitActions`/`legalActions`, `applyCommand` returns `ok`. This is the keystone
    property the whole AI and UI depend on.
+   *Amended after review:* this must hold in **both** directions — nothing yielded may be
+   refused, and nothing accepted may be missing from what the generator yields (an
+   incomplete generator is just as broken as an unsound one, because the AI would never
+   consider a legal move). An adversarial sweep found one counterexample: `legalActions`
+   yielded `EndTurn`, but applying it failed when a unit's `type` was absent from the
+   ruleset. That state is unreachable from `newGame` or the builder, but reachable from a
+   hand-built state, a foreign ruleset view, or a future save load — so `EndTurn` must be
+   **total** (refill the units it can resolve and leave the rest alone) rather than
+   refusing. A generator and an applier that disagree are a latent bug, not a nicety.
 2. `applyCommand` is pure: it never mutates its arguments (assert on a frozen
    state), and `revision` strictly increases on success and is unchanged on error.
 3. Wrong-owner commands fail with `not-your-unit`, never silently apply.

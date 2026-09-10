@@ -118,10 +118,21 @@ const settingsFor = (seed: number): Settings => ({
 const entryName = (seed: number): string =>
   `${GOLDEN_MAP_SIZE}-civs${String(GOLDEN_CIV_COUNT)}-seed${String(seed)}`;
 
+/**
+ * Render a setup failure for a test-failure message.
+ *
+ * Kept local and self-contained rather than imported from
+ * `packages/headless/src/repl.ts`: this package must not depend on the REPL (the
+ * golden harness is the thing the REPL is measured against, not the other way
+ * round), and the switch is exhaustively typed, so a new `SetupError` variant
+ * fails this build instead of degrading to "unknown setup error".
+ */
 const formatSetupError = (error: SetupError): string => {
   switch (error.kind) {
     case 'missing-terrain-role':
       return `ruleset is missing terrain role "${error.role}"`;
+    case 'missing-unit-role':
+      return `ruleset is missing a unit for role "${error.role}"`;
     case 'no-valid-starts':
       return `no valid starting tile for ${String(error.civCount)} civilizations`;
     case 'too-few-start-candidates':
@@ -236,6 +247,31 @@ describe('golden scenarios', () => {
       expect(state.settings.mapSize).toBe(GOLDEN_MAP_SIZE);
       expect(state.players).toHaveLength(GOLDEN_CIV_COUNT);
       expect(state.seed).toBe(seed);
+    }
+  });
+
+  it('names the reason when a ruleset cannot populate the world', () => {
+    // The diagnosis path a failed golden actually uses: `mustState` renders the
+    // typed `SetupError` instead of letting a raw error escape. M2 added
+    // `missing-unit-role` (`newGame` now places a starting settler per player),
+    // so this pins that the harness names it — and that it names it as a *unit*
+    // problem, not a terrain one.
+    const withoutUnits: RulesetView = { terrains: RULESET.terrains, units: [], fidelity: 'tuned' };
+    const withoutTerrain: RulesetView = { terrains: [], units: RULESET.units, fidelity: 'tuned' };
+
+    const noUnits = newGame(GOLDEN_SEEDS[0], settingsFor(GOLDEN_SEEDS[0]), withoutUnits);
+    expect(noUnits.ok).toBe(false);
+    if (!noUnits.ok) {
+      expect(formatSetupError(noUnits.error)).toBe('ruleset is missing a unit for role "settler"');
+    }
+
+    const noTerrain = newGame(GOLDEN_SEEDS[0], settingsFor(GOLDEN_SEEDS[0]), withoutTerrain);
+    expect(noTerrain.ok).toBe(false);
+    if (!noTerrain.ok) {
+      expect(formatSetupError(noTerrain.error)).toMatch(/missing terrain role/);
+      expect(formatSetupError(noTerrain.error)).not.toBe(
+        'ruleset is missing a unit for role "settler"',
+      );
     }
   });
 });

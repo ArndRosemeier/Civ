@@ -8,6 +8,9 @@
  */
 
 import { asTileIndex, type TerrainId, type TileIndex } from './ids.js';
+// Type-only, so the import is erased at runtime and cannot create a runtime
+// cycle with `units.ts` (which reads this module's `RulesetView` the same way).
+import type { UnitDef } from './units.js';
 
 export const TERRAIN_ROLES = [
   'ocean',
@@ -37,9 +40,21 @@ export interface TerrainDef {
   readonly impassable: boolean;
 }
 
-/** The engine's structural view of a validated ruleset. */
+/**
+ * The engine's structural view of a validated ruleset.
+ *
+ * Both catalogs are **required**, mirroring the `@civts/rules` `Ruleset` that
+ * satisfies this interface: a view without a unit catalog is not a view the
+ * engine can run a game from (`applyCommand` needs each unit type's `movement`
+ * to refill `movementLeft` on `EndTurn`, and `newGame` needs a settler to
+ * place), so the type requires what the engine actually reads rather than
+ * leaving a field optional and failing at runtime. A ruleset that genuinely has
+ * no units says so with `units: []`, which is a catalog, not a missing field.
+ */
 export interface RulesetView {
   readonly terrains: readonly TerrainDef[];
+  /** The unit catalog, in data order. See `units.ts`' `UnitDef`. */
+  readonly units: readonly UnitDef[];
   readonly fidelity: 'tuned' | 'cited-only';
 }
 

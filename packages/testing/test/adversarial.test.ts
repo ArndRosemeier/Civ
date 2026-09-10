@@ -36,6 +36,16 @@
  * Nothing here writes to disk. The golden file is only read; one test asserts
  * its bytes are byte-identical before and after a full build-and-hash pass, so a
  * silently self-healing golden would show up here.
+ *
+ * **Migrated to the M2 contract** (docs/INTERFACES.md M2). Three amendments bite
+ * here: `RulesetView` now *requires* `units`, `GameState` gained `nextUnitId`,
+ * `units` and `explored`, and `newGame` reports `missing-unit-role` when the
+ * ruleset cannot supply the settler it places. So the ruleset fixture below
+ * carries `CATALOG.units`, every hand-built state literal carries the M2 fields,
+ * the hash-sensitivity sweep covers them, and the hostile-ruleset suite pins the
+ * new setup failure. No existing claim was dropped or weakened by that
+ * migration: the fixture is the *only* thing that changed shape, and the
+ * adversarial expectations still fail if the behaviour they name regresses.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -71,6 +81,7 @@ import {
   type TerrainDef,
   type TerrainId,
   type TerrainRole,
+  type Unit,
 } from '@civts/core';
 import { CATALOG, type TerrainSpec } from '@civts/rules';
 import { canonicalize, fnv1a64, hashValue } from '../src/index.js';
@@ -82,6 +93,12 @@ import { goldensPath, loadGoldens } from '../src/goldens.js';
  * The ruleset adapter duplicates the one in `golden.test.ts` deliberately: the
  * reviewer should not depend on the author's helper, and `TerrainSpec` has no
  * `role` field, so the role has to be derived from the id either way.
+ *
+ * The unit catalog needs no adapter at all: `UnitSpec extends UnitDef` in
+ * `@civts/rules`, so the shipped rows *are* the engine's structural view of a
+ * unit. `units` is required by the M2 contract — a view without a catalog is not
+ * one `newGame` can start a game from, and `newGame` reports
+ * `missing-unit-role` rather than throwing.
  * ------------------------------------------------------------------ */
 
 const roleOf = (id: string): TerrainRole | undefined => TERRAIN_ROLES.find((role) => role === id);
@@ -102,7 +119,11 @@ const toTerrainDef = (spec: TerrainSpec): TerrainDef => {
   };
 };
 
-const RULESET: RulesetView = { terrains: CATALOG.terrains.map(toTerrainDef), fidelity: 'tuned' };
+const RULESET: RulesetView = {
+  terrains: CATALOG.terrains.map(toTerrainDef),
+  units: CATALOG.units,
+  fidelity: 'tuned',
+};
 const ROLE_BY_ID: ReadonlyMap<TerrainId, TerrainRole> = new Map(
   RULESET.terrains.map((terrain) => [terrain.id, terrain.role] as const),
 );
@@ -157,6 +178,12 @@ const playerAt = (state: GameState, index: number): PlayerState => {
   const player = state.players[index];
   if (player === undefined) throw new Error(`state has no player at index ${String(index)}`);
   return player;
+};
+
+const unitAt = (state: GameState, index: number): Unit => {
+  const unit = state.units[index];
+  if (unit === undefined) throw new Error(`state has no unit at index ${String(index)}`);
+  return unit;
 };
 
 const tileAt = (state: GameState, index: number): TerrainId => {
@@ -266,6 +293,11 @@ const inProcessHashes = (): ReadonlyMap<string, string> =>
  * The child re-derives everything from `@civts/core` + `@civts/rules` and prints
  * one line per case. Paths resolve through the repo `tsconfig.json` because the
  * child's cwd is the repo root.
+ *
+ * The ruleset carries the unit catalog for the same reason the in-process one
+ * does: `newGame` places a settler per player, so a view without `units` comes
+ * back as `missing-unit-role` and every case would print `SETUP-ERROR` — which
+ * would look like a determinism failure while actually being a stale fixture.
  */
 const freshProcessScript = (cases: readonly HashCase[]): string => `
 (async () => {
@@ -278,6 +310,7 @@ const freshProcessScript = (cases: readonly HashCase[]): string => `
       id: t.id, role: roleOf(t.id), name: t.name, moveCost: t.moveCost,
       defenseBonusPct: t.defenseBonusPct, yields: t.yields, impassable: t.impassable,
     })),
+    units: CATALOG.units,
     fidelity: 'tuned',
   };
   console.log('pid ' + String(process.pid));
@@ -361,7 +394,13 @@ describe('adversarial: determinism', () => {
     // FAILS IF: canonicalization stops sorting keys (then an object rebuilt in a
     // different order would hash differently, and saves would stop matching).
     const state = mustState('tiny', 2, 42);
+    // Every field of `GameState`, including the M2 additions, written in a
+    // different order from the one `newGame` builds. A missing field here would
+    // be a type error, not a silently different hash.
     const reordered: GameState = {
+      explored: state.explored,
+      units: state.units,
+      nextUnitId: state.nextUnitId,
       players: state.players,
       map: state.map,
       rng: state.rng,
@@ -464,6 +503,31 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
         { ...state, players: [{ ...first, color: '#ffffff' }, ...state.players.slice(1)] },
       ],
       ['players swapped', { ...state, players: [...state.players].reverse() }],
+      // M2 fields. Each is part of every state hash, so a save that dropped one
+      // would be silently different from the state it was written from.
+      ['nextUnitId + 1', { ...state, nextUnitId: state.nextUnitId + 1 }],
+      [
+        'units[0].movementLeft + 1',
+        {
+          ...state,
+          units: state.units.map((unit, index) =>
+            index === 0 ? { ...unit, movementLeft: unit.movementLeft + 1 } : unit,
+          ),
+        },
+      ],
+      [
+        'units array rotated by one (order is part of the digest)',
+        { ...state, units: [...state.units.slice(1), unitAt(state, 0)] },
+      ],
+      [
+        'explored[0] tile 0 flipped',
+        {
+          ...state,
+          explored: state.explored.map((row, player) =>
+            player === 0 ? row.map((seen, tile) => (tile === 0 ? !seen : seen)) : row,
+          ),
+        },
+      ],
     ];
 
     for (const [label, mutated] of mutations) {
@@ -508,6 +572,8 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
       ...state,
       map: { ...state.map, terrain: [...state.map.terrain] },
       players: state.players.map((player) => ({ ...player })),
+      units: state.units.map((unit) => ({ ...unit })),
+      explored: state.explored.map((row) => [...row]),
       settings: {
         ...state.settings,
         ai: { ...state.settings.ai },
@@ -963,16 +1029,26 @@ describe('adversarial: canonical JSON + FNV-1a 64', () => {
 describe('adversarial: settings boundary', () => {
   it('returns typed errors instead of throwing for hostile rulesets', () => {
     // FAILS IF: a generation failure escapes as an exception — the CLI and the
-    // goldens are written against `Result`, not against stack traces.
-    const missingAll: RulesetView = { terrains: [], fidelity: 'tuned' };
+    // goldens are written against `Result`, not against stack traces. Each view
+    // below is a complete `RulesetView` (the M2 contract makes `units` required),
+    // and each is hostile in exactly one dimension so the reported reason is
+    // unambiguous.
+    //
+    // `missingAll` carries no units either, and still reports the *terrain* role:
+    // the ruleset is audited for terrain before generation runs, and for a unit
+    // role before the state is assembled, so the first thing genuinely missing is
+    // what a caller is told.
+    const missingAll: RulesetView = { terrains: [], units: [], fidelity: 'tuned' };
     const missingMountains: RulesetView = {
       terrains: RULESET.terrains.filter((terrain) => terrain.role !== 'mountains'),
+      units: RULESET.units,
       fidelity: 'tuned',
     };
     const landImpassable: RulesetView = {
       terrains: RULESET.terrains.map((terrain) =>
         WATER_ROLES.has(terrain.role) ? terrain : { ...terrain, impassable: true },
       ),
+      units: RULESET.units,
       fidelity: 'tuned',
     };
     const seaPassable: RulesetView = {
@@ -980,6 +1056,7 @@ describe('adversarial: settings boundary', () => {
         ...terrain,
         impassable: !WATER_ROLES.has(terrain.role),
       })),
+      units: RULESET.units,
       fidelity: 'tuned',
     };
 
@@ -1004,16 +1081,62 @@ describe('adversarial: settings boundary', () => {
     if (!sea.ok) expect(sea.error.kind).toBe('no-valid-starts');
   });
 
+  it('reports missing-unit-role (never throws) when the ruleset cannot place a settler', () => {
+    // The M2 setup failure (docs/INTERFACES.md M2): `newGame` places one
+    // starting unit per player, so a view with terrain but no unit of the
+    // starting role cannot start a game. It is checked *before* generation — the
+    // two views below differ only in their unit catalog, and both must fail the
+    // same way rather than being discovered halfway through assembling a state.
+    // FAILS IF: the check is dropped (then this throws out of `generateWorld` or
+    // builds a state with no units), if it reports the wrong role, or if it is
+    // reported as a terrain problem.
+    const settings = settingsFor('tiny', 4, 5);
+
+    const noUnits: RulesetView = { terrains: RULESET.terrains, units: [], fidelity: 'tuned' };
+    const noSettler: RulesetView = {
+      terrains: RULESET.terrains,
+      // Every role *except* the one `newGame` places: a non-empty catalog that is
+      // still the wrong catalog, which is the case a length check would miss.
+      units: RULESET.units.filter((unit) => unit.role !== 'settler'),
+      fidelity: 'tuned',
+    };
+    expect(noSettler.units.length).toBeGreaterThan(0);
+    expect(noSettler.units.some((unit) => unit.role === 'settler')).toBe(false);
+
+    for (const [label, ruleset] of [
+      ['an empty unit catalog', noUnits],
+      ['a catalog with no settler', noSettler],
+    ] as const) {
+      expect(() => newGame(5, settings, ruleset), label).not.toThrow();
+      const result = newGame(5, settings, ruleset);
+      expect(result.ok, label).toBe(false);
+      if (!result.ok)
+        expect(result.error, label).toEqual({ kind: 'missing-unit-role', role: 'settler' });
+    }
+
+    // Control: the untouched view starts a game and places one settler per
+    // player, so the failure above is about the catalog and not about `settings`.
+    const control = newGame(5, settings, RULESET);
+    expect(control.ok).toBe(true);
+    if (control.ok) {
+      expect(control.value.units).toHaveLength(4);
+      expect(control.value.nextUnitId).toBe(4);
+      expect(control.value.units.every((unit) => unit.movementLeft > 0)).toBe(true);
+    }
+  });
+
   it('does not mutate the settings or the ruleset it is given', () => {
     // FAILS IF: generation sorts or rewrites the caller's arrays in place, which
     // would make the second call with the same objects behave differently.
     const settings = settingsFor('tiny', 4, 11);
-    const before = JSON.stringify({ settings, terrains: RULESET.terrains });
+    const before = JSON.stringify({ settings, terrains: RULESET.terrains, units: RULESET.units });
 
     mustState('tiny', 4, 11);
     mustState('small', 6, 12);
 
-    expect(JSON.stringify({ settings, terrains: RULESET.terrains })).toBe(before);
+    expect(JSON.stringify({ settings, terrains: RULESET.terrains, units: RULESET.units })).toBe(
+      before,
+    );
   });
 
   it('does not keep an explicit undefined optional value (the undefined-ruleset trap, fixed)', () => {
@@ -1115,6 +1238,7 @@ describe('adversarial: text renderer', () => {
     const second = describeState(state, RULESET);
     const rebuiltRuleset: RulesetView = {
       terrains: CATALOG.terrains.map(toTerrainDef),
+      units: CATALOG.units,
       fidelity: 'tuned',
     };
     const third = describeState(state, rebuiltRuleset);
