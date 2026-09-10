@@ -290,6 +290,88 @@ describe('generateWorld — starting positions', () => {
   });
 });
 
+describe('generateWorld — goody huts', () => {
+  it('places at least one hut, ascending, distinct and inside the map', () => {
+    const world = generateWorld(BASE, RULESET);
+    const huts = world.map.huts;
+
+    expect(huts.length).toBeGreaterThan(0);
+    expect([...huts]).toEqual([...huts].sort((a, b) => a - b)); // ascending
+    expect(new Set(huts).size).toBe(huts.length); // no tile has two huts
+    for (const hut of huts) {
+      expect(hut).toBeGreaterThanOrEqual(0);
+      expect(hut).toBeLessThan(world.map.terrain.length);
+    }
+  });
+
+  it('puts every hut on passable land and never on a start tile', () => {
+    for (const seed of [1, 42, 1337, 90210]) {
+      const world = generateWorld({ ...BASE, seed }, RULESET);
+
+      for (const hut of world.map.huts) {
+        // Land, not water.
+        expect(isWater(world.map, hut)).toBe(false);
+        const role = roleAt(world.map, hut);
+        expect(role).toBeDefined();
+
+        // Enterable: a hut inside a mountain range could never be reached, so it
+        // would be map decoration pretending to be a reward.
+        const id = world.map.terrain[hut];
+        expect(id).toBeDefined();
+        expect(id === undefined ? true : DEF_BY_ID.get(id)?.impassable).toBe(false);
+
+        // Never on a start: a civilization must not begin the game standing on a
+        // hut it would consume before anyone could see it.
+        expect(world.starts).not.toContain(hut);
+      }
+    }
+  });
+
+  it('scales the hut count with the map, and reproduces it exactly for a seed', () => {
+    const sizes = [
+      [20, 20],
+      [40, 40],
+      [60, 60],
+    ] as const;
+
+    const counts = sizes.map(
+      ([width, height]) =>
+        generateWorld({ width, height, seed: 42, civCount: 3 }, RULESET).map.huts.length,
+    );
+
+    // More tiles, more huts (the placeholder is one per HUT_TILES_PER_HUT tiles).
+    expect(pick(counts, 0)).toBeGreaterThan(0);
+    expect(pick(counts, 1)).toBeGreaterThan(pick(counts, 0));
+    expect(pick(counts, 2)).toBeGreaterThan(pick(counts, 1));
+
+    // Same seed, same huts — placement draws from the returned RNG state.
+    const a = generateWorld({ ...BASE, seed: 5 }, RULESET);
+    const b = generateWorld({ ...BASE, seed: 5 }, RULESET);
+    expect(a.map.huts).toEqual(b.map.huts);
+  });
+
+  it('moves the huts when the seed changes', () => {
+    // Not every seed pair need differ in principle, so this asserts only that the
+    // placement is seed-dependent at all: a fixed layout would be indistinguishable
+    // from a hard-coded one.
+    const layouts = [1, 2, 3, 4].map((seed) =>
+      generateWorld({ ...BASE, seed }, RULESET).map.huts.join(','),
+    );
+    expect(new Set(layouts).size).toBeGreaterThan(1);
+  });
+
+  it('does not disturb terrain or starts, which are drawn before it', () => {
+    // Huts consume RNG draws after the starts, so the world's terrain (hashed, not
+    // drawn) and the chosen starts are exactly what they were: the step is
+    // additive.
+    const world = generateWorld(BASE, RULESET);
+    const again = generateWorld(BASE, RULESET);
+    expect(again.map.terrain).toEqual(world.map.terrain);
+    expect(again.starts).toEqual(world.starts);
+    expect(again.map.huts).toEqual(world.map.huts);
+  });
+});
+
 describe('generateWorld — rng state', () => {
   it('returns the advanced state, identical for the same seed', () => {
     const a = generateWorld(BASE, RULESET);

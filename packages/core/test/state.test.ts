@@ -1,5 +1,6 @@
 /**
- * `newGame` assembly tests (INTERFACES.md W3, plus M2's units/fog half).
+ * `newGame` assembly tests (INTERFACES.md W3, plus M2's units/fog half and M3's
+ * "State shape").
  *
  * The ruleset here is a local stand-in: `newGame` only needs the structural
  * `RulesetView`, so these tests do not depend on another workstream's content
@@ -7,6 +8,12 @@
  * that every generation failure surfaces as a typed `SetupError` rather than an
  * exception — a direct `newGame` call in a test *is* the no-throw assertion,
  * because a thrown error would fail the test.
+ *
+ * M3 changed what a "player" is: `players` now holds the civilizations *and* the
+ * barbarian player. Every assertion that means "how many civilizations" goes
+ * through `civPlayers` — which is the migrated form of the M1/M2 assertion
+ * `players.length === civCount` — and the barbarian is asserted to exist, to be
+ * the last player, and to own nothing.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -23,7 +30,13 @@ import {
 } from '../src/map.js';
 import { isErr, type Result } from '../src/result.js';
 import { DEFAULT_SETTINGS, MAP_DIMENSIONS, type Settings } from '../src/settings.js';
-import { SCHEMA_VERSION, newGame, type GameState, type SetupError } from '../src/state.js';
+import {
+  SCHEMA_VERSION,
+  civPlayers,
+  newGame,
+  type GameState,
+  type SetupError,
+} from '../src/state.js';
 import { unitById, unitsOnTile, type UnitDef, type UnitRole } from '../src/units.js';
 
 const ROLES: readonly TerrainRole[] = TERRAIN_ROLES;
@@ -105,7 +118,10 @@ describe('newGame', () => {
     expect(state.map.width).toBe(expected.width);
     expect(state.map.height).toBe(expected.height);
     expect(state.map.terrain).toHaveLength(expected.width * expected.height);
-    expect(state.players).toHaveLength(SETTINGS.civCount);
+    // M3: `players` is the civilizations *plus* the barbarian player, which is
+    // why "how many civilizations" is asked through `civPlayers`.
+    expect(civPlayers(state)).toHaveLength(SETTINGS.civCount);
+    expect(state.players).toHaveLength(SETTINGS.civCount + 1);
   });
 
   it('is deterministic: the same seed reproduces terrain, players and RNG', () => {
@@ -125,11 +141,11 @@ describe('newGame', () => {
     expect(b.map.terrain).not.toEqual(a.map.terrain);
   });
 
-  it('numbers players from zero with stable names and palette colours', () => {
+  it('numbers civilizations from zero with stable names and palette colours', () => {
     const state = mustGame(42, { ...SETTINGS, civCount: 4 }, RULESET);
 
-    expect(state.players.map((p) => Number(p.id))).toEqual([0, 1, 2, 3]);
-    expect(state.players.map((p) => p.name)).toEqual([
+    expect(civPlayers(state).map((p) => Number(p.id))).toEqual([0, 1, 2, 3]);
+    expect(civPlayers(state).map((p) => p.name)).toEqual([
       'Player 1',
       'Player 2',
       'Player 3',
@@ -138,13 +154,64 @@ describe('newGame', () => {
 
     const colors = state.players.map((p) => p.color);
     for (const color of colors) expect(color).toMatch(/^#[0-9a-f]{6}$/);
+    // Every player's colour is its own, barbarians included: a barbarian painted
+    // in a civilization's colour would make the map legend lie.
     expect(new Set(colors).size).toBe(colors.length);
   });
 
-  it('places every player on a passable land tile inside the map', () => {
+  it('appends exactly one barbarian player, after the civilizations, with kind set', () => {
+    const state = mustGame(42, { ...SETTINGS, civCount: 3 }, RULESET);
+
+    expect(state.players).toHaveLength(state.settings.civCount + 1);
+    expect(civPlayers(state).map((p) => Number(p.id))).toEqual([0, 1, 2]);
+
+    const kinds = state.players.map((p) => p.kind);
+    expect(kinds).toEqual(['civ', 'civ', 'civ', 'barbarian']);
+
+    // The barbarian is the last player, so every civilization keeps the id it had
+    // before M3 — which is what makes `explored` and every `owner` reference line
+    // up with the same indices they always did.
+    const barbarian = state.players[state.players.length - 1];
+    expect(barbarian?.kind).toBe('barbarian');
+    expect(barbarian?.name).toBe('Barbarians');
+    expect(Number(barbarian?.id)).toBe(state.settings.civCount);
+    // It is a player *identity*, not a civilization: `civPlayers` is the list of
+    // civilizations, and it never contains it.
+    expect(civPlayers(state)).not.toContain(barbarian);
+  });
+
+  it('gives the barbarian player no homeland of its own', () => {
+    // M3 documents the barbarian's `startingTile` as the map's first goody hut —
+    // a real land tile no civilization starts on, and the place its units come
+    // from — because `PlayerState.startingTile` is a required field. Nothing
+    // places a barbarian unit there, and no civilization's start is stolen.
+    const state = mustGame(42, SETTINGS, RULESET);
+    const barbarian = state.players[state.players.length - 1];
+
+    expect(state.map.huts.length).toBeGreaterThan(0);
+    expect(Number(barbarian?.startingTile)).toBe(Number(state.map.huts[0]));
+    for (const civ of civPlayers(state)) {
+      expect(civ.startingTile).not.toBe(barbarian?.startingTile);
+      // `generateWorld` never places a hut on a start tile, so no civilization
+      // begins on top of one.
+      expect(state.map.huts).not.toContain(civ.startingTile);
+    }
+  });
+
+  it('starts with no cities and a nextCityId of zero', () => {
+    // M3: cities are founded by `FoundCity`, never by setup. An empty `cities`
+    // array is the honest starting state, and id 0 belongs to the first city
+    // actually founded.
+    const state = mustGame(42, SETTINGS, RULESET);
+
+    expect(state.cities).toEqual([]);
+    expect(state.nextCityId).toBe(0);
+  });
+
+  it('places every civilization on a passable land tile inside the map', () => {
     const state = mustGame(99, SETTINGS, RULESET);
 
-    const tiles = state.players.map((player) => Number(player.startingTile));
+    const tiles = civPlayers(state).map((player) => Number(player.startingTile));
     expect(new Set(tiles).size).toBe(tiles.length);
 
     for (const tile of tiles) {
@@ -258,12 +325,14 @@ describe('newGame', () => {
 });
 
 describe('starting units', () => {
-  it('gives every player exactly one settler, on its own starting tile', () => {
+  it('gives every civilization exactly one settler, on its own starting tile', () => {
     const state = mustGame(42, { ...SETTINGS, civCount: 4 }, RULESET);
 
-    expect(state.units).toHaveLength(state.players.length);
+    // One settler per *civilization*: the barbarian player is a player, but a
+    // barbarian settler would be nonsense, so it starts with nothing at all.
+    expect(state.units).toHaveLength(civPlayers(state).length);
 
-    for (const player of state.players) {
+    for (const player of civPlayers(state)) {
       const onStart = unitsOnTile(state, player.startingTile);
       const mine = onStart.filter((u) => u.owner === player.id);
 
@@ -277,6 +346,10 @@ describe('starting units', () => {
       // No two players share a start, so nothing is stacked on turn 1.
       expect(onStart).toHaveLength(1);
     }
+
+    const barbarian = state.players[state.players.length - 1];
+    expect(barbarian?.kind).toBe('barbarian');
+    expect(state.units.filter((u) => u.owner === barbarian?.id)).toEqual([]);
   });
 
   it('hands out dense, monotonic ids and keeps `units` sorted by id', () => {
@@ -302,13 +375,19 @@ describe('starting units', () => {
     expect(state.units.map((u) => Number(u.owner))).toEqual([0, 1, 2]);
   });
 
-  it('is deterministic: the same seed reproduces units and explored rows', () => {
+  it('is deterministic: the same seed reproduces units, cities and explored rows', () => {
     const first = mustGame(99, SETTINGS, RULESET);
     const second = mustGame(99, SETTINGS, RULESET);
 
     expect(second.units).toEqual(first.units);
     expect(second.explored).toEqual(first.explored);
     expect(second.nextUnitId).toBe(first.nextUnitId);
+    // M3: the new fields are part of the persisted state, so they must be as
+    // reproducible as the old ones — and `toEqual` on the whole state (below)
+    // covers `cities`, `nextCityId` and the map's huts too.
+    expect(second.cities).toEqual(first.cities);
+    expect(second.nextCityId).toBe(first.nextCityId);
+    expect(second.map.huts).toEqual(first.map.huts);
     expect(second).toEqual(first);
   });
 
@@ -322,17 +401,28 @@ describe('starting units', () => {
 });
 
 describe('starting fog', () => {
-  it('has exactly one explored row per player, each one map-sized', () => {
+  it('has exactly one explored row per player — barbarians included — each map-sized', () => {
     const state = mustGame(42, { ...SETTINGS, civCount: 3 }, RULESET);
 
+    // One row per *player*, not per civilization: `PlayerId` is the index into
+    // `players`, so the barbarian player has a row. It is all false, because a
+    // player with no units sees nothing — not a missing row, an empty memory.
     expect(state.explored).toHaveLength(state.players.length);
+    expect(state.explored).toHaveLength(state.settings.civCount + 1);
+
     for (const [index, row] of state.explored.entries()) {
       expect(row).toHaveLength(state.map.width * state.map.height);
-      expect(row.some((seen) => seen)).toBe(true);
-      expect(row.some((seen) => !seen)).toBe(true);
       // A row is addressed by tile index, so it must be dense and boolean.
       expect(row.every((seen) => typeof seen === 'boolean')).toBe(true);
       expect(Number(state.players[index]?.id)).toBe(index);
+
+      const player = state.players[index];
+      if (player?.kind === 'barbarian') {
+        expect(row.some((seen) => seen)).toBe(false);
+        continue;
+      }
+      expect(row.some((seen) => seen)).toBe(true);
+      expect(row.some((seen) => !seen)).toBe(true);
     }
   });
 
@@ -341,7 +431,7 @@ describe('starting fog', () => {
 
     // Radius 2 (Chebyshev), matching the visibility radius `fog.visibleTiles`
     // derives from a unit's position: a start sees what its settler sees.
-    for (const player of state.players) {
+    for (const player of civPlayers(state)) {
       const row = state.explored[Number(player.id)];
       expect(row).toBeDefined();
       if (row === undefined) continue;
@@ -362,16 +452,16 @@ describe('starting fog', () => {
     }
   });
 
-  it('gives each player its own row, describing its own start', () => {
+  it('gives each civilization its own row, describing its own start', () => {
     const state = mustGame(11, SETTINGS, RULESET);
-    const rows = state.players.map((player) => state.explored[Number(player.id)]);
+    const rows = civPlayers(state).map((player) => state.explored[Number(player.id)]);
 
     // Every row is a distinct array: one shared row would make all players see
     // the same tiles, and would show up here before it showed up in play.
     expect(new Set(rows).size).toBe(rows.length);
     expect(rows[0]).not.toEqual(rows[1]);
 
-    for (const [index, player] of state.players.entries()) {
+    for (const [index, player] of civPlayers(state).entries()) {
       const row = rows[index];
       expect(row).toBeDefined();
       if (row === undefined) continue;

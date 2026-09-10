@@ -7,13 +7,28 @@
  * viewport maths (crop + clamp), and — M2 — what a *viewer* may and may not see:
  * a viewer renders only explored tiles, and nothing about an unexplored tile
  * reaches the screen, not even through the legend or the `starts:` line.
+ *
+ * **Migrated to the M3 state shape** (docs/INTERFACES.md M3). The hand-built
+ * fixtures here carry the new required fields: `kind: 'civ'` on a player (these
+ * synthetic boards hold civilizations only — the barbarian player `newGame`
+ * appends is covered by the generated-state cases), `huts` on a map, and
+ * `nextCityId`/`cities` on the state. None of them is read by `describe`, and
+ * that is the point of stating them explicitly: a fixture that omitted them
+ * would only typecheck through a cast, and a cast would hide the next shape
+ * change instead of failing on it.
  */
 
 import { describe, expect, it } from 'vitest';
 import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
 import type { RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { newGame, SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
+import {
+  civPlayers,
+  newGame,
+  SCHEMA_VERSION,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 import { describe as describeState } from '../src/textview.js';
 import { type Unit, type UnitDef } from '../src/units.js';
 
@@ -90,11 +105,19 @@ const GRID_4x4: readonly TerrainRole[] = [
   'mountains',
 ];
 
+/**
+ * A civilization player. M3 gave `PlayerState` a `kind`, and these synthetic
+ * boards are all civilizations: the barbarian player `newGame` appends (M3,
+ * "State shape") is a deliberate omission here, because these tests are about a
+ * *picture* and a barbarian would only add a start marker nobody asked for. The
+ * generated-game cases at the bottom cover the real player list.
+ */
 const player = (index: number, tile: number): PlayerState => ({
   id: asPlayerId(index),
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
+  kind: 'civ',
 });
 
 /** One settler per player, on its own start tile — what `newGame` places. */
@@ -112,10 +135,12 @@ const fogRow = (seen: readonly number[]): readonly boolean[] =>
   Array.from({ length: 16 }, (_, tile) => seen.includes(tile));
 
 /**
- * A full `GameState` — including the M2 `nextUnitId`/`units`/`explored` fields,
- * because a partial literal would only typecheck through a cast. The default fog
- * row is blank: no player has explored anything until a test says so, which
- * makes the viewer tests state their fog explicitly instead of inheriting it.
+ * A full `GameState` — including the M2 `nextUnitId`/`units`/`explored` fields
+ * and M3's `nextCityId`/`cities`, because a partial literal would only typecheck
+ * through a cast. The default fog row is blank: no player has explored anything
+ * until a test says so, which makes the viewer tests state their fog explicitly
+ * instead of inheriting it. M3's map carries `huts`; this board has none,
+ * because `describe` draws terrain, starts and fog and a hut is none of those.
  */
 const syntheticState = (
   players: readonly PlayerState[],
@@ -127,11 +152,13 @@ const syntheticState = (
   seed: 7,
   settings: SETTINGS,
   rng: { a: 1, b: 2, c: 3, d: 4 },
-  map: { width: 4, height: 4, terrain: GRID_4x4.map((role) => asTerrainId(role)) },
+  map: { width: 4, height: 4, terrain: GRID_4x4.map((role) => asTerrainId(role)), huts: [] },
   players,
   nextUnitId: players.length,
   units: startingUnits(players),
   explored: explored ?? players.map(() => fogRow([])),
+  nextCityId: 0,
+  cities: [],
 });
 
 const STATE_4x4: GameState = syntheticState([player(0, 5), player(1, 10)]);
@@ -227,6 +254,7 @@ describe('describe', () => {
         width: 11,
         height: 1,
         terrain: many.map(() => asTerrainId('grassland')),
+        huts: [],
       },
     };
 
@@ -239,7 +267,12 @@ describe('describe', () => {
   it('marks tiles whose terrain id is not in the ruleset', () => {
     const state: GameState = {
       ...STATE_4x4,
-      map: { width: 2, height: 1, terrain: [asTerrainId('grassland'), asTerrainId('volcano')] },
+      map: {
+        width: 2,
+        height: 1,
+        terrain: [asTerrainId('grassland'), asTerrainId('volcano')],
+        huts: [],
+      },
     };
 
     const view = describeState(state, RULESET);
@@ -308,9 +341,15 @@ describe('describe', () => {
     expect(describeState(state.value, RULESET)).toBe(first);
     expect(rows).toHaveLength(state.value.map.height);
     for (const row of rows) expect(row).toHaveLength(state.value.map.width);
+    // Every player is named, the barbarian one included: `PlayerId` is the index
+    // into `players` (M3, "State shape"), and M3 gives the barbarian player the
+    // map's first hut as its `startingTile`, so it is a player with a start like
+    // any other and the `starts:` line reports it as such.
     for (const [index, player_] of state.value.players.entries()) {
       expect(first).toContain(`${String(index)}=${player_.name}@`);
     }
+    expect(state.value.players.some((player_) => player_.kind === 'barbarian')).toBe(true);
+    expect(civPlayers(state.value)).toHaveLength(SETTINGS.civCount);
   });
 
   it('accepts a start tile outside the map without crashing', () => {
@@ -386,6 +425,7 @@ describe('describe with a viewer', () => {
         terrain: GRID_4x4.map((role, tile) =>
           asTerrainId([4, 5, 6, 9].includes(tile) ? role : 'mountains'),
         ),
+        huts: [],
       },
     };
 
@@ -402,7 +442,12 @@ describe('describe with a viewer', () => {
     // so the legend must not acquire `? unknown` from it.
     const state: GameState = {
       ...FOGGED,
-      map: { width: 2, height: 1, terrain: [asTerrainId('volcano'), asTerrainId('grassland')] },
+      map: {
+        width: 2,
+        height: 1,
+        terrain: [asTerrainId('volcano'), asTerrainId('grassland')],
+        huts: [],
+      },
     };
 
     expect(glyphRows(describeState(state, RULESET, { viewer: asPlayerId(0) }))).toEqual(['??']);

@@ -10,6 +10,7 @@
 import { asTileIndex, type TerrainId, type TileIndex } from './ids.js';
 // Type-only, so the import is erased at runtime and cannot create a runtime
 // cycle with `units.ts` (which reads this module's `RulesetView` the same way).
+import type { BuildingDef } from './cities.js';
 import type { UnitDef } from './units.js';
 
 export const TERRAIN_ROLES = [
@@ -55,6 +56,20 @@ export interface RulesetView {
   readonly terrains: readonly TerrainDef[];
   /** The unit catalog, in data order. See `units.ts`' `UnitDef`. */
   readonly units: readonly UnitDef[];
+  /**
+   * The building catalog, in data order. See `cities.ts`' `BuildingDef`.
+   *
+   * **Optional**, unlike `units`, and deliberately so: buildings arrived in M3,
+   * so a view written before them (a test's structural stand-in, an old save's
+   * ruleset) is still a valid view the engine can run a game from — it simply
+   * has nothing to build, and `buildingCatalog` in `cities.ts` is the one place
+   * that decides what "no buildings" means. `units` is required because the M2
+   * amendment made it so: `EndTurn` cannot refill a unit whose type is missing,
+   * whereas a game without buildings is a game, only a shorter one. A validated
+   * `@civts/rules` `Ruleset` always carries the field, so content-driven games
+   * cannot end up accidentally building-less.
+   */
+  readonly buildings?: readonly BuildingDef[];
   readonly fidelity: 'tuned' | 'cited-only';
 }
 
@@ -63,6 +78,16 @@ export interface GameMap {
   readonly height: number;
   /** Row-major terrain ids; length === width * height. */
   readonly terrain: readonly TerrainId[];
+  /**
+   * Goody huts, **ascending** by tile index (M3, "Goody huts").
+   *
+   * A hut belongs to the map rather than to the state's entity arrays because it
+   * is a property of the terrain it sits on: `generateWorld` places huts on land
+   * only and never on a start tile. The list is exactly "the huts still there" —
+   * a land unit entering a hut consumes it (M3's hut rewards), so a consumed hut
+   * leaves this array.
+   */
+  readonly huts: readonly TileIndex[];
 }
 
 export const tileIndex = (width: number, x: number, y: number): TileIndex =>

@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   TERRAIN_ROLES,
   UNIT_ROLES,
+  asBuildingId,
   asTerrainId,
   asUnitTypeId,
   isPlaceholder,
@@ -14,6 +15,7 @@ import {
   provenanceSections,
   summarizeProvenance,
   validateRuleset,
+  type BuildingSpec,
   type Catalog,
   type ProvenanceSection,
   type UnitSpec,
@@ -22,6 +24,8 @@ import {
 /** The catalog's unit rows, and the ones with a sea domain. */
 const UNITS = CATALOG.units;
 const LAND_UNITS = UNITS.filter((u) => u.domain === 'land');
+/** The catalog's building rows. M3 production spends shields on these. */
+const BUILDINGS = CATALOG.buildings;
 
 /**
  * The catalog with one unit row replaced. Written as a function rather than a
@@ -29,8 +33,18 @@ const LAND_UNITS = UNITS.filter((u) => u.domain === 'land');
  * catalog's shape cannot make one of the cases below silently stop testing.
  */
 const withUnit = (id: string, patch: Partial<UnitSpec>): Catalog => ({
-  terrains: CATALOG.terrains,
+  ...CATALOG,
   units: UNITS.map((u) => (u.id === id ? { ...u, ...patch } : u)),
+});
+
+/**
+ * The catalog with one building row replaced — the building counterpart of
+ * `withUnit`, and the only way the cases below reach a broken building row
+ * without restating the whole catalog.
+ */
+const withBuilding = (id: string, patch: Partial<BuildingSpec>): Catalog => ({
+  ...CATALOG,
+  buildings: BUILDINGS.map((b) => (b.id === id ? { ...b, ...patch } : b)),
 });
 
 /** The field names of `invalid-value` errors, or the kind for every other error. */
@@ -69,7 +83,7 @@ describe('ruleset validation', () => {
   });
 
   it('reports an empty catalog', () => {
-    const r = validateRuleset({ terrains: [], units: [] }, 'tuned');
+    const r = validateRuleset({ terrains: [], units: [], buildings: [] }, 'tuned');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error[0]?.kind).toBe('empty-catalog');
   });
@@ -80,8 +94,8 @@ describe('ruleset validation', () => {
     if (first === undefined) return;
 
     const broken = {
+      ...CATALOG,
       terrains: [{ ...first, yields: { food: -1, shields: 0.5, commerce: 0 } }],
-      units: UNITS,
     };
     const r = validateRuleset(broken, 'tuned');
     expect(r.ok).toBe(false);
@@ -98,7 +112,7 @@ describe('ruleset validation', () => {
     if (first === undefined) return;
 
     const r = validateRuleset(
-      { terrains: [{ ...first, moveCost: 0, impassable: false }], units: UNITS },
+      { ...CATALOG, terrains: [{ ...first, moveCost: 0, impassable: false }] },
       'tuned',
     );
     expect(r.ok).toBe(false);
@@ -136,7 +150,7 @@ describe('unit catalog', () => {
   });
 
   it('rejects a duplicate unit id', () => {
-    const r = validateRuleset({ terrains: CATALOG.terrains, units: [...UNITS, ...UNITS] }, 'tuned');
+    const r = validateRuleset({ ...CATALOG, units: [...UNITS, ...UNITS] }, 'tuned');
     expect(r.ok).toBe(false);
     if (!r.ok) {
       const dupes = r.error.filter((e) => e.kind === 'duplicate-id');
@@ -201,7 +215,7 @@ describe('unit catalog', () => {
 
   it('rejects a sea unit in a catalog with no water terrain', () => {
     const land = CATALOG.terrains.filter((t) => t.role !== 'ocean' && t.role !== 'coast');
-    const r = validateRuleset({ terrains: land, units: UNITS }, 'tuned');
+    const r = validateRuleset({ ...CATALOG, terrains: land }, 'tuned');
     expect(r.ok).toBe(false);
     if (!r.ok) {
       // The hole is reported twice on purpose: once from the terrain side (the
@@ -219,7 +233,7 @@ describe('unit catalog', () => {
   });
 
   it('accepts a land-only unit catalog without water units', () => {
-    const r = validateRuleset({ terrains: CATALOG.terrains, units: LAND_UNITS }, 'tuned');
+    const r = validateRuleset({ ...CATALOG, units: LAND_UNITS }, 'tuned');
     expect(r.ok).toBe(true);
   });
 
@@ -230,6 +244,103 @@ describe('unit catalog', () => {
       expect(r.value.units).toEqual([...UNITS]);
       // A validated ruleset carries units, so it satisfies the engine's view.
       expect(r.value.units.every((u) => u.provenance.kind === 'placeholder')).toBe(true);
+    }
+  });
+});
+
+describe('building catalog', () => {
+  it('provides a handful of buildings, which is what M3 production needs', () => {
+    expect(BUILDINGS.length).toBeGreaterThanOrEqual(3);
+    for (const b of BUILDINGS) {
+      expect(b.name).not.toBe('');
+      expect(b.cost).toBeGreaterThanOrEqual(1);
+      expect(Number.isInteger(b.cost)).toBe(true);
+    }
+  });
+
+  it('has unique ids', () => {
+    const ids = BUILDINGS.map((b) => b.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  /**
+   * The provenance warning at the top of INTERFACES.md M3 is the point of this
+   * test: every building row is `placeholder`, and its note has to *say* the
+   * number is ours rather than claiming Civ 3. "Looks right" is not provenance.
+   */
+  it('is honest about provenance: every row is a placeholder that says so', () => {
+    for (const b of BUILDINGS) {
+      expect(b.provenance.kind).toBe('placeholder');
+      if (b.provenance.kind === 'placeholder') {
+        // The note has to *say* it: unsourced, and ours rather than Civ 3's.
+        const note = b.provenance.note.toLowerCase();
+        expect(note).toContain('unsourced');
+        expect(note).toContain('ours');
+      }
+    }
+  });
+
+  it('requires provenance by type — a spec without one does not compile', () => {
+    expectTypeOf<BuildingSpec['provenance']>().toEqualTypeOf<Provenance>();
+    expectTypeOf<BuildingSpec['cost']>().toEqualTypeOf<number>();
+  });
+
+  it('rejects a duplicate building id', () => {
+    const r = validateRuleset({ ...CATALOG, buildings: [...BUILDINGS, ...BUILDINGS] }, 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const dupes = r.error.filter((e) => e.kind === 'duplicate-id');
+      // The second copy of each row is the duplicate, so one error per building.
+      expect(dupes).toHaveLength(BUILDINGS.length);
+      expect(dupes.map((d) => d.catalog)).toEqual(BUILDINGS.map(() => 'buildings'));
+    }
+  });
+
+  it('rejects a free building and a fractional cost', () => {
+    const free = validateRuleset(withBuilding('granary', { cost: 0 }), 'tuned');
+    expect(free.ok).toBe(false);
+    if (!free.ok) {
+      expect(free.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'buildings',
+        id: asBuildingId('granary'),
+        field: 'cost',
+        detail: 'must be >= 1',
+      });
+    }
+
+    const fractional = validateRuleset(withBuilding('granary', { cost: 1.5 }), 'tuned');
+    expect(fractional.ok).toBe(false);
+    if (!fractional.ok) expect(fieldsOf(fractional.error)).toContain('cost');
+  });
+
+  it('reports an empty buildings catalog the way it reports any empty catalog', () => {
+    const r = validateRuleset({ ...CATALOG, buildings: [] }, 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({ kind: 'empty-catalog', catalog: 'buildings' });
+    }
+  });
+
+  it('refuses placeholder buildings in cited-only mode', () => {
+    const r = validateRuleset(CATALOG, 'cited-only');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const buildingsInCitedOnly = r.error.filter(
+        (e) => e.kind === 'placeholder-in-cited-only' && e.catalog === 'buildings',
+      );
+      expect(buildingsInCitedOnly).toHaveLength(BUILDINGS.length);
+    }
+  });
+
+  it('is carried through validation, so the engine can cost a building', () => {
+    const r = validateRuleset(CATALOG, 'tuned');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.buildings).toEqual([...BUILDINGS]);
+      // A validated ruleset's `buildingSpec`s are structurally the engine's
+      // `BuildingDef`s: the cost `itemCost` reads is present and is an integer.
+      for (const b of r.value.buildings) expect(Number.isInteger(b.cost)).toBe(true);
     }
   });
 });
@@ -247,6 +358,7 @@ describe('terrain role coverage', () => {
 
   it('reports a missing-role for a role no terrain provides', () => {
     const withoutOcean = {
+      ...CATALOG,
       terrains: CATALOG.terrains.filter((t) => t.role !== 'ocean'),
       units: LAND_UNITS,
     };
@@ -265,6 +377,7 @@ describe('terrain role coverage', () => {
     // property — covered in "rejects a sea unit in a catalog with no water
     // terrain" below.
     const landOnly = {
+      ...CATALOG,
       terrains: CATALOG.terrains.filter((t) => t.role !== 'ocean' && t.role !== 'coast'),
       units: LAND_UNITS,
     };
@@ -287,7 +400,7 @@ describe('terrain role coverage', () => {
       t.role === 'grassland' ? { ...t, id: savanna } : t,
     );
 
-    const r = validateRuleset({ terrains: renamed, units: UNITS }, 'tuned');
+    const r = validateRuleset({ ...CATALOG, terrains: renamed }, 'tuned');
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.value.terrains.some((t) => t.id === savanna && t.role === 'grassland')).toBe(true);
@@ -299,16 +412,16 @@ describe('terrain role coverage', () => {
 });
 
 describe('provenance summary', () => {
-  it('counts every row exactly once, terrain and unit alike', () => {
+  it('counts every row exactly once, terrain, unit and building alike', () => {
     const s = summarizeProvenance(CATALOG);
-    expect(s.total).toBe(CATALOG.terrains.length + UNITS.length);
+    expect(s.total).toBe(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
     expect(s.cited + s.placeholder).toBe(s.total);
   });
 
   it('is honest about the current state: nothing is cited yet', () => {
     const s = summarizeProvenance(CATALOG);
     expect(s.cited).toBe(0);
-    expect(s.placeholder).toBe(CATALOG.terrains.length + UNITS.length);
+    expect(s.placeholder).toBe(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
   });
 
   /**
@@ -325,7 +438,11 @@ describe('provenance summary', () => {
 
     it('covers every row of every catalog exactly once', () => {
       const ids = provenanceSections(CATALOG).flatMap((s) => s.rows.map((r) => r.id));
-      expect(ids).toEqual([...CATALOG.terrains.map((t) => t.id), ...UNITS.map((u) => u.id)]);
+      expect(ids).toEqual([
+        ...CATALOG.terrains.map((t) => t.id),
+        ...UNITS.map((u) => u.id),
+        ...BUILDINGS.map((b) => b.id),
+      ]);
     });
 
     it('adds up to the summary, so the printed table cannot disagree with the total', () => {
@@ -335,7 +452,7 @@ describe('provenance summary', () => {
       const total = sections.reduce((n, s) => n + s.summary.total, 0);
       const placeholder = sections.reduce((n, s) => n + s.summary.placeholder, 0);
 
-      expect(sections.map((s) => s.name)).toEqual(['terrains', 'units']);
+      expect(sections.map((s) => s.name)).toEqual(['terrains', 'units', 'buildings']);
       expect(total).toBe(summary.total);
       expect(placeholder).toBe(summary.placeholder);
       expect(summary.cited).toBe(summary.total - summary.placeholder);
@@ -351,6 +468,7 @@ describe('provenance summary', () => {
       }
       expect(sectionOf(CATALOG, 'terrains')?.summary.total).toBe(CATALOG.terrains.length);
       expect(sectionOf(CATALOG, 'units')?.summary.total).toBe(UNITS.length);
+      expect(sectionOf(CATALOG, 'buildings')?.summary.total).toBe(BUILDINGS.length);
     });
 
     it('counts a cited unit row as cited, not as a missing row', () => {
@@ -358,19 +476,21 @@ describe('provenance summary', () => {
       // holds it reports it — provenance is a property of the row, not of which
       // catalog the row lives in.
       const cited: Catalog = {
-        terrains: CATALOG.terrains,
+        ...CATALOG,
         units: UNITS.map((u) => (u.id === 'scout' ? { ...u, provenance: CITED_EXAMPLE } : u)),
       };
 
       const summary = summarizeProvenance(cited);
-      expect(summary.total).toBe(CATALOG.terrains.length + UNITS.length);
+      expect(summary.total).toBe(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
       expect(summary.cited).toBe(1);
       expect(summary.placeholder).toBe(summary.total - 1);
 
-      // The terrain section is untouched; the unit section carries the one cited row.
+      // The terrain and building sections are untouched; the unit section carries
+      // the one cited row.
       expect(sectionOf(cited, 'terrains')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'units')?.summary.cited).toBe(1);
       expect(sectionOf(cited, 'units')?.summary.placeholder).toBe(UNITS.length - 1);
+      expect(sectionOf(cited, 'buildings')?.summary.cited).toBe(0);
     });
   });
 });

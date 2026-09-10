@@ -55,13 +55,57 @@
  *   is best left untouched rather than silently given *some* budget. The state is
  *   unreachable from `newGame`, but reachable from a hand-built state, a foreign
  *   ruleset view or a future save load.
+ *
+ * M3 adds three commands — `FoundCity`, `SetWorkedTiles`, `SetProduction` — and
+ * with them three more notes:
+ *
+ * - **One evaluator, two callers, again.** Each new command has a *plan*
+ *   function (`planFoundCity`, `planSetWorkedTiles`, `planSetProduction`), the
+ *   same arrangement `planMove` established: `applyCommand` decides with it, and
+ *   a caller that wants to know whether a choice is legal (the AI picking a tile
+ *   to work, the UI greying out a button, a test asserting a refusal) asks the
+ *   same function. A generator and an applier that disagree is a bug, and the way
+ *   to make disagreement impossible is to have one evaluator rather than two
+ *   careful ones.
+ * - **Founding consumes the settler, and that *is* "already used".** M3 has no
+ *   "has this settler founded yet?" flag, and does not need one: the settler
+ *   leaves `units` when the city appears, so a used settler is an id that no
+ *   longer resolves. `planFoundCity` therefore requires a unit that exists, is
+ *   owned by the actor, and whose type the ruleset resolves with
+ *   `role: 'settler'` — a worker, a warrior or a type the view does not describe
+ *   cannot found, and neither can a settler that is already a city.
+ * - **The two setters emit no event.** The contract's M3 list of new
+ *   `GameEvent` members (INTERFACES.md, "Commands (added to the frozen union)")
+ *   names `CityFounded`, `CityGrew`, `CityStarved`, `CityProduced`, `HutEntered`
+ *   and `BarbariansSpawned` — and nothing for a re-assignment or a queue change.
+ *   The command's own payload is the record of that change, so `SetWorkedTiles`
+ *   and `SetProduction` apply with an empty event list rather than amending a
+ *   frozen union with members it does not have.
+ * - **The turn is not this file's idea.** `EndTurn` checks the actor, calls
+ *   `advanceTurn` in `turn.ts`, and appends its own `TurnEnded` event. Growth, production, the refill and `turn += 1` happen in that order
+ *   because `turn.ts` says so, in one place, for every caller.
+ * - **Goody huts are not implemented here.** A land unit entering a hut consumes
+ *   it and draws a reward from the state RNG; that is M3's hut workstream, and
+ *   nothing in this file draws from the RNG. The seam is the `MoveUnit` case
+ *   below, marked where the reward would resolve.
  */
 
+import {
+  autoAssignWorkedTiles,
+  cityById,
+  cityRadius,
+  MIN_CITY_DISTANCE,
+  type City,
+  type ProductionItem,
+} from './cities.js';
 import { visibleTiles, withExplored } from './fog.js';
 import {
+  asCityId,
   asPlayerId,
   asTileIndex,
   asUnitId,
+  type BuildingId,
+  type CityId,
   type PlayerId,
   type TileIndex,
   type UnitId,
@@ -74,9 +118,12 @@ import {
   terrainAtIndex,
   type RulesetView,
   type TerrainDef,
+  type TerrainRole,
 } from './map.js';
+import { itemCostOf } from './production.js';
 import { err, ok, type Result } from './result.js';
 import type { GameState, PlayerState } from './state.js';
+import { advanceTurn } from './turn.js';
 import { unitById, unitDef, unitsOnTile, type Unit } from './units.js';
 
 /**
@@ -86,12 +133,25 @@ import { unitById, unitDef, unitsOnTile, type Unit } from './units.js';
  */
 export type Command =
   | { readonly type: 'MoveUnit'; readonly unitId: UnitId; readonly to: TileIndex }
-  | { readonly type: 'EndTurn' };
+  | { readonly type: 'EndTurn' }
+  | { readonly type: 'FoundCity'; readonly unitId: UnitId }
+  | {
+      readonly type: 'SetWorkedTiles';
+      readonly cityId: CityId;
+      readonly tiles: readonly TileIndex[];
+    }
+  | { readonly type: 'SetProduction'; readonly cityId: CityId; readonly item: ProductionItem };
 
 /**
  * Every way a command can be refused, as a *reason* rather than a message
  * (PLAN.md §4.4): the AI branches on these, the UI renders them, and tests
  * assert on them.
+ *
+ * M3 adds the reasons the city commands need. They are separate members rather
+ * than one catch-all because the *fix* differs: a tile outside the radius wants a
+ * different tile, a tile another city works wants that claim released, an unknown
+ * production item wants a different item, and a building the city already has
+ * wants another project entirely.
  */
 export type GameError =
   | { readonly kind: 'unknown-unit'; readonly unitId: UnitId }
@@ -106,14 +166,69 @@ export type GameError =
       readonly available: number;
     }
   | { readonly kind: 'occupied-by-enemy'; readonly unitId: UnitId; readonly to: TileIndex }
+  /**
+   * `FoundCity` was asked of a unit that is not an unused settler-role unit —
+   * including a unit whose type the ruleset does not describe, because the engine
+   * cannot see a settler there. A settler that has *already* founded a city is
+   * gone from `state.units`, so that case reports `unknown-unit` (see the module
+   * note).
+   */
+  | { readonly kind: 'not-a-settler'; readonly unitId: UnitId }
+  /** `FoundCity` on a tile that is not land (ocean or coast). */
+  | { readonly kind: 'not-on-land'; readonly unitId: UnitId; readonly tile: TileIndex }
+  /** `FoundCity` too close to an existing city, nearest first. */
+  | {
+      readonly kind: 'city-too-close';
+      readonly unitId: UnitId;
+      readonly tile: TileIndex;
+      readonly cityId: CityId;
+      readonly distance: number;
+      readonly minDistance: number;
+    }
+  | { readonly kind: 'unknown-city'; readonly cityId: CityId }
+  | { readonly kind: 'not-your-city'; readonly cityId: CityId; readonly owner: PlayerId }
+  /**
+   * A tile a city may not work at all: outside its radius, off the map, or the
+   * city centre itself (which is always worked and costs no citizen).
+   */
+  | { readonly kind: 'tile-not-workable'; readonly cityId: CityId; readonly tile: TileIndex }
+  /** A tile another city (of any owner) already works. */
+  | {
+      readonly kind: 'tile-worked-by-another-city';
+      readonly cityId: CityId;
+      readonly tile: TileIndex;
+      readonly byCityId: CityId;
+    }
+  /** The same tile listed twice: one citizen works one tile. */
+  | { readonly kind: 'duplicate-worked-tile'; readonly cityId: CityId; readonly tile: TileIndex }
+  /** More tiles than the city has citizens to work them. */
+  | {
+      readonly kind: 'too-many-worked-tiles';
+      readonly cityId: CityId;
+      readonly requested: number;
+      readonly allowed: number;
+    }
+  /**
+   * A production item this ruleset cannot build: an id no catalog defines, or one
+   * whose cost is not a usable number of shields (see `itemCostOf`).
+   */
+  | { readonly kind: 'unknown-production-item'; readonly item: ProductionItem }
+  /** The city already has this building; building it twice is not a no-op. */
+  | { readonly kind: 'already-built'; readonly cityId: CityId; readonly building: BuildingId }
   | { readonly kind: 'invalid-argument'; readonly detail: string };
 
 /**
  * What an applied command did, for consumers that must not diff the whole state
- * (PLAN.md §5.4: the UI receives events, not 16k tiles per turn). M2 emits two:
- * a moved unit and an advanced turn. The union is exhaustive so a consumer's
- * `switch` is checked, and every event is plain data, so an event log is as
- * hashable as the state it came from.
+ * (PLAN.md §5.4: the UI receives events, not 16k tiles per turn). M2 emits two
+ * events; M3 adds the four city ones below. The union is exhaustive so a
+ * consumer's `switch` is checked, and every event is plain data, so an event log
+ * is as hashable as the state it came from.
+ *
+ * M3's two hut events (`HutEntered`, `BarbariansSpawned` — INTERFACES.md M3,
+ * "Commands (added to the frozen union)") belong to the hut workstream that emits
+ * them and are deliberately **not** declared here: their payload is that
+ * workstream's design decision, and this file should not guess a shape it does
+ * not produce. See the note at the end of the `MoveUnit` case.
  */
 export type GameEvent =
   | {
@@ -126,7 +241,44 @@ export type GameEvent =
       /** That unit's movement after the step. */
       readonly movementLeft: number;
     }
-  | { readonly type: 'TurnEnded'; readonly playerId: PlayerId; readonly turn: number };
+  | { readonly type: 'TurnEnded'; readonly playerId: PlayerId; readonly turn: number }
+  /** A city appeared: `FoundCity` succeeded, and the settler is gone. */
+  | {
+      readonly type: 'CityFounded';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      readonly name: string;
+      readonly tile: TileIndex;
+    }
+  /** `population` citizens now, with `foodBox` carried over toward the next one. */
+  | {
+      readonly type: 'CityGrew';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      readonly population: number;
+      readonly foodBox: number;
+    }
+  /** A deficit took a citizen (never below 1) and restarted the food box at 0. */
+  | {
+      readonly type: 'CityStarved';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      readonly population: number;
+      readonly foodBox: number;
+    }
+  /**
+   * A city finished an item; `shields` is what stayed in its pool. `unitId` and
+   * `tile` are present only when the item was a unit, and say where it appeared.
+   */
+  | {
+      readonly type: 'CityProduced';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      readonly item: ProductionItem;
+      readonly shields: number;
+      readonly unitId?: UnitId;
+      readonly tile?: TileIndex;
+    };
 
 /**
  * The outcome of an applied command: the new state (a fresh object; the input is
@@ -311,6 +463,334 @@ const planMoveFor = (
   });
 };
 
+/* ------------------------------------------------------------------ *
+ * M3: cities — founding, citizen assignment and production choices
+ * ------------------------------------------------------------------ */
+
+/**
+ * The terrain roles that are water. "On land" for `FoundCity` (and "a land tile"
+ * for anything else that asks) means a tile whose terrain role is neither of
+ * these — the same reading `generateWorld` uses when it places starts and huts on
+ * `isWater[i] === false` tiles. Roles are the engine's structural vocabulary for
+ * this: a terrain's `impassable` flag cannot answer it, because mountains are
+ * impassable *and* land.
+ */
+const WATER_ROLES: readonly TerrainRole[] = ['ocean', 'coast'];
+
+/** Is this terrain role water (ocean or coast)? */
+const isWaterRole = (role: TerrainRole): boolean => WATER_ROLES.includes(role);
+
+/**
+ * The id the next founded city will take.
+ *
+ * `nextCityId` is authoritative — it is the state's own statement of "the id the
+ * next founded city will take" — with the same defence `spawnUnit` applies to
+ * unit ids: on a hand-built state or an edited save whose counter is stale, the
+ * id must still not be one the state already uses, because two cities with one id
+ * are indistinguishable to `cityById`, to `cityAt` and to every ownership check.
+ */
+const nextFreeCityId = (state: GameState): CityId =>
+  asCityId(
+    state.cities.reduce((next, city) => Math.max(next, Number(city.id) + 1), state.nextCityId),
+  );
+
+/**
+ * A deterministic name for the city with this id. `City 1`, `City 2`, … numbered
+ * by id, so a city's name is a function of creation order alone.
+ *
+ * A **placeholder** naming scheme: Civ 3 draws names from a per-civilization list,
+ * this project ships no such content, and inventing one here would be content
+ * pretending to be a rule. A player-visible rename command is M4+ if it is wanted.
+ */
+const cityName = (id: CityId): string => `City ${String(Number(id) + 1)}`;
+
+/** `state` with `city` added, keeping `cities` sorted by id. */
+const withNewCity = (state: GameState, city: City): GameState => ({
+  ...state,
+  cities: [...state.cities, city].sort((a, b) => Number(a.id) - Number(b.id)),
+});
+
+/** `state` with the city of the same id replaced (`cities` is rebuilt, not mutated). */
+const withCity = (state: GameState, city: City): GameState => ({
+  ...state,
+  cities: state.cities.map((existing) => (existing.id === city.id ? city : existing)),
+});
+
+/** A city standing too close to where a new one would go. */
+interface CityClash {
+  readonly city: City;
+  readonly distance: number;
+}
+
+/**
+ * The nearest city closer to `tile` than `minDistance` (Chebyshev), or
+ * `undefined` when the site is clear.
+ *
+ * Ties go to the lowest city id, because only a *strictly* smaller distance
+ * replaces the incumbent and `state.cities` is sorted by id — so the reported
+ * clash is a function of the state rather than of iteration luck.
+ */
+const nearestCityWithin = (
+  state: GameState,
+  tile: TileIndex,
+  minDistance: number,
+): CityClash | undefined => {
+  let nearest: CityClash | undefined;
+  for (const city of state.cities) {
+    const distance = distance8(state.map, tile, city.tile);
+    if (distance >= minDistance) continue;
+    if (nearest === undefined || distance < nearest.distance) nearest = { city, distance };
+  }
+  return nearest;
+};
+
+/**
+ * What founding a city will produce, as decided by `planFoundCity`: the settler
+ * that will be consumed, and the city that will exist afterwards — including the
+ * tiles its first citizen will work, so the founder and the applier cannot
+ * disagree about the assignment either.
+ */
+export interface FoundCityPlan {
+  readonly unit: Unit;
+  readonly city: City;
+}
+
+/**
+ * Decide whether `unitId` may found a city for `playerId` — the one place
+ * `FoundCity`'s legality is stated, used by `applyCommand` to refuse and by
+ * `actions.ts` to advertise.
+ *
+ * Checks run in a fixed order so the reported reason is the most specific one
+ * available: actor, unit, ownership, settler role, a well-formed tile on the map,
+ * a terrain the ruleset describes, land, then the distance rule. The plan carries
+ * the city that will be created (id, deterministic name, centre, and the centre's
+ * first citizen's tile from `autoAssignWorkedTiles`), so nothing downstream
+ * re-decides any part of it.
+ *
+ * `MIN_CITY_DISTANCE` (2, Chebyshev, a placeholder) is enforced against *every*
+ * city, of every owner: two cities may not be adjacent, and a tile that already
+ * holds a city centre is distance 0, so "one city per tile" is the same rule.
+ *
+ * Nothing here distinguishes a barbarian settler, and that is a reading stated
+ * rather than an oversight: the frozen `GameError` union has no member for
+ * "barbarians do not build cities", and M3 makes barbarians an ordinary player
+ * holding ordinary units. Refusing one would mean inventing an error kind the
+ * contract does not define (or reusing `not-a-settler` for a unit that plainly is
+ * one, which would make the error lie about why). `commands.test.ts` pins the
+ * behaviour so the next reader sees a decision, not an accident.
+ */
+export const planFoundCity = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  unitId: UnitId,
+): Result<FoundCityPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const unit = unitById(state, unitId);
+  if (unit === undefined) return err({ kind: 'unknown-unit', unitId });
+  if (unit.owner !== playerId) return err({ kind: 'not-your-unit', unitId, owner: unit.owner });
+
+  // A unit type the ruleset does not describe cannot be shown to be a settler, so
+  // it is refused as `not-a-settler` rather than assumed to be one.
+  const def = unitDef(ruleset, unit.type);
+  if (def === undefined || def.role !== 'settler') return err({ kind: 'not-a-settler', unitId });
+
+  const tile = unit.tile;
+  if (!Number.isInteger(Number(tile))) {
+    return err({
+      kind: 'invalid-argument',
+      detail: `FoundCity needs a unit standing on an integer tile index (unit ${String(unitId)} is on ${String(tile)})`,
+    });
+  }
+  const x = indexToX(state.map, Number(tile));
+  const y = indexToY(state.map, Number(tile));
+  if (!inBounds(state.map, x, y)) return err({ kind: 'out-of-bounds', to: tile });
+
+  const terrain = terrainDefAt(state, ruleset, tile);
+  if (terrain === undefined) {
+    return err({
+      kind: 'invalid-argument',
+      detail: `the ruleset defines no terrain for tile ${String(tile)}, so the site cannot be checked`,
+    });
+  }
+  if (isWaterRole(terrain.role)) return err({ kind: 'not-on-land', unitId, tile });
+
+  const clash = nearestCityWithin(state, tile, MIN_CITY_DISTANCE);
+  if (clash !== undefined) {
+    return err({
+      kind: 'city-too-close',
+      unitId,
+      tile,
+      cityId: clash.city.id,
+      distance: clash.distance,
+      minDistance: MIN_CITY_DISTANCE,
+    });
+  }
+
+  const id = nextFreeCityId(state);
+  const founded: City = {
+    id,
+    owner: playerId,
+    name: cityName(id),
+    tile,
+    population: 1,
+    foodBox: 0,
+    shields: 0,
+    // Nothing is being built yet: production is the player's next decision. The
+    // key is *omitted* rather than written as `undefined` — `City.production` is
+    // optional, and a present-but-`undefined` key cannot be represented in
+    // canonical JSON, so `hashValue` would throw on the city just founded.
+    queue: [],
+    buildings: [],
+    workedTiles: [],
+  };
+
+  // The new city is placed in a *copy* of the state so the city-radius helpers can
+  // see it, and its first citizen's tile comes from `autoAssignWorkedTiles` — the
+  // one definition of "the best tiles this city may still take", which also keeps
+  // it off tiles another city already works.
+  const provisional = withNewCity(state, founded);
+  const workedTiles = autoAssignWorkedTiles(provisional, ruleset, id);
+
+  return ok({ unit, city: { ...founded, workedTiles } });
+};
+
+/** What `planSetWorkedTiles` decided: the city, and the assignment it will hold. */
+export interface SetWorkedTilesPlan {
+  readonly city: City;
+  readonly tiles: readonly TileIndex[];
+}
+
+/**
+ * Decide whether `cityId` may be given the assignment `tiles` — the one place
+ * `SetWorkedTiles`'s legality is stated.
+ *
+ * The checks, in order, and why:
+ *
+ * 1. the actor exists, the city exists, the actor owns it (`unknown-player`,
+ *    `unknown-city`, `not-your-city`);
+ * 2. `tiles.length <= population` (`too-many-worked-tiles`) — one citizen works
+ *    one tile, and the request is rejected as a whole rather than truncated,
+ *    because a caller that asked for six tiles with three citizens has a bug this
+ *    refusal will find;
+ * 3. each tile, in the order given: a whole number (`invalid-argument`), inside
+ *    the city radius and not the centre (`tile-not-workable`), not worked by
+ *    another city (`tile-worked-by-another-city`), and not already listed
+ *    (`duplicate-worked-tile`).
+ *
+ * The list's **order is preserved** into the state, because it is meaningful:
+ * `cityYields` counts the first `population` entries, so the order is which
+ * citizen works what. Re-listing a tile the city already works is legal (it is
+ * the same city's claim), and assigning *fewer* tiles than the city has citizens
+ * is legal too — an unassigned citizen works nothing, which is a real choice.
+ *
+ * This is the one plan function that takes no `RulesetView`: which tiles a city
+ * may work is geometry (`cityRadius`) and ownership, not content. Saying that in
+ * the signature is more honest than an unused parameter that suggests a rule the
+ * engine does not have.
+ */
+export const planSetWorkedTiles = (
+  state: GameState,
+  playerId: PlayerId,
+  cityId: CityId,
+  tiles: readonly TileIndex[],
+): Result<SetWorkedTilesPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const city = cityById(state, cityId);
+  if (city === undefined) return err({ kind: 'unknown-city', cityId });
+  if (city.owner !== playerId) return err({ kind: 'not-your-city', cityId, owner: city.owner });
+
+  if (tiles.length > city.population) {
+    return err({
+      kind: 'too-many-worked-tiles',
+      cityId,
+      requested: tiles.length,
+      allowed: city.population,
+    });
+  }
+
+  const centre = Number(city.tile);
+  const inside = new Set<number>(cityRadius(state, city.tile).map(Number));
+  const listed = new Set<number>();
+
+  for (const tile of tiles) {
+    const index = Number(tile);
+    if (!Number.isInteger(index)) {
+      return err({
+        kind: 'invalid-argument',
+        detail: `SetWorkedTiles takes integer tile indices (got ${String(tile)})`,
+      });
+    }
+    if (index === centre || !inside.has(index))
+      return err({ kind: 'tile-not-workable', cityId, tile });
+
+    const other = state.cities.find(
+      (candidate) =>
+        candidate.id !== city.id &&
+        candidate.workedTiles.some((worked) => Number(worked) === index),
+    );
+    if (other !== undefined) {
+      return err({ kind: 'tile-worked-by-another-city', cityId, tile, byCityId: other.id });
+    }
+
+    if (listed.has(index)) return err({ kind: 'duplicate-worked-tile', cityId, tile });
+    listed.add(index);
+  }
+
+  return ok({ city, tiles: [...tiles] });
+};
+
+/** What `planSetProduction` decided: the city, the item, and what it costs. */
+export interface SetProductionPlan {
+  readonly city: City;
+  readonly item: ProductionItem;
+  readonly cost: number;
+}
+
+/**
+ * Decide whether `cityId` may be set to build `item` — the one place
+ * `SetProduction`'s legality is stated.
+ *
+ * Two refusals, as the contract fixes them: an item this ruleset cannot build
+ * (`unknown-production-item`, which includes a row whose cost is not a usable
+ * number of shields — see `itemCostOf`), and a building the city already has
+ * (`already-built`; building it twice is a typed refusal, never a silent no-op).
+ * Queueing a building the city does **not** yet have is legal, and so is setting
+ * the item a city is already building — the applier accepts exactly what this
+ * function accepts, and an applier that refused a redundant-but-legal command
+ * would make the two disagree.
+ */
+export const planSetProduction = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  cityId: CityId,
+  item: ProductionItem,
+): Result<SetProductionPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const city = cityById(state, cityId);
+  if (city === undefined) return err({ kind: 'unknown-city', cityId });
+  if (city.owner !== playerId) return err({ kind: 'not-your-city', cityId, owner: city.owner });
+
+  const cost = itemCostOf(ruleset, item);
+  if (cost === undefined) return err({ kind: 'unknown-production-item', item });
+
+  if (item.kind === 'building' && city.buildings.includes(item.id)) {
+    return err({ kind: 'already-built', cityId, building: item.id });
+  }
+
+  return ok({ city, item, cost });
+};
+
 /**
  * Apply a decided move: a new `units` array with the mover replaced (in place,
  * so the array stays sorted by id), `revision` bumped once, and the mover's new
@@ -373,6 +853,14 @@ export const applyCommand = (
           movementLeft: plan.value.movementLeft,
         },
       ];
+      // M3 seam, deliberately not implemented here: a land unit entering a goody
+      // hut consumes it and draws a reward from the state RNG (a free unit, a band
+      // of barbarians, or nothing), which is the hut workstream's code. It hangs
+      // off this line — the move has succeeded and the mover is now standing on
+      // `plan.value.to` — and it is the only place in `core` that would draw from
+      // `state.rng` on this path. Emitting `HutEntered`/`BarbariansSpawned` also
+      // means adding those members to the `GameEvent` union above, which this file
+      // owns.
       return ok({ state: movedState(state, plan.value), events });
     }
 
@@ -381,20 +869,82 @@ export const applyCommand = (
         return err({ kind: 'unknown-player', playerId });
       }
 
-      // Total by design: every unit whose type the ruleset defines is refilled to
-      // that type's movement, and a unit whose type it does not define is carried
-      // over untouched. There is no honest budget to guess for an unresolvable
-      // type, and refusing the whole turn for one such unit would contradict
-      // `legalActions`, which yields `EndTurn` for every real player. Ending a
-      // turn is about the turn, not about the catalog.
-      const units: readonly Unit[] = state.units.map((unit) => {
-        const def = unitDef(ruleset, unit.type);
-        return def === undefined ? unit : { ...unit, movementLeft: def.movement };
-      });
+      // The whole of "a turn" lives in `turn.ts` — growth for every city
+      // (city-id order), production for every city (city-id order), every unit's
+      // movement refilled, `turn += 1` — and this case deliberately re-implements
+      // none of it. All this layer adds is the actor's `TurnEnded` event (which
+      // names a player, and so is not a property of the world) and the single
+      // `revision` bump every applied command performs.
+      const outcome = advanceTurn(state, ruleset);
+      const turn = outcome.state.turn;
+      const events: readonly GameEvent[] = [
+        ...outcome.events,
+        { type: 'TurnEnded', playerId, turn },
+      ];
+      return ok({ state: { ...outcome.state, revision: state.revision + 1 }, events });
+    }
 
-      const turn = state.turn + 1;
-      const events: readonly GameEvent[] = [{ type: 'TurnEnded', playerId, turn }];
-      return ok({ state: { ...state, revision: state.revision + 1, turn, units }, events });
+    case 'FoundCity': {
+      const plan = planFoundCity(state, ruleset, playerId, cmd.unitId);
+      if (!plan.ok) return err(plan.error);
+
+      const founded = plan.value.city;
+
+      // The settler is consumed and the city takes its place. Nothing else moves:
+      // `nextCityId` advances past the id just used, the cities array stays sorted
+      // by id, and every other field is shared with the input.
+      const next: GameState = {
+        ...state,
+        revision: state.revision + 1,
+        nextCityId: Number(founded.id) + 1,
+        cities: [...state.cities, founded].sort((a, b) => Number(a.id) - Number(b.id)),
+        units: state.units.filter((unit) => unit.id !== plan.value.unit.id),
+      };
+
+      const events: readonly GameEvent[] = [
+        {
+          type: 'CityFounded',
+          cityId: founded.id,
+          owner: founded.owner,
+          name: founded.name,
+          tile: founded.tile,
+        },
+      ];
+      return ok({ state: next, events });
+    }
+
+    case 'SetWorkedTiles': {
+      const plan = planSetWorkedTiles(state, playerId, cmd.cityId, cmd.tiles);
+      if (!plan.ok) return err(plan.error);
+
+      // No event (see the module note): the command's payload *is* the change, and
+      // the frozen M3 event list has no member for an assignment. The tiles are
+      // stored in the order given — that order is which citizen works what.
+      return ok({
+        state: {
+          ...withCity(state, { ...plan.value.city, workedTiles: plan.value.tiles }),
+          revision: state.revision + 1,
+        },
+        events: [],
+      });
+    }
+
+    case 'SetProduction': {
+      const plan = planSetProduction(state, ruleset, playerId, cmd.cityId, cmd.item);
+      if (!plan.ok) return err(plan.error);
+
+      // "Set" replaces the head of the queue; the rest of the queue is left alone,
+      // and so are the city's stored shields — they are the city's investment, not
+      // the item's, so redirecting production does not throw them away. There is no
+      // command in M3 that appends to the queue (that is M4's, with a cancel to go
+      // with it), so `queue` remains what a save or a hand-built state put there.
+      return ok({
+        state: {
+          ...withCity(state, { ...plan.value.city, production: plan.value.item }),
+          revision: state.revision + 1,
+        },
+        events: [],
+      });
     }
   }
 };

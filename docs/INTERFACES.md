@@ -496,3 +496,202 @@ impassable and from enemy-occupied tiles; fog expanding as a unit moves.
   adding `units`/`explored` to `GameState` will change every existing hash, so this
   is expected exactly once, in the M2 commit.
 - The three scenarios above pass and are wired into `pnpm verify`.
+
+---
+
+# M3 contracts — FROZEN
+
+Acceptance (PLAN.md §12): found city; food-box growth; citizen assignment on the
+21-tile radius; production queue; huts grant rewards or spawn barbarians; a
+growth-timing scenario.
+
+## Provenance warning — read this before writing any number
+
+Every terrain and unit row today is `placeholder`. M3 adds sizes, costs and
+thresholds that *feel* like Civ 3 constants. **Do not present a guessed number as
+Civ 3's.** The project already made this mistake once: a Civ Fanatics thread titled
+"city growth mechanics" yields `20 + 2·pop`, which is **Civ IV, not Civ III**.
+So: every new rules row is `placeholder`, its `provenance` detail states plainly
+that the value is unsourced and chosen to be playable, and any place where the real
+game is known to differ is noted. `fidelity: 'cited-only'` must keep refusing to
+start. "Looks right" is not provenance.
+
+## State shape
+
+`PlayerId` remains the index into `players` — that invariant is load-bearing for
+`explored`. Barbarians are therefore **a player**, appended by `newGame` with
+`kind: 'barbarian'`, rather than a special case outside the array:
+
+```ts
+export interface PlayerState {
+  readonly id: PlayerId;
+  readonly name: string;
+  readonly color: string;
+  readonly startingTile: TileIndex;
+  readonly kind: 'civ' | 'barbarian';   // NEW
+}
+export function civPlayers(state: GameState): readonly PlayerState[];  // kind === 'civ'
+```
+
+`players.length === settings.civCount + 1` after M3. Anything that means "how many
+civilizations" must use `civPlayers`, never `players.length`.
+
+```ts
+export interface City {
+  readonly id: CityId;
+  readonly owner: PlayerId;
+  readonly name: string;
+  readonly tile: TileIndex;                    // the city centre
+  readonly population: number;                 // citizens, >= 1
+  readonly foodBox: number;                    // progress toward the next growth
+  readonly shields: number;                    // stored production
+  readonly production?: ProductionItem;        // head of the queue; ABSENT when idle
+  readonly queue: readonly ProductionItem[];   // rest of the queue, FIFO
+  readonly buildings: readonly BuildingId[];
+  readonly workedTiles: readonly TileIndex[];  // EXCLUDES the centre, length <= population
+}
+
+export type ProductionItem =
+  | { readonly kind: 'unit'; readonly id: UnitTypeId }
+  | { readonly kind: 'building'; readonly id: BuildingId };
+```
+
+`GameState` gains `nextCityId: number` and `cities: readonly City[]` (sorted by
+id, as with units). **`SCHEMA_VERSION` goes 2 → 3 and every golden hash changes
+again** — a second intentional rehash, same rules as M2: regenerate through the
+harness's documented path, never hand-edit, and put a `rehash:` line in the commit
+message. `GameMap` also gains `huts: readonly TileIndex[]` (ascending), so the map
+changes too.
+
+**Amendment (foundation integration, binding):** `production` is **optional**, not
+`ProductionItem | undefined`. A required field holding `undefined` is not
+serialisable — a JSON save/load round trip drops the key — so every state
+containing a city was unhashable (`canonicalize` rejects `undefined` by design).
+Making the field optional under `exactOptionalPropertyTypes` means "nothing being
+built" is expressed by the key being *absent*, and the compiler refuses to let
+anyone write the unhashable spelling again. This is the third time an explicit
+`undefined` blocked hashing (see the M2 `Settings.ruleset` trap); the fix belongs
+in the producer and the type, never in the hasher.
+
+## City geometry and yields
+
+- **Radius = 21 tiles**: every tile with `max(|dx|, |dy|) <= 2` *except* the four
+  corners where `|dx| == 2 && |dy| == 2`. That is the classic shape; it is a
+  `placeholder` rule, not a sourced one.
+- The **centre is always worked and free** (it costs no citizen). Its yields are
+  the terrain's, floored at 1 food / 1 shield / 1 commerce — placeholder.
+- Each citizen works **one** tile inside the radius. `workedTiles` excludes the
+  centre, so `workedTiles.length <= population`.
+- A tile worked by one city may not be worked by another. Two cities of the same
+  or different owners may not work the same tile; assignment must reject it.
+- Yields are **integers only** (PLAN.md §5.3). Sums are plain integer addition.
+
+```ts
+// cities.ts
+export function cityById(state: GameState, id: CityId): City | undefined;
+export function citiesOf(state: GameState, playerId: PlayerId): readonly City[];
+export function cityRadius(state: GameState, tile: TileIndex): readonly TileIndex[];
+export function cityYields(state: GameState, ruleset: RulesetView, cityId: CityId):
+  { readonly food: number; readonly shields: number; readonly commerce: number;
+    readonly foodSurplus: number };
+export function cityAt(state: GameState, tile: TileIndex): City | undefined;
+export const MIN_CITY_DISTANCE = 2;   // Chebyshev; a city may not be founded closer
+```
+
+## Growth (food box)
+
+```ts
+// growth.ts
+export function foodBoxSize(population: number): number;   // placeholder thresholds
+export function applyGrowth(state: GameState, ruleset: RulesetView): GrowthOutcome;
+```
+
+- Each turn a city adds `foodSurplus` to `foodBox`. A surplus `>= 0` never starves.
+- At `foodBox >= foodBoxSize(population)`: `population += 1` and `foodBox` carries
+  the remainder over (do not silently reset it — carry-over is observable).
+- A deficit draws down `foodBox`; if it would go below zero, `population -= 1`
+  (never below 1) and `foodBox` restarts at 0. Emit `CityStarved`.
+- Growth is applied to **every** city each turn, in city-id order, so the result
+  never depends on iteration order of an object.
+
+## Production
+
+```ts
+// production.ts
+export function applyProduction(state: GameState, ruleset: RulesetView): ProductionOutcome;
+export function itemCost(ruleset: RulesetView, item: ProductionItem): number;   // shields
+```
+
+- `shields += cityYields(...).shields`; at `shields >= itemCost`: complete the
+  item, `shields` carries the remainder, the item is consumed from the queue and
+  the next queue entry becomes `production`.
+- Completing a `unit` places it on the city centre (or the first free adjacent
+  tile) with full movement; completing a `building` appends to `buildings` and is
+  rejected as a duplicate (building it twice is a `GameError`, not a silent no-op).
+- An empty queue with `shields` stored is legal — shields just accumulate.
+
+## Commands (added to the frozen union)
+
+```ts
+| { readonly type: 'FoundCity'; readonly unitId: UnitId }
+| { readonly type: 'SetWorkedTiles'; readonly cityId: CityId; readonly tiles: readonly TileIndex[] }
+| { readonly type: 'SetProduction'; readonly cityId: CityId; readonly item: ProductionItem }
+```
+
+- `FoundCity` requires a settler-role unit owned by the actor, on land, not
+  adjacent to another city (`MIN_CITY_DISTANCE`), and **consumes the settler**.
+  New cities get `population: 1`, a deterministic name, and their centre plus the
+  best-yielding radius tiles auto-assigned.
+- `legalActions` must yield `FoundCity` for a settler that can found, and must
+  **not** yield it where founding is illegal — the keystone invariant (both
+  directions) still applies, and it now spans three generators.
+- New `GameEvent` members: `CityFounded`, `CityGrew`, `CityStarved`,
+  `CityProduced`, `HutEntered`, `BarbariansSpawned`.
+
+## Turn pipeline
+
+`advanceTurn(state, ruleset)` in `turn.ts` must be the single definition of what
+"a turn" means, and its order is part of the contract:
+
+1. **growth** for every city (city-id order), then
+2. **production** for every city (city-id order), then
+3. refill every unit's movement, then
+4. `turn += 1`.
+
+`EndTurn` calls it. Resolve any disagreement about ordering here rather than in a
+caller.
+
+## Goody huts
+
+- Huts are placed by `generateWorld` (count scales with map size — placeholder),
+  sit on land only, never on a start tile, and are sorted ascending.
+- A land unit entering a hut tile **consumes** it and draws a reward from the
+  state RNG (so it is reproducible and advances `state.rng`): a free unit, a band
+  of barbarian units near the hut, or nothing. Sea units and cities never trigger.
+- Barbarian units belong to the barbarian player and are ordinary `Unit`s, so
+  movement and future combat need no special case.
+- `{ kind: 'gold' }` is deliberately **out of scope** in M3: there is no treasury
+  until M4, and inventing one here would duplicate M4's job. Say so in the
+  provenance detail rather than quietly omitting it.
+
+## Migration owners (the F6 rule)
+
+Any amendment or shape change in M3 must name the owner of every existing consumer
+before agents launch. Current consumers that WILL need migrating, by name:
+`packages/core/test/state.test.ts` (`players.length === civCount`), the goldens,
+`packages/testing/test/adversarial.test.ts`, `packages/testing/test/m2-adversarial.test.ts`,
+`packages/testing/test/golden.test.ts` (its `formatSetupError` switch, if
+`SetupError` gains a variant), `packages/core/test/textview.test.ts` (hand-built
+`GameState` literals), and the REPL transcript fixture in
+`packages/headless/test/repl.test.ts`. If you are not the named owner, escalate
+with the exact `file:line` and the fix recipe — do not edit it.
+
+## M3 acceptance evidence
+
+- `pnpm verify` green, including the both-directions keystone sweep now covering
+  `FoundCity`/`SetWorkedTiles`/`SetProduction`.
+- A **growth-timing** scenario asserting the exact turn a city grows, with the
+  exact food box remaining, plus a starvation scenario.
+- A hut scenario covering each reward branch on a fixed seed.
+- The REPL can found a city and show it, and a scripted session is still a
+  hash-pinned regression fixture.

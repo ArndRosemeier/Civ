@@ -20,6 +20,13 @@
  * The expected Chebyshev balls are computed with `distance8` from `map.ts`: an
  * independent oracle, so the box scan inside `visibleTiles` is not checked
  * against a copy of itself.
+ *
+ * **Migrated to the M3 state shape** (docs/INTERFACES.md M3). The hand-built
+ * fixtures carry `kind: 'civ'` on a player, `huts` on the map and
+ * `nextCityId`/`cities` on the state, and the generated-game cases ask
+ * `civPlayers` for "the civilizations' starts" — `players` now ends with the
+ * barbarian player, whose own fog row is asserted to be blank and map-sized
+ * rather than being silently skipped.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -41,7 +48,13 @@ import {
   type TerrainRole,
 } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { newGame, SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
+import {
+  civPlayers,
+  newGame,
+  SCHEMA_VERSION,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 import { describe as describeState } from '../src/textview.js';
 import { type Unit, type UnitDef } from '../src/units.js';
 
@@ -86,13 +99,19 @@ const MAP: GameMap = {
   width: WIDTH,
   height: WIDTH,
   terrain: Array.from({ length: SIZE }, () => asTerrainId('grassland')),
+  // M3: huts live on the map. This board has none — fog is about tiles a player
+  // has seen, and a hut is not a fog rule; the generated-game cases below do
+  // carry the real, hut-bearing map.
+  huts: [],
 };
 
+/** A civilization. M3 added `kind`; these hand-built players are all civs. */
 const player = (index: number, tile: number): PlayerState => ({
   id: asPlayerId(index),
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
+  kind: 'civ',
 });
 
 const unit = (id: number, owner: number, tile: number): Unit => ({
@@ -154,6 +173,9 @@ const STATE: GameState = {
   nextUnitId: 2,
   units: [unit(0, 0, P0_START), unit(1, 1, P1_START)],
   explored: [rowOf(ball(P0_START, 2)), rowOf(ball(P1_START, 2))],
+  // M3: a hand-built world has no cities; `FoundCity` is the only creator.
+  nextCityId: 0,
+  cities: [],
 };
 
 /** A tile player 0 has never been near: (5,5) = 35, four tiles from its unit. */
@@ -398,10 +420,14 @@ describe('withExplored', () => {
 });
 
 describe('fog in a generated game', () => {
-  it('starts with each start marked explored exactly to the visibility radius', () => {
+  it("starts with each civilization's start marked explored exactly to the visibility radius", () => {
     const state = mustGame(4242);
 
-    for (const playerState of state.players) {
+    // One player per *civilization*: since M3 `players` also carries the
+    // barbarian player, so "the starts of the civilizations" is `civPlayers`.
+    expect(civPlayers(state)).toHaveLength(SETTINGS.civCount);
+
+    for (const playerState of civPlayers(state)) {
       const wrong: number[] = [];
       for (let tile = 0; tile < state.map.width * state.map.height; tile += 1) {
         const expected = distance8(state.map, tile, playerState.startingTile) <= VISIBILITY_RADIUS;
@@ -414,13 +440,39 @@ describe('fog in a generated game', () => {
   it('starts with each settler seeing what its own start has explored, and no more', () => {
     const state = mustGame(4242);
 
-    for (const playerState of state.players) {
+    for (const playerState of civPlayers(state)) {
       const visible = visibleTiles(state, playerState.id);
       expect(visible.length).toBeGreaterThan(0);
       for (const tile of visible) {
         expect(isExplored(state, playerState.id, tile)).toBe(true);
       }
     }
+  });
+
+  it('starts the barbarian player blind: a player identity, not a civilization', () => {
+    const state = mustGame(4242);
+    const size = state.map.width * state.map.height;
+    const barbarian = state.players.find((playerState) => playerState.kind === 'barbarian');
+    if (barbarian === undefined) throw new Error('newGame must append a barbarian player');
+
+    // `players.length === civCount + 1` after M3, and the extra one is not a
+    // civilization — which is exactly why every "how many civs" question above
+    // asks `civPlayers` instead of counting this array.
+    expect(state.players).toHaveLength(SETTINGS.civCount + 1);
+    expect(civPlayers(state)).not.toContain(barbarian);
+
+    // It owns no unit at setup, so it sees nothing and remembers nothing…
+    expect(visibleTiles(state, barbarian.id)).toEqual([]);
+    const seen: number[] = [];
+    for (let tile = 0; tile < size; tile += 1) {
+      if (isExplored(state, barbarian.id, asTileIndex(tile))) seen.push(tile);
+    }
+    expect(seen).toEqual([]);
+
+    // …but its row exists and is map-sized, because `PlayerId` *is* the index
+    // into `players` and `explored` is row-indexed by it (M3, "State shape").
+    expect(state.explored[Number(barbarian.id)]).toHaveLength(size);
+    expect(state.explored).toHaveLength(state.players.length);
   });
 
   it('shows a viewer more of the map after it moves and the sight is recorded', () => {

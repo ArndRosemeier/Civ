@@ -46,6 +46,14 @@
  * new setup failure. No existing claim was dropped or weakened by that
  * migration: the fixture is the *only* thing that changed shape, and the
  * adversarial expectations still fail if the behaviour they name regresses.
+ *
+ * **Migrated to the M3 state shape** (docs/INTERFACES.md M3). `newGame` now
+ * appends a barbarian player, so `players.length === civCount + 1` and every
+ * claim that meant "the civilizations" — their starts, their count, the spread
+ * the generator guarantees — asks `civPlayers`. Where the test deliberately means
+ * "every player", it says so and is asserted against the M3 invariant
+ * (`civPlayers(state).length === civCount` plus exactly one barbarian), so
+ * "civ count" can never silently drift back to "the length of `players`".
  */
 
 import { execFileSync } from 'node:child_process';
@@ -59,7 +67,12 @@ import {
   MAP_DIMENSIONS,
   MAP_SIZES,
   TERRAIN_ROLES,
+  asCityId,
+  asPlayerId,
   asTerrainId,
+  asTileIndex,
+  asUnitTypeId,
+  civPlayers,
   describe as describeState,
   distance8,
   drawMany,
@@ -180,6 +193,35 @@ const playerAt = (state: GameState, index: number): PlayerState => {
   return player;
 };
 
+/**
+ * The barbarian player `newGame` appends after the civilizations (M3, "State
+ * shape"). It is a player *identity* — the owner a hut's band of warriors will
+ * take — not a civilization, so it is the obstacle that makes `players.length`
+ * the wrong answer to "how many civilizations".
+ */
+const barbarianOf = (state: GameState): PlayerState => {
+  const barbarian = state.players.find((player) => player.kind === 'barbarian');
+  if (barbarian === undefined) throw new Error('newGame must append a barbarian player');
+  return barbarian;
+};
+
+/**
+ * The M3 player invariant, asserted rather than assumed: `civCount`
+ * civilizations, exactly one barbarian, and `PlayerId` still being the index
+ * into `players` (which `explored` and every `owner` field depend on).
+ */
+const expectPlayerModel = (state: GameState, civCount: number): void => {
+  const civs = civPlayers(state);
+  expect(civs).toHaveLength(civCount);
+  expect(state.players).toHaveLength(civCount + 1);
+  expect(state.players.filter((player) => player.kind === 'barbarian')).toHaveLength(1);
+  expect(state.players.map((player) => Number(player.id))).toEqual(
+    Array.from({ length: civCount + 1 }, (_, index) => index),
+  );
+  expect(state.explored).toHaveLength(state.players.length);
+  expect(civs.every((player) => player.kind === 'civ')).toBe(true);
+};
+
 const unitAt = (state: GameState, index: number): Unit => {
   const unit = state.units[index];
   if (unit === undefined) throw new Error(`state has no unit at index ${String(index)}`);
@@ -206,8 +248,15 @@ const withTileReplaced = (state: GameState, index: number, terrainId: TerrainId)
   },
 });
 
+/**
+ * The civilizations' starting tiles — `civPlayers`, not `players`: since M3 the
+ * player list also carries the barbarian player, whose `startingTile` is the
+ * map's first goody hut (a real tile, but not a start the generator chose), so
+ * counting it here would make "one spread-out start per civilization" pass or
+ * fail for the wrong reason.
+ */
 const startTiles = (state: GameState): readonly number[] =>
-  state.players.map((player) => Number(player.startingTile));
+  civPlayers(state).map((player) => Number(player.startingTile));
 
 const minStartDistance = (state: GameState): number => {
   const starts = startTiles(state);
@@ -394,13 +443,16 @@ describe('adversarial: determinism', () => {
     // FAILS IF: canonicalization stops sorting keys (then an object rebuilt in a
     // different order would hash differently, and saves would stop matching).
     const state = mustState('tiny', 2, 42);
-    // Every field of `GameState`, including the M2 additions, written in a
-    // different order from the one `newGame` builds. A missing field here would
-    // be a type error, not a silently different hash.
+    // Every field of `GameState`, including the M2 additions and M3's
+    // `nextCityId`/`cities`, written in a different order from the one
+    // `newGame` builds. A missing field here would be a type error, not a
+    // silently different hash.
     const reordered: GameState = {
       explored: state.explored,
       units: state.units,
       nextUnitId: state.nextUnitId,
+      cities: state.cities,
+      nextCityId: state.nextCityId,
       players: state.players,
       map: state.map,
       rng: state.rng,
@@ -525,6 +577,48 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
           ...state,
           explored: state.explored.map((row, player) =>
             player === 0 ? row.map((seen, tile) => (tile === 0 ? !seen : seen)) : row,
+          ),
+        },
+      ],
+      // M3 fields. `nextCityId` and `cities` are part of the persisted shape and
+      // so of every hash: a save that dropped either would be silently different
+      // from the state it was written from, and `huts` is map data that decides
+      // whether entering a tile consumes a hut.
+      ['nextCityId + 1', { ...state, nextCityId: state.nextCityId + 1 }],
+      [
+        'cities replaced with one city (cities are part of the persisted shape)',
+        {
+          ...state,
+          cities: [
+            {
+              id: asCityId(0),
+              owner: asPlayerId(0),
+              name: 'City 1',
+              tile: playerAt(state, 0).startingTile,
+              population: 1,
+              foodBox: 0,
+              shields: 0,
+              // A city mid-build rather than one with an empty queue: an empty
+              // queue written as an own `production: undefined` property cannot
+              // be hashed at all — `canonicalize` refuses `undefined` — which is
+              // a live defect in `FoundCity` (packages/core/src/commands.ts:632)
+              // and in `promote` (packages/core/src/production.ts:126), reported
+              // by this migration rather than worked around here.
+              production: { kind: 'unit', id: asUnitTypeId('settler') },
+              queue: [],
+              buildings: [],
+              workedTiles: [],
+            },
+          ],
+        },
+      ],
+      ['map.huts gained a tile', { ...state, map: { ...state.map, huts: [asTileIndex(0)] } }],
+      [
+        'the barbarian player relabelled a civilization (kind is persisted)',
+        {
+          ...state,
+          players: state.players.map((player) =>
+            player.id === barbarianOf(state).id ? { ...player, kind: 'civ' } : player,
           ),
         },
       ],
@@ -668,6 +762,10 @@ describe('adversarial: terrain sanity', () => {
       const state = mustState('tiny', 4, seed);
       const starts = startTiles(state);
 
+      // One start per civilization — `startTiles` asks `civPlayers`, so the
+      // barbarian player's own `startingTile` (the map's first hut) cannot pad
+      // this count, and the player model is asserted alongside it.
+      expectPlayerModel(state, 4);
       expect(starts).toHaveLength(4);
       expect(new Set(starts).size).toBe(4);
       expect(minStartDistance(state)).toBeGreaterThan(1);
@@ -714,7 +812,10 @@ describe('adversarial: terrain sanity', () => {
     ];
     for (const [mapSize, civCount] of sizes) {
       const state = mustState(mapSize, civCount, 42);
-      expect(state.players).toHaveLength(civCount);
+      // One player per civilization, plus the barbarian player M3 appends: the
+      // count that must equal `civCount` is `civPlayers`, never `players`.
+      expect(civPlayers(state)).toHaveLength(civCount);
+      expect(state.players).toHaveLength(civCount + 1);
       expect(minStartDistance(state)).toBeGreaterThan(1);
     }
 
@@ -731,7 +832,11 @@ describe('adversarial: terrain sanity', () => {
     expect(capacity).toBe(2);
 
     const state = mustState('duel', 16, 3);
-    expect(state.players).toHaveLength(16);
+    // Sixteen *civilizations*, which since M3 is seventeen players: `civPlayers`
+    // is the count the caller asked for, and the barbarian player is appended
+    // after it.
+    expect(civPlayers(state)).toHaveLength(16);
+    expectPlayerModel(state, 16);
 
     const parsed = parseSettings({ ...settingsFor('duel', 16, 3) });
     expect(parsed.ok).toBe(false);

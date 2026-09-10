@@ -41,6 +41,10 @@ import {
   MAP_SIZES,
   applyCommand,
   asUnitId,
+  buildingDef,
+  citiesOf,
+  cityById,
+  civPlayers,
   describe,
   err,
   inBounds,
@@ -57,11 +61,14 @@ import {
   visibleTiles,
   type Command,
   type CommandOutcome,
+  type BuildingId,
+  type CityId,
   type GameError,
   type GameMap,
   type GameState,
   type MapSize,
   type PlayerId,
+  type ProductionItem,
   type Result,
   type RulesetView,
   type SetupError,
@@ -260,6 +267,39 @@ const yourUnitsLines = (context: ErrorContext): readonly string[] => {
   return [`  your units: ${labels.join('; ')}.`];
 };
 
+/** The acting player's own cities, so a bad city id is a one-line fix. */
+const yourCitiesLines = (context: ErrorContext): readonly string[] => {
+  const mine = citiesOf(context.state, context.playerId);
+  if (mine.length === 0) return ['  your cities: none.'];
+
+  const labels = mine.map(
+    (city) => `${String(city.id)} ${city.name} at ${coordOf(context.state.map, city.tile)}`,
+  );
+  return [`  your cities: ${labels.join('; ')}.`];
+};
+
+/**
+ * `city 0 "City 1" (Player 1 (p0) at 12,8)`, or `city 0` when the state has no
+ * such city — an error about a city the state does not define must still print,
+ * and it must not claim a name or an owner it never read.
+ */
+const cityLabel = (state: GameState, cityId: CityId): string => {
+  const city = cityById(state, cityId);
+  if (city === undefined) return `city ${String(cityId)}`;
+  return (
+    `city ${String(city.id)} "${city.name}" (${playerLabel(state, city.owner)} at ` +
+    `${coordOf(state.map, city.tile)})`
+  );
+};
+
+/** A production item as prose: `unit "settler"` or `building "granary"`. */
+const itemLabel = (ruleset: RulesetView, item: ProductionItem): string =>
+  item.kind === 'unit' ? `unit "${typeName(ruleset, item.id)}"` : buildingLabel(ruleset, item.id);
+
+/** A building as prose, falling back to the raw id when the ruleset cannot name it. */
+const buildingLabel = (ruleset: RulesetView, id: BuildingId): string =>
+  `building "${buildingDef(ruleset, id)?.name ?? id}"`;
+
 /**
  * Render a `GameError` as an explanation plus, where it can be derived, the
  * moves that were legal.
@@ -329,11 +369,109 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
       ].join('\n');
     }
 
+    /* ---------------- M3: founding, citizens and production ---------------- */
+
+    case 'not-a-settler':
+      return [
+        `error: not-a-settler - ${unitLabel(context.state, context.ruleset, error.unitId)} is not a`,
+        '  settler, and only a settler can found a city (founding consumes it).',
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'not-on-land': {
+      const terrain = terrainDefAt(context.state, context.ruleset, error.tile);
+      const what = terrain === undefined ? 'not land' : `"${terrain.name}" (water)`;
+      return [
+        `error: not-on-land - a city can only be founded on land, and ` +
+          `(${coordOf(context.state.map, error.tile)}) is ${what}.`,
+        ...legalMovesLines(context),
+      ].join('\n');
+    }
+
+    case 'city-too-close':
+      return [
+        `error: city-too-close - (${coordOf(context.state.map, error.tile)}) is ` +
+          `${String(error.distance)} tile(s) from ${cityLabel(context.state, error.cityId)}, and ` +
+          `cities must be at least ${String(error.minDistance)} apart (counting diagonals).`,
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'unknown-city':
+      return [
+        `error: unknown-city - there is no city with id ${String(error.cityId)}.`,
+        ...yourCitiesLines(context),
+      ].join('\n');
+
+    case 'not-your-city':
+      return [
+        `error: not-your-city - ${cityLabel(context.state, error.cityId)} belongs to ` +
+          `${playerLabel(context.state, error.owner)}, and you are ` +
+          `${playerLabel(context.state, context.playerId)}.`,
+        ...yourCitiesLines(context),
+      ].join('\n');
+
+    case 'tile-not-workable': {
+      const where = `(${coordOf(context.state.map, error.tile)})`;
+      const city = cityById(context.state, error.cityId);
+      if (city !== undefined && city.tile === error.tile) {
+        return [
+          `error: tile-not-workable - ${where} is the centre of ` +
+            `${cityLabel(context.state, error.cityId)}, and the centre is always`,
+          '  worked for free: it costs no citizen, so it is never listed as a worked tile.',
+        ].join('\n');
+      }
+      return [
+        `error: tile-not-workable - ${where} is not inside the working radius of ` +
+          `${cityLabel(context.state, error.cityId)}.`,
+        '  a city works the tiles within two of its centre (the four corners excepted), and only',
+        '  tiles that are on the map: a tile at or past an edge has no yields to assign.',
+      ].join('\n');
+    }
+
+    case 'tile-worked-by-another-city':
+      return [
+        `error: tile-worked-by-another-city - ` +
+          `(${coordOf(context.state.map, error.tile)}) is already worked by ` +
+          `${cityLabel(context.state, error.byCityId)}.`,
+        '  a tile may be worked by only one city, of any owner, at a time.',
+      ].join('\n');
+
+    case 'duplicate-worked-tile':
+      return [
+        `error: duplicate-worked-tile - (${coordOf(context.state.map, error.tile)}) is listed ` +
+          `twice for ${cityLabel(context.state, error.cityId)}.`,
+        '  one citizen works one tile, so a repeated tile would spend two citizens on one job.',
+      ].join('\n');
+
+    case 'too-many-worked-tiles':
+      return [
+        `error: too-many-worked-tiles - ${cityLabel(context.state, error.cityId)} has ` +
+          `${String(error.allowed)} citizen(s) and can work at most ${String(error.allowed)} ` +
+          `tile(s), but ${String(error.requested)} were given.`,
+        '  the whole request is refused rather than truncated: an assignment longer than the',
+        '  citizen count is a mistake, and a shorter one is what you meant to send.',
+      ].join('\n');
+
+    case 'unknown-production-item':
+      return [
+        `error: unknown-production-item - this ruleset cannot build ` +
+          `${itemLabel(context.ruleset, error.item)}.`,
+        '  an item is buildable when its catalog row exists and its cost is a whole number of',
+        '  shields greater than zero. "state" shows the hash; the ruleset is @civts/rules.',
+      ].join('\n');
+
+    case 'already-built':
+      return [
+        `error: already-built - ${cityLabel(context.state, error.cityId)} already has ` +
+          `${buildingLabel(context.ruleset, error.building)}.`,
+        '  each building is built once per city; building it again is refused rather than',
+        '  quietly ignored, so a queue cannot silently waste shields on a duplicate.',
+      ].join('\n');
+
     case 'invalid-argument':
       return [`error: invalid-argument - ${error.detail}`, ...legalMovesLines(context)].join('\n');
   }
 };
-
 /** A `SetupError` as prose. Shared with the `map` command, so both say the same thing. */
 export const formatSetupError = (error: SetupError): string => {
   switch (error.kind) {
@@ -412,7 +550,10 @@ const promptFor = (playerId: PlayerId): string => `p${String(playerId)}> `;
 const bannerText = (state: GameState, playerId: PlayerId, god: boolean): string =>
   `CivTS play - seed ${String(state.seed)}, ${state.settings.mapSize} map ` +
   `${String(state.map.width)}x${String(state.map.height)}, ` +
-  `${String(state.players.length)} civs\n` +
+  // `civPlayers`, never `players.length`: M3 appends the barbarian player, so the
+  // array is one longer than the civilization count and `--civs 2` would print
+  // "3 civs" (INTERFACES.md M3, "State shape").
+  `${String(civPlayers(state).length)} civs\n` +
   `you are ${playerName(state, playerId)} (p${String(playerId)}); ` +
   (god
     ? 'GOD MODE - the whole map is rendered and fog is ignored\n'
@@ -546,7 +687,10 @@ export const createSession = (options: SessionOptions): ReplSession => {
     const explored = (state.explored[Number(playerId)] ?? []).filter((seen) => seen).length;
     const seeing = visibleTiles(state, playerId).length;
     const mine = state.units.filter((unit) => unit.owner === playerId).length;
-    const civs = state.players
+    // The `civs:` line names civilizations, so it is `civPlayers`: the barbarian
+    // player is a player identity (`PlayerId` is the index into `players`) but not
+    // a civilization, and listing it here would contradict the count above.
+    const civs = civPlayers(state)
       .map((player) => `${playerLabel(state, player.id)}${player.id === playerId ? ' <- you' : ''}`)
       .join(', ');
 
@@ -555,7 +699,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
         `state: seed=${String(state.seed)} turn=${String(state.turn)} ` +
           `revision=${String(state.revision)} schema=${String(state.schemaVersion)} ` +
           `map=${state.settings.mapSize}(${String(state.map.width)}x` +
-          `${String(state.map.height)}) civs=${String(state.players.length)}`,
+          `${String(state.map.height)}) civs=${String(civPlayers(state).length)}`,
         `you: ${String(mine)} unit(s), explored ${String(explored)}/${String(size)} tiles, ` +
           `${String(seeing)} visible right now`,
         `civs: ${civs}`,

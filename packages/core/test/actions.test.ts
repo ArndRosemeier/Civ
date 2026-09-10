@@ -1,6 +1,6 @@
 /**
  * Legal actions — `unitMoveOptions`, `unitActions`, `legalActions`, and the
- * keystone property of M2 (docs/INTERFACES.md, invariant 1, as amended):
+ * keystone property (docs/INTERFACES.md, invariant 1, as amended):
  *
  * > every command a generator yields applies successfully through `applyCommand`
  * > — and every command `applyCommand` accepts is one the generator yields.
@@ -14,9 +14,25 @@
  * ruleset — so the unknown-type state is an explicit case below, and `EndTurn` is
  * total (`commands.ts`).
  *
- * The walk covers four states — a hand-built board, a starved one, a rich one,
- * the unknown-type one, and real `newGame` boards — and applies every candidate
- * to the state it came from.
+ * M3 extends the pair to the city commands, and the extension is deliberately
+ * *asymmetric*, with the asymmetry stated rather than hidden:
+ *
+ * - `FoundCity` is a unit's action, so all three generators yield it exactly when
+ *   `planFoundCity` accepts it — the same both-directions sweep as movement, and
+ *   the candidate universe below grew to include it.
+ * - `SetWorkedTiles` and `SetProduction` are *choices* over a search space (an
+ *   assignment is `C(radius, population)` candidates) and are not enumerated by
+ *   any generator — `actions.ts` says why. Their two directions are therefore
+ *   asserted against the evaluator that `applyCommand` itself consults:
+ *   `assertSetterAgreement` below walks a universe of legal *and* illegal choices
+ *   and requires the applier's verdict (and its typed refusal) to be the plan's,
+ *   while asserting that none of them is advertised as an action. The one thing
+ *   that would be a bug — a setter the applier accepts but the plan refuses, or
+ *   the reverse — fails there.
+ *
+ * The walk covers six states — a hand-built board, one with cities, a starved
+ * one, a rich one, the unknown-type one, and real `newGame` boards — and applies
+ * every candidate to the state it came from.
  *
  * The hand-built board is the one from `commands.test.ts`: width 4, tile index
  * `y * 4 + x`, every `explored` row `false` so that legality is visibly not a fog
@@ -25,8 +41,17 @@
 
 import { describe, expect, it } from 'vitest';
 import { legalActions, unitActions, unitMoveOptions } from '../src/actions.js';
-import { applyCommand, type Command } from '../src/commands.js';
+import { cityRadius, type City, type ProductionItem } from '../src/cities.js';
 import {
+  applyCommand,
+  planSetProduction,
+  planSetWorkedTiles,
+  type Command,
+  type GameError,
+} from '../src/commands.js';
+import {
+  asBuildingId,
+  asCityId,
   asPlayerId,
   asTerrainId,
   asTileIndex,
@@ -41,6 +66,7 @@ import {
   type TerrainDef,
   type TerrainRole,
 } from '../src/map.js';
+import type { Result } from '../src/result.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { SCHEMA_VERSION, newGame, type GameState, type PlayerState } from '../src/state.js';
 import type { Unit, UnitDef, UnitRole } from '../src/units.js';
@@ -88,6 +114,9 @@ const MAP: GameMap = {
   width: 4,
   height: 4,
   terrain: TERRAIN_GRID.map((role) => asTerrainId(role)),
+  // M3: the map carries its goody huts; none here, so no action below can be
+  // affected by one (hut rewards are another workstream's).
+  huts: [],
 };
 
 const makeDef = (id: string, role: UnitRole, movement: number): UnitDef => ({
@@ -108,6 +137,10 @@ const WARRIOR = makeDef('warrior', 'military', 2);
 const RULESET: RulesetView = {
   terrains: TERRAINS,
   units: [SETTLER, SCOUT, WARRIOR],
+  buildings: [
+    { id: asBuildingId('granary'), name: 'Granary', cost: 10 },
+    { id: asBuildingId('library'), name: 'Library', cost: 20 },
+  ],
   fidelity: 'tuned',
 };
 
@@ -118,6 +151,22 @@ const player = (index: number, startingTile: number): PlayerState => ({
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(startingTile),
+  kind: 'civ',
+});
+
+/** A city with M3's shape and playable defaults; every field is spelled out. */
+const city = (id: number, owner: number, tile: number, overrides: Partial<City> = {}): City => ({
+  id: asCityId(id),
+  owner: asPlayerId(owner),
+  name: `City ${String(id + 1)}`,
+  tile: asTileIndex(tile),
+  population: 1,
+  foodBox: 0,
+  shields: 0,
+  queue: [],
+  buildings: [],
+  workedTiles: [],
+  ...overrides,
 });
 
 const unit = (
@@ -153,6 +202,8 @@ const STATE: GameState = {
     unit(2, WARRIOR, 1, 6, 0),
   ],
   explored: [seen(false), seen(false)],
+  nextCityId: 0,
+  cities: [],
 };
 
 const P0 = asPlayerId(0);
@@ -168,6 +219,46 @@ const move = (unitId: number, to: number): Command => ({
   unitId: asUnitId(unitId),
   to: asTileIndex(to),
 });
+
+const foundCity = (unitId: number): Command => ({ type: 'FoundCity', unitId: asUnitId(unitId) });
+
+const setWorkedTiles = (cityId: number, tiles: readonly number[]): Command => ({
+  type: 'SetWorkedTiles',
+  cityId: asCityId(cityId),
+  tiles: tiles.map((tile) => asTileIndex(tile)),
+});
+
+const setProduction = (cityId: number, item: ProductionItem): Command => ({
+  type: 'SetProduction',
+  cityId: asCityId(cityId),
+  item,
+});
+
+const unitItem = (id: string): ProductionItem => ({ kind: 'unit', id: asUnitTypeId(id) });
+const buildingItem = (id: string): ProductionItem => ({ kind: 'building', id: asBuildingId(id) });
+
+/** `state` with `cities`, and `nextCityId` past the highest id present. */
+const withCities = (state: GameState, cities: readonly City[]): GameState => ({
+  ...state,
+  cities: [...cities],
+  nextCityId: cities.reduce((next, existing) => Math.max(next, Number(existing.id) + 1), 0),
+});
+
+/**
+ * Player 0's city on tile 13 ((1,3)), population 2, working nothing — the board
+ * the city-command sweeps run on. It is two tiles from the settler on 5, so
+ * founding a city there is still legal.
+ */
+const CITY = city(0, 0, 13, { population: 2 });
+
+/** The hand-built board plus player 0's city. */
+const CITY_STATE: GameState = withCities(STATE, [CITY]);
+
+/** A board with two cities: player 0's on 13 and player 1's on 5 working tile 8. */
+const SHARED_STATE: GameState = withCities(STATE, [
+  CITY,
+  city(1, 1, 5, { population: 1, workedTiles: [asTileIndex(8)] }),
+]);
 
 /**
  * The ruleset map generation actually runs with: all six terrain roles (or
@@ -259,11 +350,25 @@ const assertEveryUnitActionApplies = (state: GameState, ruleset: RulesetView): n
   return checked;
 };
 
-/** A stable identity for a command, so generators and appliers can be compared as sets. */
-const commandKey = (cmd: Command): string =>
-  cmd.type === 'EndTurn'
-    ? 'EndTurn'
-    : `MoveUnit:${String(Number(cmd.unitId))}:${String(Number(cmd.to))}`;
+/**
+ * A stable identity for a command, so generators and appliers can be compared as
+ * sets. Total over the M3 union, including the two city setters, so a comparison
+ * that included one could not silently collapse it onto another shape.
+ */
+const commandKey = (cmd: Command): string => {
+  switch (cmd.type) {
+    case 'MoveUnit':
+      return `MoveUnit:${String(Number(cmd.unitId))}:${String(Number(cmd.to))}`;
+    case 'EndTurn':
+      return 'EndTurn';
+    case 'FoundCity':
+      return `FoundCity:${String(Number(cmd.unitId))}`;
+    case 'SetWorkedTiles':
+      return `SetWorkedTiles:${String(Number(cmd.cityId))}:${cmd.tiles.map(Number).join(',')}`;
+    case 'SetProduction':
+      return `SetProduction:${String(Number(cmd.cityId))}:${cmd.item.kind}:${cmd.item.id}`;
+  }
+};
 
 /**
  * A superset of every command the generators *could* produce for `playerId`:
@@ -285,10 +390,144 @@ const candidateCommands = (state: GameState, playerId: PlayerId): readonly Comma
     if (owner.owner !== playerId) continue;
     for (let tile = -1; tile <= size; tile += 1) candidates.push(move(Number(owner.id), tile));
     candidates.push({ type: 'MoveUnit', unitId: owner.id, to: asTileIndex(1.5) });
+    // M3: founding is one entry per unit — a unit either can found where it
+    // stands or it cannot — so the universe stays exhaustive without exploding.
+    candidates.push(foundCity(Number(owner.id)));
   }
   candidates.push({ type: 'EndTurn' });
 
   return candidates;
+};
+
+/**
+ * The setter candidate universe: every shape of `SetWorkedTiles`/`SetProduction`
+ * a caller could hand over for this player's cities, legal and illegal alike.
+ * Derived from each city's actual radius (so it works on a generated board too),
+ * and deliberately wider than anything the applier accepts — that is what makes
+ * the agreement check below meaningful.
+ */
+const setterCommands = (state: GameState, playerId: PlayerId): readonly Command[] => {
+  const commands: Command[] = [];
+  const size = state.map.width * state.map.height;
+  const items: readonly ProductionItem[] = [
+    unitItem('settler'),
+    unitItem('scout'),
+    unitItem('warrior'),
+    unitItem('spaceship'),
+    buildingItem('granary'),
+    buildingItem('library'),
+    buildingItem('spaceship'),
+  ];
+
+  for (const owned of state.cities) {
+    if (owned.owner !== playerId) continue;
+    const radius = cityRadius(state, owned.tile);
+    const inRadius = new Set<number>(radius.map(Number));
+    const outside = Array.from({ length: size }, (_, index) => index).find(
+      (index) => !inRadius.has(index),
+    );
+    const first = radius[0];
+    const second = radius[1];
+    const two = radius.slice(0, 2).map(Number);
+    const tooMany = radius.slice(0, owned.population + 1).map(Number);
+
+    const assignments: readonly (readonly number[])[] = [
+      [], // no citizen assigned at all: legal, and it works nothing
+      two, // the first two tiles in radius order
+      [...two].reverse(), // order matters, so the reverse is a different request
+      first === undefined ? [] : [Number(first), Number(first)], // a duplicate
+      [Number(owned.tile)], // the centre: always worked, never a citizen's tile
+      tooMany, // one tile more than there are citizens
+      outside === undefined ? [] : [outside], // off the radius entirely
+      [1.5], // not a tile index at all
+    ];
+
+    for (const tiles of assignments) commands.push(setWorkedTiles(Number(owned.id), tiles));
+    if (second !== undefined) {
+      commands.push(setWorkedTiles(Number(owned.id), [Number(second)]));
+    }
+
+    // A tile another city works, when one lies inside this city's radius — the
+    // `tile-worked-by-another-city` branch, derived rather than hard-coded so it
+    // exists on every board this universe runs against.
+    const rivalClaim = radius
+      .map(Number)
+      .find((tile) =>
+        state.cities.some(
+          (other) =>
+            other.id !== owned.id && other.workedTiles.some((worked) => Number(worked) === tile),
+        ),
+      );
+    if (rivalClaim !== undefined) {
+      commands.push(setWorkedTiles(Number(owned.id), [rivalClaim]));
+    }
+    for (const item of items) commands.push(setProduction(Number(owned.id), item));
+  }
+
+  // Unknown and foreign city ids, so the `unknown-city` / `not-your-city` branches
+  // are swept too.
+  for (const id of [77, 99]) {
+    commands.push(setWorkedTiles(id, []));
+    commands.push(setProduction(id, unitItem('scout')));
+  }
+
+  return commands;
+};
+
+/** The plan evaluator a setter command is decided by — the applier's own. */
+const planSetter = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  cmd: Command,
+): Result<unknown, GameError> => {
+  if (cmd.type === 'SetWorkedTiles') {
+    return planSetWorkedTiles(state, playerId, cmd.cityId, cmd.tiles);
+  }
+  if (cmd.type === 'SetProduction') {
+    return planSetProduction(state, ruleset, playerId, cmd.cityId, cmd.item);
+  }
+  throw new Error(`not a setter command: ${cmd.type}`);
+};
+
+/** What one setter sweep measured, so a caller can prove it was not vacuous. */
+interface SetterTotals {
+  readonly checked: number;
+  readonly accepted: number;
+  readonly yielded: number;
+}
+
+/**
+ * The two directions for the city *choice* commands, as described in the file
+ * header: for every candidate, the applier's verdict — and its typed refusal —
+ * must be the plan evaluator's, and no candidate may be advertised by
+ * `legalActions`. The counts let a caller assert the sweep was neither empty nor
+ * all-accepting.
+ */
+const assertSetterAgreement = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): SetterTotals => {
+  const yielded = new Set([...legalActions(state, ruleset, playerId)].map(commandKey));
+
+  let checked = 0;
+  let accepted = 0;
+  for (const cmd of setterCommands(state, playerId)) {
+    checked += 1;
+    const applied = applyCommand(state, playerId, cmd, ruleset);
+    const planned = planSetter(state, ruleset, playerId, cmd);
+
+    expect(applied.ok).toBe(planned.ok);
+    if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+
+    if (applied.ok) {
+      accepted += 1;
+      expect(yielded.has(commandKey(cmd))).toBe(false);
+    }
+  }
+
+  return { checked, accepted, yielded: yielded.size };
 };
 
 /**
@@ -402,23 +641,89 @@ describe('unitMoveOptions', () => {
 });
 
 describe('unitActions', () => {
-  it('turns each option into the matching MoveUnit command', () => {
-    expect(unitActions(STATE, RULESET, asUnitId(0))).toEqual(
-      unitMoveOptions(STATE, RULESET, asUnitId(0)).map((to) => move(0, to)),
-    );
+  it('offers FoundCity first, then one MoveUnit per option', () => {
+    expect(unitActions(STATE, RULESET, asUnitId(0))).toEqual([
+      foundCity(0),
+      ...unitMoveOptions(STATE, RULESET, asUnitId(0)).map((to) => move(0, to)),
+    ]);
   });
 
   it('has no actions for a unit that has none', () => {
     expect(unitActions(STATE, RULESET, asUnitId(1))).toEqual([]);
     expect(unitActions(STATE, RULESET, asUnitId(99))).toEqual([]);
   });
+
+  it('offers FoundCity exactly where founding is legal, and nowhere else', () => {
+    const offers = (state: GameState, unitId: number): boolean =>
+      unitActions(state, RULESET, asUnitId(unitId)).some((cmd) => cmd.type === 'FoundCity');
+    const applies = (state: GameState, unitId: number): boolean =>
+      applyCommand(state, asPlayerId(0), foundCity(unitId), RULESET).ok;
+
+    // The settler on 5 can found: land, no city within MIN_CITY_DISTANCE, and its
+    // type is a settler's.
+    expect(offers(STATE, 0)).toBe(true);
+    expect(applies(STATE, 0)).toBe(true);
+
+    // Not a settler: the scout and the warrior can never found, whatever their
+    // movement — founding is a property of the unit's *type*.
+    expect(offers(STATE, 1)).toBe(false);
+    expect(applies(STATE, 1)).toBe(false);
+    expect(offers(STATE, 2)).toBe(false);
+    expect(applies(STATE, 2)).toBe(false);
+
+    // A type the ruleset cannot resolve is not a settler either.
+    const ghost = ghostState(0);
+    expect(offers(ghost, 0)).toBe(false);
+    expect(applies(ghost, 0)).toBe(false);
+
+    // Off land: a settler standing on a coast tile has nowhere to put a city.
+    const atSea: GameState = { ...STATE, nextUnitId: 1, units: [unit(0, SETTLER, 0, 3, 2)] };
+    expect(offers(atSea, 0)).toBe(false);
+    expect(applies(atSea, 0)).toBe(false);
+
+    // Too close to an existing city (tile 4 is adjacent to 5).
+    const crowded = withCities(STATE, [city(0, 1, 4)]);
+    expect(offers(crowded, 0)).toBe(false);
+    expect(applies(crowded, 0)).toBe(false);
+
+    // A settler that has already founded: the unit is gone, so its id resolves to
+    // nothing and nothing is offered for it.
+    const founded = applyCommand(STATE, P0, foundCity(0), RULESET);
+    if (!founded.ok) throw new Error('the settler should have founded a city');
+    expect(offers(founded.value.state, 0)).toBe(false);
+    expect(applies(founded.value.state, 0)).toBe(false);
+  });
+
+  it('does not offer FoundCity for another player’s settler, and the applier refuses it', () => {
+    const rival = withCities(
+      // Tile 1 (hills) is land, and three tiles from the city on 13 — so this
+      // settler has somewhere to found, and the only thing standing between it and
+      // a city is whose settler it is.
+      { ...STATE, nextUnitId: 4, units: [...STATE.units, unit(3, SETTLER, 1, 1, 2)] },
+      [CITY],
+    );
+
+    // The per-unit generator speaks for the unit's own owner, so the rival settler
+    // is offered its own city — but never to player 0, and applying it as player 0
+    // is `not-your-unit`.
+    expect(unitActions(rival, RULESET, asUnitId(3))).toContainEqual(foundCity(3));
+    expect(
+      [...legalActions(rival, RULESET, P0)].some(
+        (cmd) => cmd.type === 'FoundCity' && cmd.unitId === asUnitId(3),
+      ),
+    ).toBe(false);
+    expect(applyCommand(rival, P0, foundCity(3), RULESET).ok).toBe(false);
+  });
 });
 
 describe('legalActions', () => {
-  it("yields this player's moves, then a single EndTurn", () => {
+  it("yields this player's unit actions, then a single EndTurn", () => {
     const actions = [...legalActions(STATE, RULESET, P0)];
 
+    // The settler's FoundCity comes before its moves (see `unitActions`); the
+    // scout has spent its movement and offers nothing; EndTurn is last.
     expect(actions).toEqual([
+      foundCity(0),
       move(0, 1),
       move(0, 4),
       move(0, 8),
@@ -430,7 +735,9 @@ describe('legalActions', () => {
 
   it("never yields another player's units", () => {
     const actions = [...legalActions(STATE, RULESET, P0)];
-    const units = actions.flatMap((cmd) => (cmd.type === 'MoveUnit' ? [cmd.unitId] : []));
+    const units = actions.flatMap((cmd) =>
+      cmd.type === 'MoveUnit' || cmd.type === 'FoundCity' ? [cmd.unitId] : [],
+    );
     expect(units.every((unitId) => unitId !== asUnitId(2))).toBe(true);
   });
 
@@ -441,7 +748,8 @@ describe('legalActions', () => {
     // materialise the whole space (PLAN.md §5.2).
     const walk = legalActions(STATE, RULESET, P0);
     expect(walk.next().done).toBe(false);
-    expect([...walk]).toHaveLength(5);
+    // Seven in total (FoundCity, five moves, EndTurn), one of them already taken.
+    expect([...walk]).toHaveLength(6);
   });
 
   it('yields nothing at all for a player that does not exist', () => {
@@ -451,27 +759,52 @@ describe('legalActions', () => {
   });
 
   it('covers exactly the union of the player units’ actions, plus EndTurn', () => {
-    const actions = [...legalActions(STATE, RULESET, P0)].filter(
-      (cmd): cmd is Extract<Command, { type: 'MoveUnit' }> => cmd.type === 'MoveUnit',
-    );
-    const expected = [asUnitId(0), asUnitId(1)].flatMap((unitId) =>
-      unitActions(STATE, RULESET, unitId),
-    );
+    const expected = [
+      ...[asUnitId(0), asUnitId(1)].flatMap((unitId) => unitActions(STATE, RULESET, unitId)),
+      { type: 'EndTurn' } as Command,
+    ];
 
-    expect(actions).toEqual(expected);
+    expect([...legalActions(STATE, RULESET, P0)]).toEqual(expected);
+  });
+
+  it('does not advertise the two city choice commands, however many cities exist', () => {
+    // `SetWorkedTiles` and `SetProduction` are queries, not actions: an assignment
+    // is a search space and a production item is a content choice, so a generator
+    // that yielded "the" assignment would advertise an arbitrary subset as if it
+    // were the whole of what is legal. Their legality is asserted against the plan
+    // evaluators in the keystone sweep below.
+    for (const state of [CITY_STATE, SHARED_STATE]) {
+      const actions = [...legalActions(state, RULESET, P0)];
+      expect(actions.some((cmd) => cmd.type === 'SetWorkedTiles')).toBe(false);
+      expect(actions.some((cmd) => cmd.type === 'SetProduction')).toBe(false);
+      // …while a legal choice really is legal: the applier accepts it.
+      expect(applyCommand(state, P0, setWorkedTiles(0, []), RULESET).ok).toBe(true);
+      expect(applyCommand(state, P0, setProduction(0, unitItem('scout')), RULESET).ok).toBe(true);
+    }
   });
 });
 
 describe('keystone — the generator and the applier agree, in both directions', () => {
   it('holds for the hand-built board, exhaustively, for both players', () => {
-    // Soundness: 5 settler moves + 1 EndTurn for player 0; 1 EndTurn for player 1
-    // (its warrior has spent everything). Completeness: the applier accepts those
-    // same 7 and nothing else. Asserted exactly, so the walk cannot pass
-    // vacuously.
-    expect(assertEveryLegalActionApplies(STATE, RULESET, [P0, P1])).toBe(7);
-    expect(assertEveryUnitActionApplies(STATE, RULESET)).toBe(5);
-    expect(assertKeystone(STATE, RULESET, P0)).toEqual({ yielded: 6, accepted: 6 });
+    // Soundness: FoundCity plus 5 settler moves plus 1 EndTurn for player 0; 1
+    // EndTurn for player 1 (its warrior has spent everything, and a warrior cannot
+    // found). Completeness: the applier accepts those same 8 and nothing else.
+    // Asserted exactly, so the walk cannot pass vacuously.
+    expect(assertEveryLegalActionApplies(STATE, RULESET, [P0, P1])).toBe(8);
+    expect(assertEveryUnitActionApplies(STATE, RULESET)).toBe(6);
+    expect(assertKeystone(STATE, RULESET, P0)).toEqual({ yielded: 7, accepted: 7 });
     expect(assertKeystone(STATE, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
+  });
+
+  it('holds on a board with cities, for both players', () => {
+    // Cities change nothing about the action space yet — `FoundCity` is still the
+    // only city command the generators express, and player 0's settler may still
+    // found (its city on 13 is exactly MIN_CITY_DISTANCE away) — so the counts
+    // match the cityless board. That is the point: adding cities did not change
+    // what is *enumerated*, only what is *queried*.
+    expect(assertEveryLegalActionApplies(CITY_STATE, RULESET, [P0, P1])).toBe(8);
+    expect(assertKeystone(CITY_STATE, RULESET, P0)).toEqual({ yielded: 7, accepted: 7 });
+    expect(assertKeystone(CITY_STATE, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
   });
 
   it('holds for a starved board and for a board where everything is affordable', () => {
@@ -481,12 +814,15 @@ describe('keystone — the generator and the applier agree, in both directions',
     };
     const rich: GameState = withMovement(STATE, 1, SCOUT.movement);
 
-    expect(assertEveryLegalActionApplies(starved, RULESET, [P0, P1])).toBe(2);
-    expect(assertKeystone(starved, RULESET, P0)).toEqual({ yielded: 1, accepted: 1 });
+    // A spent settler cannot *move*, but it can still *found*: founding costs no
+    // movement in M3 (it consumes the unit instead), so each player offers one
+    // action more than M2's board did.
+    expect(assertEveryLegalActionApplies(starved, RULESET, [P0, P1])).toBe(3);
+    expect(assertKeystone(starved, RULESET, P0)).toEqual({ yielded: 2, accepted: 2 });
     expect(assertKeystone(starved, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
 
-    expect(assertEveryLegalActionApplies(rich, RULESET, [P0, P1])).toBe(13);
-    expect(assertKeystone(rich, RULESET, P0)).toEqual({ yielded: 12, accepted: 12 });
+    expect(assertEveryLegalActionApplies(rich, RULESET, [P0, P1])).toBe(14);
+    expect(assertKeystone(rich, RULESET, P0)).toEqual({ yielded: 13, accepted: 13 });
     expect(assertKeystone(rich, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
   });
 
@@ -550,10 +886,11 @@ describe('keystone — the generator and the applier agree, in both directions',
     const after = applyCommand(STATE, P0, move(0, 1), RULESET);
     if (!after.ok) throw new Error('the first move should have applied');
 
-    // The settler spent its 2 points on the hills, so it has no options left.
+    // The settler spent its 2 points on the hills, so it has no options left — but
+    // it can still found where it now stands (tile 1 is hills: land).
     expect(unitMoveOptions(after.value.state, RULESET, asUnitId(0))).toEqual([]);
-    expect(assertEveryLegalActionApplies(after.value.state, RULESET, [P0, P1])).toBe(2);
-    expect(assertKeystone(after.value.state, RULESET, P0)).toEqual({ yielded: 1, accepted: 1 });
+    expect(assertEveryLegalActionApplies(after.value.state, RULESET, [P0, P1])).toBe(3);
+    expect(assertKeystone(after.value.state, RULESET, P0)).toEqual({ yielded: 2, accepted: 2 });
   });
 
   it('holds on generated boards, for every seed and every player', () => {
@@ -576,6 +913,62 @@ describe('keystone — the generator and the applier agree, in both directions',
         expect(assertGeneratorIsComplete(board, GEN_RULESET, playerId)).toBe(one);
       }
     }
+  });
+
+  it('holds on a real generated board after a city has been founded on it', () => {
+    const board = generatedBoard(42);
+    const founding = applyCommand(board, P0, foundCity(0), GEN_RULESET);
+    if (!founding.ok) {
+      throw new Error(
+        `founding on a generated board was refused: ${JSON.stringify(founding.error)}`,
+      );
+    }
+    const founded = founding.value.state;
+    expect(founded.cities).toHaveLength(1);
+
+    // The settler is gone (consumed), so player 0's next actions are its city's —
+    // which are queries — and the board's *enumerated* actions are the produced
+    // city's neighbours… of which there are none until it produces something. What
+    // must hold: both directions still agree, and the choice commands are decided
+    // by the same evaluator the applier uses.
+    for (const playerId of [P0, P1]) {
+      const one = assertEveryLegalActionApplies(founded, GEN_RULESET, [playerId]);
+      expect(assertGeneratorIsComplete(founded, GEN_RULESET, playerId)).toBe(one);
+    }
+
+    const totals = assertSetterAgreement(founded, GEN_RULESET, P0);
+    expect(totals.accepted).toBeGreaterThan(0);
+    expect(totals.checked).toBeGreaterThan(totals.accepted);
+  });
+
+  it('holds for the city choice commands: the plan is the applier’s decision', () => {
+    // The other half of the M3 extension (see the file header). Player 0's city on
+    // 13, on a board where player 1's city on 5 works tile 8, so the
+    // `tile-worked-by-another-city` branch is in the universe too.
+    const totals = assertSetterAgreement(SHARED_STATE, RULESET, P0);
+
+    // One city of player 0 (8 assignment shapes + 1 second-tile shape + 1 rival-claim
+    // shape + 7 items) plus four commands aimed at city ids that do not exist.
+    expect(totals.checked).toBe(21);
+    expect(totals.accepted).toBeGreaterThan(0); // not vacuously all-refused
+    expect(totals.checked).toBeGreaterThan(totals.accepted); // …nor all-accepted
+    // And none of the accepted choices was advertised as an action.
+    expect(totals.yielded).toBe(assertEveryLegalActionApplies(SHARED_STATE, RULESET, [P0]));
+  });
+
+  it('accepts a legal assignment the generator does not advertise (the stated scope)', () => {
+    // Said out loud rather than left implicit: `legalActions` yields no assignment,
+    // so a legal-but-unsolicited one applies without appearing in any action list.
+    // The completeness claim for the setters is therefore "the applier's decision
+    // is the plan evaluator's" (asserted above), not "every accepted setter command
+    // is yielded" — which no generator could honour without enumerating
+    // C(radius, population) assignments.
+    const choice = setWorkedTiles(0, [8, 4]);
+
+    expect(applyCommand(CITY_STATE, P0, choice, RULESET).ok).toBe(true);
+    expect([...legalActions(CITY_STATE, RULESET, P0)].map(commandKey)).not.toContain(
+      commandKey(choice),
+    );
   });
 
   it('plays a whole turn from the generators alone, stepping until nothing is left', () => {

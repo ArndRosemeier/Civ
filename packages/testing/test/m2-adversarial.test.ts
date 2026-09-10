@@ -60,6 +60,16 @@
  * fog memory even though its units can already see — an asymmetry with
  * `newGame`, which marks what the starting unit sees as explored.
  *
+ * **Migrated to the M3 state shape** (docs/INTERFACES.md M3). `newGame` now
+ * appends a barbarian player, so `players.length === civCount + 1` and every
+ * "how many civilizations" question goes through `civPlayers`. The sweeps keep
+ * iterating `players` on purpose — a barbarian unit is an ordinary `Unit` whose
+ * `owner` is an ordinary `PlayerId`, so the keystone property must hold for it —
+ * and the player model those sweeps walk is now asserted instead of assumed.
+ * No existing claim was weakened by the migration: the goldens compared here are
+ * the regenerated M3 file, and `EndTurn` for a player that owns no unit is swept
+ * as well.
+ *
  * Findings that could NOT be turned into a test are reported in prose with the
  * review (cast/`any`/non-null audit, the `rehash:` commit note, the golden
  * harness's refusal to auto-write, CLI transcript hashes).
@@ -81,6 +91,7 @@ import {
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  civPlayers,
   describe as renderState,
   distance8,
   indexToX,
@@ -177,9 +188,29 @@ const deepFrozenCopy = <T>(value: T): T => {
   return value;
 };
 
-/** A stable key for a command, so two generators can be compared as sets. */
-const cmdKey = (cmd: Command): string =>
-  cmd.type === 'EndTurn' ? 'EndTurn' : `MoveUnit ${String(cmd.unitId)} -> ${String(cmd.to)}`;
+/**
+ * A stable key for a command, so two generators can be compared as sets.
+ *
+ * Migrated twice: M2's pair (`MoveUnit`/`EndTurn`), and M3, which added the two
+ * city commands and `FoundCity` to the frozen `Command` union. The switch is
+ * exhaustive on purpose — a `Command` variant that is not keyed here is a
+ * *typecheck* failure, not a silently equal pair of different commands, which is
+ * what a comparator used as evidence for the keystone property has to guarantee.
+ */
+const cmdKey = (cmd: Command): string => {
+  switch (cmd.type) {
+    case 'EndTurn':
+      return 'EndTurn';
+    case 'MoveUnit':
+      return `MoveUnit ${String(cmd.unitId)} -> ${String(cmd.to)}`;
+    case 'FoundCity':
+      return `FoundCity ${String(cmd.unitId)}`;
+    case 'SetWorkedTiles':
+      return `SetWorkedTiles ${String(cmd.cityId)} [${cmd.tiles.map(String).join(',')}]`;
+    case 'SetProduction':
+      return `SetProduction ${String(cmd.cityId)} ${cmd.item.kind}:${String(cmd.item.id)}`;
+  }
+};
 
 const errorText = (error: GameError): string => JSON.stringify(error);
 
@@ -330,6 +361,40 @@ const sweepGames = (
                 '(generator incomplete)',
             );
           }
+
+          // M3: `unitActions` yields a second command family — `FoundCity`, for a
+          // settler that can found. The `MoveUnit` sweep above enumerates every
+          // tile but no `FoundCity`, so `accepted` would fall short of
+          // `unitActions` by exactly the founders and the completeness count would
+          // read as a generator bug. `FoundCity` carries no tile (the unit's own
+          // tile is the site), so there is exactly one candidate per unit: it is
+          // enumerated unconditionally, exactly as the applier is asked about it.
+          const foundCity: Command = { type: 'FoundCity', unitId: unit.id };
+          enumerated += 1;
+
+          const founded = applyCommand(state, player.id, foundCity, RULESET);
+          if (founded.ok) {
+            accepted += 1;
+            check(
+              mine.has(cmdKey(foundCity)),
+              `seed ${String(seed)}: engine ACCEPTED ${cmdKey(foundCity)} but unitActions never ` +
+                'yields it (generator incomplete)',
+            );
+            check(
+              legal.has(cmdKey(foundCity)),
+              `seed ${String(seed)}: engine ACCEPTED ${cmdKey(foundCity)} but legalActions never ` +
+                'yields it (generator incomplete)',
+            );
+          }
+          // The equality, rather than only the "accepted implies yielded" half:
+          // a generator that offered a founding this engine refuses is just as
+          // broken as one that hid a founding it accepts, and it is the exact
+          // shape of the M2 counterexample the `EndTurn` check above pins.
+          check(
+            founded.ok === mine.has(cmdKey(foundCity)),
+            `seed ${String(seed)} step ${String(step)}: FoundCity accepted=${String(founded.ok)} ` +
+              `but unitActions yielded=${String(mine.has(cmdKey(foundCity)))}`,
+          );
         }
       }
 
@@ -391,6 +456,39 @@ describe('keystone — the engine and the generator agree, in both directions', 
     // by both generators, and every yielded action applied.
     expect(totals.applied).toBe(totals.legalActions);
     expect(totals.accepted).toBe(totals.unitActions);
+  });
+
+  it('walks every player the M3 player model defines, barbarians included', () => {
+    // MIGRATED (docs/INTERFACES.md M3, "State shape"). The sweeps above iterate
+    // `state.players` on purpose: a barbarian unit is an ordinary `Unit` with an
+    // ordinary `owner`, so the keystone property has to hold for its owner too.
+    // That is only meaningful while `players` really is the full list, so the
+    // model the sweep walks is asserted here rather than assumed: civCount
+    // civilizations, then exactly one barbarian player, with `PlayerId` still the
+    // index into `players` (which `explored` and every `owner` field rely on).
+    for (const civCount of [2, 3, 4]) {
+      const state = generatedFor(42, civCount);
+      const civs = civPlayers(state);
+      const barbarians = state.players.filter((player) => player.kind === 'barbarian');
+
+      expect(civs).toHaveLength(civCount);
+      expect(barbarians).toHaveLength(1);
+      expect(state.players).toHaveLength(civCount + 1);
+      expect(state.players.map((player) => Number(player.id))).toEqual(
+        Array.from({ length: civCount + 1 }, (_, index) => index),
+      );
+      expect(state.explored).toHaveLength(state.players.length);
+
+      // The barbarian player is a player identity, not a civilization: `newGame`
+      // gives it no settler, so it owns no unit and yields only `EndTurn` — the
+      // one action a player with nothing to move can still take.
+      const barbarian = barbarians[0];
+      if (barbarian === undefined) throw new Error('no barbarian player');
+      expect(state.units.some((unit) => unit.owner === barbarian.id)).toBe(false);
+      const actions = [...legalActions(state, RULESET, barbarian.id)];
+      expect(actions).toEqual([{ type: 'EndTurn' }]);
+      expect(applyCommand(state, barbarian.id, { type: 'EndTurn' }, RULESET).ok).toBe(true);
+    }
   });
 
   it('holds with three and four civilizations crowded onto the same map', () => {

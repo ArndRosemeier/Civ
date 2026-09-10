@@ -11,6 +11,7 @@
 import {
   TERRAIN_ROLES,
   UNIT_ROLES,
+  asBuildingId,
   asTerrainId,
   asUnitTypeId,
   err,
@@ -18,6 +19,7 @@ import {
   ok,
   placeholder,
   cited,
+  type BuildingDef,
   type Fidelity,
   type Provenance,
   type Result,
@@ -63,6 +65,14 @@ export interface TerrainSpec {
 export interface Catalog {
   readonly terrains: readonly TerrainSpec[];
   readonly units: readonly UnitSpec[];
+  /**
+   * The building catalog. Required, like `units`: a catalog that ships no
+   * buildings says so with `buildings: []`, which validation rejects as an
+   * empty catalog — exactly the treatment an empty unit or terrain catalog
+   * gets. Buildings are what M3 production spends shields on, and every row
+   * carries provenance like every other rules row (PLAN.md §6.2).
+   */
+  readonly buildings: readonly BuildingSpec[];
 }
 
 /**
@@ -79,6 +89,24 @@ export interface Catalog {
  * not by review.
  */
 export interface UnitSpec extends UnitDef {
+  readonly provenance: Provenance;
+}
+
+/**
+ * A building type — what a city's shields can be spent on besides units.
+ *
+ * M3 needs exactly one number from this row: `cost`, the shields
+ * `production.itemCost` charges for `{ kind: 'building', id }`. There is
+ * deliberately **no `effect` field yet**: no system exists that could read one,
+ * and an empty effect table would be a promise the engine does not keep. The row
+ * grows when the system that consumes it does.
+ *
+ * As with `UnitSpec`, the row `extends` the engine's structural `BuildingDef`
+ * (see `cities.ts`) so the compile-time proof that content ships what the engine
+ * reads is the type itself, and `provenance` is required — a row without one
+ * does not compile.
+ */
+export interface BuildingSpec extends BuildingDef {
   readonly provenance: Provenance;
 }
 
@@ -104,6 +132,7 @@ export type RulesetError =
 export interface Ruleset {
   readonly terrains: readonly TerrainSpec[];
   readonly units: readonly UnitSpec[];
+  readonly buildings: readonly BuildingSpec[];
   readonly fidelity: Fidelity;
 }
 
@@ -238,6 +267,61 @@ export const CATALOG: Catalog = {
       ),
     },
   ],
+  /**
+   * Building rows — all PLACEHOLDER, and the numbers are *ours*, not Civ 3's.
+   *
+   * M3 models exactly one property of a building: what it costs in shields.
+   * Effects (happiness, growth, defense, science) arrive with the systems that
+   * can read them, so a row here claims nothing about what the building does.
+   *
+   * The costs are chosen to be playable against this catalog's city output
+   * (roughly a handful of shields per turn early on), which makes a building a
+   * several-turn investment rather than the one-turn purchase a 1-3 shield unit
+   * is. That relationship is a tuning choice, not a sourced one: no row below
+   * is traced to Civ 3, and the real costs there are unverified.
+   */
+  buildings: [
+    {
+      id: asBuildingId('granary'),
+      name: 'Granary',
+      cost: 10,
+      provenance: placeholder(
+        'unsourced: this cost is ours, chosen so an early city finishes one in a few turns; no effect in M3',
+      ),
+    },
+    {
+      id: asBuildingId('barracks'),
+      name: 'Barracks',
+      cost: 12,
+      provenance: placeholder(
+        'unsourced: this cost is ours, chosen to sit just above a granary; no effect in M3',
+      ),
+    },
+    {
+      id: asBuildingId('walls'),
+      name: 'City Walls',
+      cost: 15,
+      provenance: placeholder(
+        'unsourced: this cost is ours; no defensive effect is modelled until combat arrives in M6',
+      ),
+    },
+    {
+      id: asBuildingId('temple'),
+      name: 'Temple',
+      cost: 15,
+      provenance: placeholder(
+        'unsourced: this cost is ours; no happiness effect is modelled in M3',
+      ),
+    },
+    {
+      id: asBuildingId('library'),
+      name: 'Library',
+      cost: 20,
+      provenance: placeholder(
+        'unsourced: this cost is ours, the priciest row here; no science effect; M3 models none',
+      ),
+    },
+  ],
 };
 
 /**
@@ -368,11 +452,37 @@ const checkSeaUnits = (
 };
 
 /**
+ * A building row is one number as far as M3 is concerned, and that number is a
+ * shield cost: it must be a whole number of shields and at least one. A free
+ * building would let `production.itemCost` complete an item on the turn it is
+ * queued, and a fractional cost would put a fraction in `City.shields`, which is
+ * part of every state hash (PLAN.md §5.3) — a determinism hazard the type system
+ * cannot see, exactly as with a unit's stats.
+ */
+const checkBuilding = (b: BuildingSpec): readonly RulesetError[] => {
+  const errors: RulesetError[] = [];
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'buildings',
+    id: b.id,
+    field,
+    detail,
+  });
+
+  if (!Number.isInteger(b.cost)) errors.push(bad('cost', 'must be an integer'));
+  if (b.cost < 1) errors.push(bad('cost', 'must be >= 1'));
+
+  return errors;
+};
+
+/**
  * Validate a catalog. In `cited-only` mode any placeholder row is a hard error,
  * which is what makes "is this Civ 3-shaped or Civ 3-exact?" checkable.
  *
- * Terrains are checked before units so the first error a caller sees is the
- * terrain one, which is the failure that stops generation earliest.
+ * Terrains are checked before units, and units before buildings, so the first
+ * error a caller sees comes from the catalog that would stop a game earliest:
+ * a terrain hole stops generation, a unit hole stops `newGame` placing a
+ * settler, and a building hole only stops production later.
  */
 export const validateRuleset = (
   catalog: Catalog,
@@ -385,6 +495,8 @@ export const validateRuleset = (
     ...checkRows('units', catalog.units),
     ...catalog.units.flatMap(checkUnit),
     ...checkSeaUnits(catalog.units, catalog.terrains),
+    ...checkRows('buildings', catalog.buildings),
+    ...catalog.buildings.flatMap(checkBuilding),
   ];
 
   if (fidelity === 'cited-only') {
@@ -408,13 +520,26 @@ export const validateRuleset = (
         });
       }
     }
+    for (const b of catalog.buildings) {
+      if (isPlaceholder(b.provenance)) {
+        errors.push({
+          kind: 'placeholder-in-cited-only',
+          catalog: 'buildings',
+          id: b.id,
+          note: b.provenance.note,
+        });
+      }
+    }
   }
 
   // The annotation states the contract `UnitSpec extends UnitDef` encodes, and
   // keeps the return type honest: what leaves validation is the engine's view.
   const units: readonly UnitSpec[] = catalog.units;
+  const buildings: readonly BuildingSpec[] = catalog.buildings;
 
-  return errors.length > 0 ? err(errors) : ok({ terrains: catalog.terrains, units, fidelity });
+  return errors.length > 0
+    ? err(errors)
+    : ok({ terrains: catalog.terrains, units, buildings, fidelity });
 };
 
 export interface ProvenanceSummary {
@@ -426,7 +551,7 @@ export interface ProvenanceSummary {
 /**
  * One row of a provenance report: the id the row is filed under and the claim it
  * makes. Both catalogs' rows have this shape, which is what lets one renderer
- * (and one counter) cover terrains and units alike.
+ * (and one counter) cover every catalog alike.
  */
 export interface ProvenanceRow {
   readonly id: string;
@@ -434,8 +559,9 @@ export interface ProvenanceRow {
 }
 
 /**
- * A catalog section — the terrains, or the units — with its rows *and* its own
- * count, so a report can print a subtotal beside the rows it was derived from.
+ * A catalog section — the terrains, the units, or the buildings — with its rows
+ * *and* its own count, so a report can print a subtotal beside the rows it was
+ * derived from.
  */
 export interface ProvenanceSection {
   readonly name: string;
@@ -469,14 +595,21 @@ const sectionOf = (name: string, rows: readonly ProvenanceRow[]): ProvenanceSect
  * contradicted itself — the half-truth PLAN.md §6.2 exists to prevent. A
  * renderer that iterates these sections cannot repeat it, because there is no
  * second list of rows to disagree with the total.
+ *
+ * Buildings are a section here for the same reason: adding a catalog to
+ * `Catalog` without adding it here would leave new rows uncounted by the report
+ * — and unvalidated by the cited-only audit — while the engine already reads
+ * their costs.
  */
 export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection[] => [
   sectionOf('terrains', catalog.terrains),
   sectionOf('units', catalog.units),
+  sectionOf('buildings', catalog.buildings),
 ];
 
 /**
- * Count **every** row in the catalog — terrain and unit alike. The number answers
+ * Count **every** row in the catalog — terrain, unit and building alike. The number
+ * answers
  * "how much of what the engine runs on is traced to a source?", so a summary
  * that quietly skipped a catalog would be exactly the half-truth PLAN.md §6.2
  * exists to prevent.

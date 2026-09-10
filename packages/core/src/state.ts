@@ -16,19 +16,25 @@
  *   into `SetupError` values so callers (CLI, UI, goldens) react to a reason
  *   rather than to a stack trace. The unit-role check runs *before* generation
  *   for the same reason.
- * - **A new game is populated, not empty.** Every player gets one settler on its
- *   starting tile and an `explored` row covering what that settler can see, so
- *   M2's first legal action is available immediately and the starting position is
- *   never "somewhere in the fog".
+ * - **A new game is populated, not empty.** Every civilization gets one settler
+ *   on its starting tile and an `explored` row covering what that settler can
+ *   see, so M2's first legal action is available immediately and the starting
+ *   position is never "somewhere in the fog". The barbarian player (M3) is
+ *   appended to `players` and gets neither: it is a player identity for the
+ *   units a hut will later spawn, not a civilization.
  */
 
 import { generateWorld, type GeneratedWorld } from './gen.js';
+// Type-only: `GameState` gains `cities` in M3, and this module never calls into
+// `cities.ts` at runtime (the city *helpers* are the callers' business). The
+// import is erased, so the type-only edge cannot become a runtime cycle.
+import type { City } from './cities.js';
 // Value imports, not type-only: `newGame` folds each player's sight into its
 // explored row through these, so `fog.ts` stays the single owner of the radius and
 // the single writer of the explored layer. There is no runtime cycle — `fog.ts`
 // imports `GameState` from here with `import type`, which erases.
 import { visibleTiles, withExplored } from './fog.js';
-import { asPlayerId, asUnitId, type PlayerId, type TileIndex } from './ids.js';
+import { asPlayerId, asTileIndex, asUnitId, type PlayerId, type TileIndex } from './ids.js';
 import {
   TERRAIN_BY_ROLE,
   TERRAIN_ROLES,
@@ -48,14 +54,29 @@ import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js'
  * - 2 — M2: adds `nextUnitId`, `units` and `explored`. Additive fields still
  *   change *every* state hash, which is why the goldens were regenerated in the
  *   same commit (INTERFACES.md, "Core — units, movement, fog").
+ * - 3 — M3: adds `nextCityId` and `cities` to the state, `kind` to a player and
+ *   a barbarian player to the player list, and `huts` to the map. Additive
+ *   again, and every hash moves again for the same reason; the goldens were
+ *   regenerated intentionally, through the harness's documented path, in the
+ *   same commit (INTERFACES.md M3, "State shape").
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+
+/** What a player *is*: a civilization, or the barbarians. */
+export type PlayerKind = 'civ' | 'barbarian';
 
 export interface PlayerState {
   readonly id: PlayerId;
-  readonly name: string; // "Player 1".."Player N" for M1
+  readonly name: string; // "Player 1".."Player N" for the civs, "Barbarians" for the rest
   readonly color: string; // '#rrggbb', from a fixed palette, deterministic
   readonly startingTile: TileIndex;
+  /**
+   * M3: barbarians are a *player* rather than a special case outside the array,
+   * because `PlayerId` is the player's index into `players` and `explored` is
+   * row-indexed by it. Anything that means "how many civilizations" must ask
+   * `civPlayers`, never `players.length` (INTERFACES.md M3, "State shape").
+   */
+  readonly kind: PlayerKind;
 }
 
 export interface GameState {
@@ -78,8 +99,22 @@ export interface GameState {
    * The explored layer, one row per player indexed by `PlayerId`, each of length
    * `width * height`. *Visible* tiles are derived from unit positions on demand
    * and never stored — this is the memory of what a player has seen (M2 "Fog").
+   *
+   * One row per player, barbarians included: `PlayerId` is the index into
+   * `players`, and the barbarian player sees nothing (it owns no units at the
+   * start), which is exactly an all-false row rather than a missing one.
    */
   readonly explored: readonly (readonly boolean[])[];
+  /**
+   * The id the next founded city will take. Monotonic, never reused, and part of
+   * the state so that id assignment is a function of creation order alone.
+   */
+  readonly nextCityId: number;
+  /**
+   * Every city in the world, sorted by `id` (see `cities.ts`). Empty at
+   * `newGame`: cities are founded by `FoundCity`, not by setup.
+   */
+  readonly cities: readonly City[];
 }
 
 export type SetupError =
@@ -118,6 +153,31 @@ const COLOR_FALLBACK = '#000000';
 /** Colour for player `index`; cycles the palette if a caller exceeds it. */
 const playerColor = (index: number): string =>
   PLAYER_COLORS[index % PLAYER_COLORS.length] ?? COLOR_FALLBACK;
+
+/**
+ * The barbarian player's name and colour.
+ *
+ * A fixed colour rather than the next palette entry: the palette belongs to the
+ * civilizations, and a barbarian painted in a civilization's colour would make
+ * `textview`'s legend and any future minimap lie about who owns a band of
+ * warriors. It is distinct from every palette entry, so "every player's colour is
+ * unique" still holds.
+ */
+const BARBARIAN_NAME = 'Barbarians';
+const BARBARIAN_COLOR = '#3f3f46';
+
+/**
+ * The civilizations in a game — every player that is not the barbarian one.
+ *
+ * This is the answer to "how many civilizations are there?" (M3: "anything that
+ * means 'how many civilizations' must use `civPlayers`, never `players.length`"),
+ * and the player list to iterate for anything a civilization does — placing a
+ * settler, numbering starts, painting civ colours. `players` stays the full list
+ * because `PlayerId` *is* the index into it, which is what makes `explored` and
+ * every owner reference line up.
+ */
+export const civPlayers = (state: GameState): readonly PlayerState[] =>
+  state.players.filter((player) => player.kind === 'civ');
 
 /**
  * The first terrain role a ruleset is missing, in the canonical role order
@@ -259,18 +319,41 @@ export const newGame = (
   // Player ids are the player's index in `players`, which is also the marker
   // `textview.describe` paints on a start tile; `name` carries the human-facing
   // "Player 1".."Player N" numbering required by INTERFACES.md.
-  const players: PlayerState[] = world.starts.map((startingTile, index) => ({
+  const civs: readonly PlayerState[] = world.starts.map((startingTile, index) => ({
     id: asPlayerId(index),
     name: `Player ${String(index + 1)}`,
     color: playerColor(index),
     startingTile,
+    kind: 'civ',
   }));
 
-  // One starting unit per player, on its own start tile. Ids are handed out in
-  // player order (`0..civCount-1`), so the array is sorted by id by
+  // M3: barbarians are a player, appended after the civilizations, so that
+  // `players.length === civCount + 1` and every `PlayerId` is still an index into
+  // this array (which `explored` and every `owner` field rely on).
+  //
+  // They are a player *identity*, not a civilization: they have no homeland and
+  // `newGame` gives them no settler (a barbarian settler would be nonsense), and
+  // their units only appear later, when a hut spawns a band of them. Their
+  // `startingTile` is therefore the map's first goody hut — a real land tile no
+  // civilization starts on, and the place M3's barbarians actually come from —
+  // falling back to tile 0 only on a degenerate map with no hut at all, where the
+  // field is a formality nothing reads. Every "how many civilizations" question
+  // goes through `civPlayers`, never through this field or `players.length`.
+  const barbarianTile = world.map.huts[0] ?? asTileIndex(0);
+  const barbarians: PlayerState = {
+    id: asPlayerId(civs.length),
+    name: BARBARIAN_NAME,
+    color: BARBARIAN_COLOR,
+    startingTile: barbarianTile,
+    kind: 'barbarian',
+  };
+  const players: readonly PlayerState[] = [...civs, barbarians];
+
+  // One starting unit per *civilization*, on its own start tile. Ids are handed
+  // out in player order (`0..civCount-1`), so the array is sorted by id by
   // construction and `nextUnitId` is simply how many units exist — no counter to
   // keep in sync and nothing ambient to store.
-  const units: readonly Unit[] = players.map((player, index) => ({
+  const units: readonly Unit[] = civs.map((player, index) => ({
     id: asUnitId(index),
     type: startingUnit.id,
     owner: player.id,
@@ -281,7 +364,9 @@ export const newGame = (
   // Fog: one row per player, indexed by `PlayerId`. Each start sees its
   // surroundings; what a unit sees later is derived from its position and folded
   // into these rows by movement (M2 "Fog"). Both the blank rows and the folding
-  // go through `fog.ts`, which owns the rule.
+  // go through `fog.ts`, which owns the rule. The barbarian player owns no unit,
+  // so `visibleTiles` answers "nothing" for it and its row stays blank — an
+  // all-false row is a player that has seen nothing, which is true.
   const seeded: GameState = {
     schemaVersion: SCHEMA_VERSION,
     revision: 0,
@@ -294,6 +379,11 @@ export const newGame = (
     nextUnitId: units.length,
     units,
     explored: blankFog(world.map, players),
+    // M3: no city exists at setup. `FoundCity` is the only creator, and it takes
+    // `nextCityId` as the id — 0 here, so the first city founded in a game is
+    // city 0.
+    nextCityId: 0,
+    cities: [],
   };
 
   return ok(initialFog(seeded));

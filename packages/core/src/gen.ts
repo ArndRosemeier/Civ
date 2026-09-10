@@ -61,6 +61,13 @@ const GRASSLAND_LOWLAND_PERMILLE = 550;
 
 /** Minimum Chebyshev distance between two starts: never adjacent, never equal. */
 const MIN_START_DISTANCE = 2;
+/**
+ * One goody hut per this many map tiles (M3, "Goody huts": the count scales with
+ * map size). 128 is a **placeholder** — it puts a dozen huts on a duel map and
+ * a few hundred on a huge one, which is enough for a first game to run into one
+ * without turning the map into confetti — and it is not a sourced Civ 3 figure.
+ */
+const HUT_TILES_PER_HUT = 128;
 /** How many of the best-scoring tiles the RNG may draw the first start from. */
 const START_POOL = 24;
 /**
@@ -244,6 +251,10 @@ const landComponentSizes = (map: GameMap, isWater: readonly boolean[]): number[]
  * starts, same returned RNG state. Throws when the ruleset lacks a terrain role
  * generation needs, or when the map cannot host `civCount` spread-out starts
  * (W3 converts both into typed `SetupError`s).
+ *
+ * The returned map carries its goody huts (`map.huts`, ascending) and the
+ * returned RNG state is the one *after* those placement draws, so a caller that
+ * stores it (W3 does) has a stream that no future caller can replay by accident.
  */
 export const generateWorld = (opts: GenOptions, ruleset: RulesetView): GeneratedWorld => {
   const { width, height, seed, civCount } = opts;
@@ -342,7 +353,10 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
 
   const terrain: TerrainId[] = [];
   for (const role of roleByIndex) terrain.push(roleIds[role]);
-  const map: GameMap = { width, height, terrain };
+  // Huts are placed at the very end (step 7), once the starts are known, so this
+  // intermediate map carries an empty list; the returned map is this map plus the
+  // huts. Everything before step 7 reads terrain only.
+  const map: GameMap = { width, height, terrain, huts: [] };
 
   // 5. Second pass: water touching land (8-way) becomes coast, the rest ocean.
   for (let i = 0; i < count; i++) {
@@ -431,5 +445,44 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
     }
   }
 
-  return { map, rng, starts };
+  // 7. Goody huts (M3, "Goody huts"): drawn from the map's land, never on a
+  //    start tile, and never on impassable terrain — a hut inside a mountain
+  //    range could never be entered, so it would be map decoration pretending to
+  //    be a reward. Placement draws from the RNG *after* the starts, so the
+  //    start positions (and the terrain, which never uses the stream at all) are
+  //    unaffected by this step; only the returned RNG state moves on.
+  //
+  //    A partial Fisher-Yates picks `wantHuts` distinct candidates in one pass:
+  //    each draw removes one tile from the pool, so two huts can never land on
+  //    the same tile and the result depends only on the RNG state and the
+  //    candidate order (ascending index), never on sort stability.
+  const isStart: boolean[] = new Array<boolean>(count).fill(false);
+  for (const start of starts) isStart[Number(start)] = true;
+
+  const hutPool: number[] = [];
+  for (let i = 0; i < count; i++) {
+    if (isWater[i] !== false) continue; // land only
+    if (isStart[i] === true) continue; // never on a start tile
+    const id = terrain[i];
+    if (id === undefined) continue;
+    if (impassableById.get(id) !== false) continue; // must be enterable
+    hutPool.push(i);
+  }
+
+  // At least one hut on any map that can host one, scaling from there; capped by
+  // the pool so a tiny island map cannot ask for more huts than it has tiles.
+  const wanted = Math.min(hutPool.length, Math.max(1, Math.floor(count / HUT_TILES_PER_HUT)));
+  for (let i = 0; i < wanted; i++) {
+    const draw = nextBelow(rng, hutPool.length - i);
+    rng = draw[1];
+    const j = i + draw[0];
+    const swap = at(hutPool, i);
+    hutPool[i] = at(hutPool, j);
+    hutPool[j] = swap;
+  }
+
+  const huts: TileIndex[] = hutPool.slice(0, wanted).map((index) => asTileIndex(index));
+  huts.sort((a, b) => a - b); // ascending, as M3 requires
+
+  return { map: { ...map, huts }, rng, starts };
 };

@@ -399,7 +399,17 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
           'no pre-history to fall back on',
       );
     }
-    return { id: asPlayerId(index), name, color: playerColor(index), startingTile };
+    return {
+      id: asPlayerId(index),
+      name,
+      color: playerColor(index),
+      startingTile,
+      // Every player the builder makes is a civilization. The builder is a
+      // hand-built world with no `newGame` pass behind it, so it adds no
+      // barbarian player; `kind` is still part of the persisted shape and is
+      // therefore spelled out rather than defaulted (`civPlayers` reads it).
+      kind: 'civ',
+    };
   });
 
   // The player list decides `civCount`; the rest of the patch layers over the
@@ -425,11 +435,16 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
     seed: resolved.value.seed,
     settings: resolved.value,
     rng: seedRng(resolved.value.seed),
-    map: { width: world.width, height: world.height, terrain },
+    map: { width: world.width, height: world.height, terrain, huts: [] },
     players,
     nextUnitId: units.length,
     units,
     explored,
+    // No city has been founded: a scenario that wants one issues `FoundCity`
+    // through `run`. `nextCityId` starts at 0 and `cities` is empty, matching
+    // what `newGame` leaves behind, so a `FoundCity` here is id 0.
+    nextCityId: 0,
+    cities: [],
   });
 };
 

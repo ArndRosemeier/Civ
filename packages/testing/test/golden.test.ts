@@ -24,12 +24,20 @@
  * put through the same `validateRuleset` the CLI runs — a validated `Ruleset`
  * carries a `role` per terrain and is therefore structurally the engine's
  * `RulesetView`, with no adapter in between.
+ *
+ * **Migrated to the M3 state shape** (docs/INTERFACES.md M3). The golden hashes
+ * moved a second time — `SCHEMA_VERSION` 2 -> 3, `nextCityId`/`cities` on the
+ * state, `kind` on a player and a barbarian player appended by `newGame`, `huts`
+ * on the map — and the file was regenerated through this harness's own opt-in
+ * path (`CIVTS_WRITE_GOLDENS=1`), never by hand. The civ-count check below now
+ * asks `civPlayers`, because `players` ends with the barbarian player.
  */
 
 import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
+  civPlayers,
   newGame,
   type GameState,
   type RulesetView,
@@ -245,7 +253,11 @@ describe('golden scenarios', () => {
     for (const seed of GOLDEN_SEEDS) {
       const state = mustState(seed);
       expect(state.settings.mapSize).toBe(GOLDEN_MAP_SIZE);
-      expect(state.players).toHaveLength(GOLDEN_CIV_COUNT);
+      // One player per *civilization*: M3 appends a barbarian player to
+      // `players`, so the count that answers "how many civilizations did the
+      // harness ask for" is `civPlayers`, never `players.length`.
+      expect(civPlayers(state)).toHaveLength(GOLDEN_CIV_COUNT);
+      expect(state.players).toHaveLength(GOLDEN_CIV_COUNT + 1);
       expect(state.seed).toBe(seed);
     }
   });

@@ -32,6 +32,7 @@ import {
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  civPlayers,
   isExplored,
   tileIndex,
   unitById,
@@ -582,9 +583,14 @@ describe('the scenario builder', () => {
     expect(state.map.terrain[Number(at(5, 5))]).toBe(TERRAIN_BY_ROLE(RULESET, 'grassland')?.id);
     expect(state.map.terrain[Number(at(6, 5))]).toBe(TERRAIN_BY_ROLE(RULESET, 'hills')?.id);
 
-    expect(state.players.map((player) => player.name)).toEqual(['Rome', 'Carthage']);
-    expect(state.players.map((player) => player.startingTile)).toEqual([at(5, 5), at(6, 6)]);
-    expect(state.players.map((player) => player.color)).toEqual(['#d12f2f', '#2f6fd1']);
+    // The world's players are the civilizations the scenario asked for — asked
+    // through `civPlayers`, because M3 made `players` the *full* player list
+    // (`newGame` appends a barbarian player to it) and "the names this scenario
+    // added" is a civilization question.
+    expect(civPlayers(state).map((player) => player.name)).toEqual(['Rome', 'Carthage']);
+    expect(civPlayers(state).map((player) => player.startingTile)).toEqual([at(5, 5), at(6, 6)]);
+    expect(civPlayers(state).map((player) => player.color)).toEqual(['#d12f2f', '#2f6fd1']);
+    expect(civPlayers(state).every((player) => player.kind === 'civ')).toBe(true);
 
     // Dense ids in creation order, full movement, and `nextUnitId` past them.
     expect(state.units.map((unit) => unit.id)).toEqual([asUnitId(0), asUnitId(1)]);
@@ -594,8 +600,12 @@ describe('the scenario builder', () => {
     expect(state.units[1]?.movementLeft).toBe(unitDef(RULESET, WARRIOR)?.movement);
     expect(state.nextUnitId).toBe(2);
 
-    // The player list decides the civ count, not the settings patch.
+    // The player list decides the civ count, not the settings patch — and the
+    // count it decides is the number of *civilizations*: if the builder ever
+    // appended the barbarian player `newGame` appends, `settings.civCount` must
+    // not follow it upward.
     expect(state.settings.civCount).toBe(2);
+    expect(state.settings.civCount).toBe(civPlayers(state).length);
     expect(state.settings.mapSize).toBe('duel');
   });
 });

@@ -88,6 +88,7 @@ const MAP: GameMap = {
   width: 4,
   height: 4,
   terrain: Array.from({ length: 16 }, () => asTerrainId('grassland')),
+  huts: [],
 };
 
 const player = (index: number, tile: number): PlayerState => ({
@@ -95,6 +96,7 @@ const player = (index: number, tile: number): PlayerState => ({
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
+  kind: 'civ',
 });
 
 const unit = (id: number, owner: number, tile: number, movementLeft: number): Unit => ({
@@ -124,6 +126,8 @@ const STATE: GameState = {
   nextUnitId: 3,
   units: UNITS,
   explored: [exploredRow([0, 1, 4, 5]), exploredRow([10, 11, 14, 15])],
+  nextCityId: 0,
+  cities: [],
 };
 
 describe('unitById', () => {

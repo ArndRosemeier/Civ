@@ -58,7 +58,7 @@ const USAGE = `civts — headless tooling
 Usage: civts <command> [options]
 
 Commands:
-  provenance   print every rules-data row's provenance (terrains and units)
+  provenance   print every rules-data row's provenance (terrains, units, buildings)
   map          generate a world, render it as ASCII, print its state hash
   play         interactive text REPL: play the game from a terminal or a script
   run          headless AI-vs-AI game                     (arrives in M7)

@@ -31,7 +31,7 @@ import {
   type RulesetView,
   type TerrainRole,
 } from './map.js';
-import type { GameState } from './state.js';
+import { civPlayers, type GameState } from './state.js';
 
 export interface Viewport {
   readonly x: number;
@@ -122,11 +122,18 @@ const startMarker = (playerIndex: number): string =>
 /** Strip trailing spaces: no line may carry invisible trailing whitespace. */
 const stripEnd = (line: string): string => line.replace(/ +$/, '');
 
+/**
+ * The header's `civs=` field asks `civPlayers`, never `players.length`: M3 appends
+ * a barbarian player to `players`, so the array length is the number of *player
+ * identities*, one more than the number of civilizations, and a `civs=3` for a
+ * two-civilization game is simply a wrong count (INTERFACES.md M3, "State shape":
+ * anything that means "how many civilizations" must use `civPlayers`).
+ */
 const headerLine = (state: GameState, viewer: PlayerId | undefined): string =>
   `CivTS state: seed=${String(state.seed)} turn=${String(state.turn)} ` +
   `revision=${String(state.revision)} map=${state.settings.mapSize}` +
   `(${String(state.map.width)}x${String(state.map.height)}) ` +
-  `civs=${String(state.players.length)}` +
+  `civs=${String(civPlayers(state).length)}` +
   // God mode has no viewer, so it says nothing extra: the no-`viewer` header is
   // byte-for-byte what it was before this option existed.
   (viewer === undefined ? '' : ` viewer=${String(viewer)}`);
@@ -171,6 +178,16 @@ const legendLine = (sawUnknown: boolean, sawUnexplored: boolean): string => {
 /**
  * One line naming every player and its start tile, marking starts outside the
  * rendered window so a cropped view never looks like a player has vanished.
+ *
+ * This line names **every** player, barbarians included, while the header's
+ * `civs=` counts only civilizations — the asymmetry is deliberate, not an
+ * oversight. `civPlayers` answers "how many civilizations are there?", which is
+ * exactly what the header asks; `starts:` is the legend for the digits painted
+ * on the map, and those markers are drawn for every player's `startingTile`
+ * (M1: "starting tiles marked with the player number"), the barbarian player's
+ * included — M3 gives it the map's first hut as its anchor. A digit with no
+ * entry here would be a marker the reader cannot name, so the two sets are kept
+ * equal rather than filtered to civilizations.
  *
  * `explored` (present only in viewer mode) is the viewer's fog row, and a start
  * the viewer has not explored is omitted entirely — a `starts:` line that
@@ -310,6 +327,9 @@ export const describe = (
   }
 
   lines.push(legendLine(sawUnknown, sawUnexplored));
+  // Any player with a start tile gets a `starts:` line, so the digits on the map
+  // always have a legend (see `startsLine` on why this is `players` and not
+  // `civPlayers`, unlike the `civs=` count in the header).
   if (showStarts && state.players.length > 0) {
     lines.push(startsLine(state, map, view, viewerRow));
   }

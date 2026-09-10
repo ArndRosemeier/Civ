@@ -23,12 +23,20 @@
  *   package, so it declares the structural view it reads, exactly as
  *   `TerrainDef`/`TerrainSpec` do for terrain. `packages/rules` checks at compile
  *   time that its `UnitSpec` still satisfies this view.
+ * - **`spawnUnit` is the one place a unit comes into being after setup.** M3
+ *   needs it for a produced unit (and M3's huts, and barbarian bands, need the
+ *   same thing), so the id allocation, the array insertion and the "full
+ *   movement" rule live here once rather than in each caller. It is *not* a
+ *   command: it does not touch `revision`, `turn` or the RNG — the caller that
+ *   owns the transition does that (see `commands.ts` and the turn pipeline).
  *
  * Nothing here reads ambient state: no RNG, no clock, no I/O. Every function is
- * a pure read of the state or the ruleset it is handed.
+ * a pure read of the state or the ruleset it is handed; `spawnUnit` is a pure
+ * rebuild of one.
  */
 
 import {
+  asUnitId,
   type PlayerId,
   type ResourceId,
   type TileIndex,
@@ -122,3 +130,81 @@ export const unitById = (state: GameState, id: UnitId): Unit | undefined =>
  */
 export const unitsOnTile = (state: GameState, tile: TileIndex): readonly Unit[] =>
   state.units.filter((unit) => unit.tile === tile);
+
+/** The highest unit id in the state, or `-1` when there are no units at all. */
+const highestUnitId = (state: GameState): number =>
+  state.units.reduce((highest, unit) => Math.max(highest, Number(unit.id)), -1);
+
+/**
+ * The id the next unit created in this state must take.
+ *
+ * `nextUnitId` is authoritative — it is the state's own statement of "the id the
+ * next created unit will take", and on any state `newGame` or `spawnUnit`
+ * produced it is already past every existing id. The `max` below is a defence
+ * against a *hand-built* state (or a hand-edited save) whose counter is stale: it
+ * can only be tighter than `nextUnitId` when the state already uses the id it
+ * would hand out, and reusing an id would make two units indistinguishable to
+ * `unitById`, `unitsOnTile` and every owner check. Being total here is cheap;
+ * discovering a duplicate id three systems later is not.
+ */
+const nextFreeUnitId = (state: GameState): UnitId =>
+  asUnitId(Math.max(state.nextUnitId, highestUnitId(state) + 1));
+
+/**
+ * The movement a newly created unit of type `def` gets: the type's `movement`,
+ * and only when that is a positive whole number.
+ *
+ * `validateRuleset` guarantees an integer `movement >= 1`, but a foreign or
+ * hand-built view can carry a broken one, and `movementLeft` is part of every
+ * state hash: a fractional or NaN budget would put a value into the state that
+ * `canonicalize` cannot represent. A definition the engine cannot read therefore
+ * grants 0 movement — the unit exists and can be seen, it simply cannot move
+ * until the ruleset describes it properly.
+ */
+const fullMovement = (def: UnitDef): number =>
+  Number.isInteger(def.movement) && def.movement > 0 ? def.movement : 0;
+
+/** A unit that `spawnUnit` just created, together with the state that has it. */
+export interface SpawnedUnit {
+  readonly state: GameState;
+  readonly unit: Unit;
+}
+
+/**
+ * Place a new unit of type `def`, owned by `owner`, on `tile`, at full
+ * movement — the one definition of "a unit comes into being" outside `newGame`.
+ *
+ * - **Id.** `nextFreeUnitId`, which is `state.nextUnitId` on every state the
+ *   engine built and never an id already in use (see above). The new unit is
+ *   appended and the array re-sorted by id, so the "sorted by id" invariant
+ *   holds for the caller's state as well as for a well-formed one.
+ * - **Movement.** Full (`def.movement`), because a unit that has just been built
+ *   or just appeared has not spent anything this turn. `EndTurn` refills to the
+ *   same number, so a unit spawned mid-turn is indistinguishable from one that
+ *   started the turn there.
+ * - **What it does not do.** No RNG draw (spawning is not a random event), no
+ *   `revision` bump (that counts *applied commands*, M2 invariant 2), no fog
+ *   fold (memory grows from movement and from `newGame`; a unit placed in a city
+ *   sees what the player who founded that city already saw), and no terrain
+ *   check: *where* a unit may appear is the caller's rule — M3 places a produced
+ *   unit in its city's centre, a hut reward near the hut — and duplicating that
+ *   judgement here would be a second statement of it.
+ */
+export const spawnUnit = (
+  state: GameState,
+  def: UnitDef,
+  owner: PlayerId,
+  tile: TileIndex,
+): SpawnedUnit => {
+  const id = nextFreeUnitId(state);
+  const unit: Unit = {
+    id,
+    type: def.id,
+    owner,
+    tile,
+    movementLeft: fullMovement(def),
+  };
+
+  const units = [...state.units, unit].sort((a, b) => Number(a.id) - Number(b.id));
+  return { state: { ...state, nextUnitId: Number(id) + 1, units }, unit };
+};

@@ -78,6 +78,14 @@ const terrainIds = (): TerrainId[] => {
  * Every refusal worth testing is one step away from (0,0): (1,0) mountains,
  * (0,1) enemy-held, (1,1) free grassland, and (2,2) hills that cost more than
  * the unit has left once it has stepped to (1,1).
+ *
+ * Migrated to the M3 state shape (docs/INTERFACES.md M3): both players are
+ * civilizations (`kind`), the map carries `huts` (this board has none — the
+ * fixture is about movement and fog, and a hut would only be a M3 reward test of
+ * its own), and the state carries `nextCityId`/`cities`. There is deliberately
+ * **no** barbarian player here: the session is driven against a hand-built
+ * board, so the transcript stays a fixture of the *REPL*, while the barbarian
+ * player `newGame` appends is exercised by the real-CLI tests below.
  */
 const syntheticState = (): GameState => ({
   schemaVersion: SCHEMA_VERSION,
@@ -86,19 +94,21 @@ const syntheticState = (): GameState => ({
   seed: 7,
   settings: { ...DEFAULT_SETTINGS, mapSize: 'tiny', civCount: 2, seed: 7 },
   rng: seedRng(7),
-  map: { width: WIDTH, height: HEIGHT, terrain: terrainIds() },
+  map: { width: WIDTH, height: HEIGHT, terrain: terrainIds(), huts: [] },
   players: [
     {
       id: asPlayerId(0),
       name: 'Player 1',
       color: '#d12f2f',
       startingTile: tileIndex(WIDTH, 0, 0),
+      kind: 'civ',
     },
     {
       id: asPlayerId(1),
       name: 'Player 2',
       color: '#2f6fd1',
       startingTile: tileIndex(WIDTH, 0, 1),
+      kind: 'civ',
     },
   ],
   nextUnitId: 2,
@@ -122,6 +132,8 @@ const syntheticState = (): GameState => ({
     new Array<boolean>(WIDTH * HEIGHT).fill(true),
     new Array<boolean>(WIDTH * HEIGHT).fill(true),
   ],
+  nextCityId: 0,
+  cities: [],
 });
 
 /** A state whose explored rows are all `false`: the viewer sees nothing. */
@@ -318,7 +330,13 @@ describe('the REPL transcript', () => {
     // The fixture is pinned as well as its rendering: if the shape of
     // `GameState`, the generation or the rules data moves, this hash moves and
     // the transcript below is no longer the transcript of *this* state.
-    expect(hashValue(syntheticState())).toBe('b9166aa11541451a');
+    //
+    // Rehashed for M3 (SCHEMA_VERSION 2 -> 3): the state gained `nextCityId` and
+    // `cities`, the map gained `huts` and each player gained `kind`, so every
+    // state hash moved. b9166aa11541451a -> d270dc95982b4fdb. The *transcript*
+    // did not move: this fixture's two players are both civilizations, so
+    // nothing that lists players changed for it.
+    expect(hashValue(syntheticState())).toBe('d270dc95982b4fdb');
 
     const capture = open();
     runScript(capture.session, SCRIPT.join('\n'), capture.write);
@@ -344,7 +362,9 @@ describe('the REPL transcript', () => {
     // refused or malformed, so the final revision is exactly 2.
     expect(capture.session.state.revision).toBe(2);
     expect(capture.session.state.turn).toBe(2);
-    expect(hashValue(capture.session.state)).toBe('416a43bd669192b4');
+    // Rehashed for M3: 416a43bd669192b4 -> 880e2d6fa2c828dd (see the fixture hash
+    // above for why the state shape, not the transcript, moved).
+    expect(hashValue(capture.session.state)).toBe('880e2d6fa2c828dd');
   });
 });
 
@@ -488,7 +508,7 @@ describe('commands', () => {
 
     expect(capture.session.state).not.toBe(state);
     expect(hashValue(state)).toBe(before);
-    expect(hashValue(state)).toBe('b9166aa11541451a');
+    expect(hashValue(state)).toBe('d270dc95982b4fdb');
 
     // Same input, same result: the session holds no hidden state of its own.
     const fresh = open();
@@ -703,9 +723,24 @@ describe('the play command', () => {
 
     expect(run.stderr).not.toContain('fatal');
     expect(run.status).toBe(0);
+    // CORRECTED (M3 civ-count fix). `--civs 2` starts a game with two
+    // civilizations *plus* the barbarian player `newGame` appends, so a count over
+    // `state.players` would print "3 civs". It did: this line used to record that
+    // as observed output, with a note that the defect lived outside the migration's
+    // file list. `bannerText` and `describe`'s header now both ask `civPlayers`
+    // (docs/INTERFACES.md M3, "State shape": anything that means "how many
+    // civilizations" must use `civPlayers`, never `players.length`), so the honest
+    // assertion is 2. The `civs=` field of the `CivTS state:` line below it moved
+    // with it.
     expect(run.stdout).toContain('CivTS play - seed 42, duel map 40x40, 2 civs');
     expect(run.stdout).toContain('you are Player 1 (p0)');
     expect(run.stdout).toContain('CivTS state: seed=42 turn=1 revision=0');
+    // One start marker per player, the barbarian one included: the barbarian is
+    // a player, and its `startingTile` is the map's first goody hut (M3). This is
+    // the `starts:` legend for the digits drawn on the map, so it stays keyed to
+    // `players` and not to `civPlayers` — unlike the `civs=` count above.
+    expect(run.stdout).toContain('starts: 0=Player 1@');
+    expect(run.stdout).not.toContain('civs=3');
   }, 120_000);
 
   it('runs --script deterministically, against the same engine the tests use', () => {
@@ -766,7 +801,7 @@ describe('the play command', () => {
 /** A section heading: `terrains — 6 rows, 0 cited, 6 placeholder`. */
 const SECTION_HEADING = /^(\w+) — (\d+) rows?, (\d+) cited, (\d+) placeholder$/;
 
-/** The first line: `ruleset provenance — 0/11 cited (0%), 11 placeholder`. */
+/** The first line: `ruleset provenance — 0/16 cited (0%), 16 placeholder`. */
 const PROVENANCE_HEADER = /^ruleset provenance — (\d+)\/(\d+) cited \((\d+)%\), (\d+) placeholder$/;
 
 /** One printed row: `id`, the provenance kind, and the claim itself. */
@@ -848,7 +883,7 @@ const printedRows = (printed: PrintedProvenance): readonly PrintedRow[] =>
   printed.sections.flatMap((section) => section.rows);
 
 describe('the provenance command', () => {
-  it('lists every row its totals count — terrain and unit alike', () => {
+  it('lists every row its totals count — terrain, unit and building alike', () => {
     const run = runCli(['provenance'], '');
 
     expect(run.status).toBe(0);
@@ -860,13 +895,17 @@ describe('the provenance command', () => {
     expect(printed.cited + printed.placeholder).toBe(printed.total);
     expect(printed.total).toBeGreaterThan(0);
 
-    // The rows printed are exactly the rows of the catalog — both catalogs, in
+    // The rows printed are exactly the rows of the catalog — every catalog, in
     // catalog order. While only the terrain table was rendered, this listed six
     // rows under a total of eleven: a report that overstated its own coverage.
+    // M3 added a third catalog (buildings), which the same claim now covers: the
+    // report is the honesty surface for the M3 numbers, so a section it forgot
+    // would be exactly the kind of unstated guess the rule exists to prevent.
     const rows = printedRows(printed);
     expect(rows.map((row) => row.id)).toEqual([
       ...CATALOG.terrains.map((t) => t.id),
       ...CATALOG.units.map((u) => u.id),
+      ...CATALOG.buildings.map((b) => b.id),
     ]);
 
     // …which is what makes the table and the totals agree.
@@ -879,7 +918,11 @@ describe('the provenance command', () => {
     const stdout = runCli(['provenance'], '').stdout;
     const printed = parseProvenance(stdout);
 
-    expect(printed.sections.map((section) => section.name)).toEqual(['terrains', 'units']);
+    expect(printed.sections.map((section) => section.name)).toEqual([
+      'terrains',
+      'units',
+      'buildings',
+    ]);
 
     for (const section of printed.sections) {
       // Every section heading is a claim about the rows printed beneath it.
@@ -906,6 +949,18 @@ describe('the provenance command', () => {
     if (settler?.provenance.kind === 'placeholder') {
       expect(units?.rows[0]?.detail).toBe(settler.provenance.note);
       expect(stdout).toContain(settler.provenance.note);
+    }
+
+    // The same holds for M3's building rows: every one of them is a
+    // `placeholder` whose printed detail is the catalog's own note, which is
+    // where the "unsourced, chosen to be playable" claim is written down.
+    const buildings = printed.sections.find((section) => section.name === 'buildings');
+    expect(buildings?.rows.map((row) => row.id)).toEqual(CATALOG.buildings.map((b) => b.id));
+    for (const [index, spec] of CATALOG.buildings.entries()) {
+      expect(spec.provenance.kind).toBe('placeholder');
+      if (spec.provenance.kind === 'placeholder') {
+        expect(buildings?.rows[index]?.detail).toBe(spec.provenance.note);
+      }
     }
   }, 120_000);
 });
