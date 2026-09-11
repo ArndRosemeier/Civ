@@ -156,6 +156,11 @@ import {
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
+
 import { loadGoldens } from '../src/goldens.js';
 import {
   canonicalize,
@@ -268,6 +273,14 @@ const cmdKey = (cmd: Command): string => {
       return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(
         cmd.rates.luxury,
       )}`;
+    // M5. `SetResearch` is the third planner-only setter: no generator yields it
+    // (choosing a tech is a setting, reached through `planSetResearch`), so this line
+    // never appears in the sweeps below. It is here because the switch is exhaustive
+    // on purpose — an unkeyed `Command` variant is a comparator that calls two
+    // different commands equal — and it carries the tech, keying the payload exactly
+    // as the `SetRates` case keys the triple.
+    case 'SetResearch':
+      return `SetResearch ${String(cmd.tech)}`;
   }
 };
 
@@ -862,34 +875,40 @@ const keystoneSweep = (seeds: readonly number[], steps: number): KeystoneRun => 
 };
 
 describe('1. keystone — six generators agree with the applier, in both directions', () => {
-  it('holds over played games with workers, cities and armies, rate space included', () => {
-    const { failures, totals } = keystoneSweep([1, 2, 3, 5, 8, 13], 8);
+  // Full tier: 20 s — the widest keystone sweep in the M4b file: played games with the rate space
+  // included, so the action space is a product of the board and the rates.
+  it.skipIf(!FULL_TIER)(
+    'holds over played games with workers, cities and armies, rate space included',
+    () => {
+      const { failures, totals } = keystoneSweep([1, 2, 3, 5, 8, 13], 8);
 
-    console.log('m4b keystone totals:', JSON.stringify(totals));
-    expect(failures).toEqual([]);
+      console.log('m4b keystone totals:', JSON.stringify(totals));
+      expect(failures).toEqual([]);
 
-    // Non-vacuity, stated as counts: a sweep that never saw a rate command, never
-    // accepted or refused one, or never disbanded anything would pass while proving
-    // nothing about the milestone it is reviewing.
-    expect(totals.states).toBeGreaterThan(0);
-    expect(totals.legalYielded).toBeGreaterThan(0);
-    expect(totals.generatorApplied).toBe(totals.legalYielded);
-    expect(totals.movesAccepted).toBe(totals.movesYielded);
-    expect(totals.workCandidates).toBeGreaterThan(0);
-    expect(totals.workYielded).toBe(totals.workAccepted);
-    expect(totals.rateAccepted).toBeGreaterThan(0);
-    expect(totals.rateRefused).toBe(0); // every legal triple applies
-    expect(totals.malformedRefused).toBeGreaterThan(0);
-    // The policy decision `actions.ts` documents, asserted rather than assumed: the
-    // enumerating generators yield no rate command at all.
-    expect(totals.rateCommandsYielded).toBe(0);
-    expect(totals.endTurns).toBeGreaterThan(0);
-    // Money really moved during the walk, so the shapes above were reached.
-    expect(totals.disbands).toBeGreaterThan(0);
-    // The finding in the header: with a maintenance-free catalog, `unpaid` cannot
-    // happen (a shortfall never exceeds what the billable units can cover).
-    expect(totals.shortfalls).toBe(0);
-  }, 180_000);
+      // Non-vacuity, stated as counts: a sweep that never saw a rate command, never
+      // accepted or refused one, or never disbanded anything would pass while proving
+      // nothing about the milestone it is reviewing.
+      expect(totals.states).toBeGreaterThan(0);
+      expect(totals.legalYielded).toBeGreaterThan(0);
+      expect(totals.generatorApplied).toBe(totals.legalYielded);
+      expect(totals.movesAccepted).toBe(totals.movesYielded);
+      expect(totals.workCandidates).toBeGreaterThan(0);
+      expect(totals.workYielded).toBe(totals.workAccepted);
+      expect(totals.rateAccepted).toBeGreaterThan(0);
+      expect(totals.rateRefused).toBe(0); // every legal triple applies
+      expect(totals.malformedRefused).toBeGreaterThan(0);
+      // The policy decision `actions.ts` documents, asserted rather than assumed: the
+      // enumerating generators yield no rate command at all.
+      expect(totals.rateCommandsYielded).toBe(0);
+      expect(totals.endTurns).toBeGreaterThan(0);
+      // Money really moved during the walk, so the shapes above were reached.
+      expect(totals.disbands).toBeGreaterThan(0);
+      // The finding in the header: with a maintenance-free catalog, `unpaid` cannot
+      // happen (a shortfall never exceeds what the billable units can cover).
+      expect(totals.shortfalls).toBe(0);
+    },
+    180_000,
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -1299,40 +1318,47 @@ const moneySweep = (seeds: readonly number[], turns: number, civCount: number): 
 };
 
 describe('2. money conservation — income minus upkeep equals the delta, every turn', () => {
-  it('accounts for every gold piece over 120 turns on three seeds, with cities and mass bankruptcy', () => {
-    const { failures, totals, finals } = moneySweep([3, 11, 29], 120, 3);
+  // Full tier: 14.6 s — a 120-turn conservation run on three seeds. Conservation is only interesting
+  // over a long run (a short one cannot bankrupt anybody), which is precisely why the standing
+  // requirement puts long sweeps here.
+  it.skipIf(!FULL_TIER)(
+    'accounts for every gold piece over 120 turns on three seeds, with cities and mass bankruptcy',
+    () => {
+      const { failures, totals, finals } = moneySweep([3, 11, 29], 120, 3);
 
-    console.log('m4b money totals:', JSON.stringify(totals));
-    expect(failures).toEqual([]);
+      console.log('m4b money totals:', JSON.stringify(totals));
+      expect(failures).toEqual([]);
 
-    // Non-vacuity: money has to have moved, in both directions, or "conservation" is a
-    // statement about zero. Cities earned, upkeep bit, and units were disbanded.
-    expect(totals.playerTurns).toBeGreaterThanOrEqual(300);
-    expect(totals.citiesFounded).toBeGreaterThan(0);
-    expect(totals.commerceSplit).toBeGreaterThan(0);
-    expect(totals.incomeGold).toBeGreaterThan(0);
-    expect(totals.incomeLuxuries).toBeGreaterThan(0);
-    expect(totals.rateChanges).toBeGreaterThan(0);
-    expect(totals.disbands).toBeGreaterThan(0);
-    expect(totals.bankruptPlayerTurns).toBeGreaterThan(0);
-    expect(totals.zeroTreasuryTurns).toBeGreaterThan(0);
-    expect(totals.minTreasury).toBe(0);
-    // The finding in the header, re-stated at its M4c width. The old reason ("the
-    // shipped catalog declares no maintenance") is now *false* — M4c's catalog declares
-    // 1-3 gold on seven buildings — so the zero below is pinned to the reason that is
-    // still true of this sweep: it queues units only (settlers, then military) and its
-    // cities are hand-built empty, so no city it plays ever holds a building to maintain
-    // and maintenance is 0 on every line. The assertion right below is what keeps that
-    // reason from decaying silently into "we stopped looking": if a future edit lets this
-    // sweep build something, this fails and a human restores the reachability claim.
-    expect(totals.shortfalls).toBe(0);
+      // Non-vacuity: money has to have moved, in both directions, or "conservation" is a
+      // statement about zero. Cities earned, upkeep bit, and units were disbanded.
+      expect(totals.playerTurns).toBeGreaterThanOrEqual(300);
+      expect(totals.citiesFounded).toBeGreaterThan(0);
+      expect(totals.commerceSplit).toBeGreaterThan(0);
+      expect(totals.incomeGold).toBeGreaterThan(0);
+      expect(totals.incomeLuxuries).toBeGreaterThan(0);
+      expect(totals.rateChanges).toBeGreaterThan(0);
+      expect(totals.disbands).toBeGreaterThan(0);
+      expect(totals.bankruptPlayerTurns).toBeGreaterThan(0);
+      expect(totals.zeroTreasuryTurns).toBeGreaterThan(0);
+      expect(totals.minTreasury).toBe(0);
+      // The finding in the header, re-stated at its M4c width. The old reason ("the
+      // shipped catalog declares no maintenance") is now *false* — M4c's catalog declares
+      // 1-3 gold on seven buildings — so the zero below is pinned to the reason that is
+      // still true of this sweep: it queues units only (settlers, then military) and its
+      // cities are hand-built empty, so no city it plays ever holds a building to maintain
+      // and maintenance is 0 on every line. The assertion right below is what keeps that
+      // reason from decaying silently into "we stopped looking": if a future edit lets this
+      // sweep build something, this fails and a human restores the reachability claim.
+      expect(totals.shortfalls).toBe(0);
 
-    for (const state of finals) {
-      expect(state.cities.every((city) => city.buildings.length === 0)).toBe(true);
-      expect(state.players.every((player) => player.treasury >= 0)).toBe(true);
-      expect(isHashable(state)).toBe(true);
-    }
-  }, 300_000);
+      for (const state of finals) {
+        expect(state.cities.every((city) => city.buildings.length === 0)).toBe(true);
+        expect(state.players.every((player) => player.treasury >= 0)).toBe(true);
+        expect(isHashable(state)).toBe(true);
+      }
+    },
+    300_000,
+  );
 
   it('reaches the unpaid branch only through a catalog that declares maintenance', () => {
     // The other half of the finding, unchanged by M4c and still worth pinning *here*
@@ -2085,121 +2111,128 @@ describe('5. rates', () => {
  * ------------------------------------------------------------------ */
 
 describe('6. starting units', () => {
-  it('gives exactly one settler and one worker per civilization, on every size and civ count', () => {
-    const rec = recorder();
-    let games = 0;
-    let workers = 0;
-    let expectedGames = 0;
-    let expectedWorkers = 0;
+  // Full tier: 9 s — a sweep over every map size and civilization count, so its cost is the number of
+  // combinations rather than the length of one game. Every combination is asserted, so narrowing it
+  // would narrow the claim.
+  it.skipIf(!FULL_TIER)(
+    'gives exactly one settler and one worker per civilization, on every size and civ count',
+    () => {
+      const rec = recorder();
+      let games = 0;
+      let workers = 0;
+      let expectedGames = 0;
+      let expectedWorkers = 0;
 
-    for (const mapSize of MAP_SIZES) {
-      const maxCivs = MAP_DIMENSIONS[mapSize].maxCivs;
-      for (let civCount = 2; civCount <= maxCivs; civCount += 1) {
-        expectedGames += 2; // two seeds
-        expectedWorkers += 2 * civCount; // one worker per civilization, per seed
-        for (const seed of [1, 42]) {
-          const settings: Settings = { ...DEFAULT_SETTINGS, mapSize, civCount, seed };
-          const result = newGame(seed, settings, RULESET);
-          const where = `${mapSize}/${String(civCount)} civs, seed ${String(seed)}`;
+      for (const mapSize of MAP_SIZES) {
+        const maxCivs = MAP_DIMENSIONS[mapSize].maxCivs;
+        for (let civCount = 2; civCount <= maxCivs; civCount += 1) {
+          expectedGames += 2; // two seeds
+          expectedWorkers += 2 * civCount; // one worker per civilization, per seed
+          for (const seed of [1, 42]) {
+            const settings: Settings = { ...DEFAULT_SETTINGS, mapSize, civCount, seed };
+            const result = newGame(seed, settings, RULESET);
+            const where = `${mapSize}/${String(civCount)} civs, seed ${String(seed)}`;
 
-          rec.check(result.ok, `${where}: newGame failed`);
-          if (!result.ok) continue;
-          games += 1;
+            rec.check(result.ok, `${where}: newGame failed`);
+            if (!result.ok) continue;
+            games += 1;
 
-          const state = result.value;
-          const civs = state.players.filter((player) => player.kind === 'civ');
-          const barbarians = state.players.filter((player) => player.kind === 'barbarian');
-          rec.check(civs.length === civCount, `${where}: ${String(civs.length)} civilizations`);
-          rec.check(
-            barbarians.length === 1,
-            `${where}: ${String(barbarians.length)} barbarian players`,
-          );
-
-          const settlers = state.units.filter((unit) => unit.type === SETTLER.id);
-          const boards = state.units.filter((unit) => unit.type === WORKER.id);
-          workers += boards.length;
-          rec.check(
-            settlers.length === civCount,
-            `${where}: ${String(settlers.length)} settlers for ${String(civCount)} civilizations`,
-          );
-          rec.check(
-            boards.length === civCount,
-            `${where}: ${String(boards.length)} workers for ${String(civCount)} civilizations`,
-          );
-
-          const claimed = new Set<number>();
-          for (const unit of state.units) {
-            const tileIndex = Number(unit.tile);
-            const owner = playerOf(state, unit.owner);
+            const state = result.value;
+            const civs = state.players.filter((player) => player.kind === 'civ');
+            const barbarians = state.players.filter((player) => player.kind === 'barbarian');
+            rec.check(civs.length === civCount, `${where}: ${String(civs.length)} civilizations`);
             rec.check(
-              owner?.kind === 'civ',
-              `${where}: unit ${String(unit.id)} belongs to a player that is not a civilization`,
-            );
-            rec.check(
-              Number.isInteger(tileIndex) &&
-                tileIndex >= 0 &&
-                tileIndex < state.map.width * state.map.height,
-              `${where}: unit ${String(unit.id)} stands off the map`,
-            );
-            const terrain = terrainAtIndex(state.map, tileIndex);
-            const def = RULESET.terrains.find((candidate) => candidate.id === terrain);
-            rec.check(
-              def !== undefined && !def.impassable,
-              `${where}: unit ${String(unit.id)} stands on impassable or undescribed terrain`,
-            );
-            rec.check(
-              !claimed.has(tileIndex),
-              `${where}: two starting units share tile ${String(tileIndex)}`,
-            );
-            claimed.add(tileIndex);
-
-            const type = unitDef(RULESET, unit.type);
-            rec.check(
-              type !== undefined && unit.movementLeft === type.movement && unit.movementLeft > 0,
-              `${where}: unit ${String(unit.id)} starts with ${String(unit.movementLeft)} movement`,
+              barbarians.length === 1,
+              `${where}: ${String(barbarians.length)} barbarian players`,
             );
 
-            if (unit.type === SETTLER.id && owner !== undefined) {
+            const settlers = state.units.filter((unit) => unit.type === SETTLER.id);
+            const boards = state.units.filter((unit) => unit.type === WORKER.id);
+            workers += boards.length;
+            rec.check(
+              settlers.length === civCount,
+              `${where}: ${String(settlers.length)} settlers for ${String(civCount)} civilizations`,
+            );
+            rec.check(
+              boards.length === civCount,
+              `${where}: ${String(boards.length)} workers for ${String(civCount)} civilizations`,
+            );
+
+            const claimed = new Set<number>();
+            for (const unit of state.units) {
+              const tileIndex = Number(unit.tile);
+              const owner = playerOf(state, unit.owner);
               rec.check(
-                unit.tile === owner.startingTile,
-                `${where}: a settler is not on its civilization's starting tile`,
+                owner?.kind === 'civ',
+                `${where}: unit ${String(unit.id)} belongs to a player that is not a civilization`,
               );
-            }
-            if (unit.type === WORKER.id && owner !== undefined) {
-              const neighbours = neighbors8(state.map, Number(owner.startingTile)).map(Number);
               rec.check(
-                neighbours.includes(tileIndex) && unit.tile !== owner.startingTile,
-                `${where}: a worker is not on a free tile beside its settler`,
+                Number.isInteger(tileIndex) &&
+                  tileIndex >= 0 &&
+                  tileIndex < state.map.width * state.map.height,
+                `${where}: unit ${String(unit.id)} stands off the map`,
               );
+              const terrain = terrainAtIndex(state.map, tileIndex);
+              const def = RULESET.terrains.find((candidate) => candidate.id === terrain);
+              rec.check(
+                def !== undefined && !def.impassable,
+                `${where}: unit ${String(unit.id)} stands on impassable or undescribed terrain`,
+              );
+              rec.check(
+                !claimed.has(tileIndex),
+                `${where}: two starting units share tile ${String(tileIndex)}`,
+              );
+              claimed.add(tileIndex);
+
+              const type = unitDef(RULESET, unit.type);
+              rec.check(
+                type !== undefined && unit.movementLeft === type.movement && unit.movementLeft > 0,
+                `${where}: unit ${String(unit.id)} starts with ${String(unit.movementLeft)} movement`,
+              );
+
+              if (unit.type === SETTLER.id && owner !== undefined) {
+                rec.check(
+                  unit.tile === owner.startingTile,
+                  `${where}: a settler is not on its civilization's starting tile`,
+                );
+              }
+              if (unit.type === WORKER.id && owner !== undefined) {
+                const neighbours = neighbors8(state.map, Number(owner.startingTile)).map(Number);
+                rec.check(
+                  neighbours.includes(tileIndex) && unit.tile !== owner.startingTile,
+                  `${where}: a worker is not on a free tile beside its settler`,
+                );
+              }
             }
+
+            rec.check(
+              state.nextUnitId === state.units.length,
+              `${where}: nextUnitId is ${String(state.nextUnitId)} for ${String(
+                state.units.length,
+              )} units`,
+            );
+            rec.check(
+              state.units.every((unit, index) => Number(unit.id) === index),
+              `${where}: unit ids are not dense and ordered`,
+            );
+            rec.check(isHashable(state), `${where}: the starting state is unhashable`);
+            checkMoneyShape(rec, state, where);
           }
-
-          rec.check(
-            state.nextUnitId === state.units.length,
-            `${where}: nextUnitId is ${String(state.nextUnitId)} for ${String(
-              state.units.length,
-            )} units`,
-          );
-          rec.check(
-            state.units.every((unit, index) => Number(unit.id) === index),
-            `${where}: unit ids are not dense and ordered`,
-          );
-          rec.check(isHashable(state), `${where}: the starting state is unhashable`);
-          checkMoneyShape(rec, state, where);
         }
       }
-    }
 
-    // Discriminating, and exact: every size and every legal civilization count was really
-    // built, and every worker was really placed (not silently skipped). The expected
-    // counts are computed from `MAP_SIZES`/`MAP_DIMENSIONS` rather than written down, so a
-    // size added later is covered by construction.
-    expect(games).toBe(expectedGames);
-    expect(games).toBeGreaterThan(80);
-    expect(workers).toBe(expectedWorkers);
-    expect(workers).toBeGreaterThan(500);
-    expect(rec.problems).toEqual([]);
-  }, 180_000);
+      // Discriminating, and exact: every size and every legal civilization count was really
+      // built, and every worker was really placed (not silently skipped). The expected
+      // counts are computed from `MAP_SIZES`/`MAP_DIMENSIONS` rather than written down, so a
+      // size added later is covered by construction.
+      expect(games).toBe(expectedGames);
+      expect(games).toBeGreaterThan(80);
+      expect(workers).toBe(expectedWorkers);
+      expect(workers).toBeGreaterThan(500);
+      expect(rec.problems).toEqual([]);
+    },
+    180_000,
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -2493,22 +2526,30 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
     //
     // M4c then moved them once more (`SCHEMA_VERSION` 5 -> 6: `GameMap.resources`, the
     // sorted sparse resource pair list that generation now fills), again through the
-    // harness's opt-in path and again with a rehash note. So the pins below are the M4c
-    // values, and this assertion is unchanged in strength: the file must equal what this
-    // build computes, entry by entry, or the gate is red.
-    expect(stored.entries.map((entry) => entry.hash)).toEqual(computed);
+    // harness's opt-in path and again with a rehash note.
+    //
+    // M5 moved them a third time (`SCHEMA_VERSION` 6 -> 7: `techs` on every player row,
+    // required and empty for a fresh game) and added a fourth entry — the *played*
+    // golden, which this file cannot recompute because it holds no command script. So
+    // the entries this file owns are compared value for value and the file's whole
+    // scenario list is pinned: the assertion is unchanged in strength — nothing short of
+    // "the file on disk is exactly what this build produces, for exactly these
+    // scenarios" passes it.
+    const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
+    expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
       'tiny-civs2-seed1',
       'tiny-civs2-seed42',
       'tiny-civs2-seed1337',
+      'played-civs2-seed42',
     ]);
     expect(stored.nodeMajor).toBe(Number.parseInt(process.versions.node, 10));
 
     const state = goldenState(42);
     expect(state.schemaVersion).toBe(SCHEMA_VERSION);
-    // 6, not 5: M4c's `GameMap.resources`. Named rather than written as `> 5` so a
+    // 7, not 6: M5's `PlayerState.techs`. Named rather than written as `> 6` so a
     // future schema bump has to come here and say so.
-    expect(SCHEMA_VERSION).toBe(6);
+    expect(SCHEMA_VERSION).toBe(7);
 
     // The four new keys are inside the canonical JSON `hashValue` hashes, so a shape
     // change of any of them — added, renamed, removed — trips the gate. This is the check

@@ -37,6 +37,7 @@ import {
   planFoundCity,
   planMove,
   planSetProduction,
+  planSetResearch,
   planSetWorkedTiles,
   planStartWork,
   type Command,
@@ -52,6 +53,7 @@ import {
   asCityId,
   asPlayerId,
   asResourceId,
+  asTechId,
   asTerrainId,
   asTileIndex,
   asUnitId,
@@ -79,6 +81,10 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+// M5's research *rule*, asked directly in the agreement sweep at the bottom of this
+// file: the applier must accept exactly what `planSetResearch` accepts, and the
+// surest way to check that is to ask the same question both ways.
+import { researchProblem, researchingOf, type TechDef } from '../src/tech.js';
 import { advanceTurn } from '../src/turn.js';
 import {
   spawnUnit,
@@ -302,16 +308,70 @@ const IRRIGATION: ImprovementDef = {
 const IMPROVEMENTS: readonly ImprovementDef[] = [ROAD, MINE, IRRIGATION];
 
 /**
- * The engine's view of a ruleset: terrain, a unit catalog, buildings, improvements
- * and — M4c — a resource catalog. `SWORDSMAN` is the one gated row and is
- * **appended**, so catalog order for everything before it is unchanged.
+ * Four rows of a tech tree, enough for every `SetResearch` answer: two roots
+ * (`pottery`, `bronze-working`), a second tier (`masonry`, behind `bronze-working`)
+ * and a join (`literature`, needing both `pottery` and `masonry`, so its refusal
+ * lists *two* missing prerequisites and the answer is not a single-string special
+ * case).
+ *
+ * The costs are distinct and the catalog order is not the id order, so an assertion
+ * that mixes two rows up fails instead of passing by coincidence.
  */
-const RULESET: RulesetView = {
+const POTTERY: TechDef = {
+  id: asTechId('pottery'),
+  name: 'Pottery',
+  era: 'ancient',
+  cost: 5,
+  requires: [],
+};
+
+const BRONZE_WORKING: TechDef = {
+  id: asTechId('bronze-working'),
+  name: 'Bronze Working',
+  era: 'ancient',
+  cost: 6,
+  requires: [],
+};
+
+const MASONRY: TechDef = {
+  id: asTechId('masonry'),
+  name: 'Masonry',
+  era: 'ancient',
+  cost: 9,
+  requires: [asTechId('bronze-working')],
+};
+
+const LITERATURE: TechDef = {
+  id: asTechId('literature'),
+  name: 'Literature',
+  era: 'medieval',
+  cost: 15,
+  requires: [asTechId('pottery'), asTechId('masonry')],
+};
+
+const TECHS: readonly TechDef[] = [POTTERY, BRONZE_WORKING, MASONRY, LITERATURE];
+
+/**
+ * The engine's view of a ruleset: terrain, a unit catalog, buildings, improvements,
+ * a resource catalog (M4c) and — M5 — a tech tree. `SWORDSMAN` is the one gated row
+ * and is **appended**, so catalog order for everything before it is unchanged.
+ *
+ * `RulesetView` does not declare `techs` (M5's gating workstream owns that field and
+ * `map.ts` is not this workstream's file), so the tree arrives as a local extension
+ * of the view — the shape the field will take when it is declared, and the shape
+ * `tech.ts` reads structurally.
+ */
+interface TechView extends RulesetView {
+  readonly techs: readonly TechDef[];
+}
+
+const RULESET: TechView = {
   terrains: TERRAINS,
   units: [SETTLER, SCOUT, WARRIOR, WORKER, SWORDSMAN],
   buildings: BUILDINGS,
   improvements: IMPROVEMENTS,
   resources: RESOURCES,
+  techs: TECHS,
   fidelity: 'tuned',
 };
 
@@ -334,6 +394,11 @@ const player = (
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: a fixture player knows no techs. `techs` is required and `[]` is how the
+  // state says "knows nothing"; `researching` is **absent** on purpose, which is the
+  // only way this state spells "not researching anything" (see `PlayerState`). The
+  // M5 sections below set both where they care.
+  techs: [],
 });
 
 const unit = (
@@ -3537,5 +3602,294 @@ describe('applyCommand — M3 purity and revision', () => {
     }
 
     expect(board).toEqual(snapshot);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M5 — SetResearch
+ * ------------------------------------------------------------------ */
+
+/** The command under test, spelled once. */
+const setResearch = (tech: string): Command => ({ type: 'SetResearch', tech: asTechId(tech) });
+
+/** `STATE` with one player's tech list and beaker pool set, for the M5 sections. */
+const researching = (
+  state: GameState,
+  index: number,
+  overrides: Partial<PlayerState>,
+): GameState => ({
+  ...state,
+  players: state.players.map((each) =>
+    each.id === asPlayerId(index) ? { ...each, ...overrides } : each,
+  ),
+});
+
+describe('applyCommand — SetResearch', () => {
+  it('stores the choice and touches nothing else', () => {
+    const outcome = mustOk(apply(STATE, P0, setResearch('pottery')));
+    const after = playerOf(outcome.state, 0);
+
+    expect(researchingOf(after)).toBe('pottery');
+    // The key is *present*: a selection is a real value, and only "not researching"
+    // is an absent key.
+    expect(Object.hasOwn(after, 'researching')).toBe(true);
+    // Nothing else moves. `techs` grows when a tech *completes* (the pipeline's job),
+    // never when it is selected, and the beaker pool is untouched — choosing what to
+    // research is not progress toward it.
+    expect([...after.techs]).toEqual([]);
+    expect(after.beakers).toBe(playerOf(STATE, 0).beakers);
+    expect(after.treasury).toBe(playerOf(STATE, 0).treasury);
+    expect(after.rates).toEqual(playerOf(STATE, 0).rates);
+    expect(after.luxuries).toBe(playerOf(STATE, 0).luxuries);
+    // The other player is not the actor and is not touched.
+    expect(playerOf(outcome.state, 1)).toBe(playerOf(STATE, 1));
+    expect(outcome.state.units).toBe(STATE.units);
+    expect(outcome.state.cities).toBe(STATE.cities);
+    expect(outcome.state.revision).toBe(STATE.revision + 1);
+    // No event: M3's setter precedent. The `TechResearched` event belongs to the
+    // pipeline step that finishes a tech, not to the command that selects one.
+    expect(outcome.events).toEqual([]);
+  });
+
+  it('is idempotent: selecting the tech a player is already researching is legal', () => {
+    // Like `SetRates`, and unlike a "no-op" refusal: a UI's confirm button must not
+    // be wrong because the choice was already made. It is still a command, so it
+    // still costs a revision.
+    const once = mustOk(apply(STATE, P0, setResearch('pottery')));
+    const twice = mustOk(apply(once.state, P0, setResearch('pottery')));
+
+    expect(researchingOf(playerOf(twice.state, 0))).toBe('pottery');
+    expect(twice.state.revision).toBe(once.state.revision + 1);
+  });
+
+  it('overwrites a selection that can no longer be researched, without reading it', () => {
+    // The player is never trapped by a stale or impossible choice: the applier writes
+    // the new tech and does not consult the old one at all. (Which is why
+    // `applyResearch` can afford to *report* a stuck selection rather than repair it.)
+    const stuck = researching(STATE, 0, { researching: asTechId('literature') });
+    const outcome = mustOk(apply(stuck, P0, setResearch('pottery')));
+
+    expect(researchingOf(playerOf(outcome.state, 0))).toBe('pottery');
+  });
+
+  it('refuses a tech this ruleset does not define', () => {
+    expect(refusedAs(apply(STATE, P0, setResearch('mithril')), 'unknown-tech')).toEqual({
+      kind: 'unknown-tech',
+      tech: 'mithril',
+    });
+    // The refusal is a *decision*, not a mutation: the state is exactly as it was.
+    expect(STATE.revision).toBe(0);
+    expect(researchingOf(playerOf(STATE, 0))).toBeUndefined();
+  });
+
+  it('refuses a tech the player already knows', () => {
+    const knows = researching(STATE, 0, { techs: [asTechId('pottery')] });
+
+    expect(refusedAs(apply(knows, P0, setResearch('pottery')), 'tech-already-known')).toEqual({
+      kind: 'tech-already-known',
+      tech: 'pottery',
+    });
+  });
+
+  it('refuses a tech whose prerequisite is not known, naming every missing one', () => {
+    // `literature` needs `pottery` and `masonry`, and this player has neither — so the
+    // refusal carries *both*, sorted, rather than making a UI ask again. A refusal
+    // that named nothing would be a refusal with no reason in it.
+    expect(
+      refusedAs(apply(STATE, P0, setResearch('literature')), 'tech-prerequisites-unmet'),
+    ).toEqual({
+      kind: 'tech-prerequisites-unmet',
+      tech: 'literature',
+      missing: [asTechId('masonry'), asTechId('pottery')],
+    });
+
+    // With one of the two known, the answer narrows to the other.
+    const half = researching(STATE, 0, { techs: [asTechId('pottery')] });
+    expect(
+      refusedAs(apply(half, P0, setResearch('literature')), 'tech-prerequisites-unmet'),
+    ).toEqual({
+      kind: 'tech-prerequisites-unmet',
+      tech: 'literature',
+      missing: [asTechId('masonry')],
+    });
+
+    // And with both known the command is legal: the refusal above was about the
+    // prerequisites and about nothing else.
+    const ready = researching(STATE, 0, {
+      techs: [asTechId('pottery'), asTechId('masonry')],
+    });
+    expect(apply(ready, P0, setResearch('literature')).ok).toBe(true);
+  });
+
+  it('refuses an actor the state does not have', () => {
+    expect(
+      refusedAs(apply(STATE, asPlayerId(7), setResearch('pottery')), 'unknown-player'),
+    ).toEqual({
+      kind: 'unknown-player',
+      playerId: asPlayerId(7),
+    });
+  });
+
+  it('is legal for a barbarian actor too, whose choice nothing advances', () => {
+    // The contract's rule has no `kind` in it, and `applyResearch` skips barbarians
+    // exactly as the money loop does — so the command is legal, writes the setting,
+    // and nothing about the game changes. Refusing would be a rule the frozen
+    // contract does not state.
+    const withBarbarians: GameState = {
+      ...STATE,
+      players: [...STATE.players, player(2, 8, 'barbarian')],
+    };
+
+    const outcome = mustOk(apply(withBarbarians, asPlayerId(2), setResearch('pottery')));
+    expect(researchingOf(playerOf(outcome.state, 2))).toBe('pottery');
+
+    // A turn passes; the barbarian's choice is inert, and its pool (which nothing
+    // credits) is untouched.
+    const afterTurn = advanceTurn(outcome.state, RULESET);
+    expect(playerOf(afterTurn.state, 2).beakers).toBe(0);
+    expect([...playerOf(afterTurn.state, 2).techs]).toEqual([]);
+    expect(researchingOf(playerOf(afterTurn.state, 2))).toBe('pottery');
+  });
+
+  it('wires the command to the pipeline: a selected tech completes when the pool covers it', () => {
+    // The end-to-end check that the two halves are one rule: the command writes what
+    // the research step reads, and the step completes it from banked beakers.
+    const funded = researching(STATE, 0, { beakers: 5 });
+    const selected = mustOk(apply(funded, P0, setResearch('pottery')));
+    const turn = mustOk(apply(selected.state, P0, END_TURN));
+
+    expect(turn.events).toContainEqual({
+      type: 'TechResearched',
+      playerId: P0,
+      tech: asTechId('pottery'),
+      cost: 5,
+      beakers: 0,
+    });
+    expect([...playerOf(turn.state, 0).techs]).toEqual([asTechId('pottery')]);
+    expect(Object.hasOwn(playerOf(turn.state, 0), 'researching')).toBe(false);
+  });
+
+  it('leaves the resulting state hashable, with no key holding undefined', () => {
+    // The M3 bug class this milestone's optional field could have reintroduced: a
+    // `researching: undefined` key would compile against a looser type and make
+    // `canonicalize` throw. It cannot here — `withResearching` never writes
+    // `undefined` and `exactOptionalPropertyTypes` makes that a compile error — and
+    // this asserts the runtime consequence.
+    const outcome = mustOk(apply(STATE, P0, setResearch('pottery')));
+
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+    expect(() => hashValue(outcome.state)).not.toThrow();
+    expect(canonicalize(outcome.state)).toContain('"researching":"pottery"');
+  });
+
+  it('is pure: the input state is not modified, by the planner or the applier', () => {
+    const before = hashValue(STATE);
+
+    planSetResearch(STATE, RULESET, P0, asTechId('pottery'));
+    planSetResearch(STATE, RULESET, P0, asTechId('mithril'));
+    apply(STATE, P0, setResearch('pottery'));
+
+    expect(hashValue(STATE)).toBe(before);
+    expect(STATE.revision).toBe(0);
+  });
+});
+
+describe('planSetResearch agrees with the applier, over the whole catalog and beyond', () => {
+  /** The tech ids a caller might name: every real row, plus ids no row defines. */
+  const CANDIDATES: readonly string[] = [
+    ...TECHS.map((tech) => String(tech.id)),
+    'mithril',
+    '',
+    'Pottery', // case matters: ids are exact, and a near miss is not a tech
+    'pottery ',
+  ];
+
+  /** Players worth sweeping: an empty one, one with a tech, one with several. */
+  const BOARDS: readonly GameState[] = [
+    STATE,
+    researching(STATE, 0, { techs: [asTechId('pottery')] }),
+    researching(STATE, 0, { techs: [asTechId('bronze-working'), asTechId('masonry')] }),
+    researching(STATE, 0, {
+      techs: [asTechId('pottery'), asTechId('masonry'), asTechId('literature')],
+    }),
+    researching(STATE, 0, { beakers: 40 }),
+  ];
+
+  it('accepts exactly what it refuses, for every candidate on every board', () => {
+    // The keystone property for this command, in both directions: the planner is what
+    // a UI greys a tech out with and `applyCommand` is what refuses it, so a
+    // disagreement is either a button that fails or a refusal nobody can predict.
+    for (const board of BOARDS) {
+      for (const candidate of CANDIDATES) {
+        const tech = asTechId(candidate);
+        const plan = planSetResearch(board, RULESET, P0, tech);
+        const applied = apply(board, P0, { type: 'SetResearch', tech });
+
+        expect(applied.ok, `plan/applier disagree on "${candidate}"`).toBe(plan.ok);
+        if (!plan.ok && !applied.ok) expect(applied.error).toEqual(plan.error);
+      }
+    }
+  });
+
+  it('is the same question as tech.ts’ researchProblem, mapped onto GameError', () => {
+    // The mapping stated as a property rather than as a table: `undefined` from the
+    // rule means the plan succeeds, and each problem kind means its own refusal.
+    for (const board of BOARDS) {
+      for (const candidate of CANDIDATES) {
+        const tech = asTechId(candidate);
+        const problem = researchProblem(RULESET, playerOf(board, 0), tech);
+        const plan = planSetResearch(board, RULESET, P0, tech);
+
+        if (problem === undefined) {
+          expect(plan.ok, `"${candidate}" is researchable but the planner refused`).toBe(true);
+          continue;
+        }
+        expect(plan.ok).toBe(false);
+        if (plan.ok) continue;
+        switch (problem.kind) {
+          case 'unknown-tech':
+            expect(plan.error.kind).toBe('unknown-tech');
+            break;
+          case 'already-known':
+            expect(plan.error.kind).toBe('tech-already-known');
+            break;
+          case 'unmet-prerequisite':
+            expect(plan.error.kind).toBe('tech-prerequisites-unmet');
+            if (plan.error.kind === 'tech-prerequisites-unmet') {
+              expect(plan.error.missing).toEqual(problem.missing);
+            }
+            break;
+          case 'nothing-being-researched':
+            throw new Error('researchProblem must not answer a question about a candidate');
+        }
+      }
+    }
+  });
+
+  it('never lets the applier accept something the planner refused, for another actor', () => {
+    // The same sweep from player 1's seat, so "the actor’s own row is the only row in
+    // reach" is checked rather than assumed: player 1 knows nothing, whatever player 0
+    // knows.
+    const board = researching(STATE, 0, { techs: [asTechId('pottery')] });
+    for (const candidate of CANDIDATES) {
+      const tech = asTechId(candidate);
+      const plan = planSetResearch(board, RULESET, P1, tech);
+      const applied = apply(board, P1, { type: 'SetResearch', tech });
+      expect(applied.ok, `plan/applier disagree for player 1 on "${candidate}"`).toBe(plan.ok);
+    }
+  });
+
+  it('carries the tech through on success, and only on success', () => {
+    const ok = planSetResearch(STATE, RULESET, P0, asTechId('masonry'));
+    // `masonry` needs `bronze-working`, so this one is the refusal — and the *legal*
+    // one is a root.
+    expect(ok.ok).toBe(false);
+
+    const plan = planSetResearch(STATE, RULESET, P0, asTechId('pottery'));
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.value.tech).toBe('pottery');
+      expect(plan.value.player.id).toBe(P0);
+    }
   });
 });

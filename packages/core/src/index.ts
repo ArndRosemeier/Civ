@@ -25,6 +25,12 @@ export * from './cities.js';
 export * from './buildings.js';
 export * from './growth.js';
 export * from './economy.js';
+// M5's technology rules. Before `production.js`/`turn.js` in reading order because
+// the research step is the pipeline's step 4 (`turn.ts` calls `applyResearch`) and the
+// `SetResearch` command consults `researchProblem`; the runtime edges run
+// `turn.ts → tech.ts` and `commands.ts → tech.ts`, while `tech.ts` imports
+// `GameEvent` from `commands.ts` type-only, so there is no cycle at runtime.
+export * from './tech.js';
 export * from './production.js';
 export * from './turn.js';
 export * from './hut.js';

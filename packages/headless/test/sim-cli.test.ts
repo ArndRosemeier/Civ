@@ -41,6 +41,10 @@ import { fileURLToPath } from 'node:url';
 import type { Result } from '@civts/core';
 import { CORE_INVARIANTS } from '@civts/sim';
 import { describe, expect, it } from 'vitest';
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
 
 import {
   HORIZON_METRICS,
@@ -359,44 +363,51 @@ describe('the sim report is one structured value, rendered', () => {
     expect(output.stdout).toContain('city-tile-unique');
   });
 
-  it('holds the seeds that used to trip the food-box check, at ONE horizon', () => {
-    // The five seeds whose cities completed a granary on the turn the growth pass had
-    // already filled their box, and which `city-food-box-within-threshold` therefore
-    // reported — a false positive: `advanceTurn` runs growth *before* production, so the
-    // reduced threshold a completion brings applies to the NEXT growth check. They are
-    // pinned here through the shipped command as a regression, and what is asserted is the
-    // property that matters to a balance run: no violation, and one horizon. A batch whose
-    // runs stop on different turns makes `BatchResult.aggregates` a mean over games of
-    // different lengths, silently.
-    const args: readonly string[] = [
-      '--seeds',
-      '6,17,29,38,39',
-      '--map-size',
-      'tiny',
-      '--turns',
-      '20',
-    ];
-    const output = okOrThrow(runSimCommand(args));
-    const report = simReportOf(args);
+  // Full tier: 3.8 s — a multi-seed sweep through the real CLI, i.e. a batch run out of process. It is
+  // the regression evidence for a fixed food-box bug, so it must keep running; the fast tier keeps the
+  // single-seed CLI tests.
+  it.skipIf(!FULL_TIER)(
+    'holds the seeds that used to trip the food-box check, at ONE horizon',
+    () => {
+      // The five seeds whose cities completed a granary on the turn the growth pass had
+      // already filled their box, and which `city-food-box-within-threshold` therefore
+      // reported — a false positive: `advanceTurn` runs growth *before* production, so the
+      // reduced threshold a completion brings applies to the NEXT growth check. They are
+      // pinned here through the shipped command as a regression, and what is asserted is the
+      // property that matters to a balance run: no violation, and one horizon. A batch whose
+      // runs stop on different turns makes `BatchResult.aggregates` a mean over games of
+      // different lengths, silently.
+      const args: readonly string[] = [
+        '--seeds',
+        '6,17,29,38,39',
+        '--map-size',
+        'tiny',
+        '--turns',
+        '20',
+      ];
+      const output = okOrThrow(runSimCommand(args));
+      const report = simReportOf(args);
 
-    expect(report.status).toBe('ok');
-    expect(report.exitCode).toBe(0);
-    expect(report.invariants.violations).toBe(0);
-    expect(report.violations).toStrictEqual([]);
-    expect(report.runs).toHaveLength(5);
-    // Every run reached `maxTurns` — no run was truncated by a check.
-    expect([...new Set(report.runs.map((run) => run.turnsPlayed))]).toStrictEqual([20]);
-    expect(report.runs.every((run) => run.stoppedBecause === 'max-turns')).toBe(true);
-    // ...and the report says so itself, in the field the renderer reads to print its
-    // horizon caveat: one horizon, no caveat.
-    expect(report.totals.horizonVaries).toBe(false);
-    expect(report.totals.horizonTurnMin).toBe(report.totals.horizonTurnMax);
-    expect([...new Set(report.runs.map((run) => run.finalTurn))]).toStrictEqual([
-      report.totals.horizonTurnMax,
-    ]);
-    expect(output.stdout).not.toContain('runs stopped on different turns');
-    expect(output.stderr).toBe('');
-  }, 300_000);
+      expect(report.status).toBe('ok');
+      expect(report.exitCode).toBe(0);
+      expect(report.invariants.violations).toBe(0);
+      expect(report.violations).toStrictEqual([]);
+      expect(report.runs).toHaveLength(5);
+      // Every run reached `maxTurns` — no run was truncated by a check.
+      expect([...new Set(report.runs.map((run) => run.turnsPlayed))]).toStrictEqual([20]);
+      expect(report.runs.every((run) => run.stoppedBecause === 'max-turns')).toBe(true);
+      // ...and the report says so itself, in the field the renderer reads to print its
+      // horizon caveat: one horizon, no caveat.
+      expect(report.totals.horizonVaries).toBe(false);
+      expect(report.totals.horizonTurnMin).toBe(report.totals.horizonTurnMax);
+      expect([...new Set(report.runs.map((run) => run.finalTurn))]).toStrictEqual([
+        report.totals.horizonTurnMax,
+      ]);
+      expect(output.stdout).not.toContain('runs stopped on different turns');
+      expect(output.stderr).toBe('');
+    },
+    300_000,
+  );
 
   it('prints exactly the figures the structured value holds, for every metric', () => {
     const output = okOrThrow(runSimCommand(SMALL));
@@ -548,19 +559,25 @@ describe('the sim command through the real CLI', () => {
     expect(run.stdout).not.toContain('!!!');
   }, 300_000);
 
-  it('prints the same --json bytes twice, in two fresh processes', () => {
-    const first = runCli(['sim', ...SMALL, '--json']);
-    const second = runCli(['sim', ...SMALL, '--json']);
+  // Full tier: determinism across two fresh processes, named by the standing requirement. Cheap in
+  // wall clock (1.26 s) and impossible to test in-process, so it is worth the deferral.
+  it.skipIf(!FULL_TIER)(
+    'prints the same --json bytes twice, in two fresh processes',
+    () => {
+      const first = runCli(['sim', ...SMALL, '--json']);
+      const second = runCli(['sim', ...SMALL, '--json']);
 
-    expect(first.status).toBe(0);
-    expect(second.status).toBe(0);
-    expect(first.stderr).toBe('');
-    expect(first.stdout).toBe(second.stdout);
+      expect(first.status).toBe(0);
+      expect(second.status).toBe(0);
+      expect(first.stderr).toBe('');
+      expect(first.stdout).toBe(second.stdout);
 
-    const parsed: unknown = JSON.parse(first.stdout);
-    expectSortedKeys(parsed, '$');
-    expect(parsed).toMatchObject({ kind: 'civts-sim-report', status: 'ok', exitCode: 0 });
-  }, 300_000);
+      const parsed: unknown = JSON.parse(first.stdout);
+      expectSortedKeys(parsed, '$');
+      expect(parsed).toMatchObject({ kind: 'civts-sim-report', status: 'ok', exitCode: 0 });
+    },
+    300_000,
+  );
 
   it('refuses an invalid --override with a clear message and a non-zero exit', () => {
     const run = runCli(['sim', ...SMALL, '--override', 'units.dragon.cost=4']);
@@ -619,63 +636,73 @@ describe('the balance sweep', () => {
     if (!unknown.ok) expect(unknown.error).toContain('unknown option for the sweep');
   });
 
-  it('runs the same seeds under every value, with the shipped row as its own control', () => {
-    const report = sweepReportOf([], TEST_DEFAULTS);
+  // Full tier: 1.75 s — the same seeds under every value of a knob, i.e. a batch per variant, which is
+  // exactly the mutation-sweep shape the standing requirement assigns to the full tier.
+  it.skipIf(!FULL_TIER)(
+    'runs the same seeds under every value, with the shipped row as its own control',
+    () => {
+      const report = sweepReportOf([], TEST_DEFAULTS);
 
-    expect(report.kind).toBe('civts-balance-sweep');
-    expect(report.status).toBe('ok');
-    expect(report.exitCode).toBe(0);
-    expect(report.knob.field).toBe('units.settler.cost');
-    // The shipped value and its provenance come from the catalog, never from the caller.
-    expect(report.knob.shipped).toBe(3);
-    expect(report.knob.provenanceKind).toBe('placeholder');
-    expect(report.knob.provenanceDetail.length).toBeGreaterThan(0);
+      expect(report.kind).toBe('civts-balance-sweep');
+      expect(report.status).toBe('ok');
+      expect(report.exitCode).toBe(0);
+      expect(report.knob.field).toBe('units.settler.cost');
+      // The shipped value and its provenance come from the catalog, never from the caller.
+      expect(report.knob.shipped).toBe(3);
+      expect(report.knob.provenanceKind).toBe('placeholder');
+      expect(report.knob.provenanceDetail.length).toBeGreaterThan(0);
 
-    // The control: no override at all, so its hash is the shipped catalog's.
-    expect(report.baseline.overrides).toStrictEqual([]);
-    expect(report.baseline.runs).toBe(2);
+      // The control: no override at all, so its hash is the shipped catalog's.
+      expect(report.baseline.overrides).toStrictEqual([]);
+      expect(report.baseline.runs).toBe(2);
 
-    const rows = measuredRows(report);
-    expect(rows).toHaveLength(3);
-    expect(rows.map((row) => row.value)).toStrictEqual([1, 3, 9]);
-    expect(rows.map((row) => row.shipped)).toStrictEqual([false, true, false]);
-    // Each value really produced a different ruleset, or the table would be measuring one
-    // catalog three times and calling it a sweep.
-    expect(new Set(rows.map((row) => row.rulesetHash)).size).toBe(3);
-    expect(rows.every((row) => row.overrides.length === 1)).toBe(true);
-    expect(report.violations).toStrictEqual([]);
-    // The banner's own sentence is a stored count, not arithmetic the renderer does.
-    expect(report.totals).toStrictEqual({ runs: 6, violatingRuns: 0 });
+      const rows = measuredRows(report);
+      expect(rows).toHaveLength(3);
+      expect(rows.map((row) => row.value)).toStrictEqual([1, 3, 9]);
+      expect(rows.map((row) => row.shipped)).toStrictEqual([false, true, false]);
+      // Each value really produced a different ruleset, or the table would be measuring one
+      // catalog three times and calling it a sweep.
+      expect(new Set(rows.map((row) => row.rulesetHash)).size).toBe(3);
+      expect(rows.every((row) => row.overrides.length === 1)).toBe(true);
+      expect(report.violations).toStrictEqual([]);
+      // The banner's own sentence is a stored count, not arithmetic the renderer does.
+      expect(report.totals).toStrictEqual({ runs: 6, violatingRuns: 0 });
 
-    // The shipped row and the no-override control measure the same numbers: the sweep
-    // does not assume that, it displays it — and this is the display, asserted.
-    const shipped = rows.find((row) => row.shipped);
-    expect(shipped).toBeDefined();
-    if (shipped === undefined) return;
-    expect(shipped.rulesetHash).toBe(report.baseline.rulesetHash);
-    expect(shipped.horizons).toStrictEqual(report.baseline.horizons);
-    expect(shipped.deltas.every((delta) => delta.delta === 0)).toBe(true);
-  });
+      // The shipped row and the no-override control measure the same numbers: the sweep
+      // does not assume that, it displays it — and this is the display, asserted.
+      const shipped = rows.find((row) => row.shipped);
+      expect(shipped).toBeDefined();
+      if (shipped === undefined) return;
+      expect(shipped.rulesetHash).toBe(report.baseline.rulesetHash);
+      expect(shipped.horizons).toStrictEqual(report.baseline.horizons);
+      expect(shipped.deltas.every((delta) => delta.delta === 0)).toBe(true);
+    },
+  );
 
-  it('shows a visible effect, and says so in a verdict rather than leaving it to the eye', () => {
-    const output = okOrThrow(runSweepCommand([], TEST_DEFAULTS));
-    const report = output.report;
-    expect(report).toBeDefined();
-    if (report === undefined) return;
+  // Full tier: 1.55 s, and it is not independently runnable — it reads the balance sweep's output,
+  // which is itself a batch run. Running it fast would mean running the sweep anyway.
+  it.skipIf(!FULL_TIER)(
+    'shows a visible effect, and says so in a verdict rather than leaving it to the eye',
+    () => {
+      const output = okOrThrow(runSweepCommand([], TEST_DEFAULTS));
+      const report = output.report;
+      expect(report).toBeDefined();
+      if (report === undefined) return;
 
-    // The requirement is explicit: a sweep that shows no difference proves nothing. This
-    // asserts the *relation* (some metric moved; the verdict says so) rather than pinned
-    // figures, which would turn a content change into a test failure.
-    const moved = report.effects.filter((effect) => effect.spread > 0);
-    expect(moved.length).toBeGreaterThan(0);
-    expect(report.verdict).toBe('moves-metrics');
-    expect(moved.every((effect) => effect.min <= effect.max)).toBe(true);
+      // The requirement is explicit: a sweep that shows no difference proves nothing. This
+      // asserts the *relation* (some metric moved; the verdict says so) rather than pinned
+      // figures, which would turn a content change into a test failure.
+      const moved = report.effects.filter((effect) => effect.spread > 0);
+      expect(moved.length).toBeGreaterThan(0);
+      expect(report.verdict).toBe('moves-metrics');
+      expect(moved.every((effect) => effect.min <= effect.max)).toBe(true);
 
-    expect(output.stdout).toContain('VERDICT: the knob moves the measured metrics');
-    expect(output.stdout).toContain(report.knob.field);
-    expect(output.stdout).toContain(`${String(report.knob.shipped)} (shipped)`);
-    expect(output.exitCode).toBe(0);
-  });
+      expect(output.stdout).toContain('VERDICT: the knob moves the measured metrics');
+      expect(output.stdout).toContain(report.knob.field);
+      expect(output.stdout).toContain(`${String(report.knob.shipped)} (shipped)`);
+      expect(output.exitCode).toBe(0);
+    },
+  );
 
   it('says plainly when a knob moves nothing at all', () => {
     // A factory costs 25 shields, so no city has one 12 turns in: the maintenance of a
@@ -756,19 +783,26 @@ describe('the balance sweep', () => {
  * ------------------------------------------------------------------ */
 
 describe('scripts/balance-sweep.ts', () => {
-  it('runs as `npx tsx scripts/balance-sweep.ts …` and prints the same table twice', () => {
-    const args = ['--values', '2,3', '--seeds', '1,4', '--turns', '8'];
-    const first = runSweepScript(args);
-    const second = runSweepScript(args);
+  // Full tier: 2.4 s and two subprocess runs of the balance sweep. The standing requirement's
+  // "vary one catalog number, run a batch" evidence is a sweep of batches; the fast tier keeps the
+  // cheap half of the sweep suite and this one waits.
+  it.skipIf(!FULL_TIER)(
+    'runs as `npx tsx scripts/balance-sweep.ts …` and prints the same table twice',
+    () => {
+      const args = ['--values', '2,3', '--seeds', '1,4', '--turns', '8'];
+      const first = runSweepScript(args);
+      const second = runSweepScript(args);
 
-    expect(first.status).toBe(0);
-    expect(first.stderr).toBe('');
-    expect(first.stdout).toBe(second.stdout);
-    expect(first.stdout).toContain('balance sweep — units.settler.cost');
-    expect(first.stdout).toContain('shipped value');
-    expect(first.stdout).toContain('provenance');
-    expect(first.stdout).toContain('VERDICT');
-  }, 300_000);
+      expect(first.status).toBe(0);
+      expect(first.stderr).toBe('');
+      expect(first.stdout).toBe(second.stdout);
+      expect(first.stdout).toContain('balance sweep — units.settler.cost');
+      expect(first.stdout).toContain('shipped value');
+      expect(first.stdout).toContain('provenance');
+      expect(first.stdout).toContain('VERDICT');
+    },
+    300_000,
+  );
 
   it('refuses a flag it does not know, and explains itself when asked', () => {
     const bad = runSweepScript(['--nope']);

@@ -104,10 +104,12 @@ play commands (inside a session; "help" prints the same list with detail):
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
   work <unitId> <improve>    cancel <unitId>
   rates <tax> <science> <luxury>
+  research <techId>          tech
   end   units   state   save <path>   help   quit
 
-  gold, the three rates and the (currently inert) beakers and luxuries are shown in
-  the banner, under every view, and in "state".
+  gold, the three rates and your research (what you are researching, its cost and the
+  beakers banked toward it) are shown in the banner, under every view, and in "state".
+  Luxuries are shown too and still do nothing: happiness is M9.
 
 Examples:
   pnpm map --seed 42

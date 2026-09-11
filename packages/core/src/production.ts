@@ -43,6 +43,19 @@
  *   the item, once here), rather than two rules that have to be kept in step. A
  *   wonder lost to bankruptcy leaves `city.buildings` everywhere, so the same test
  *   starts accepting it again, which is the whole of "buildable again".
+ * - **M5: the availability gate is one rule with two askers, and this pass is the
+ *   second.** `resources.ts`' `productionGate` answers whether an item is buildable
+ *   *for this owner at all* — `open`, `tech-required` (naming the tech) or `blocked`
+ *   (naming the resource) — and the completion pass asks it exactly as it already
+ *   asks `mayStartBuilding`. A city whose queue holds an item the gate refuses is
+ *   **not** charged and **not** completed: the shields stay banked and the item waits,
+ *   which is the truthful answer while a tech a player holds can only grow. What this
+ *   pass is *not* is a second opinion: it asks the same function `actions.ts`' menu
+ *   asks, so a queue entry the menu would never have offered cannot be produced here
+ *   either. M4c deliberately re-checked the resource half only in a comment
+ *   ("provably unreachable: roads are only ever added"); M5 turns that into a check
+ *   and extends it to the tech half, where the planner's own wiring is still owed —
+ *   named in `resources.ts` rather than implied.
  * - **Integers only** (PLAN.md §5.3), and no ambient state: costs come from the
  *   ruleset, yields from `cityYields`, and nothing here draws from the RNG or
  *   reads a clock.
@@ -72,6 +85,12 @@ import { mayStartBuilding } from './buildings.js';
 import type { GameEvent } from './commands.js';
 import type { CityId, TileIndex } from './ids.js';
 import { neighbors8, type RulesetView } from './map.js';
+// M5: the availability gate, asked here and in `actions.ts`' menu so the two cannot
+// disagree about what a city may build. A value import from `resources.ts`, which is
+// a leaf of the reachability graph: it imports `buildings.ts`, `improvements.ts`,
+// `units.ts` and `tech.ts`, none of which imports this module, so the edge stays
+// one-way. `resources.ts` also imports `cities.ts` *type-only* for the same reason.
+import { productionGate } from './resources.js';
 import type { GameState } from './state.js';
 import { spawnUnit, unitDef, unitsOnTile } from './units.js';
 
@@ -201,6 +220,35 @@ export const applyProduction = (state: GameState, ruleset: RulesetView): Product
     const item = city.production;
 
     if (item === undefined) {
+      current = withCity(current, { ...city, shields });
+      continue;
+    }
+
+    // M5's third gating dimension, asked at the moment of completion as well as where
+    // the order is decided — the same "one rule, two askers" arrangement the building
+    // rule below already has, and for the same reason: a queue built before a tech
+    // was known, a hand-edited save, or a state this build did not assemble can hold
+    // an entry the gate refuses, and completing it would put an item on the map that
+    // the player may not have.
+    //
+    // The response is the **waiting** one, not the dropping one: nothing was
+    // produced, so nothing is charged, the shields stay banked, and the item
+    // completes on the turn the tech lands (or the road reaches the resource). A tech
+    // a player holds only ever grows, as does a road network — a city is never
+    // destroyed and no tech is ever un-learned — so an entry this refuses is one the
+    // planner would have refused and "later" is the truthful answer rather than
+    // "never". Nothing is emitted, exactly as the placement-wait below emits nothing:
+    // no item was produced, and a `CityProduced` event for a city that produced
+    // nothing would be a lie in the event stream.
+    //
+    // M4c left this as a *comment* rather than a check, because re-asking the
+    // resource gate was provably unreachable for a state the command layer could
+    // build ("roads are only ever added"). M5 makes it a check, on the same
+    // reachability argument plus one more: the gate's *tech* dimension is enforced
+    // here and in `actions.ts`' menu while `planSetProduction` does not ask it yet
+    // (the wiring `resources.ts` names as owed), so this is the one place the
+    // pipeline refuses a tech-gated item rather than producing it.
+    if (productionGate(current, ruleset, city.owner, item).kind !== 'open') {
       current = withCity(current, { ...city, shields });
       continue;
     }

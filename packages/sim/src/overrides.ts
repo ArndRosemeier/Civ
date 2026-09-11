@@ -550,6 +550,15 @@ export const tryApplyOverrides = (
       buildings: buildings.value,
       improvements: improvements.value,
       resources: resources.value,
+      // M5's tech tree is carried through **unchanged**, and that is stated rather
+      // than left to look like an oversight: `RulesetPatch` has no `techs` section yet,
+      // so no patch can move a tech's price through this surface. The catalog is still
+      // rebuilt field by field so a future `techs` section is a one-line addition
+      // beside this one, and — more importantly — so the validated catalog a sweep
+      // runs on stays the tree `@civts/rules` shipped rather than silently losing it.
+      // `scripts/tech-balance-sweep.ts` measures the consequence of the missing
+      // section and prints it, rather than pretending the knob is reachable.
+      techs: catalog.techs,
     },
     applied: notes,
   });

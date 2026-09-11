@@ -802,16 +802,39 @@ describe('starting fog', () => {
  * it is the contract a save file and a golden file are read under. M4c moved it
  * 5 → 6 because `GameMap` gained the sparse resource list, which changes every
  * state hash exactly as a new `GameState` key would (INTERFACES.md M4c,
- * "Resources" and "Migration owners").
+ * "Resources" and "Migration owners"). M5 moves it 6 → 7 because `PlayerState`
+ * gained `techs` and the optional `researching` — two new keys inside the hashed
+ * JSON, so every stored hash moves again (INTERFACES.md M5, "Research").
  */
 describe('the persisted state shape', () => {
-  it('is schema version 6 — M4c put the resource list on the map', () => {
+  it('is schema version 7 — M5 put the tech list and the research choice on the player', () => {
     // Pinned by *value*, not by `toBe(SCHEMA_VERSION)`. A test that agrees with
     // whatever the constant says cannot notice a shape change that was never
     // recorded, and recording it is the whole point of the number: the comment
     // above `SCHEMA_VERSION` is where the history is written down, this is where it
     // is enforced. When the shape moves again, this line moves with it — in the
     // same commit as the golden regeneration, which is what a rehash is.
-    expect(SCHEMA_VERSION).toBe(6);
+    expect(SCHEMA_VERSION).toBe(7);
+  });
+
+  it('gives every player a tech list, and gives nobody a research choice', () => {
+    // The two M5 keys, as `newGame` writes them. `techs` is required on every row of
+    // `players` — civilizations and barbarians alike, the one-shape rule `treasury`
+    // and `rates` already follow — and it is `[]`, because "knows nothing" is a real
+    // value rather than a missing one.
+    const r = newGame(42, SETTINGS, RULESET);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    for (const player of r.value.players) {
+      expect(player.techs).toEqual([]);
+    }
+    // `researching` is **absent**, not present-and-`undefined`: the key cannot be
+    // written with an `undefined` value at all (`exactOptionalPropertyTypes` makes
+    // that a compile error, and `canonicalize` refuses `undefined` at runtime), so
+    // this asserts the absence the type promises. `Object.hasOwn` is the check that
+    // distinguishes the two.
+    for (const player of r.value.players) {
+      expect(Object.hasOwn(player, 'researching')).toBe(false);
+    }
   });
 });

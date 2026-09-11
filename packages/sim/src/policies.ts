@@ -60,6 +60,17 @@
  * alone (a step would cancel the job); anything else steps toward the best ground
  * it can reach, scored as an integer tuple.
  *
+ * **M5 adds research, between the two.** Once per turn the policy picks the tech its
+ * own ranking prefers among the ones `researchProblem` calls legal and issues one
+ * `SetResearch` — so a simulated game actually walks the tech tree instead of banking
+ * beakers for ever, which is what makes a research cost knob *measurable* in the
+ * balance harness rather than a number nothing reads. The rule is
+ * `chooseResearch`'s and it is not restated here; what matters at this level is that
+ * the choice is deterministic, reads no randomness, and prefers a tech that unlocks
+ * something this AI is actually trying to build. It is, like everything else in this
+ * file, a **placeholder for M7's real AI**: there is no lookahead, no era planning and
+ * no evaluation of whether the tech is *reachable* in the turns a game has left.
+ *
  * ## The policy is a function of the CONTENT, never of the catalog's ROW ORDER
  *
  * Every choice this file makes among several candidates — a unit of a role, a
@@ -97,11 +108,18 @@ import {
   isExplored,
   itemCost,
   improvementDef,
+  knownTechs,
   planFoundCity,
+  researchProblem,
+  researchingOf,
+  techCatalog,
+  techCostOf,
+  techUnlocks,
   tileIndex,
   tileYieldsWithResources,
   unitActions,
   unitById,
+  unitCatalog,
   unitDef,
   VISIBILITY_RADIUS,
   type City,
@@ -111,6 +129,7 @@ import {
   type PlayerId,
   type ProductionItem,
   type RulesetView,
+  type TechId,
   type TileIndex,
   type Unit,
   type UnitId,
@@ -651,6 +670,164 @@ const chooseWorkedTiles = (
 };
 
 /* ------------------------------------------------------------------ *
+ * M5: what this policy researches
+ * ------------------------------------------------------------------ */
+
+/**
+ * The unit roles this AI actually builds, best first — read from
+ * `SIMPLE_POLICY_TUNING`'s own priorities, not from civ-3 judgement.
+ *
+ * The order mirrors `chooseProduction`: settlers while the city target is unmet, then
+ * workers, then military. A tech that unlocks a settler therefore matters more than
+ * one that unlocks a swordsman, because the settler is the unit this AI is actually
+ * trying to build. The list is the *only* statement of that preference here: the
+ * research ranking reads it rather than repeating the priorities, so the two halves of
+ * "what this AI wants" cannot drift apart.
+ */
+const RESEARCH_WANTED_ROLES: readonly UnitRole[] = ['settler', 'worker', 'military'];
+
+/** The rank of a wanted role, larger = wanted more; `0` for a role this AI never builds. */
+const wantedRoleRank = (role: UnitRole): number => {
+  const index = RESEARCH_WANTED_ROLES.indexOf(role);
+  return index < 0 ? 0 : RESEARCH_WANTED_ROLES.length - index;
+};
+
+/**
+ * How much a tech's unlocks matter to this AI, as one integer: the best (largest)
+ * wanted-role rank over the rows the tech unlocks, `1` if it unlocks anything else,
+ * and `0` if it unlocks nothing at all.
+ *
+ * Read through `techUnlocks` — the engine's own statement of "what does knowing this
+ * tech unlock" — rather than by scanning the catalogs here. That is the same
+ * one-rule-one-reader arrangement the rest of this file follows, and it is why the
+ * field can be added to a catalog row without teaching this policy a second read of
+ * `requiresTech`.
+ *
+ * The `1`/`0` split is deliberate and is a placeholder opinion, not a claim: a tech
+ * that unlocks a *building* (a marketplace, a library) is worth more to this AI than
+ * one that unlocks nothing at all, but less than one that unlocks a unit it is trying
+ * to field.
+ */
+const unlockRank = (ruleset: RulesetView, tech: TechId): number => {
+  let rank = 0;
+  for (const unlock of techUnlocks(ruleset, tech)) {
+    if (unlock.kind !== 'unit') {
+      rank = Math.max(rank, 1);
+      continue;
+    }
+    const row = unitCatalog(ruleset).find((def) => def.id === unlock.id);
+    rank = Math.max(rank, row === undefined ? 1 : Math.max(1, wantedRoleRank(row.role)));
+  }
+  return rank;
+};
+
+/**
+ * A tech's desirability as a rank — larger is better, compared lexicographically by
+ * `compareRanks`: unlocks first, then **cheap first**.
+ *
+ * - `unlockRank` first, because "does this get me something I want?" is the whole
+ *   point of research.
+ * - Cost second, negated so that the cheaper tech wins. A placeholder AI that
+ *   maximised cost would also work, and the choice between the two is taste rather
+ *   than evidence; cheap-first is chosen because it makes the AI's *first* research
+ *   the affordable one, which is what a real opening looks like, and because it makes
+ *   a completion schedule that responds sharply to a cost knob (the balance sweep's
+ *   whole reason for existing).
+ *
+ * The rank deliberately carries **nothing about the tech's id**: two techs with the
+ * same unlocks and the same cost are genuinely tied, and the tie is broken once, by
+ * id, in the naming pass at the end of `chooseResearch` — not by a component here
+ * that would only restate the same comparison in a second spelling.
+ */
+const researchRank = (ruleset: RulesetView, tech: TechId, cost: number): Rank => [
+  unlockRank(ruleset, tech),
+  -cost,
+];
+
+/**
+ * The tech this player should research next, or `undefined` when there is nothing to
+ * change.
+ *
+ * Five decisions, and each one is stated rather than left to the reader:
+ *
+ * 1. **A selection the player already has is left alone.** Re-issuing the same
+ *    `SetResearch` every turn would be legal (the applier treats it as idempotent,
+ *    like `SetRates`) and would bump `revision` for nothing; skipping it keeps the
+ *    policy's command list — and therefore a run's event stream and final hash —
+ *    about *decisions*, not about restating them. Note that this is about the
+ *    *selection*: a player whose pool has not yet covered the tech keeps researching
+ *    it, which is the whole of "progress".
+ * 2. **Legality is the engine's answer, not a copy of it.** Every candidate is folded
+ *    through `researchProblem` — the same function `planSetResearch` refuses a
+ *    `SetResearch` with and the pipeline consults before completing anything — so a
+ *    candidate this policy proposes is one the applier accepts and the pipeline can
+ *    finish. The engine's `nothing-being-researched` member is not reachable here
+ *    (it answers "what am I researching?", not "may I research this?"), and it is
+ *    treated as "not legal" rather than special-cased, because a candidate a policy
+ *    cannot show to be researchable is exactly a candidate it must not propose.
+ * 3. **Known techs and unknown techs both fall out of that fold.** `already-known`
+ *    and `unknown-tech` are refusals, so the candidate list needs no filter of its
+ *    own — a second filter would be a second opinion about legality.
+ * 4. **Candidates are ranked and then sorted; the winner is never "the best so far".**
+ *    A running maximum would keep the first candidate of a tie, and "first" is the
+ *    catalog's row order — a decision taken from an array's positions, which the
+ *    module note forbids. Collecting, then sorting by `(rank desc, id asc)`, gives one
+ *    answer per set of candidates and makes the whole function independent of row
+ *    order, which `policies.test.ts` checks by replaying seeds against shuffled rows.
+ * 5. **It reads no randomness.** The choice is a total order over the content, so the
+ *    same `(state, ruleset)` always produces the same command; the policy never calls
+ *    `ctx.rng` for it, because a draw here would also move every later draw in the
+ *    policy's own stream and a balance comparison between two strategies would stop
+ *    being one.
+ *
+ * `known` is the caller's view of what the player knows, which is `knownTechs(player)`
+ * plus any tech this same turn has already successfully selected, so the policy cannot
+ * propose a selection it has just made.
+ */
+const chooseResearch = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  known: readonly TechId[],
+): TechId | undefined => {
+  const player = state.players.find((candidate) => candidate.id === playerId);
+  if (player === undefined) return undefined;
+
+  // The selection this player already has, read totally (`undefined` when the key is
+  // absent, which is what "not researching" means).
+  const selected = researchingOf(player);
+  // The engine's rule, asked with the caller's knowledge rather than the state's: a
+  // tech selected earlier in this turn is not in the state yet.
+  const knower = { ...player, techs: known };
+
+  const candidates: { readonly tech: TechId; readonly rank: Rank }[] = [];
+  for (const row of techCatalog(ruleset)) {
+    // A row this engine cannot price is not a candidate: `researchProblem` would say
+    // so, but asking it about every unpriced row is work whose answer cannot matter.
+    const cost = techCostOf(ruleset, row.id);
+    if (cost === undefined) continue;
+    // Already known — the engine's own rule would refuse it, and asking is cheaper than
+    // the fold below is. (`researchProblem` would answer `already-known` either way;
+    // this is the same rule read from the same list the fold is given.)
+    if (known.includes(row.id)) continue;
+    if (researchProblem(ruleset, knower, row.id) !== undefined) continue;
+
+    candidates.push({ tech: row.id, rank: researchRank(ruleset, row.id, cost) });
+  }
+
+  if (candidates.length === 0) return undefined;
+
+  const best = [...candidates].sort((a, b) => {
+    const byRank = compareRanks(b.rank, a.rank); // larger rank first
+    if (byRank !== 0) return byRank;
+    return compareText(String(a.tech), String(b.tech));
+  })[0];
+  if (best === undefined) return undefined;
+
+  return best.tech === selected ? undefined : best.tech;
+};
+
+/* ------------------------------------------------------------------ *
  * One turn of the simple policy
  * ------------------------------------------------------------------ */
 
@@ -697,6 +874,25 @@ const planTurn = (ctx: PolicyContext, tuning: SimplePolicyTuning): readonly Comm
     const tiles = chooseWorkedTiles(current, ruleset, city);
     if (tiles !== undefined) attempt({ type: 'SetWorkedTiles', cityId: city.id, tiles });
   }
+
+  // M5: research, once per turn, after the cities and before the units. The position
+  // is a decision and it is *not* observable in the way the engine's pipeline order
+  // is — `SetResearch` only writes a selection, and selections take effect at the next
+  // turn's research step regardless of when in this turn they were made — so this
+  // placement is about reading order rather than about a rule. It sits between the two
+  // loops because it is a *civilization* decision, like production, and because the
+  // `current` state it must fold against is already the one the city commands produced.
+  //
+  // `known` starts from the state and grows by whatever this turn actually selects, so
+  // a second call in the same turn cannot re-propose the tech it just chose. The tech
+  // is read back off `current` rather than assumed: `attempt` returns whether the
+  // applier accepted the command, and a selection the engine refused must not be
+  // recorded as one this AI made.
+  const known: TechId[] = [];
+  const researching = current.players.find((candidate) => candidate.id === playerId);
+  if (researching !== undefined) known.push(...knownTechs(researching));
+  const tech = chooseResearch(current, ruleset, playerId, known);
+  if (tech !== undefined && attempt({ type: 'SetResearch', tech })) known.push(tech);
 
   // Units, in id order (`state.units` is sorted by id). The list is a snapshot of
   // ids, and each id is re-read from `current` before it is acted on: a settler that

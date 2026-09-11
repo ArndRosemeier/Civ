@@ -135,6 +135,11 @@ import {
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
+
 import { loadGoldens } from '../src/goldens.js';
 import {
   canonicalize,
@@ -305,6 +310,14 @@ const cmdKey = (cmd: Command): string => {
     // prevent.
     case 'SetRates':
       return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
+    // M5, and the third planner-only setter: no generator yields `SetResearch`
+    // (choosing a tech is a setting, reachable through `planSetResearch`), so the keys
+    // the sweeps compare never contain this line. It exists because the switch is
+    // exhaustive on purpose — an unkeyed `Command` variant would let two different
+    // commands compare equal — and it carries the tech, for the same "key the payload"
+    // reason the M4a work keys carry the improvement kind.
+    case 'SetResearch':
+      return `SetResearch ${String(cmd.tech)}`;
   }
 };
 
@@ -748,30 +761,35 @@ const keystoneSweep = (seeds: readonly number[], steps: number): KeystoneRun => 
 };
 
 describe('1. keystone — five generators agree with the applier, in both directions', () => {
-  it('holds over played games with workers, including every work command the applier accepts', () => {
-    const { failures, totals } = keystoneSweep([1, 2, 3, 5, 8, 13, 21, 34], 12);
+  // Full tier: 3.4 s — the M4a keystone property over played games. The fast tier keeps the
+  // deterministic unit-level work assertions; the played-game sweep defers.
+  it.skipIf(!FULL_TIER)(
+    'holds over played games with workers, including every work command the applier accepts',
+    () => {
+      const { failures, totals } = keystoneSweep([1, 2, 3, 5, 8, 13, 21, 34], 12);
 
-    console.log('m4a keystone totals:', JSON.stringify(totals));
-    expect(failures).toEqual([]);
+      console.log('m4a keystone totals:', JSON.stringify(totals));
+      expect(failures).toEqual([]);
 
-    // Non-vacuity, stated as counts: a sweep that never saw a work command, never
-    // built anything or never refilled a turn would pass while proving nothing.
-    expect(totals.states).toBeGreaterThan(0);
-    expect(totals.workCandidates).toBeGreaterThan(0);
-    expect(totals.workAccepted).toBeGreaterThan(0);
-    expect(totals.workRefused).toBeGreaterThan(0);
-    expect(totals.workYielded).toBe(totals.workAccepted);
-    expect(totals.started).toBeGreaterThan(0);
-    expect(totals.completed).toBeGreaterThan(0);
-    expect(totals.cancelledByPlayer).toBeGreaterThan(0);
-    expect(totals.cancelledByMoving).toBeGreaterThan(0);
-    expect(totals.pairsBuilt).toBeGreaterThan(0);
-    // `MoveUnit` completeness: every tile the applier accepted was yielded.
-    expect(totals.movesAccepted).toBe(totals.movesYielded);
-    // The two city setters are queries, not enumerated actions (M3's decision).
-    expect(totals.cityCommandsYielded).toBe(0);
-    expect(totals.endTurns).toBeGreaterThan(0);
-  });
+      // Non-vacuity, stated as counts: a sweep that never saw a work command, never
+      // built anything or never refilled a turn would pass while proving nothing.
+      expect(totals.states).toBeGreaterThan(0);
+      expect(totals.workCandidates).toBeGreaterThan(0);
+      expect(totals.workAccepted).toBeGreaterThan(0);
+      expect(totals.workRefused).toBeGreaterThan(0);
+      expect(totals.workYielded).toBe(totals.workAccepted);
+      expect(totals.started).toBeGreaterThan(0);
+      expect(totals.completed).toBeGreaterThan(0);
+      expect(totals.cancelledByPlayer).toBeGreaterThan(0);
+      expect(totals.cancelledByMoving).toBeGreaterThan(0);
+      expect(totals.pairsBuilt).toBeGreaterThan(0);
+      // `MoveUnit` completeness: every tile the applier accepted was yielded.
+      expect(totals.movesAccepted).toBe(totals.movesYielded);
+      // The two city setters are queries, not enumerated actions (M3's decision).
+      expect(totals.cityCommandsYielded).toBe(0);
+      expect(totals.endTurns).toBeGreaterThan(0);
+    },
+  );
 
   it('agrees about where work may start on the boundary boards a played game cannot reach', () => {
     // A generated game never puts a worker on the ocean, on terrain the ruleset
@@ -1427,20 +1445,25 @@ const longPlay = (seeds: readonly number[], steps: number): LongPlayRun => {
 };
 
 describe('3. work honesty', () => {
-  it('pays exactly one turn of a job per turn, completes it once, and never lets a move complete it', () => {
-    const { recorder: rec, totals } = longPlay([3, 5, 8, 13], 120);
+  // Full tier: 1.7 s — a long played run, since the property is about what happens across many turns
+  // of a job. One turn cannot falsify it.
+  it.skipIf(!FULL_TIER)(
+    'pays exactly one turn of a job per turn, completes it once, and never lets a move complete it',
+    () => {
+      const { recorder: rec, totals } = longPlay([3, 5, 8, 13], 120);
 
-    console.log('m4a long play totals:', JSON.stringify(totals));
-    expect(rec.problems).toEqual([]);
+      console.log('m4a long play totals:', JSON.stringify(totals));
+      expect(rec.problems).toEqual([]);
 
-    // Non-vacuity: the walk must actually have started, completed and cancelled
-    // work — by a command and by walking away — or it is evidence of nothing.
-    expect(totals.starts).toBeGreaterThan(0);
-    expect(totals.completions).toBeGreaterThan(0);
-    expect(totals.cancellations).toBeGreaterThan(0);
-    expect(totals.movesByWorkingUnits).toBeGreaterThan(0);
-    expect(totals.pairsBuilt).toBeGreaterThan(0);
-  });
+      // Non-vacuity: the walk must actually have started, completed and cancelled
+      // work — by a command and by walking away — or it is evidence of nothing.
+      expect(totals.starts).toBeGreaterThan(0);
+      expect(totals.completions).toBeGreaterThan(0);
+      expect(totals.cancellations).toBeGreaterThan(0);
+      expect(totals.movesByWorkingUnits).toBeGreaterThan(0);
+      expect(totals.pairsBuilt).toBeGreaterThan(0);
+    },
+  );
 
   it('cancels on movement and never completes the abandoned job', () => {
     // A hill, a worker standing on it, and a mine — the shipped catalog's longest
@@ -2008,35 +2031,39 @@ describe('5. determinism, in-process and in a fresh process', () => {
     );
   });
 
-  it('reproduces the same hash, completions and pair list in a fresh process', () => {
-    const recording = recordWorkGame(21, 40);
-    const expected = replay(recording);
+  // Full tier: determinism across a fresh process, named by the standing requirement.
+  it.skipIf(!FULL_TIER)(
+    'reproduces the same hash, completions and pair list in a fresh process',
+    () => {
+      const recording = recordWorkGame(21, 40);
+      const expected = replay(recording);
 
-    const result = spawnSync(process.execPath, [tsxCliPath(), '-e', childScript(recording)], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      timeout: 120_000,
-    });
-    const stderr = `${result.stderr}${
-      result.error === undefined ? '' : `launch failed: ${result.error.message}`
-    }`;
-    expect(result.status, `the fresh process failed:\n${stderr}`).toBe(0);
+      const result = spawnSync(process.execPath, [tsxCliPath(), '-e', childScript(recording)], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        timeout: 120_000,
+      });
+      const stderr = `${result.stderr}${
+        result.error === undefined ? '' : `launch failed: ${result.error.message}`
+      }`;
+      expect(result.status, `the fresh process failed:\n${stderr}`).toBe(0);
 
-    const lines = result.stdout
-      .split('\n')
-      .filter((candidate) => candidate.startsWith('RESULT '))
-      .map((candidate) => candidate.slice('RESULT '.length).trim());
+      const lines = result.stdout
+        .split('\n')
+        .filter((candidate) => candidate.startsWith('RESULT '))
+        .map((candidate) => candidate.slice('RESULT '.length).trim());
 
-    expect(lines).toHaveLength(1);
-    const observed = lines[0] ?? '';
-    console.log(`fresh process: ${observed} | in-process: ${replayLine(expected)}`);
+      expect(lines).toHaveLength(1);
+      const observed = lines[0] ?? '';
+      console.log(`fresh process: ${observed} | in-process: ${replayLine(expected)}`);
 
-    // The whole line, not just the hash: a hash collision could hide a different
-    // event log, and the pair list is the part M4a added.
-    expect(observed).toBe(replayLine(expected));
-    expect(expected.completions).toBeGreaterThan(0);
-    expect(expected.pairs).toBeGreaterThan(0);
-  });
+      // The whole line, not just the hash: a hash collision could hide a different
+      // event log, and the pair list is the part M4a added.
+      expect(observed).toBe(replayLine(expected));
+      expect(expected.completions).toBeGreaterThan(0);
+      expect(expected.pairs).toBeGreaterThan(0);
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -2052,11 +2079,20 @@ describe('6. goldens: what they cover, and what they do not', () => {
     const computed = [1, 42, 1337].map((seed) => hashValue(goldenState(seed)));
     console.log('m4a golden hashes:', computed.join(' '));
 
-    expect(stored.entries.map((entry) => entry.hash)).toEqual(computed);
+    // M5 moved every hash in this file once more (`SCHEMA_VERSION` 6 -> 7: `techs` on
+    // every player row, required and empty for a fresh game), through the harness's own
+    // opt-in path and with a `rehash:` note — and it added a **fourth** entry, the
+    // played golden, which this file cannot recompute because it holds no command
+    // script. So the entries this file owns are compared value for value, and the file's
+    // *whole* scenario list is pinned below: a missing scenario or a stray one fails
+    // here exactly as it did when the file held three.
+    const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
+    expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
       'tiny-civs2-seed1',
       'tiny-civs2-seed42',
       'tiny-civs2-seed1337',
+      'played-civs2-seed42',
     ]);
 
     const state = goldenState(42);

@@ -29,7 +29,17 @@ import { describe, expect, it } from 'vitest';
 import { CATALOG } from '@civts/rules';
 import { hashValue } from '@civts/testing';
 import { cityYields, type City } from '../src/cities.js';
-import { asCityId, asPlayerId, asTerrainId, asTileIndex, asUnitTypeId } from '../src/ids.js';
+import {
+  asCityId,
+  asPlayerId,
+  asTechId,
+  asTerrainId,
+  asTileIndex,
+  asUnitTypeId,
+  type TechId,
+} from '../src/ids.js';
+import { unmetTechFor } from '../src/resources.js';
+import type { TechDef } from '../src/tech.js';
 import {
   IMPROVEMENT_KINDS,
   asImprovementId,
@@ -232,7 +242,12 @@ const at = (x: number, y: number): number => tileIndex(WIDTH, x, y);
 const terrainIds = (): readonly ReturnType<typeof asTerrainId>[] =>
   GRID.map((role) => asTerrainId(role));
 
-const player = (index: number, tile: number, kind: 'civ' | 'barbarian' = 'civ'): PlayerState => ({
+const player = (
+  index: number,
+  tile: number,
+  kind: 'civ' | 'barbarian' = 'civ',
+  techs: readonly TechId[] = [],
+): PlayerState => ({
   id: asPlayerId(index),
   name: kind === 'barbarian' ? 'Barbarians' : `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
@@ -246,6 +261,12 @@ const player = (index: number, tile: number, kind: 'civ' | 'barbarian' = 'civ'):
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: `techs` is required and never absent — "knows nothing" is an *empty list*,
+  // the same way "no cities" is an empty `cities` array. This file's subject is tile
+  // yields, so the default is that a fixture player has researched nothing; the
+  // parameter exists because the improvement kind is gated by tech too (M5's
+  // "Gating"), and the one section that says so needs a player who knows one.
+  techs: [...techs],
 });
 
 const PLAYERS: readonly PlayerState[] = [
@@ -323,9 +344,9 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
  * ------------------------------------------------------------------ */
 
 describe('GameState.improvements at setup', () => {
-  it('starts empty, as an array, at schema version 6', () => {
-    // A fifth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b -> M4c): the field
-    // is empty here, and the version moved with it, so a save from the previous
+  it('starts empty, as an array, at schema version 7', () => {
+    // A fifth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b -> M4c -> M5): the
+    // field is empty here, and the version moved with it, so a save from the previous
     // shape is recognisable rather than silently misread. M4b moved it because
     // `PlayerState` gained `treasury`/`rates`/`beakers`/`luxuries` and `newGame`
     // now also places a worker — both of which change every existing hash
@@ -333,6 +354,10 @@ describe('GameState.improvements at setup', () => {
     // gained `resources`: no `GameState` key is new this time, but `map` is inside
     // the state and is hashed with it, so a new map key moves every hash exactly as
     // a new state key would (INTERFACES.md M4c, "Resources", "Migration owners").
+    // M5 moved it for `PlayerState.techs`: a required list on every player, so every
+    // player row of every existing save hashes differently (INTERFACES.md M5,
+    // "Research", "Migration owners"). The version is the *applier's* fact, not this
+    // file's — `state.ts` owns it and `state.test.ts` pins it by value too.
     const game = newGame(42, SETTINGS, RULESET);
     expect(game.ok).toBe(true);
     if (!game.ok) return;
@@ -340,7 +365,7 @@ describe('GameState.improvements at setup', () => {
     expect(game.value.improvements).toEqual([]);
     expect(Array.isArray(game.value.improvements)).toBe(true);
     expect(game.value.schemaVersion).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(6);
+    expect(SCHEMA_VERSION).toBe(7);
 
     // M4c's map key, read the same way and for the same reason: a fresh game's map
     // always *carries* `resources`, and this stand-in catalog ships no resource row,
@@ -856,5 +881,109 @@ describe('yields with improvements', () => {
     expect(indexToY(forwards.map, HILLS)).toBe(2);
     // The two tiles the pairs name really are two tiles.
     expect(HILLS).not.toBe(WORKED);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M5 gating — an improvement row's tech, and the yields it does not change
+ * ------------------------------------------------------------------ */
+
+/**
+ * The M5 fixture tech rows: two **placeholder** rows of ours (the costs are arbitrary
+ * and unread — a requirement is a membership test on `player.techs`). `BRONZE` gates
+ * the row below; `UNUSED_TECH` gates nothing, which is the control the contract asks
+ * for.
+ */
+const BRONZE = asTechId('bronze-working');
+const UNUSED_TECH = asTechId('ceremonial-burial');
+
+const TECHS: readonly TechDef[] = [
+  { id: BRONZE, name: 'Bronze Working', era: 'ancient', cost: 6, requires: [] },
+  { id: UNUSED_TECH, name: 'Ceremonial Burial', era: 'ancient', cost: 6, requires: [] },
+];
+
+/**
+ * The one gated improvement row, with an id of its own rather than a second `mine`:
+ * an id is the key a catalog is looked up by, so two rows sharing one would make "the
+ * row for `mine`" depend on catalog order. Its shape is the mine's — same kind, same
+ * delta, same roles — so the only difference between it and the mine is the tech.
+ */
+const PROSPECTING: ImprovementDef & { readonly requiresTech: TechId } = {
+  id: asImprovementId('prospecting'),
+  kind: 'mine',
+  name: 'Prospecting Pit',
+  turns: 3,
+  yields: { food: 0, shields: 1, commerce: 0 },
+  allowedRoles: ['hills', 'mountains'],
+  requiresTech: BRONZE,
+};
+
+/** The fixture view plus the one gated row, and somewhere for techs to live. */
+const TECH_RULESET: RulesetView & { readonly techs: readonly TechDef[] } = {
+  ...RULESET,
+  improvements: [...IMPROVEMENTS, PROSPECTING],
+  techs: TECHS,
+};
+
+describe('M5 gating — an improvement row may declare a tech', () => {
+  const P0 = asPlayerId(0);
+
+  /** The fixture board with player 0 knowing exactly `techs`, and nothing else changed. */
+  const knowing = (techs: readonly TechId[]): GameState => {
+    const base = state([]);
+    return {
+      ...base,
+      players: base.players.map((p) => (p.id === P0 ? player(0, at(1, 1), 'civ', techs) : p)),
+    };
+  };
+
+  it('reads the requirement off the catalog row, before and after the tech', () => {
+    // The row `improvementDef` resolves is where the field lives, and the gate reads
+    // it off that row rather than off the id or the kind.
+    const row = improvementDef(TECH_RULESET, PROSPECTING.id);
+    expect(row).toBe(PROSPECTING);
+    expect(unmetTechFor(knowing([]), P0, row)).toBe(BRONZE);
+
+    // Control: the same board with one player field changed is satisfied.
+    expect(unmetTechFor(knowing([BRONZE]), P0, row)).toBeUndefined();
+
+    // A tech that gates nothing does not satisfy it — the requirement is `BRONZE`.
+    expect(unmetTechFor(knowing([UNUSED_TECH]), P0, row)).toBe(BRONZE);
+
+    // A row the catalog does not define has no requirement to report, and the
+    // *ungated* mine's requirement is nothing whatever the player knows.
+    expect(improvementDef(TECH_RULESET, asImprovementId('nope'))).toBeUndefined();
+    expect(unmetTechFor(knowing([]), P0, improvementDef(RULESET, MINE))).toBeUndefined();
+  });
+
+  it('leaves every row that declares no tech ungated', () => {
+    // The other half of the sweep, over this file's own catalog: three of its four
+    // rows declare nothing, and a player who knows nothing may still start them.
+    let ungated = 0;
+    for (const row of improvementCatalog(TECH_RULESET)) {
+      if (row === PROSPECTING) continue;
+      ungated += 1;
+      expect(unmetTechFor(knowing([]), P0, row)).toBeUndefined();
+      expect(unmetTechFor(knowing([UNUSED_TECH]), P0, row)).toBeUndefined();
+    }
+    expect(ungated).toBe(IMPROVEMENTS.length);
+  });
+
+  it('does not change what a gated improvement is worth on a tile', () => {
+    // The requirement gates *building* the improvement (M5's gating section is about
+    // what may be built, not about what a thing is worth), so the delta a gated row
+    // adds is the delta any player sees: a tile that already carries one is worth the
+    // same to a player who could not have built it.
+    const plain = tileYields(knowing([]), TECH_RULESET, asTileIndex(HILLS));
+    const dug = tileYields(
+      state([{ tile: asTileIndex(HILLS), kind: PROSPECTING.id }]),
+      TECH_RULESET,
+      asTileIndex(HILLS),
+    );
+
+    // Hills are 1/2/1 here and the row adds one shield — the mine's own delta — with
+    // no reference to any player's techs.
+    expect(plain).toEqual({ food: 1, shields: 2, commerce: 1 });
+    expect(dug).toEqual({ food: 1, shields: 3, commerce: 1 });
   });
 });

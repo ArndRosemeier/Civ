@@ -66,6 +66,10 @@ import { describe, expect, it } from 'vitest';
 
 import { CORE_INVARIANTS, SIMPLE_POLICY, checkInvariants, runSimulation } from '@civts/sim';
 import type { Invariant, InvariantContext, SimulationResult, Violation } from '@civts/sim';
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
 
 /* ------------------------------------------------------------------ *
  * Fixtures
@@ -896,71 +900,86 @@ describe('every invariant fires on a deliberately broken state', () => {
     return sweepCache;
   };
 
-  it('reports nothing across 200 seeds of real play (the widened bound is quiet)', () => {
-    const runs = sweep();
-    expect(runs).toHaveLength(200);
+  // Full tier: 55 s — the single slowest test in the repository, and the widest sweep: 200 seeds of
+  // real play with every invariant checked on every turn. It is the evidence that the shipped content
+  // does not trip the invariants, which is a claim about *scale*; ten seeds would not make it.
+  it.skipIf(!FULL_TIER)(
+    'reports nothing across 200 seeds of real play (the widened bound is quiet)',
+    () => {
+      const runs = sweep();
+      expect(runs).toHaveLength(200);
 
-    // Every violation of every turn of every game, by name: the CLI's 0-violations claim
-    // over four times the seeds of the acceptance run.
-    const violations = runs.flatMap(({ result }) => result.violations);
-    expect(
-      violations.map((violation) => `${violation.invariant}@${String(violation.turn)}`),
-    ).toEqual([]);
-    // ...and every run reached its horizon, so nothing was truncated and no aggregate is
-    // a mean over games of different lengths.
-    expect([...new Set(runs.map(({ result }) => result.stoppedBecause))]).toEqual(['max-turns']);
+      // Every violation of every turn of every game, by name: the CLI's 0-violations claim
+      // over four times the seeds of the acceptance run.
+      const violations = runs.flatMap(({ result }) => result.violations);
+      expect(
+        violations.map((violation) => `${violation.invariant}@${String(violation.turn)}`),
+      ).toEqual([]);
+      // ...and every run reached its horizon, so nothing was truncated and no aggregate is
+      // a mean over games of different lengths.
+      expect([...new Set(runs.map(({ result }) => result.stoppedBecause))]).toEqual(['max-turns']);
 
-    // Non-vacuity, so "nothing fired" is not "nothing happened": the sweep really played
-    // 8000 player-turns, cities were founded and grew, and buildings were put up — which
-    // is what the food-box check needs in order to have anything to say.
-    const rows = runs.flatMap(({ result }) => result.metrics);
-    expect(rows).toHaveLength(SWEEP_SEEDS.length * SWEEP_TURNS * 2);
-    expect(rows.filter((row) => row.population > 0).length).toBeGreaterThan(0);
-    expect(rows.reduce((total, row) => total + row.population, 0)).toBeGreaterThan(rows.length);
-    expect(rows.reduce((total, row) => total + row.buildings, 0)).toBeGreaterThan(0);
-  }, 300_000);
+      // Non-vacuity, so "nothing fired" is not "nothing happened": the sweep really played
+      // 8000 player-turns, cities were founded and grew, and buildings were put up — which
+      // is what the food-box check needs in order to have anything to say.
+      const rows = runs.flatMap(({ result }) => result.metrics);
+      expect(rows).toHaveLength(SWEEP_SEEDS.length * SWEEP_TURNS * 2);
+      expect(rows.filter((row) => row.population > 0).length).toBeGreaterThan(0);
+      expect(rows.reduce((total, row) => total + row.population, 0)).toBeGreaterThan(rows.length);
+      expect(rows.reduce((total, row) => total + row.buildings, 0)).toBeGreaterThan(0);
+    },
+    300_000,
+  );
 
-  it('fires for every reduced-threshold city in that sweep, shortfall or not (the escape is closed)', () => {
-    // The configuration the old shared predicate let through, rebuilt from *real* cities
-    // rather than from one fixture: every city in the 200-seed sweep whose buildings
-    // genuinely lower its threshold, with its box set exactly at that threshold — caught
-    // when nothing happened this turn, and (the fix) caught identically when its owner
-    // reported a shortfall. The two message lists must be the same list, so the clause is
-    // gone rather than merely reordered.
-    const probes = sweep().flatMap(({ seed, result }) =>
-      result.finalState.cities.flatMap((city) => {
-        const bare = foodBoxSize(city.population);
-        const reduced = reducedThreshold(city);
-        if (reduced >= bare) return []; // no growth-food row: this bound is not stricter here
-        return [{ seed, state: result.finalState, city, reduced }];
-      }),
-    );
-    // Non-vacuity: the sweep really contains cities a `growth-food` building lowers the
-    // threshold for, so the loop below is not an empty loop.
-    expect(probes.length).toBeGreaterThan(0);
-
-    for (const { state, city, reduced } of probes) {
-      const full = withCity(state, city.id, (candidate) => ({ ...candidate, foodBox: reduced }));
-      const plain = messagesOf('city-food-box-within-threshold', contextFor({ state: full }));
-      const withShortfall = messagesOf(
-        'city-food-box-within-threshold',
-        contextFor({
-          state: full,
-          events: [{ type: 'TreasuryShortfall', playerId: city.owner, unpaid: 1 }],
+  // Full tier: it is the *same* sweep — `sweep()` is memoised, so this test computed the
+  // 200-seed run itself once the test above started skipping, and the fast tier paid the
+  // whole 54 s here instead. A skipped test that leaves its work behind is not a saved
+  // second; the two go together, and the tier boundary is stated at both.
+  it.skipIf(!FULL_TIER)(
+    'fires for every reduced-threshold city in that sweep, shortfall or not (the escape is closed)',
+    () => {
+      // The configuration the old shared predicate let through, rebuilt from *real* cities
+      // rather than from one fixture: every city in the 200-seed sweep whose buildings
+      // genuinely lower its threshold, with its box set exactly at that threshold — caught
+      // when nothing happened this turn, and (the fix) caught identically when its owner
+      // reported a shortfall. The two message lists must be the same list, so the clause is
+      // gone rather than merely reordered.
+      const probes = sweep().flatMap(({ seed, result }) =>
+        result.finalState.cities.flatMap((city) => {
+          const bare = foodBoxSize(city.population);
+          const reduced = reducedThreshold(city);
+          if (reduced >= bare) return []; // no growth-food row: this bound is not stricter here
+          return [{ seed, state: result.finalState, city, reduced }];
         }),
       );
+      // Non-vacuity: the sweep really contains cities a `growth-food` building lowers the
+      // threshold for, so the loop below is not an empty loop.
+      expect(probes.length).toBeGreaterThan(0);
 
-      expect(plain).toHaveLength(1);
-      expect(plain[0]).toContain(`outside [0, ${String(reduced)})`);
-      expect(withShortfall).toEqual(plain);
-    }
+      for (const { state, city, reduced } of probes) {
+        const full = withCity(state, city.id, (candidate) => ({ ...candidate, foodBox: reduced }));
+        const plain = messagesOf('city-food-box-within-threshold', contextFor({ state: full }));
+        const withShortfall = messagesOf(
+          'city-food-box-within-threshold',
+          contextFor({
+            state: full,
+            events: [{ type: 'TreasuryShortfall', playerId: city.owner, unpaid: 1 }],
+          }),
+        );
 
-    console.log(
-      `food-box sweep: ${String(probes.length)} reduced-threshold city probes over ` +
-        `${String(SWEEP_SEEDS.length)} seeds x ${String(SWEEP_TURNS)} turns, all caught with and ` +
-        `without the owner's shortfall`,
-    );
-  }, 300_000);
+        expect(plain).toHaveLength(1);
+        expect(plain[0]).toContain(`outside [0, ${String(reduced)})`);
+        expect(withShortfall).toEqual(plain);
+      }
+
+      console.log(
+        `food-box sweep: ${String(probes.length)} reduced-threshold city probes over ` +
+          `${String(SWEEP_SEEDS.length)} seeds x ${String(SWEEP_TURNS)} turns, all caught with and ` +
+          `without the owner's shortfall`,
+      );
+    },
+    300_000,
+  );
 
   it('city-shields-non-negative: a negative shield pool', () => {
     const ctx = contextFor({

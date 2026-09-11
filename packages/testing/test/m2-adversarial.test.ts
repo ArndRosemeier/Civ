@@ -208,6 +208,11 @@ import {
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
+
 import { loadGoldens } from '../src/goldens.js';
 import { hashValue } from '../src/hash.js';
 import { createScenarioBuilder } from '../src/scenario.js';
@@ -317,6 +322,15 @@ const cmdKey = (cmd: Command): string => {
     // prevent.
     case 'SetRates':
       return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
+    // M5. `SetResearch` is the third *planner-only* setter and is keyed for the same
+    // two reasons `SetRates` is: the switch is exhaustive on purpose, so a `Command`
+    // variant this comparator cannot name would make two different commands compare
+    // equal; and the key carries the tech id, because selecting pottery and selecting
+    // bronze working are different commands. `actions.ts` yields neither
+    // `SetResearch` nor `SetRates`, which is why this key never appears in a
+    // generator's output and the sweeps below are unaffected by its addition.
+    case 'SetResearch':
+      return `SetResearch ${String(cmd.tech)}`;
   }
 };
 
@@ -597,24 +611,30 @@ const sweepGames = (
 };
 
 describe('keystone — the engine and the generator agree, in both directions', () => {
-  it('every yielded action applies, and every accepted action is yielded', () => {
-    const { totals, failures } = sweepGames(SWEEP_SEEDS, SWEEP_STEPS);
-    console.log('keystone sweep totals:', JSON.stringify(totals));
+  // Full tier: 4.1 s — the M2 keystone property swept over played games. The property is the one this
+  // repository is built on, so it keeps running in the full tier at full width; the fast tier keeps the
+  // smaller hand-written boards below it.
+  it.skipIf(!FULL_TIER)(
+    'every yielded action applies, and every accepted action is yielded',
+    () => {
+      const { totals, failures } = sweepGames(SWEEP_SEEDS, SWEEP_STEPS);
+      console.log('keystone sweep totals:', JSON.stringify(totals));
 
-    expect(failures).toEqual([]);
+      expect(failures).toEqual([]);
 
-    // Non-vacuity: the sweep must actually have walked a real action space.
-    expect(totals.legalActions).toBeGreaterThan(500);
-    expect(totals.unitActions).toBeGreaterThan(400);
-    expect(totals.enumerated).toBeGreaterThan(500_000);
-    // At least one EndTurn per seed, so both halves of the generator were walked.
-    expect(totals.endTurns).toBeGreaterThan(SWEEP_SEEDS.length);
+      // Non-vacuity: the sweep must actually have walked a real action space.
+      expect(totals.legalActions).toBeGreaterThan(500);
+      expect(totals.unitActions).toBeGreaterThan(400);
+      expect(totals.enumerated).toBeGreaterThan(500_000);
+      // At least one EndTurn per seed, so both halves of the generator were walked.
+      expect(totals.endTurns).toBeGreaterThan(SWEEP_SEEDS.length);
 
-    // Soundness and completeness, as counts: every accepted command was yielded
-    // by both generators, and every yielded action applied.
-    expect(totals.applied).toBe(totals.legalActions);
-    expect(totals.accepted).toBe(totals.unitActions);
-  });
+      // Soundness and completeness, as counts: every accepted command was yielded
+      // by both generators, and every yielded action applied.
+      expect(totals.applied).toBe(totals.legalActions);
+      expect(totals.accepted).toBe(totals.unitActions);
+    },
+  );
 
   it('walks every player the M3 player model defines, barbarians included', () => {
     // MIGRATED (docs/INTERFACES.md M3, "State shape"). The sweeps above iterate
@@ -649,7 +669,9 @@ describe('keystone — the engine and the generator agree, in both directions', 
     }
   });
 
-  it('holds with three and four civilizations crowded onto the same map', () => {
+  // Full tier: 1.85 s — the same keystone property at four civilizations on a shared map, which is a
+  // multiple of the base sweep's cost by construction (more actors, more actions per turn).
+  it.skipIf(!FULL_TIER)('holds with three and four civilizations crowded onto the same map', () => {
     for (const civCount of [3, 4]) {
       const { totals, failures } = sweepGames([1, 5, 42, 777, 1337, 31337], 4, civCount);
       console.log(`keystone sweep (${String(civCount)} civs):`, JSON.stringify(totals));
@@ -2047,7 +2069,8 @@ describe('determinism — the same seed and commands hash the same, everywhere',
     expect(new Set(hashes).size).toBe(GOLDEN_SEEDS.length);
   });
 
-  it('reproduces the same hashes in a fresh process (tsx -e)', () => {
+  // Full tier: determinism across a fresh process, named by the standing requirement.
+  it.skipIf(!FULL_TIER)('reproduces the same hashes in a fresh process (tsx -e)', () => {
     const expected = GOLDEN_SEEDS.map((seed) => hashValue(playSequence(seed, DETERMINISM_STEPS)));
 
     const child = runInFreshProcess(CHILD_SCRIPT);
@@ -2086,8 +2109,22 @@ describe('goldens — still a real, non-vacuous gate', () => {
     // An independent reconstruction: if generation, state assembly or the hasher
     // drifts, this fails with the expected/actual pair even if golden.test.ts
     // were somehow weakened.
-    expect(stored.entries).toEqual(computed);
-    expect(new Set(stored.entries.map((entry) => entry.hash)).size).toBe(GOLDEN_SEEDS.length);
+    //
+    // M5 moved every hash here (`SCHEMA_VERSION` 6 -> 7: `techs` on every player row,
+    // required and empty for a fresh game) and added a **fourth** entry — the played
+    // golden, which this file cannot recompute because it holds no command script and
+    // which is therefore not this file's to judge. So the entries this file owns are
+    // compared value for value, and the file's whole scenario list is pinned below:
+    // neither a missing scenario nor a stray one can pass.
+    const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
+    expect(newGameEntries).toEqual(computed);
+    expect(stored.entries.map((entry) => entry.name)).toEqual([
+      'tiny-civs2-seed1',
+      'tiny-civs2-seed42',
+      'tiny-civs2-seed1337',
+      'played-civs2-seed42',
+    ]);
+    expect(new Set(stored.entries.map((entry) => entry.hash)).size).toBe(GOLDEN_SEEDS.length + 1);
     expect(
       stored.entries.every((entry) => /^[0-9a-f]{16}$/.test(entry.hash)),
       'every hash is a 16-character FNV-1a 64 digest',
@@ -2171,53 +2208,57 @@ const runCli = (args: readonly string[], input = '') =>
   });
 
 describe('the REPL — a scripted session is a stable regression fixture', () => {
-  it('prints byte-identical transcripts in two fresh processes and exits 0', () => {
-    const state = generated(42);
-    const unit = state.units[0];
-    if (unit === undefined) throw new Error('no units');
-    const target = unitMoveOptions(state, RULESET, unit.id)[0];
+  // Full tier: determinism across two fresh processes, named by the standing requirement.
+  it.skipIf(!FULL_TIER)(
+    'prints byte-identical transcripts in two fresh processes and exits 0',
+    () => {
+      const state = generated(42);
+      const unit = state.units[0];
+      if (unit === undefined) throw new Error('no units');
+      const target = unitMoveOptions(state, RULESET, unit.id)[0];
 
-    const lines = ['units', 'state'];
-    if (target !== undefined) {
-      lines.push(
-        `move ${String(unit.id)} ${String(indexToX(state.map, target))} ${String(indexToY(state.map, target))}`,
-      );
-    }
-    lines.push('end', 'bogus', 'quit');
+      const lines = ['units', 'state'];
+      if (target !== undefined) {
+        lines.push(
+          `move ${String(unit.id)} ${String(indexToX(state.map, target))} ${String(indexToY(state.map, target))}`,
+        );
+      }
+      lines.push('end', 'bogus', 'quit');
 
-    const directory = mkdtempSync(join(tmpdir(), 'civts-m2-adversarial-'));
-    try {
-      const scriptPath = join(directory, 'session.txt');
-      writeFileSync(scriptPath, `${lines.join('\n')}\n`, 'utf8');
+      const directory = mkdtempSync(join(tmpdir(), 'civts-m2-adversarial-'));
+      try {
+        const scriptPath = join(directory, 'session.txt');
+        writeFileSync(scriptPath, `${lines.join('\n')}\n`, 'utf8');
 
-      const args = [
-        'play',
-        '--seed',
-        '42',
-        '--map-size',
-        'tiny',
-        '--civs',
-        '2',
-        '--script',
-        scriptPath,
-      ];
-      const first = runCli(args);
-      const second = runCli(args);
+        const args = [
+          'play',
+          '--seed',
+          '42',
+          '--map-size',
+          'tiny',
+          '--civs',
+          '2',
+          '--script',
+          scriptPath,
+        ];
+        const first = runCli(args);
+        const second = runCli(args);
 
-      expect(first.status).toBe(0);
-      expect(second.status).toBe(0);
-      expect(first.stdout.length).toBeGreaterThan(200);
-      expect(second.stdout).toBe(first.stdout);
+        expect(first.status).toBe(0);
+        expect(second.status).toBe(0);
+        expect(first.stdout.length).toBeGreaterThan(200);
+        expect(second.stdout).toBe(first.stdout);
 
-      expect(first.stdout).toContain('ok: turn 2 begins');
-      expect(first.stdout).toContain('error: unknown command "bogus"');
-      if (target !== undefined)
-        expect(first.stdout).toContain(`ok: unit ${String(unit.id)} moved to`);
-      expect(first.stdout).not.toMatch(/undefined|NaN/);
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
+        expect(first.stdout).toContain('ok: turn 2 begins');
+        expect(first.stdout).toContain('error: unknown command "bogus"');
+        if (target !== undefined)
+          expect(first.stdout).toContain(`ok: unit ${String(unit.id)} moved to`);
+        expect(first.stdout).not.toMatch(/undefined|NaN/);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('exits 0 at end of input instead of hanging', () => {
     const result = runCli(['play', '--seed', '42', '--map-size', 'tiny'], '');

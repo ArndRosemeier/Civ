@@ -24,7 +24,10 @@
  *   asserts both directions on every board it builds, that state included, and
  *   M4a's work commands extend the sweep to five generators rather than three.
  *   M4b's `planSetRates` is the sixth: the rate space is a query, not an
- *   enumeration, for the reasons in the `SetRates` note below.
+ *   enumeration, for the reasons in the `SetRates` note below. M5's `planSetResearch`
+ *   is the seventh, on the same queried side and for a related reason — the tree is
+ *   content the UI renders in full, refusals included, so it is not a generator's
+ *   job to enumerate it.
  * - **`StartWork` is enumerated over the catalog, and that is complete.** The
  *   command names an improvement kind, so "every way this worker may start work"
  *   is exactly "every kind this ruleset can build here" — a finite list read from
@@ -62,6 +65,15 @@
  *   sweeps treat "an advertised action with no observable effect" as a generator
  *   that has drifted. `actions.test.ts` sweeps the options against `applyCommand`
  *   in both directions.
+ * - **M5's tech gate reaches this menu through its own verdict** (`productionGate`),
+ *   which `planSetProduction` and `production.ts`' completion pass ask as well — one
+ *   rule, three askers, the arrangement the bullet above describes. The planner now
+ *   asks it too (M5's integration wave closed the wiring this comment used to say was
+ *   owed), so this conjunct is a redundant restatement of a rule the planner already
+ *   applies: a tech-gated item is absent from the menu *and* refused by
+ *   `applyCommand`, with the same typed `tech-required`. Written as the same verdict
+ *   and not as a filter of its own, which is why the agreement is by construction
+ *   rather than by review.
  * - **`SetRates` (M4b) is a query too, and the sixth generator is its evaluator.**
  *   `planSetRates` is the applier's own decision — "this actor exists, and this
  *   triple is three integers `>= 0` summing to `RATE_TOTAL`" — and `applyCommand`
@@ -127,6 +139,7 @@ import {
 import { improvementCatalog, type ImprovementId } from './improvements.js';
 import type { CityId, PlayerId, TileIndex, UnitId } from './ids.js';
 import { neighbors8, type RulesetView } from './map.js';
+import { productionGate } from './resources.js';
 import type { GameState } from './state.js';
 import { unitById, unitCatalog } from './units.js';
 
@@ -283,6 +296,15 @@ export const cityProductionOptions = (
     if (seen.has(key)) continue;
     seen.add(key);
     if (!planSetProduction(state, ruleset, city.owner, cityId, item).ok) continue;
+    // M5's third gating dimension, asked of the gate that owns it rather than
+    // reimplemented here: an item whose own row — or whose *resource*'s row — demands
+    // a tech this owner has not researched is not offered, because the production
+    // pass will not complete it (`production.ts` asks the same gate). Two askers, one
+    // verdict (`productionGate`), which is the same arrangement M4c gave the resource
+    // rule. Owed wiring, named in `resources.ts` and in the report rather than
+    // implied: `planSetProduction` itself does not ask this gate yet, so until it does
+    // this conjunct is the only place the *menu* refuses a tech-gated item.
+    if (productionGate(state, ruleset, city.owner, item).kind !== 'open') continue;
     options.push(item);
   }
 
@@ -304,6 +326,20 @@ export const cityProductionOptions = (
  * M4b's `SetRates` is deliberately **not** among these yields, for both
  * barbarians and civilizations: it is a setting over a 66-triple space with no
  * event of its own, and `planSetRates` is its evaluator — see the module note.
+ *
+ * M5's `SetResearch` is **not** yielded either, and for a reason worth separating
+ * from `SetRates`': there is no combinatorial space here (a ruleset ships a finite
+ * list of techs) but the list is *content*, not an action — it is what the router
+ * renders in a tree, complete with the techs this player may not have yet, so a
+ * generator that yielded "every researchable tech" would be advertising a menu as if
+ * it were the whole of what is legal, while the refusals a player most needs to see
+ * (an unmet prerequisite, a tech already known) are exactly the ones no generator
+ * emits. Its legality is `planSetResearch` — the same evaluator `applyCommand`
+ * refuses with and the same research rule the pipeline consults (`tech.ts`), so the
+ * two directions of the keystone property hold by construction rather than by a
+ * second list of techs here. `actions.test.ts` sweeps the whole catalog plus unknown
+ * ids through `planSetResearch` against `applyCommand` and asserts that no
+ * `SetResearch` is ever advertised.
  */
 export function* legalActions(
   state: GameState,

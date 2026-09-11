@@ -133,6 +133,22 @@ export interface ImprovementDef {
   readonly yields: TerrainYields;
   /** Where it may be built. Empty is a data error, not "anywhere". */
   readonly allowedRoles: readonly TerrainRole[];
+  /**
+   * M5's `requiresTech` is read **structurally**, not declared here. It is declared
+   * by content (`@civts/rules` `ImprovementSpec`); the engine's one read is `tech.ts`'
+   * `requiresTechOf(row: unknown)` and its one gating entry point is `resources.ts`'
+   * `unmetTechFor`. Restating the field on this view would put one M5 field on two of
+   * the engine's four catalog views and would suggest that *this* module decides who
+   * may build what — it decides only what a built improvement is worth. A row that
+   * declares one may not be started by a player who has not researched it, asked
+   * where `StartWork`'s legality is decided: `planStartWork` in `commands.ts` (see the
+   * wiring note in `resources.ts` — that call site is owed the gate).
+   *
+   * A tech requirement gates **building** the improvement and nothing else: it never
+   * changes what the row is worth on a tile, and an improvement already on the map
+   * keeps its yield delta whatever its row demands (M5 has no un-building, and this
+   * module has no opinion about techs).
+   */
 }
 
 /**

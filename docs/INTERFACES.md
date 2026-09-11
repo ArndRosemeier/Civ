@@ -1239,3 +1239,133 @@ came to disagree with the CLI.
 - A balance sweep demonstrates the loop end to end: vary one catalog number, run a
   batch, and show the measured effect. This is the deliverable the principal asked
   for — the ability to *test and balance* systems, not merely to run them.
+
+---
+
+# M5 contracts — FROZEN (technology)
+
+Provenance rule unchanged: every new row is `placeholder`, its detail says the value
+is unsourced and chosen to be playable, and no number is presented as Civ 3's.
+
+## The tech tree
+
+```ts
+export interface TechSpec {
+  readonly id: TechId;
+  readonly name: string;
+  readonly era: EraId;
+  readonly cost: number;                     // beakers, integer >= 1
+  readonly requires: readonly TechId[];      // direct prerequisites, may be empty
+  readonly provenance: Provenance;
+}
+export const ERAS: readonly EraId[];         // ordered, earliest first
+```
+
+`validateRuleset` must reject: a duplicate tech id, `cost < 1` or non-integer,
+an unknown era, a `requires` naming an unknown tech, **and a cycle in the
+prerequisites**. The cycle check is not optional — a cycle makes research
+permanently unreachable, and it is the one tree defect that a play test would
+never surface as an error, only as a game that quietly cannot progress.
+
+Eras are an ordered vocabulary, not a free string. A tech's era must be reachable
+from its prerequisites' eras (a tech may not sit in an earlier era than something
+it requires) — again a structural check, not a runtime one.
+
+## Research
+
+`PlayerState` gains:
+
+```ts
+readonly techs: readonly TechId[];        // known, sorted by id
+readonly researching?: TechId;            // ABSENT when nothing is being researched
+```
+
+`researching` is **optional, never `| undefined`** — the M3 rule. "Not researching"
+is an absent key.
+
+The `beakers` pool has existed since M4b and has done nothing. It now means
+something, and the frozen turn pipeline gains a step. Order is contractual:
+
+1. work progress (unit-id order)
+2. growth (city-id order)
+3. production (city-id order)
+4. **research** — after production, because production can complete a
+   science-multiplying building this turn and the M4c rule is that an effect
+   finished this turn contributes to this turn
+5. the money loop
+6. movement refill
+7. `turn += 1`
+
+Research: accumulate the beakers the money loop has **not yet** credited — the split
+happens in the money step, so research must read the pool the split just filled. If
+you find that ordering makes the pool ambiguous, say so and report it rather than
+picking silently; a double-credited or uncredited beaker is exactly the class of bug
+the M4 conservation invariants exist to catch.
+
+When `beakers >= cost` of the current `researching` tech: complete it (append to
+`techs`, keep sorted and unique), emit `TechResearched`, **subtract the cost and
+carry the remainder** into whatever is researched next. If nothing is being
+researched, beakers still accumulate and are simply banked — a player may stockpile.
+Completing a tech whose prerequisite list is not satisfied is impossible by
+construction; assert that invariant anyway.
+
+`GameEvent` gains `TechResearched { player, tech }`.
+
+```ts
+| { readonly type: 'SetResearch'; readonly tech: TechId }
+```
+
+Legal only for the actor, only for a tech it does not already know, whose
+prerequisites it satisfies, and which the ruleset defines. Emits no event (the M3
+setter precedent — setters are planner-only, reachable through `plan*`, exactly like
+`SetWorkedTiles`, `SetProduction` and `SetRates`; do not add it to `legalActions`).
+
+## Gating
+
+A spec may declare `requiresTech?: TechId` (units, buildings, improvements) and
+resources may declare `requiresTech?: TechId` (when the resource becomes visible and
+connectable). Gating must be enforced in the **same place** production and build
+legality are already decided, so the generator and the applier cannot disagree — the
+keystone invariant is BOTH directions and this is the third gating dimension after
+resources (M4c) and terrain.
+
+`validateRuleset` rejects a `requiresTech` naming an unknown tech.
+
+## The goldens, finally covering a real game
+
+A golden state is `newGame` at turn 0, so **no city exists and no M3/M4 mechanic is
+covered at hash level** — measured in M4c, not assumed. M5 adds at least one
+**played, city-bearing golden**: a fixed seed and a fixed command script, played
+enough turns to include city founding, growth, production, improvements, research
+and the money loop, recording the final hash. Same rules as every golden: generated
+only through the documented opt-in path, never hand-edited, `rehash:` in the commit
+message, and a failure on a different engine version or Node major.
+
+## Gate tiers (A5)
+
+Alpha requires the fast tier ≤ 90 s and `verify:full` ≤ 10 min. The fast tier is
+already ~60 s and one 200-seed sweep added ~50 s of it, so:
+
+- **fast (`pnpm verify`)**: typecheck, lint, format:check, and the unit/scenario
+  suites. Target ≤ 90 s and it must stay there as M6–M11 land.
+- **full (`pnpm verify:full`)**: everything in fast **plus** the long sweeps,
+  tournaments, determinism-across-processes and the UI suite. Currently an alias for
+  fast — that is debt, and this wave makes it real.
+
+Anything that runs a large batch must live in the full tier. A test that is too slow
+to run is a test that gets skipped, and a gate that takes twenty minutes is a gate
+people stop running.
+
+## Acceptance evidence for M5
+
+- A research scenario: exact turn a tech completes, with the exact beaker remainder
+  carried, and banked beakers when nothing is being researched.
+- A gating scenario: a tech-gated unit/building/improvement is refused with the typed
+  error naming the tech before it is known, and accepted after — in BOTH the
+  generator and the applier.
+- A prerequisite scenario: an unmet prerequisite is refused; a completed tech
+  unlocks exactly what it should and nothing else.
+- A **balance sweep over a tech cost** run through `@civts/sim`, with the measured
+  effect (research completion turns) reported — the milestone's balance evidence
+  comes from the harness, not from eye.
+- The played golden, plus the fast tier still under 90 s.

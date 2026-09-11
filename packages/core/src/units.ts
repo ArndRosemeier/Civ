@@ -103,6 +103,23 @@ export interface UnitDef {
    * `validateRuleset` rejects a value naming a resource no catalog row defines.
    */
   readonly requiresResource?: ResourceId;
+  /**
+   * M5's `requiresTech` is **not** declared on this view, and that is a decision
+   * rather than an omission. Where it is declared is content (`@civts/rules`
+   * `UnitSpec`, and the other three spec types); how the engine reads it is
+   * `tech.ts`' `requiresTechOf(row: unknown)` — total on any row, whatever type that
+   * row declares — with `resources.ts`' `unmetTechFor` as its one entry point for
+   * gating. Declaring it here *as well* would state one field in two of the four
+   * catalog views (`BuildingDef` lives in `cities.ts`, `ResourceDef` in `map.ts`),
+   * and a view that declared it would invite readers to think this module decides
+   * gating: it does not. `src/units.ts` owns the field's *shape* where it exists
+   * (`requiresResource` above) and nothing about who may build what.
+   *
+   * A unit row that declares one is gated by it: `productionGate` (`resources.ts`)
+   * refuses the item with the missing tech named, and `validateRuleset` — not this
+   * module — is where a `requiresTech` naming a tech no catalog row defines is
+   * rejected.
+   */
 }
 
 /**

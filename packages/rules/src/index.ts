@@ -17,6 +17,7 @@ import {
   asBuildingId,
   asImprovementId,
   asResourceId,
+  asTechId,
   asTerrainId,
   asUnitTypeId,
   err,
@@ -34,6 +35,8 @@ import {
   type ResourceDef,
   type ResourceKind,
   type Result,
+  type TechDef,
+  type TechId,
   type TerrainId,
   type TerrainRole,
   type UnitDef,
@@ -125,6 +128,17 @@ export interface Catalog {
    * (PLAN.md §6.2).
    */
   readonly resources: readonly ResourceSpec[];
+  /**
+   * The tech tree. Required, like the four catalogs above, and for the same reason
+   * with the M4c resource twist: `RulesetView` does not *declare* `techs` (the
+   * engine reads the tree through `core/tech.ts`'s `techCatalog`, which is total
+   * and treats "no tech catalog" as "no techs"), but a **catalog** that omitted it
+   * would be content that silently ships no research where the milestone asks for
+   * a tree — so a catalog says `techs: []` and validation rejects that as an empty
+   * catalog, exactly as it does for units, buildings, improvements and resources
+   * (PLAN.md §6.2).
+   */
+  readonly techs: readonly TechSpec[];
 }
 
 /**
@@ -244,6 +258,57 @@ export interface ImprovementSpec extends ImprovementDef {
   readonly provenance: Provenance;
 }
 
+/**
+ * The eras, **in progression order, earliest first** — an ordered vocabulary, not
+ * a free string (INTERFACES.md M5, "The tech tree").
+ *
+ * The order is data because two checks are stated in terms of it: a tech may not
+ * sit in an *earlier* era than something it requires (so the tree cannot run
+ * backwards in time), and a UI that lists eras must list them in the same order
+ * the catalog claims. Four eras rather than Civ 3's exact set, and their names are
+ * ours: this is a placeholder vocabulary chosen to be playable, and nothing here
+ * is claimed to match Civ 3's ages.
+ *
+ * The list lives here rather than in `core` because nothing in the engine orders
+ * eras: `core/tech.ts` reads `TechDef`'s `era` as an opaque label (it prices a
+ * tech, checks its prerequisites and spends beakers), and only content and
+ * validation care what the labels are. That is the same split `ImprovementKind`
+ * deliberately does *not* take — there the engine's own ordering rule needs the
+ * kind, so the kind list is a `core` concept. A future UI that draws the tree
+ * imports this list from `@civts/rules`.
+ */
+export const ERAS = ['ancient', 'medieval', 'industrial', 'modern'] as const;
+
+export type EraId = (typeof ERAS)[number];
+
+/**
+ * A technology — one node of the tree: what it costs in beakers, what it requires
+ * before it may be researched, and which era it belongs to.
+ *
+ * `requires` lists **direct** prerequisites only. The tree's transitive closure is
+ * derived (`core/tech.ts`'s `researchProblem` asks whether every direct
+ * prerequisite is known, which is enough because a tech can only become known by
+ * completing its own prerequisites first), and a row that listed the whole closure
+ * would be a second, hand-maintained copy of the graph — free to disagree with the
+ * rows it duplicates.
+ *
+ * As with the other specs, the row `extends` the engine's structural `TechDef`
+ * (`core/tech.ts`), which is the compile-time proof that content ships exactly
+ * what the engine reads, and `provenance` is required — a row without one does not
+ * compile (PLAN.md §6.2).
+ *
+ * **Provenance: every shipped row is `placeholder`.** The costs, the eras and the
+ * prerequisite graph in `CATALOG` are ours — unsourced values chosen so the tree
+ * is playable and research has a real choice at the start — and no row is traced
+ * to Civ 3's tech tree, its costs or its ages. `fidelity: 'cited-only'` rejects
+ * all of them, which is the check that keeps that honest.
+ */
+export interface TechSpec extends TechDef {
+  /** The era this tech belongs to; one of `ERAS`, checked at validation. */
+  readonly era: EraId;
+  readonly provenance: Provenance;
+}
+
 export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
@@ -261,7 +326,31 @@ export type RulesetError =
       readonly detail: string;
     }
   /** No terrain in the catalog fills this role, so generation cannot run. */
-  | { readonly kind: 'missing-role'; readonly role: TerrainRole };
+  | { readonly kind: 'missing-role'; readonly role: TerrainRole }
+  /**
+   * The tech prerequisites contain a cycle — a tech that, directly or through
+   * other techs, requires itself.
+   *
+   * This gets its own member rather than riding on `invalid-value` because it is
+   * the one tree defect that is **not visible in any single row**: every row of
+   * the cycle is internally well-formed, each names a tech that exists, and the
+   * cost is a plausible integer. A play test therefore cannot surface it as an
+   * error — the game simply never lets research progress past the cycle — which is
+   * exactly why it is a load-time validation error with the cycle spelled out
+   * (INTERFACES.md M5: "the cycle check is not optional").
+   *
+   * `cycle` is the loop's ids **in prerequisite order**, with the id it returns to
+   * repeated at the end (`a -> b -> a` is `[a, b, a]`), so the message names the
+   * cycle rather than merely asserting one exists. `detail` is the same loop as a
+   * printable string, because a caller that only renders `detail` must not lose
+   * the information.
+   */
+  | {
+      readonly kind: 'tech-cycle';
+      readonly catalog: string;
+      readonly cycle: readonly TechId[];
+      readonly detail: string;
+    };
 
 export interface Ruleset {
   readonly terrains: readonly TerrainSpec[];
@@ -269,8 +358,52 @@ export interface Ruleset {
   readonly buildings: readonly BuildingSpec[];
   readonly improvements: readonly ImprovementSpec[];
   readonly resources: readonly ResourceSpec[];
+  /**
+   * The tech tree, carried through validation unchanged — and **present on the
+   * validated ruleset**, not only on the catalog. That is load-bearing rather than
+   * tidiness: `validateRuleset`'s output *is* the engine's `RulesetView`
+   * (INTERFACES.md W4: "a validated `Ruleset` is structurally the engine's
+   * `RulesetView`, with no adapter in between"), and the research step can only
+   * price a tech if the tree reaches it. A validated ruleset that dropped `techs`
+   * would leave every game researching something no rule can cost, which is the
+   * shape of bug the "no adapter" rule exists to make impossible.
+   */
+  readonly techs: readonly TechSpec[];
   readonly fidelity: Fidelity;
 }
+
+/**
+ * One tech row, with its provenance built in rather than typed out seventeen
+ * times.
+ *
+ * The `why` argument is the row's own reason for existing as it does ("the first
+ * choice a player makes is which of three roots to open with"), and the rest of
+ * the note is the part that must never be forgotten: every row says out loud that
+ * its cost, its era and its prerequisites are **unsourced values of ours chosen to
+ * be playable**, which is PLAN.md §6.2's rule. Building the note here makes it
+ * impossible to add a tech row that omits that claim, and it keeps the seventeen
+ * rows below readable as a *shape* — which is the thing a reader has to check
+ * (roots, branches, depth, era layering) — rather than as a hundred lines of
+ * repeated boilerplate.
+ */
+const techRow = (
+  id: string,
+  name: string,
+  era: EraId,
+  cost: number,
+  requires: readonly string[],
+  why: string,
+): TechSpec => ({
+  id: asTechId(id),
+  name,
+  era,
+  cost,
+  requires: requires.map((required) => asTechId(required)),
+  provenance: placeholder(
+    `unsourced: ${why}; the ${String(cost)}-beaker cost, the era and the prerequisites of this row are ` +
+      'ours, chosen to be playable rather than measured, and nothing in this tree is traced to Civ 3',
+  ),
+});
 
 /** Placeholder catalog: shape is intentional, numbers are ours (PLAN.md 6.2). */
 export const CATALOG: Catalog = {
@@ -730,6 +863,174 @@ export const CATALOG: Catalog = {
       ),
     },
   ],
+  /**
+   * The tech tree (M5) — our own placeholder tree, and the *shape* is what this
+   * table is defending:
+   *
+   * - **Three roots** (`pottery`, `bronze-working`, `ceremonial-burial`) with no
+   *   prerequisites, so the first research decision is a real choice rather than a
+   *   formality, and three different openings are playable.
+   * - **Four eras in `ERAS` order, each layered on the last.** No tech sits in an
+   *   earlier era than something it requires, which is the structural check the
+   *   contract asks for (`checkTechEras`) and the reason `ERAS` is ordered data.
+   * - **Every tech is reachable**, and reachability is *proved* rather than
+   *   asserted: `rules.test.ts` walks the graph from the roots and requires the
+   *   walk to reach all seventeen rows, and `core/test/tech.test.ts` replays the
+   *   same property through the research rule itself (a player who always
+   *   researches something available ends up knowing the whole tree). A tree with
+   *   an orphan — or with a cycle, which is the one defect no play test surfaces as
+   *   an error — fails `validateRuleset` before a game can start.
+   * - **Costs rise by era** (5–9 beakers ancient, 13–18 medieval, 24–28 industrial,
+   *   40–45 modern) against early city science of roughly one to four beakers a
+   *   turn at the default 6/4/0 rates: an ancient tech is a handful of turns, a
+   *   modern one is a long investment. Those numbers are **ours**, chosen to be
+   *   playable; they are not Civ 3's research costs, which are per-advance,
+   *   difficulty-scaled and unverified here.
+   * - **What a tech unlocks is not yet wired.** M5's gating section (`requiresTech`
+   *   on units, buildings, improvements and resources, enforced where production
+   *   and build legality are decided) is not part of this row set and no row below
+   *   claims it: `core/tech.ts`'s `techUnlocks` reads such a field totally and
+   *   honestly reports nothing until content declares one. Saying that out loud is
+   *   better than a tree whose names imply gates the engine does not enforce.
+   */
+  techs: [
+    techRow(
+      'pottery',
+      'Pottery',
+      'ancient',
+      5,
+      [],
+      'an opening root, so the first research decision is a choice between three paths',
+    ),
+    techRow(
+      'bronze-working',
+      'Bronze Working',
+      'ancient',
+      6,
+      [],
+      'an opening root, and the head of the military/masonry branch',
+    ),
+    techRow(
+      'ceremonial-burial',
+      'Ceremonial Burial',
+      'ancient',
+      6,
+      [],
+      'an opening root, and the only way into the literature branch',
+    ),
+    techRow(
+      'alphabet',
+      'Alphabet',
+      'ancient',
+      7,
+      ['pottery'],
+      'the shared trunk of the three medieval science branches, so pottery pays off twice',
+    ),
+    techRow(
+      'warrior-code',
+      'Warrior Code',
+      'ancient',
+      5,
+      ['bronze-working'],
+      'cheap on purpose: the military opening must compete with the science one',
+    ),
+    techRow(
+      'the-wheel',
+      'The Wheel',
+      'ancient',
+      8,
+      ['pottery'],
+      'the commerce branch, costing more beakers than the science one it competes with',
+    ),
+    techRow(
+      'masonry',
+      'Masonry',
+      'ancient',
+      9,
+      ['bronze-working'],
+      'the expensive ancient tech, and the gate in front of iron working',
+    ),
+    techRow(
+      'iron-working',
+      'Iron Working',
+      'medieval',
+      14,
+      ['bronze-working', 'masonry'],
+      'two ancient prerequisites, so the medieval era cannot be reached by one branch alone',
+    ),
+    techRow(
+      'mathematics',
+      'Mathematics',
+      'medieval',
+      16,
+      ['alphabet', 'masonry'],
+      'joins the science trunk to the masonry branch, which is what makes the early choice matter later',
+    ),
+    techRow(
+      'currency',
+      'Currency',
+      'medieval',
+      13,
+      ['the-wheel', 'alphabet'],
+      'the cheaper medieval row, reachable from either of two ancient openings through alphabet',
+    ),
+    techRow(
+      'literature',
+      'Literature',
+      'medieval',
+      15,
+      ['alphabet', 'ceremonial-burial'],
+      'the only row that needs ceremonial burial, so the third root is not decorative',
+    ),
+    techRow(
+      'feudalism',
+      'Feudalism',
+      'medieval',
+      18,
+      ['warrior-code', 'iron-working'],
+      'the most expensive medieval row: the military line has to reach the era it sits in first',
+    ),
+    techRow(
+      'engineering',
+      'Engineering',
+      'industrial',
+      26,
+      ['mathematics', 'iron-working'],
+      'the first industrial row, requiring both the science and the metal half of the medieval era',
+    ),
+    techRow(
+      'banking',
+      'Banking',
+      'industrial',
+      24,
+      ['currency', 'feudalism'],
+      'the money branch, deliberately cheaper than engineering so the two industrial openings differ',
+    ),
+    techRow(
+      'education',
+      'Education',
+      'industrial',
+      28,
+      ['literature', 'mathematics'],
+      'the science branch, the most expensive industrial row, and one of the two routes to the modern era',
+    ),
+    techRow(
+      'steam-power',
+      'Steam Power',
+      'modern',
+      40,
+      ['engineering', 'banking'],
+      'a modern row, priced so that reaching it is a game-long investment rather than a formality',
+    ),
+    techRow(
+      'electricity',
+      'Electricity',
+      'modern',
+      45,
+      ['steam-power', 'education'],
+      'the last row, requiring the modern row before it as well as the science branch',
+    ),
+  ],
 };
 
 /**
@@ -1177,20 +1478,207 @@ const checkImprovement = (i: ImprovementSpec): readonly RulesetError[] => {
 };
 
 /**
+ * One tech row, on its own: a name, an integer cost of at least one beaker, an era
+ * from the ordered vocabulary, and prerequisites that are ids rather than nothing.
+ *
+ * What is **not** checked here is anything about the *graph* — whether `requires`
+ * names a tech that exists, whether the eras run backwards, whether the edges form
+ * a cycle. Those are properties of the tree as a whole, they are the checks the
+ * contract singles out, and they live in the three functions below so that each
+ * one states its rule once rather than being re-derived per row.
+ */
+const checkTech = (tech: TechSpec): readonly RulesetError[] => {
+  const errors: RulesetError[] = [];
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'techs',
+    id: tech.id,
+    field,
+    detail,
+  });
+
+  // A cost is a simulation number — it is compared against `PlayerState.beakers`
+  // and subtracted from it — so a fraction here would put an unhashable value in
+  // the state, exactly as a fractional yield would (PLAN.md §5.3).
+  if (!Number.isInteger(tech.cost)) errors.push(bad('cost', 'must be an integer'));
+  if (tech.cost < 1) errors.push(bad('cost', 'must be >= 1'));
+
+  if (tech.name === '') errors.push(bad('name', 'must not be empty'));
+
+  if (!ERAS.some((era) => era === tech.era)) {
+    errors.push(bad('era', `must be one of ${ERAS.join(', ')} (got ${JSON.stringify(tech.era)})`));
+  }
+
+  return errors;
+};
+
+/**
+ * Every `requires` entry must name a tech this catalog defines.
+ *
+ * Reported against the *tech that declares the dependency*, naming its `requires`
+ * field, because that is the row a caller fixes — the same shape
+ * `checkResourceRefs` uses for a unit's `requiresResource`. A prerequisite naming
+ * nothing is not a harmless extra: research would ask a question no row can answer
+ * and the tech would be permanently unreachable, which is precisely the silent
+ * dead-end the cycle check exists to prevent.
+ *
+ * A tech that requires nothing is not complained about: the roots of the tree are
+ * *supposed* to have empty prerequisite lists.
+ */
+const checkTechRefs = (techs: readonly TechSpec[]): readonly RulesetError[] =>
+  techs.flatMap((tech) =>
+    tech.requires
+      .filter((required) => !techs.some((row) => row.id === required))
+      .map((required) => ({
+        kind: 'invalid-value' as const,
+        catalog: 'techs',
+        id: tech.id,
+        field: 'requires',
+        detail: `names tech ${JSON.stringify(required)}, which this catalog does not define`,
+      })),
+  );
+
+/**
+ * The era of a tech must not precede the era of anything it requires.
+ *
+ * `ERAS` is an ordered vocabulary precisely so this can be a structural check: a
+ * tech that sits in an earlier era than its own prerequisite would make the tree
+ * run backwards in time, and a UI that grouped research by era (or an AI that
+ * weighed "what is available this age") would then see a tech it cannot possibly
+ * have researched yet. Equal eras are legal — two rows of the same era may depend on
+ * each other — and an unknown era is reported by `checkTech` rather than here, so
+ * this check only orders eras it can actually place.
+ */
+const checkTechEras = (techs: readonly TechSpec[]): readonly RulesetError[] => {
+  const rank = (era: EraId): number => ERAS.findIndex((known) => known === era);
+
+  return techs.flatMap((tech) => {
+    const own = rank(tech.era);
+    if (own < 0) return [];
+
+    return tech.requires.flatMap((required) => {
+      const row = techs.find((candidate) => candidate.id === required);
+      if (row === undefined) return [];
+      const theirs = rank(row.era);
+
+      return theirs >= 0 && theirs > own
+        ? [
+            {
+              kind: 'invalid-value' as const,
+              catalog: 'techs',
+              id: tech.id,
+              field: 'era',
+              detail:
+                `is ${tech.era}, which is earlier than ${row.era} — the era of ` +
+                `${JSON.stringify(required)}, a tech it requires`,
+            },
+          ]
+        : [];
+    });
+  });
+};
+
+/**
+ * Find a cycle in the prerequisites, if there is one — the check the contract
+ * calls "not optional".
+ *
+ * A cycle is the one tree defect that **no play test can surface as an error**:
+ * every row in the loop is well-formed, each prerequisite exists, every cost is a
+ * plausible integer, and validation without this check passes. The game then simply
+ * never offers the looped techs to anyone, forever, with nothing anywhere saying
+ * why. So it is a load-time error, and it names the loop (`[a, b, a]`) rather than
+ * announcing that "a cycle exists somewhere".
+ *
+ * The walk is a depth-first search over catalog order, with the classic three
+ * colours: `open` marks the nodes on the current path, `closed` the nodes whose
+ * whole subtree has been explored without finding one. Rebinding a node that is
+ * `open` therefore *is* a cycle, and the ids from that node's position in the path
+ * to the end are exactly the loop. Catalog order — never RNG, never a hash of the
+ * ids — makes the reported cycle stable across runs, so the same broken catalog
+ * always produces the same message.
+ *
+ * A `requires` entry naming an unknown tech is skipped rather than followed: that
+ * is a different error, reported once by `checkTechRefs` against the row that made
+ * it, and treating an unknown id as a leaf keeps this function from claiming a
+ * cycle that the catalog does not contain.
+ */
+const findTechCycle = (techs: readonly TechSpec[]): readonly TechId[] | undefined => {
+  const byId = new Map<TechId, TechSpec>();
+  for (const tech of techs) if (!byId.has(tech.id)) byId.set(tech.id, tech);
+
+  const colour = new Map<TechId, 'open' | 'closed'>();
+  const path: TechId[] = [];
+
+  const walk = (id: TechId): readonly TechId[] | undefined => {
+    const seen = colour.get(id);
+    if (seen === 'closed') return undefined;
+    if (seen === 'open') {
+      const from = path.indexOf(id);
+      return [...path.slice(from < 0 ? 0 : from), id];
+    }
+
+    colour.set(id, 'open');
+    path.push(id);
+
+    for (const required of byId.get(id)?.requires ?? []) {
+      if (!byId.has(required)) continue;
+      const cycle = walk(required);
+      if (cycle !== undefined) return cycle;
+    }
+
+    path.pop();
+    colour.set(id, 'closed');
+    return undefined;
+  };
+
+  for (const tech of techs) {
+    const cycle = walk(tech.id);
+    if (cycle !== undefined) return cycle;
+  }
+
+  return undefined;
+};
+
+/** `a -> b -> a`, the printable form of a cycle `findTechCycle` found. */
+const cycleDetail = (cycle: readonly TechId[]): string =>
+  `prerequisite cycle: ${cycle.map((id) => String(id)).join(' -> ')}`;
+
+/**
+ * The tech tree's graph checks — references, era order and the cycle check — run
+ * together and reported in that order, so a catalog's first complaint about its
+ * tree is the one that stops a game earliest: an unknown prerequisite makes a tech
+ * unreachable, a backwards era misorders the whole progression, and a cycle makes
+ * part of the tree unreachable forever.
+ */
+const checkTechGraph = (techs: readonly TechSpec[]): readonly RulesetError[] => {
+  const cycle = findTechCycle(techs);
+  return [
+    ...checkTechRefs(techs),
+    ...checkTechEras(techs),
+    ...(cycle === undefined
+      ? []
+      : [{ kind: 'tech-cycle' as const, catalog: 'techs', cycle, detail: cycleDetail(cycle) }]),
+  ];
+};
+
+/**
  * Validate a catalog. In `cited-only` mode any placeholder row is a hard error,
  * which is what makes "is this Civ 3-shaped or Civ 3-exact?" checkable.
  *
  * Terrains are checked before units, units before buildings, buildings before
- * improvements, and improvements before resources, so the first error a caller
- * sees comes from the catalog that would stop a game earliest: a terrain hole
- * stops generation, a unit hole stops `newGame` placing a settler, and a
- * building, improvement or resource hole only stops production, a worker or a
- * resource placement later.
+ * improvements, improvements before resources, and resources before techs, so the
+ * first error a caller sees comes from the catalog that would stop a game
+ * earliest: a terrain hole stops generation, a unit hole stops `newGame` placing a
+ * settler, and a building, improvement, resource or tech hole only stops
+ * production, a worker, a resource placement or research later.
  *
  * The one cross-catalog check is `checkResourceRefs` — a unit's `requiresResource`
  * is a reference into the *resource* catalog — and it stays with the units it is
  * reported against, immediately after the rest of the unit checks, so a caller
  * fixing a broken catalog sees every complaint about that catalog in one place.
+ * M5's tree checks are cross-*row* rather than cross-catalog (a tech's `requires`
+ * points at other techs, its era is ordered against theirs), so they are grouped at
+ * the end of the tech block where every complaint about the tree is together.
  */
 export const validateRuleset = (
   catalog: Catalog,
@@ -1210,6 +1698,12 @@ export const validateRuleset = (
     ...catalog.improvements.flatMap(checkImprovement),
     ...checkRows('resources', catalog.resources),
     ...catalog.resources.flatMap(checkResource),
+    ...checkRows('techs', catalog.techs),
+    ...catalog.techs.flatMap(checkTech),
+    // The tree's own checks last: a per-row complaint (a bad cost, an unknown era)
+    // is what a caller fixes first, and a graph complaint is only meaningful once
+    // the rows it is about are themselves well-formed.
+    ...checkTechGraph(catalog.techs),
   ];
 
   if (fidelity === 'cited-only') {
@@ -1263,6 +1757,16 @@ export const validateRuleset = (
         });
       }
     }
+    for (const tech of catalog.techs) {
+      if (isPlaceholder(tech.provenance)) {
+        errors.push({
+          kind: 'placeholder-in-cited-only',
+          catalog: 'techs',
+          id: tech.id,
+          note: tech.provenance.note,
+        });
+      }
+    }
   }
 
   // The annotations state the contract each `extends` encodes, and keep the
@@ -1271,10 +1775,19 @@ export const validateRuleset = (
   const buildings: readonly BuildingSpec[] = catalog.buildings;
   const improvements: readonly ImprovementSpec[] = catalog.improvements;
   const resources: readonly ResourceSpec[] = catalog.resources;
+  const techs: readonly TechSpec[] = catalog.techs;
 
   return errors.length > 0
     ? err(errors)
-    : ok({ terrains: catalog.terrains, units, buildings, improvements, resources, fidelity });
+    : ok({
+        terrains: catalog.terrains,
+        units,
+        buildings,
+        improvements,
+        resources,
+        techs,
+        fidelity,
+      });
 };
 
 export interface ProvenanceSummary {
@@ -1341,6 +1854,13 @@ const sectionOf = (name: string, rows: readonly ProvenanceRow[]): ProvenanceSect
  * terrain restrictions), so a report that counted them without listing them — or
  * listed them under a total that did not count them — would be the exact
  * half-truth this function exists to prevent.
+ *
+ * Techs are the sixth, and M5 sharpens the point: the tree is seventeen rows of
+ * *research costs* — the largest block of new numbers the milestone adds — and every
+ * one of them is a `placeholder` row. A provenance report that counted rows without
+ * listing the tech rows would understate exactly the numbers this wave introduced,
+ * which is why the section list and `summarizeProvenance` are one function's worth of
+ * truth rather than two.
  */
 export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection[] => [
   sectionOf('terrains', catalog.terrains),
@@ -1348,11 +1868,12 @@ export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection
   sectionOf('buildings', catalog.buildings),
   sectionOf('improvements', catalog.improvements),
   sectionOf('resources', catalog.resources),
+  sectionOf('techs', catalog.techs),
 ];
 
 /**
- * Count **every** row in the catalog — terrain, unit, building, improvement and
- * resource alike. The number answers
+ * Count **every** row in the catalog — terrain, unit, building, improvement,
+ * resource and tech alike. The number answers
  * "how much of what the engine runs on is traced to a source?", so a summary
  * that quietly skipped a catalog would be exactly the half-truth PLAN.md §6.2
  * exists to prevent.

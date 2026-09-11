@@ -283,6 +283,13 @@ export const formatRulesetError = (e: RulesetError): string => {
       return `invalid value: ${e.catalog}/${e.id}.${e.field} — ${e.detail}`;
     case 'missing-role':
       return `no terrain fills role "${e.role}"`;
+    // M5: a prerequisite cycle is refused at validation time, and it is rendered as
+    // the loop it is (`a -> b -> a`) rather than as a set of rows, because the loop is
+    // what the operator has to break. The wording is `golden.test.ts`'s, verbatim: the
+    // two renderers exist because one is shipped and one is a test helper, and a
+    // reader comparing a CLI failure with a golden failure must see the same sentence.
+    case 'tech-cycle':
+      return `tech prerequisite cycle in ${e.catalog}: ${e.detail}`;
   }
 };
 

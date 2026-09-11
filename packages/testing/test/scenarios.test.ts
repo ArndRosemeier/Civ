@@ -19,6 +19,17 @@
  *
  * Everything runs on `@civts/rules`' `CATALOG` through the same `validateRuleset`
  * the CLI runs, so a scenario measures the engine the game actually plays.
+ *
+ * **M3, M4a, M4b, M4c and M5 appended their own acceptance evidence to this file**,
+ * each in its own numbered section at the end, so one run of one file is the
+ * milestone suite. M5's section (16) is the last: research *timing* (the exact turn a
+ * tech completes, the beaker remainder carried into the next tech, and beakers banked
+ * when nothing is selected), prerequisites (an unmet one refused; a completed tech
+ * unlocking exactly what it should and nothing else), and gating (a tech-gated item
+ * refused before and accepted after, including an item whose resource is itself
+ * behind a tech, so the two gates compose). Each scenario has a falsification test
+ * below it that runs its own assertions against a world where the rule is broken —
+ * an assertion that cannot fail is not evidence.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -36,11 +47,16 @@ import {
   UNIT_SUPPORT_COST,
   VISIBILITY_RADIUS,
   applyCommand,
+  applyEconomy,
+  applyGrowth,
+  applyProduction,
+  applyResearch,
   asBuildingId,
   asCityId,
   asImprovementId,
   asPlayerId,
   asResourceId,
+  asTechId,
   asTileIndex,
   asUnitId,
   asUnitTypeId,
@@ -62,22 +78,33 @@ import {
   isExplored,
   isPlaceholder,
   isWonder,
+  knownTechs,
   loadSettings,
   maintenanceOf,
   mayStartBuilding,
   neighbors8,
   newGame,
   nextBelow,
+  planSetResearch,
+  prerequisitesOf,
+  placeholder,
   playerIncome,
+  productionGate,
   ratesProblem,
+  researchingOf,
+  researchStep,
   seedRng,
   splitCommerce,
+  techDef,
+  techUnlocks,
   tileIndex,
   tileYields,
   unitById,
   unitDef,
   unitSupport,
   unitsOnTile,
+  unmetTechFor,
+  planStartWork,
   visibleTiles,
   type City,
   type CityId,
@@ -92,13 +119,23 @@ import {
   type PlayerId,
   type ProductionItem,
   type Rates,
+  type ResearchStep,
   type Result,
   type RulesetView,
+  type TechId,
   type TileIndex,
   type UnitTypeId,
   type UnitWork,
 } from '@civts/core';
-import { CATALOG, validateRuleset } from '@civts/rules';
+import {
+  CATALOG,
+  validateRuleset,
+  type BuildingSpec,
+  type Catalog,
+  type ImprovementSpec,
+  type ResourceSpec,
+  type UnitSpec,
+} from '@civts/rules';
 import {
   createScenarioBuilder,
   defineScenario,
@@ -6890,5 +6927,1456 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
     const text = failures(result.assertions).join('\n');
     expect(text).toMatch(/the buildings that ran it up paid/);
     expect(text).toMatch(/the treasury floored at exactly 0/);
+  });
+
+  /* ------------------------------------------------------------------ *
+   * 16. M5 — research timing, prerequisites, gating
+   * ------------------------------------------------------------------ */
+
+  /**
+   * M5's acceptance evidence, in one place.
+   *
+   * The milestone's acceptance lines (docs/INTERFACES.md, "Acceptance evidence for M5")
+   * are:
+   *
+   * 1. a research scenario with the exact turn a tech completes, the exact beaker
+   *    remainder carried, and banked beakers when nothing is being researched;
+   * 2. a prerequisite scenario: an unmet prerequisite refused, and a completed tech
+   *    unlocking exactly what it should and nothing else;
+   * 3. a gating scenario: a tech-gated unit/building/improvement refused with the typed
+   *    error before the tech is known and accepted after;
+   * 4. the balance sweep in `scripts/tech-balance-sweep.ts` (not this file).
+   *
+   * Every scenario below is paired with a falsification test that runs **its own
+   * assertions** against a world where the rule is broken, because an assertion that
+   * cannot fail is not evidence.
+   *
+   * ## The world, and why its numbers are what they are
+   *
+   * One Roman city at `(6, 5)` on a hand-built `duel` map, working exactly two tiles — a
+   * grassland with a road and a hills with a road and a mine — and Carthage parked in a
+   * corner with a single unit so the settings have the two civilizations they claim.
+   *
+   * ```
+   *   centre  (6, 5) grassland          2 food  1 shield  1 commerce
+   *   worked  (5, 6) grassland + road   2 food  1 shield  2 commerce
+   *   worked  (6, 6) hills + road+mine  0 food  3 shield  1 commerce
+   *   ---------------------------------------------------------------
+   *   CITY                              4 food  5 shield  4 commerce
+   * ```
+   *
+   * Two of those numbers carry the research arithmetic, so they are stated rather than
+   * left to the reader:
+   *
+   * - **`foodSurplus` is exactly 0.** Two citizens eat 4 food and the city makes 4, so the
+   *   city never grows and never starves. A city that grew would work another tile and its
+   *   beaker rate would change mid-scenario, which would make "the remainder" a function
+   *   of when the growth happened. `population === 2` is asserted, so that is a checked
+   *   property rather than a hope.
+   * - **The rates are 5/5/0**, so the 4 commerce splits into **2 gold and 2 beakers**
+   *   (`splitCommerce`: neither floor bites at 4 commerce). Every beaker total below is
+   *   therefore 2 per turn, banked at the end of each turn by the money loop and spent at
+   *   the *start* of the next one by the research step — the pipeline-delay reading
+   *   `tech.ts` argues out, and the reason `pottery` completes on turn 5 rather than 4.
+   *
+   * All of it is placeholder content from the shipped catalog; nothing here is a claim
+   * about Civ 3.
+   */
+  const RESEARCH_CITY = asCityId(0);
+  const RESEARCH_GRASS = at(5, 6);
+  const RESEARCH_HILLS = at(6, 6);
+  /** `(x, y)` pairs: the builder's unit and resource methods take coordinates, not indices. */
+  const RESEARCH_FAR: readonly [number, number] = [30, 30];
+  const RESEARCH_WORKER_TILE: readonly [number, number] = [7, 5];
+
+  /**
+   * A tech row's placeholder cost, or a loud failure. `noUncheckedIndexedAccess` is why this
+   * exists rather than a `?.`: a scenario that named a tech the catalog does not define must
+   * fail at the point it looked, not compare `undefined` to a number and pass.
+   */
+  const techCost = (ruleset: RulesetView, tech: TechId): number => {
+    const row = techDef(ruleset, tech);
+    if (row === undefined) throw new Error(`the catalog defines no tech "${String(tech)}"`);
+    return row.cost;
+  };
+
+  /** The shipped techs these scenarios name, with their placeholder costs. */
+  const POTTERY = asTechId('pottery'); // 5 beakers, a root
+  const ALPHABET = asTechId('alphabet'); // 7 beakers, requires pottery
+  const BRONZE_WORKING = asTechId('bronze-working'); // 6 beakers, a root
+  const MASONRY = asTechId('masonry'); // 9 beakers, requires bronze-working
+  const IRON_WORKING = asTechId('iron-working'); // 14 beakers, requires bronze + masonry
+  const NOT_A_TECH = asTechId('mithril');
+
+  /** 2 beakers a turn: 4 commerce split 5/5/0 by `splitCommerce`. */
+  const BEAKERS_PER_TURN = 2;
+
+  /**
+   * The research world. `granted` comes first so a scenario can hand a player a tech it
+   * never researched (that is what `grantTech` is for); `selected` is what it is working
+   * on, and the builder checks it against the engine's own rule.
+   */
+  const researchSetup =
+    (granted: readonly TechId[], selected?: TechId) =>
+    (b: ScenarioBuilder): ScenarioBuilder => {
+      const world = b
+        .addPlayer('Rome')
+        .addPlayer('Carthage')
+        .fillTerrain('grassland')
+        .setTile(6, 6, 'hills')
+        .addImprovement(5, 6, asImprovementId('road'))
+        .addImprovement(6, 6, asImprovementId('road'))
+        .addImprovement(6, 6, asImprovementId('mine'))
+        // Carthage's own unit, far away: a second civilization so the settings are
+        // honest, and no interaction with Rome's research.
+        .addUnit(0, WARRIOR, [6, 5])
+        .addUnit(1, WARRIOR, [RESEARCH_FAR[0], RESEARCH_FAR[1]])
+        .addUnit(0, asUnitTypeId('worker'), [RESEARCH_WORKER_TILE[0], RESEARCH_WORKER_TILE[1]])
+        .setRates(0, { tax: 5, science: 5, luxury: 0 })
+        .addCity(0, [6, 5], {
+          name: 'Roma',
+          population: 2,
+          foodBox: 0,
+          shields: 0,
+          workedTiles: [RESEARCH_GRASS, RESEARCH_HILLS],
+        });
+
+      for (const tech of granted) world.grantTech(0, tech);
+      return selected === undefined ? world : world.setResearching(0, selected);
+    };
+
+  /** The techs `playerId` knows in `state`, as comparable strings. */
+  const techsIn = (state: GameState, playerId: PlayerId): readonly string[] => {
+    const player = state.players.find((candidate) => candidate.id === playerId);
+    return player === undefined ? [] : [...knownTechs(player)].map(String);
+  };
+
+  /** What `playerId` is researching, or `undefined` — read through `tech.ts`' reader. */
+  const researchOf = (state: GameState, playerId: PlayerId): TechId | undefined => {
+    const player = state.players.find((candidate) => candidate.id === playerId);
+    return player === undefined ? undefined : researchingOf(player);
+  };
+
+  /** The beakers `playerId` has banked. */
+  const beakersIn = (state: GameState, playerId: PlayerId): number => {
+    const player = state.players.find((candidate) => candidate.id === playerId);
+    return player === undefined ? 0 : player.beakers;
+  };
+
+  /** One `TechResearched` line, as the event carries it. */
+  interface TechLine {
+    readonly playerId: PlayerId;
+    readonly tech: TechId;
+    readonly cost: number;
+    readonly beakers: number;
+  }
+
+  /** The `TechResearched` lines in `events`, in the order the pipeline emitted them. */
+  const techLines = (events: readonly GameEvent[]): readonly TechLine[] =>
+    events.flatMap((event) =>
+      event.type === 'TechResearched'
+        ? [
+            {
+              playerId: event.playerId,
+              tech: event.tech,
+              cost: event.cost,
+              beakers: event.beakers,
+            },
+          ]
+        : [],
+    );
+
+  /** How many citizens `playerId` has, summed over its cities. */
+  const populationOf = (state: GameState, playerId: PlayerId): number =>
+    state.cities
+      .filter((city) => city.owner === playerId)
+      .reduce((total, city) => total + city.population, 0);
+
+  /** The states a scripted run passed through, rebuilt through the engine's own applier. */
+  const replayFrom = (
+    setup: (b: ScenarioBuilder) => ScenarioBuilder,
+    ruleset: RulesetView,
+    commands: readonly Command[],
+    steps: number,
+  ): GameState => replayEventsFrom(setup, ruleset, commands, steps).state;
+
+  /**
+   * The events a prefix of a scripted run produced, with the state that prefix ended in.
+   *
+   * Every command goes through `applyFor` — the engine's own applier, the same one a player
+   * drives — so this is a replay of the run and not a second implementation of the pipeline.
+   */
+  const replayEventsFrom = (
+    setup: (b: ScenarioBuilder) => ScenarioBuilder,
+    ruleset: RulesetView,
+    commands: readonly Command[],
+    steps: number,
+  ): { readonly state: GameState; readonly events: readonly GameEvent[] } => {
+    const built = setup(createScenarioBuilder(ruleset, DUEL_SETTINGS)).build();
+    if (!built.ok) throw new Error(`the replay fixture must build: ${JSON.stringify(built.error)}`);
+
+    let current = built.value;
+    const events: GameEvent[] = [];
+    for (const command of commands.slice(0, steps)) {
+      const outcome = applyFor(current, ROME, command, ruleset);
+      current = outcome.state;
+      events.push(...outcome.events);
+    }
+    return { state: current, events };
+  };
+
+  /**
+   * The timing run played with **research after the money loop** instead of before it — the
+   * reading `turn.ts` and `tech.ts` explicitly reject.
+   *
+   * Every step is still the engine's own exported function (`applyGrowth`, `applyProduction`,
+   * `applyEconomy`, `applyResearch`); only the order of the last two differs, so a difference
+   * between the two runs is that order and nothing else. This exists for the falsification
+   * test below and is used nowhere else: the real pipeline is `advanceTurn`, and no scenario
+   * plays this one.
+   */
+  const replayWithResearchAfterTheMoneyLoop = (
+    setup: (b: ScenarioBuilder) => ScenarioBuilder,
+    ruleset: RulesetView,
+    commands: readonly Command[],
+  ): { readonly state: GameState; readonly events: readonly GameEvent[] } => {
+    const built = setup(createScenarioBuilder(ruleset, DUEL_SETTINGS)).build();
+    if (!built.ok) {
+      throw new Error(`the counterfactual fixture must build: ${JSON.stringify(built.error)}`);
+    }
+
+    let current = built.value;
+    const events: GameEvent[] = [];
+    for (const command of commands) {
+      if (command.type !== 'EndTurn') {
+        const outcome = applyFor(current, ROME, command, ruleset);
+        current = outcome.state;
+        events.push(...outcome.events);
+        continue;
+      }
+      // The same six steps with steps 4 and 5 exchanged: production, then the money loop,
+      // then research. (The movement refill is step 6 and is not exported; nothing in this
+      // scenario moves a unit, so leaving it out changes no number under test.)
+      const grown = applyGrowth(current, ruleset);
+      const produced = applyProduction(grown.state, ruleset);
+      const paid = applyEconomy(produced.state, ruleset);
+      const researched = applyResearch(paid.state, ruleset);
+      events.push(...grown.events, ...produced.events, ...paid.events, ...researched.events);
+      current = { ...researched.state, turn: researched.state.turn + 1 };
+    }
+    return { state: current, events };
+  };
+
+  /* ---- 16a. Research timing and the beaker carry -------------------- */
+
+  /** `SetResearch`, named the way `endTurn` and `setProduction` name their commands. */
+  const setResearch = (tech: TechId): Command => ({ type: 'SetResearch', tech });
+
+  /** The scripted run: 3 turns, a 4th, a selection, then 3 more. */
+  const TIMING_RUN: readonly Command[] = [
+    ...endTurns(3),
+    endTurn(),
+    setResearch(ALPHABET),
+    ...endTurns(3),
+  ];
+
+  /**
+   * Where a falsification test puts the world it wants a scenario's assertions to be run
+   * against, and the only reason this exists.
+   *
+   * A scenario's `assert` callback receives the state and ruleset of its own run, which is
+   * exactly right for acceptance evidence and exactly wrong for falsifying it: the
+   * falsification needs the *same assertions* aimed at a broken world. Rather than write a
+   * second copy of them (which would prove nothing about the first copy), the timing
+   * scenario reads this when it is set. `undefined` in every real run, and nothing in the
+   * engine knows it exists.
+   */
+  let timingCounterfactual:
+    { readonly state: GameState; readonly events: readonly GameEvent[] } | undefined;
+
+  /**
+   * **The exact turn a tech completes, the exact remainder carried, and the pool after.**
+   *
+   * Rome starts researching `pottery` (5 beakers) with an empty pool and makes 2 beakers a
+   * turn:
+   *
+   * | turn | pool at the start of the research step | what the step does |
+   * |---|---|---|
+   * | 1 | 0 | nothing banked yet — research runs *before* the money loop |
+   * | 2 | 0 | accumulating, `needed: 5` |
+   * | 3 | 2 | accumulating, `needed: 3` |
+   * | 4 | 4 | accumulating, `needed: 1` |
+   * | 5 | 6 | **completes**: pottery known, 5 charged, **1 carried** |
+   *
+   * The pool at the start of turn 5 is 6 rather than 5 because the money loop of turn 4
+   * banked its 2 beakers *after* that turn's research step ran. The completion turn is
+   * therefore a direct consequence of the frozen step order, which is what makes it
+   * evidence: with the two steps exchanged, pottery completes on **turn 4** and the pool
+   * runs one collection ahead forever after. The falsification test below measures that by
+   * aiming these same assertions at that world.
+   *
+   * `alphabet` (7 beakers, requires pottery) is selected at turn 5, and the carried beaker
+   * is part of the next tech's progress rather than being discarded: the pool goes 1 → 3 →
+   * 5 → 7 → 9 and alphabet completes on **turn 8**, having charged 7. Nothing is lost and
+   * nothing is created: 1 + 4 × 2 = 9, minus 7 = **2**, which is the pool at the end.
+   *
+   * Every number is read back out of the engine: the completion turns from `state.turn` and
+   * each player's sorted `techs`, the charge and the remainder from the engine's own
+   * `TechResearched` events (`cost`, `beakers`), and the beaker rate from the pools
+   * themselves.
+   */
+  const researchTimingScenario = defineScenario({
+    name: 'm5-research-timing-carries-the-remainder',
+    settings: DUEL_SETTINGS,
+    setup: researchSetup([], POTTERY),
+    run: TIMING_RUN,
+    assert: (after, ruleset) => {
+      const counterfactual = timingCounterfactual;
+      const world = (steps: number): GameState =>
+        counterfactual?.state ?? replayFrom(researchSetup([], POTTERY), ruleset, TIMING_RUN, steps);
+      const eventsAt = (steps: number): readonly GameEvent[] =>
+        counterfactual?.events ??
+        replayEventsFrom(researchSetup([], POTTERY), ruleset, TIMING_RUN, steps).events;
+
+      const afterThree = world(3); // state turn 4: pool 6, pottery one beaker short
+      const afterFour = world(4); // state turn 5: completion charged, 1 carried, 3 banked
+      const afterEight = world(8); // state turn 8: alphabet charged, 2 banked after it
+      const pottery = techLines(eventsAt(4)).find((line) => line.tech === POTTERY);
+      const alphabet = techLines(eventsAt(8)).find((line) => line.tech === ALPHABET);
+
+      return [
+        check(
+          counterfactual === undefined || after.turn === 8,
+          `the run is 7 turns long, so it ends at turn 8 (got ${String(after.turn)})`,
+        ),
+        check(
+          populationOf(after, ROME) === 2,
+          'the city never grew and never starved, so every beaker total below is a multiple of ' +
+            `the same 2-a-turn rate (population ${String(populationOf(after, ROME))})`,
+        ),
+        check(
+          techsIn(afterThree, ROME).join(',') === '' && beakersIn(afterThree, ROME) === 6,
+          'after 3 turns (state turn 4) pottery is NOT known: the pool is 6 against a cost of 5, ' +
+            'and the research step has not run on it yet — the collection arrives after the ' +
+            `step, which is why the 4th turn completes it and not the 3rd (got ` +
+            `[${techsIn(afterThree, ROME).join(', ')}] with ` +
+            `${String(beakersIn(afterThree, ROME))} beakers)`,
+        ),
+        check(
+          techsIn(afterFour, ROME).join(',') === 'pottery',
+          'and it IS known after the 4th turn (state turn 5) — the turn its pool first covers the ' +
+            "price. This is the pipeline-delay reading: the 4th turn's collection arrives after " +
+            `that turn's research step and cannot be spent until turn 5 (got ` +
+            `[${techsIn(afterFour, ROME).join(', ')}])`,
+        ),
+        check(
+          beakersIn(afterFour, ROME) === 3,
+          "and exactly 1 beaker is carried past the completion — 6 banked minus pottery's 5 — and " +
+            'the turn the completion happens on then banks its own 2, so the pool at the end of ' +
+            `turn 5 is 3 (got ${String(beakersIn(afterFour, ROME))})`,
+        ),
+        check(
+          pottery !== undefined &&
+            pottery.playerId === ROME &&
+            pottery.cost === 5 &&
+            pottery.beakers === 1,
+          "the engine's own account of that completion is TechResearched(Rome, pottery, cost 5, " +
+            `beakers 1) — the remainder carried rather than discarded (got ${JSON.stringify(pottery)})`,
+        ),
+        check(
+          researchOf(afterFour, ROME) === undefined,
+          'and the completion clears the selection itself: the key is ABSENT, never present and ' +
+            `undefined (got ${String(researchOf(afterFour, ROME))})`,
+        ),
+        check(
+          researchOf(afterEight, ROME) === undefined,
+          'the next tech selected after that is alphabet, and alphabet in turn completes on ' +
+            "turn 8 — the run's last turn — so nothing is being researched at the end (got " +
+            `${String(researchOf(afterEight, ROME))})`,
+        ),
+        check(
+          techsIn(afterEight, ROME).join(',') === 'alphabet,pottery',
+          "by turn 8 Rome knows alphabet and pottery, in the contract's sorted order (got " +
+            `[${techsIn(afterEight, ROME).join(', ')}])`,
+        ),
+        check(
+          beakersIn(afterEight, ROME) === 2,
+          "and the pool is 2: 1 carried + 4 turns x 2 = 9, minus alphabet's 7 (got " +
+            `${String(beakersIn(afterEight, ROME))})`,
+        ),
+        check(
+          alphabet !== undefined && alphabet.cost === 7 && alphabet.beakers === 0,
+          'alphabet charged its own 7 out of the 7 the pool held when its step ran, leaving 0 ' +
+            "carried — and the 2 beakers in the pool at the end of the turn are that turn's own " +
+            `collection, which the step could not spend (got ${JSON.stringify(alphabet)})`,
+        ),
+        check(
+          techsIn(after, CARTHAGE).join(',') === '',
+          'Carthage, which selected nothing, still knows nothing — the events are per player, and ' +
+            `this run granted nobody anything (got [${techsIn(after, CARTHAGE).join(', ')}])`,
+        ),
+      ];
+    },
+  });
+
+  /**
+   * **Beakers are BANKED when nothing is being researched.**
+   *
+   * The same world with 3 beakers already banked and **no** selection: four turns of 2
+   * beakers each must leave 11 — the whole 8 collected, on top of the 3 already there.
+   * Nothing is spent, nothing is lost and no tech is granted. A pool that was drained or
+   * reset while the player is not researching would be the quietest way for a beaker to
+   * disappear, and that is the failure this scenario exists to catch.
+   *
+   * The pool must also still be *growing* rather than merely present: the `researchStep` the
+   * pipeline itself computes is asked, and it must answer `nothing-being-researched` — so
+   * "banked" is a property of the engine's step, not of a number a scenario happened to find.
+   */
+  const bankedBeakersScenario = defineScenario({
+    name: 'm5-beakers-are-banked-when-nothing-is-researched',
+    settings: DUEL_SETTINGS,
+    setup: (b) => researchSetup([], undefined)(b).setPools(0, { beakers: 3 }),
+    run: endTurns(4),
+    assert: (after, ruleset) => {
+      const { events } = replayEventsFrom(researchSetup([], undefined), ruleset, endTurns(4), 4);
+      const step: ResearchStep = researchStep(after, ruleset, ROME);
+      return [
+        check(
+          beakersIn(after, ROME) === BEAKERS_PER_TURN * 4 + 3,
+          `3 banked + 4 turns x ${String(BEAKERS_PER_TURN)} = 11 beakers, all still banked (got ` +
+            `${String(beakersIn(after, ROME))})`,
+        ),
+        check(
+          techLines(events).length === 0,
+          'and no tech was researched at all: the pool grew every turn and completed nothing (got ' +
+            `${JSON.stringify(techLines(events))})`,
+        ),
+        check(
+          step.kind === 'nothing-being-researched',
+          "and the pipeline's own step answers nothing-being-researched for that player, which is " +
+            `why the pool can only grow (got ${step.kind})`,
+        ),
+        check(
+          techsIn(after, ROME).join(',') === '',
+          `Rome knows nothing after banking 11 beakers (got [${techsIn(after, ROME).join(', ')}])`,
+        ),
+        check(
+          researchOf(after, ROME) === undefined,
+          'the selection is still absent, because a scenario that names none leaves the key off ' +
+            `(got ${String(researchOf(after, ROME))})`,
+        ),
+        check(after.turn === 5, `the run really played 4 turns (got turn ${String(after.turn)})`),
+      ];
+    },
+  });
+
+  /* ---- 16b. Prerequisites ------------------------------------------- */
+
+  /**
+   * **An unmet prerequisite is refused, by name.**
+   *
+   * `alphabet` requires `pottery`, and this Rome knows nothing. `literature` is the
+   * two-prerequisite case (`alphabet` **and** `ceremonial-burial`), so the refusal has to
+   * report a list rather than one id — the shape a UI renders "requires …" from. Selecting a
+   * tech the player already has, and one no catalog row defines, are the two other refusals
+   * the same planner produces, and both are asserted so the three are visibly distinct
+   * answers rather than one "refused".
+   *
+   * The planner and the applier are asked for the same command and must return the same
+   * `kind`: "the generator and the applier must not disagree" is the standing requirement,
+   * and the same planner is what the two of them are built from.
+   */
+  const prerequisiteRefusalScenario = defineScenario({
+    name: 'm5-unmet-prerequisite-is-refused',
+    settings: DUEL_SETTINGS,
+    setup: researchSetup([], undefined),
+    // Nothing scripted: every probe below applies a command the engine must refuse, and the
+    // empty `run` is what keeps the world untouched while they do.
+    run: [],
+    assert: (after, ruleset) => {
+      const alphabet = planSetResearch(after, ruleset, ROME, ALPHABET);
+      const literature = planSetResearch(after, ruleset, ROME, asTechId('literature'));
+      const applied = applyCommand(after, ROME, setResearch(ALPHABET), ruleset);
+      const unknown = applyCommand(after, ROME, setResearch(NOT_A_TECH), ruleset);
+
+      return [
+        check(after.turn === 1, `the world never advanced (got turn ${String(after.turn)})`),
+        check(
+          !alphabet.ok && alphabet.error.kind === 'tech-prerequisites-unmet',
+          'planSetResearch(alphabet) is refused, not accepted (got ' +
+            `${alphabet.ok ? 'accepted' : alphabet.error.kind})`,
+        ),
+        check(
+          !alphabet.ok &&
+            alphabet.error.kind === 'tech-prerequisites-unmet' &&
+            alphabet.error.missing.join(',') === 'pottery',
+          'and the refusal names the ONE missing prerequisite: pottery (got ' +
+            `${alphabet.ok ? 'accepted' : JSON.stringify(alphabet.error)})`,
+        ),
+        check(
+          !literature.ok &&
+            literature.error.kind === 'tech-prerequisites-unmet' &&
+            literature.error.missing.join(',') === 'alphabet,ceremonial-burial',
+          'literature — which requires alphabet AND ceremonial burial — lists both, in the ' +
+            `contract's canonical order (got ` +
+            `${literature.ok ? 'accepted' : JSON.stringify(literature.error)})`,
+        ),
+        check(
+          !applied.ok &&
+            !alphabet.ok &&
+            applied.error.kind === 'tech-prerequisites-unmet' &&
+            applied.error.kind === alphabet.error.kind,
+          'and the APPLIER returns the same typed refusal for the same command, so the two cannot ' +
+            `disagree about it (got ${applied.ok ? 'applied' : applied.error.kind})`,
+        ),
+        check(
+          !unknown.ok && unknown.error.kind === 'unknown-tech',
+          'a tech no catalog row defines is refused as unknown-tech — a different answer from a ' +
+            `real tech whose prerequisites are unmet (got ` +
+            `${unknown.ok ? 'applied' : unknown.error.kind})`,
+        ),
+        check(
+          planSetResearch(after, ruleset, ROME, POTTERY).ok,
+          'while a root tech with no prerequisites at all is NOT refused: the rule is about ' +
+            'prerequisites rather than a refusal of everything',
+        ),
+      ];
+    },
+  });
+
+  /**
+   * **A completed tech unlocks exactly what it should, and nothing else.**
+   *
+   * `techUnlocks` is the engine's answer to "what does knowing this tech unlock", read off
+   * the four catalogs a `requiresTech` may appear in. On the variant catalog
+   * `bronze-working` unlocks precisely the `legion` and the `prospecting` row: the
+   * `man-of-war` is gated on `iron-working` (and on a resource that is itself gated on
+   * `iron-working`), the `observatory` on `pottery`, and the `saltpetre` resource on
+   * `iron-working`. So the assertion is an **exact set**, in the kind vocabulary's order —
+   * and "nothing else" is the half that catches a reader that matched the wrong field, or
+   * one that reported every row of the catalog as unlocked.
+   *
+   * The second half asks the same question the other way round: a player granted
+   * `bronze-working` must **not** be able to select `iron-working` (whose other
+   * prerequisite, `masonry`, is missing) and must have no selection made for it, because
+   * granting knowledge is not playing the game.
+   */
+  const unlockScenario = defineScenario({
+    name: 'm5-a-completed-tech-unlocks-exactly-its-own-rows',
+    settings: DUEL_SETTINGS,
+    setup: researchSetup([BRONZE_WORKING], undefined),
+    run: [],
+    assert: (after, ruleset) => {
+      const unlocked = techUnlocks(ruleset, BRONZE_WORKING);
+      const keys = unlocked.map((row) => `${row.kind}:${row.id}`).join(',');
+      const ironWorking = planSetResearch(after, ruleset, ROME, IRON_WORKING);
+
+      return [
+        check(
+          keys === 'unit:legion,improvement:prospecting',
+          'bronze-working unlocks exactly the legion and the prospecting row, in the kind ' +
+            `vocabulary's order (got [${keys}])`,
+        ),
+        check(
+          unlocked.length === 2,
+          `and the set holds exactly two rows, counted rather than inferred (got ` +
+            `${String(unlocked.length)})`,
+        ),
+        check(
+          !unlocked.some((row) => row.id === LOCKED_RESOURCE),
+          'and it does not unlock the saltpetre resource, whose own row is gated on iron working',
+        ),
+        check(
+          !unlocked.some((row) => row.id === GATED_BUILDING),
+          'nor the observatory, which is gated on pottery',
+        ),
+        check(
+          !unlocked.some((row) => row.id === GATED_UNIT_WITH_RESOURCE),
+          'nor the man-of-war, which is gated on iron working',
+        ),
+        check(
+          techCost(ruleset, BRONZE_WORKING) === 6 &&
+            prerequisitesOf(ruleset, IRON_WORKING).join(',') === 'bronze-working,masonry',
+          'and the catalog the reader walked is the one under test: bronze-working costs 6 and ' +
+            'iron-working requires bronze-working and masonry, in canonical order (got ' +
+            `${String(techCost(ruleset, BRONZE_WORKING))} and ` +
+            `[${prerequisitesOf(ruleset, IRON_WORKING).join(', ')}])`,
+        ),
+        check(
+          !ironWorking.ok && ironWorking.error.kind === 'tech-prerequisites-unmet',
+          'knowing bronze-working does not let Rome select iron-working, whose other prerequisite ' +
+            '(masonry) is missing — a grant is knowledge, not a licence (got ' +
+            `${ironWorking.ok ? 'accepted' : JSON.stringify(ironWorking.error)})`,
+        ),
+        check(
+          researchOf(after, ROME) === undefined && after.turn === 1,
+          'and granting knowledge selects nothing: the player is still researching nothing at ' +
+            `turn 1 (got ${String(researchOf(after, ROME))} at turn ${String(after.turn)})`,
+        ),
+      ];
+    },
+  });
+
+  /* ---- 16c. Gating -------------------------------------------------- */
+
+  /** A gated improvement, unit, building and resource — the variant catalog's content. */
+  const GATED_IMPROVEMENT = asImprovementId('prospecting');
+  const GATED_UNIT = asUnitTypeId('legion');
+  const GATED_BUILDING = asBuildingId('observatory');
+  const GATED_UNIT_WITH_RESOURCE = asUnitTypeId('man-of-war');
+  const GATED_UNIT_RESOURCE_ONLY = asUnitTypeId('sea-scout');
+  const LOCKED_RESOURCE = asResourceId('saltpetre');
+
+  /**
+   * The `requiresTech`-bearing rows, written as they are and cast **once**, at the fixture
+   * boundary.
+   *
+   * `requiresTech` is deliberately not declared on `UnitDef`/`BuildingDef`/
+   * `ImprovementDef`/`ResourceDef`: `units.ts` states the decision in as many words — the
+   * field's *shape* belongs to content, and the engine reads it **totally** from any row
+   * (`tech.ts`' `requiresTechOf(row: unknown)`), so declaring it on the structural views
+   * would state one field in four places. That leaves a test that wants a ruleset whose rows
+   * declare one with no way to *type* it, because `UnitSpec extends UnitDef` and so cannot
+   * carry a field its base does not have.
+   *
+   * The assertions below are the honest way out and they are confined to these five rows.
+   * The rows are exactly the shape `techUnlocks` and `productionGate` read (`requiresTechOf`
+   * checks `typeof field === 'string'`), and `validateRuleset` — which *does* know the field
+   * and rejects an id no catalog row defines — runs over the result before any scenario sees
+   * it, so a mistake here fails loudly at load rather than passing quietly.
+   */
+  const gatedRows = {
+    unit: {
+      id: GATED_UNIT,
+      role: 'military',
+      name: 'Legion',
+      attack: 3,
+      defense: 3,
+      movement: 1,
+      cost: 3,
+      domain: 'land',
+      requiresTech: BRONZE_WORKING,
+      provenance: placeholder(
+        'unsourced and chosen to be playable: a scenario fixture row, added so the engine has a unit that declares requiresTech',
+      ),
+    } as UnitSpec & { readonly requiresTech: TechId },
+    unitResourceOnly: {
+      id: GATED_UNIT_RESOURCE_ONLY,
+      role: 'military',
+      name: 'Sea Scout',
+      attack: 1,
+      defense: 2,
+      movement: 2,
+      cost: 3,
+      domain: 'sea',
+      requiresResource: LOCKED_RESOURCE,
+      provenance: placeholder(
+        "unsourced and chosen to be playable: a fixture row that declares requiresResource and NO requiresTech, so the resource row's own tech gate is the one the engine reaches",
+      ),
+    } as UnitSpec,
+    unitWithResource: {
+      id: GATED_UNIT_WITH_RESOURCE,
+      role: 'military',
+      name: 'Man-of-War',
+      attack: 2,
+      defense: 2,
+      movement: 1,
+      cost: 4,
+      domain: 'sea',
+      requiresResource: LOCKED_RESOURCE,
+      requiresTech: IRON_WORKING,
+      provenance: placeholder(
+        'unsourced and chosen to be playable: a fixture row declaring both requiresTech and requiresResource, so the two gates can be shown to compose',
+      ),
+    } as UnitSpec & { readonly requiresTech: TechId },
+    building: {
+      id: GATED_BUILDING,
+      name: 'Observatory',
+      cost: 6,
+      maintenance: 1,
+      effects: [{ kind: 'beaker-multiplier', pct: 25 }],
+      requiresTech: POTTERY,
+      provenance: placeholder(
+        'unsourced and chosen to be playable: a fixture row, added so the engine has a building that declares requiresTech',
+      ),
+    } as BuildingSpec & { readonly requiresTech: TechId },
+    improvement: {
+      id: GATED_IMPROVEMENT,
+      kind: 'mine',
+      name: 'Prospecting',
+      turns: 2,
+      yields: { food: 0, shields: 1, commerce: 0 },
+      allowedRoles: ['grassland', 'plains', 'hills'],
+      requiresTech: BRONZE_WORKING,
+      provenance: placeholder(
+        'unsourced and chosen to be playable: a fixture row, added so the engine has an improvement that declares requiresTech',
+      ),
+    } as ImprovementSpec & { readonly requiresTech: TechId },
+    resource: {
+      id: LOCKED_RESOURCE,
+      name: 'Saltpetre',
+      kind: 'strategic',
+      yields: { food: 0, shields: 0, commerce: 0 },
+      allowedRoles: ['grassland', 'plains', 'hills'],
+      requiresTech: IRON_WORKING,
+      provenance: placeholder(
+        'unsourced and chosen to be playable: a fixture row whose own requiresTech locks it until iron working, so a unit needing it is gated twice over',
+      ),
+    } as ResourceSpec & { readonly requiresTech: TechId },
+  } as const;
+
+  /**
+   * A variant of the shipped catalog with **one gated row of each kind**, which is what M5's
+   * gating evidence needs and what the shipped catalog deliberately does not ship: no shipped
+   * row declares `requiresTech` (`@civts/rules` says so in as many words), so the *rule* has
+   * no content exercising it end to end.
+   *
+   * The variant is the shipped rows verbatim plus five additions, so a world built from it is
+   * the shipped world in every other respect:
+   *
+   * | row | kind | what it demands |
+   * |---|---|---|
+   * | `observatory` | building | `pottery` |
+   * | `legion` | unit | `bronze-working` |
+   * | `prospecting` | improvement | `bronze-working` |
+   * | `man-of-war` | unit | `iron-working` **and** the `saltpetre` resource |
+   * | `saltpetre` | strategic resource | `iron-working`, so a unit needing it is gated twice |
+   *
+   * Every added magnitude is a **placeholder**: unsourced, chosen to be playable, and not
+   * claimed to match Civ 3. `validateRuleset` runs over the result at the fidelity these
+   * scenarios ask for, exactly as it does for the shipped catalog.
+   */
+  const GATED_CATALOG: Catalog = {
+    ...CATALOG,
+    units: [
+      ...CATALOG.units,
+      gatedRows.unit,
+      gatedRows.unitWithResource,
+      gatedRows.unitResourceOnly,
+    ],
+    buildings: [...CATALOG.buildings, gatedRows.building],
+    improvements: [...CATALOG.improvements, gatedRows.improvement],
+    resources: [...CATALOG.resources, gatedRows.resource],
+  };
+
+  /** Validate a variant catalog, or fail where it is written — the shipped catalog's gate. */
+  const rulesetOf = (catalog: Catalog, what: string): RulesetView => {
+    const validated = validateRuleset(catalog, 'tuned');
+    if (!validated.ok) {
+      throw new Error(
+        `${what} must validate at fidelity "tuned": ${JSON.stringify(validated.error)}`,
+      );
+    }
+    return validated.value;
+  };
+
+  /**
+   * The variant above, validated once — the same gate the CLI and `runScenario` apply. This
+   * view is what the gating scenarios run under, and `rulesetOf` is used again for each
+   * stripped variant the falsification tests build.
+   */
+  const GATED_RULESET: RulesetView = rulesetOf(GATED_CATALOG, 'the gated fixture catalog');
+
+  /**
+   * One row with its `requiresTech` removed, for the falsification tests below.
+   *
+   * A copy with the key **deleted** rather than set to `undefined`: a present-and-undefined
+   * key is not a state this engine represents (the same rule `PlayerState.researching`
+   * follows), and `exactOptionalPropertyTypes` is what makes that a compile error rather
+   * than a convention.
+   */
+  const withoutTechRequirement = <Row extends { readonly id: unknown }>(
+    row: Row,
+  ): Omit<Row, 'requiresTech'> => {
+    const copy: Record<string, unknown> = { ...row };
+    delete copy['requiresTech'];
+    return copy as Omit<Row, 'requiresTech'>;
+  };
+
+  /**
+   * The world the gating scenarios build: a city, a worker, and a locked resource the city is
+   * **already road-connected to**.
+   *
+   * ```
+   *   (6, 5)  tile 206  ROMA (city centre — always worked, always a path tile)
+   *   (5, 6)  tile 245  grassland, worked
+   *   (7, 6)  tile 246  hills, road + mine, worked, the worker stands here
+   *   (8, 6)  tile 207  grassland, road, carries saltpetre
+   * ```
+   *
+   * The road from the centre to `246` and on to `207` is the point: the resource is *reached*
+   * by the connection walk (`reachableTiles` starts at the centre and walks 8-way over road
+   * tiles), so the **only** thing that can keep it unconnected is its own row's `requiresTech`.
+   * That is what makes the composed-gate scenario discriminating — a deposit nobody can reach
+   * would be `blocked` for a reason that has nothing to do with the tech gate, and a
+   * falsification test that removed the requirement would change nothing.
+   */
+  const GATING_CITY: readonly [number, number] = [6, 5];
+  const GATING_RESOURCE: readonly [number, number] = [8, 6];
+  const GATING_WORKER: readonly [number, number] = [7, 6];
+
+  const gatingSetup =
+    (granted: readonly TechId[]) =>
+    (b: ScenarioBuilder): ScenarioBuilder => {
+      const world = b
+        .addPlayer('Rome')
+        .addPlayer('Carthage')
+        .fillTerrain('grassland')
+        .setTile(GATING_WORKER[0], GATING_WORKER[1], 'hills')
+        .addImprovement(GATING_WORKER[0], GATING_WORKER[1], asImprovementId('road'))
+        .addImprovement(GATING_WORKER[0], GATING_WORKER[1], asImprovementId('mine'))
+        .addImprovement(GATING_RESOURCE[0], GATING_RESOURCE[1], asImprovementId('road'))
+        .addResource(GATING_RESOURCE[0], GATING_RESOURCE[1], LOCKED_RESOURCE)
+        .addUnit(0, WARRIOR, [GATING_CITY[0], GATING_CITY[1]])
+        .addUnit(1, WARRIOR, [RESEARCH_FAR[0], RESEARCH_FAR[1]])
+        .addUnit(0, asUnitTypeId('worker'), [GATING_WORKER[0], GATING_WORKER[1]])
+        .setRates(0, { tax: 5, science: 5, luxury: 0 })
+        .addCity(0, [GATING_CITY[0], GATING_CITY[1]], {
+          name: 'Roma',
+          population: 2,
+          foodBox: 0,
+          shields: 0,
+          workedTiles: [at(5, 6), at(GATING_WORKER[0], GATING_WORKER[1])],
+        });
+
+      for (const tech of granted) world.grantTech(0, tech);
+      return world;
+    };
+
+  /**
+   * Build the gating world with `granted` known — the "after" half of a before/after.
+   *
+   * It builds on `GATED_RULESET` when the caller passes the same view the scenarios run
+   * under, and on the caller's view otherwise (a falsification test runs a scenario against
+   * a stripped catalog, and the "after" worlds must be built from *that* catalog or the two
+   * halves would not be comparable).
+   */
+  const buildGatedWorld = (granted: readonly TechId[], ruleset: RulesetView): GameState => {
+    const built = gatingSetup(granted)(createScenarioBuilder(ruleset, DUEL_SETTINGS)).build();
+    if (!built.ok) throw new Error(`the gated fixture must build: ${JSON.stringify(built.error)}`);
+    return built.value;
+  };
+
+  /**
+   * **The tech gate, in the generator and the applier, before and after.**
+   *
+   * The variant catalog's `observatory` (building) and `legion` (unit) declare
+   * `requiresTech`. Before the tech is known:
+   *
+   * - `cityProductionOptions` — the **generator**, and the engine's answer to "what may this
+   *   city be set to build" — must not offer either item;
+   * - `productionGate` — the one verdict both askers read — must answer `tech-required` and
+   *   **name the tech**;
+   * - and `applyCommand`'s `SetProduction`, the **applier**, must refuse the same item with
+   *   the matching typed error.
+   *
+   * After the tech is granted all three must flip: offered, `open`, and applied. "Before" and
+   * "after" are one grant apart and nothing else, which is what makes a difference between
+   * them the tech's.
+   *
+   * The applier half used to be written to the **correct** behaviour and to fail, because
+   * `planSetProduction` (`commands.ts`) asked `resourceGate` alone and `GameError` had no
+   * `tech-required` member: a tech-gated item was accepted and merely stalled at completion.
+   * **M5's integration wave closed that gap** — the planner asks `productionGate` and refuses
+   * with the typed `tech-required` naming the tech — so the assertion below now passes and is
+   * asserted as a *pass*, in the same scenario, with no assertion changed in strength (the
+   * applier must refuse the same item the menu omits, with the tech named).
+   */
+  const gatedItemScenario = defineScenario({
+    name: 'm5-tech-gated-item-refused-then-accepted',
+    settings: DUEL_SETTINGS,
+    setup: gatingSetup([]),
+    run: [],
+    assert: (before, ruleset) => {
+      const building = { kind: 'building', id: GATED_BUILDING } as const;
+      const unit = { kind: 'unit', id: GATED_UNIT } as const;
+      const optionsBefore = optionIds(before, ruleset, RESEARCH_CITY);
+      const gateBefore = productionGate(before, ruleset, ROME, building);
+      const gateUnitBefore = productionGate(before, ruleset, ROME, unit);
+
+      const granted = buildGatedWorld([POTTERY, BRONZE_WORKING], ruleset);
+      const appliedBefore = applyCommand(before, ROME, setProduction(0, building), ruleset);
+      const appliedAfter = applyCommand(granted, ROME, setProduction(0, building), ruleset);
+
+      return [
+        check(
+          !optionsBefore.includes('building:observatory') && !optionsBefore.includes('unit:legion'),
+          "before the tech: the city's production menu offers neither the observatory nor the " +
+            `legion (got [${optionsBefore.join(', ')}])`,
+        ),
+        check(
+          gateBefore.kind === 'tech-required' && gateBefore.tech === POTTERY,
+          "and the gate's verdict for the observatory is tech-required, NAMING pottery (got " +
+            `${JSON.stringify(gateBefore)})`,
+        ),
+        check(
+          gateUnitBefore.kind === 'tech-required' && gateUnitBefore.tech === BRONZE_WORKING,
+          'and for the legion it names bronze-working rather than pottery — the verdict is read ' +
+            `off the row the item names (got ${JSON.stringify(gateUnitBefore)})`,
+        ),
+        check(
+          optionIds(granted, ruleset, RESEARCH_CITY).includes('building:observatory') &&
+            optionIds(granted, ruleset, RESEARCH_CITY).includes('unit:legion'),
+          'after granting pottery and bronze-working both are offered (got ' +
+            `[${optionIds(granted, ruleset, RESEARCH_CITY).join(', ')}])`,
+        ),
+        check(
+          productionGate(granted, ruleset, ROME, building).kind === 'open',
+          'and the gate is open for the observatory (got ' +
+            `${JSON.stringify(productionGate(granted, ruleset, ROME, building))})`,
+        ),
+        check(
+          // No `as never` any more: the refusal is a real member of `GameError` now, so the
+          // comparison is the compiler's business rather than an escape hatch. It names the
+          // tech too, which is what makes the applier's answer the *same answer* the gate
+          // gave three lines up rather than merely a refusal.
+          !appliedBefore.ok &&
+            appliedBefore.error.kind === 'tech-required' &&
+            appliedBefore.error.tech === POTTERY,
+          'before the tech the APPLIER refuses SetProduction(observatory) with the typed ' +
+            'tech-required error, NAMING pottery — the same verdict `productionGate` gave, ' +
+            'because `planSetProduction` asks that one verdict (got ' +
+            `${appliedBefore.ok ? 'ACCEPTED' : JSON.stringify(appliedBefore.error)})`,
+        ),
+        check(
+          appliedAfter.ok,
+          'after the tech the same command is accepted (got ' +
+            `${appliedAfter.ok ? 'applied' : appliedAfter.error.kind})`,
+        ),
+      ];
+    },
+  });
+
+  /**
+   * **The two gates COMPOSE.** An item that demands a tech *and* a resource must be refused
+   * for the tech first, then for the resource — never "refused" for one reason while the
+   * other is unchecked, and never accepted because one of the two happened to hold.
+   *
+   * `man-of-war` requires the `saltpetre` resource, and the **resource's own row** is gated
+   * on `iron-working`; its own row is gated on `iron-working` too. That is what makes this
+   * the composing case rather than a repetition of the scenario above:
+   *
+   * | state | `productionGate` | applier |
+   * |---|---|---|
+   * | knows nothing | `tech-required` (iron-working) | refused — the *same* typed verdict, tech named |
+   * | knows the ancients, not iron-working | `tech-required` (iron-working), through the resource's own row | refused — the same verdict again |
+   * | knows iron-working, deposit unconnected | `blocked` (saltpetre) | refused — `resource-not-connected`, a *different* reason |
+   * | knows it, deposit in the radius | `open` | accepted |
+   *
+   * The third row proves composition: the tech gate is satisfied and the resource gate is
+   * not, so the answer must name the **resource**. A gate that reported the tech
+   * unconditionally would answer `tech-required` there too and be wrong; a gate that ignored
+   * the resource row's own tech would answer `blocked` in the first row and be wrong the
+   * other way. Both directions are asserted, and the resource's connection is read through
+   * the engine's own rule rather than assumed from the map.
+   *
+   * The applier column used to read "refused — the resource is not connected" for the first
+   * row, which was a *statement about the old wiring*: `planSetProduction` asked
+   * `resourceGate` alone, so it named the resource while the gate named the tech, and the two
+   * answers disagreed on the one case this scenario exists to compose. M5's integration wave
+   * closed that, so the column now asserts the stronger fact: the applier's typed refusal is
+   * the gate's own verdict, tech and all, in every row.
+   */
+  const composedGateScenario = defineScenario({
+    name: 'm5-tech-and-resource-gates-compose',
+    settings: DUEL_SETTINGS,
+    setup: gatingSetup([]),
+    run: [],
+    assert: (before, ruleset) => {
+      // The unit that declares **only** the resource: its own row has no `requiresTech`, so
+      // everything the gate knows about a tech comes from the deposit's own row. That is the
+      // branch `unmetItemTech`'s documentation calls out as "the case a reader is most likely to
+      // miss", and it is the branch a composite unit — which declares its own tech — would hide,
+      // because the item's own requirement is answered first and the resource is never consulted.
+      const item = { kind: 'unit', id: GATED_UNIT_RESOURCE_ONLY } as const;
+
+      // `iron-working` requires bronze-working AND masonry; knowing it is what makes the deposit
+      // connectable, and knowing the deposit is connected is what makes the unit buildable.
+      const ancients = buildGatedWorld([BRONZE_WORKING], ruleset);
+      const unlocked = buildGatedWorld([BRONZE_WORKING, MASONRY, IRON_WORKING], ruleset);
+
+      const gateNothing = productionGate(before, ruleset, ROME, item);
+      const gateAncients = productionGate(ancients, ruleset, ROME, item);
+      const gateUnlocked = productionGate(unlocked, ruleset, ROME, item);
+
+      const appliedBefore = applyCommand(before, ROME, setProduction(0, item), ruleset);
+      const appliedAfter = applyCommand(unlocked, ROME, setProduction(0, item), ruleset);
+      const composite = { kind: 'unit', id: GATED_UNIT_WITH_RESOURCE } as const;
+      const gateAncientsComposite = productionGate(ancients, ruleset, ROME, composite);
+
+      return [
+        check(
+          gateNothing.kind === 'tech-required' && gateNothing.tech === IRON_WORKING,
+          'with nothing known the gate names a TECH, and the tech it names is the one the ' +
+            "*deposit's own row* demands — the unit itself declares none, so nothing but the " +
+            `resource could have put it there (got ${JSON.stringify(gateNothing)})`,
+        ),
+        check(
+          // The planner asks the *composite* gate, so its refusal is the gate's own verdict —
+          // the tech, asked first, because it is the closer cause a player can act on. This is
+          // the row-for-row agreement the composition property needs: not merely "the applier
+          // refused", but "the applier refused with exactly what the gate said".
+          !appliedBefore.ok &&
+            appliedBefore.error.kind === 'tech-required' &&
+            appliedBefore.error.tech === IRON_WORKING,
+          'and the applier refuses it with the SAME verdict the gate gave — tech-required naming ' +
+            "iron-working, the tech the deposit's own row demands, rather than the resource " +
+            'the refusal would name once the tech is known (got ' +
+            `${appliedBefore.ok ? 'ACCEPTED' : JSON.stringify(appliedBefore.error)})`,
+        ),
+        check(
+          !optionIds(before, ruleset, RESEARCH_CITY).includes('unit:sea-scout'),
+          'and the menu does not offer it, so the generator agrees with the gate',
+        ),
+        check(
+          gateAncients.kind === 'tech-required' && gateAncients.tech === IRON_WORKING,
+          'knowing bronze-working changes nothing: the deposit is still not connectable, so the ' +
+            'resource is still not connected and the gate still names the tech that would ' +
+            `connect it (got ${JSON.stringify(gateAncients)})`,
+        ),
+        check(
+          !connectedIds(ancients, ruleset, ROME).includes(String(LOCKED_RESOURCE)),
+          "and the deposit really is unconnected in that state, read through the engine's own " +
+            `rule (connected was [${connectedIds(ancients, ruleset, ROME).join(', ')}])`,
+        ),
+        check(
+          gateUnlocked.kind === 'open',
+          'once iron-working is known the deposit becomes connectable, the road this world ' +
+            'already had reaches it, and the verdict is open (got ' +
+            `${JSON.stringify(gateUnlocked)})`,
+        ),
+        check(
+          connectedIds(unlocked, ruleset, ROME).includes(String(LOCKED_RESOURCE)),
+          'and the connection is real in that state rather than assumed (connected was ' +
+            `[${connectedIds(unlocked, ruleset, ROME).join(', ')}])`,
+        ),
+        check(
+          appliedAfter.ok,
+          'so the applier accepts the same SetProduction it refused two states ago (got ' +
+            `${appliedAfter.ok ? 'applied' : appliedAfter.error.kind})`,
+        ),
+        check(
+          gateAncientsComposite.kind === 'tech-required' &&
+            gateAncientsComposite.tech === IRON_WORKING,
+          'and the COMPOSITE unit — which declares the resource *and* its own iron-working — is ' +
+            'answering tech-required in that same state, while the resource-only unit would be ' +
+            'answering it only because of the deposit. Both rows are read, and each is the ' +
+            'closer cause of its own item, which is the composition this scenario is for (got ' +
+            `${JSON.stringify(gateAncientsComposite)})`,
+        ),
+      ];
+    },
+  });
+
+  /**
+   * **A tech-gated improvement.** `StartWork` is the applier for improvements and
+   * `planStartWork` is its one planner — the same evaluator `actions.ts` reads the menu from.
+   *
+   * The worker stands on an ordinary grassland tile and `prospecting` allows that role, so the
+   * only thing that can refuse the job is the tech. `planStartWork` **now asks that gate** — M5's
+   * integration wave closed the gap this comment used to name — so the scenario asserts the
+   * whole property in one place: the gate's verdict names bronze-working, the planner refuses
+   * with the matching typed error *naming the same tech*, and the applier accepts the job once
+   * the tech is known. Behaviour that was three separate facts is now one property with a
+   * before/after.
+   */
+  const gatedImprovementScenario = defineScenario({
+    name: 'm5-tech-gated-improvement-refused-then-accepted',
+    settings: DUEL_SETTINGS,
+    setup: gatingSetup([]),
+    run: [],
+    assert: (before, ruleset) => {
+      const worker = before.units.find((unit) => unit.type === asUnitTypeId('worker'));
+      const row = improvementDef(ruleset, GATED_IMPROVEMENT);
+      const missing = unmetTechFor(before, ROME, row);
+
+      const granted = buildGatedWorld([BRONZE_WORKING], ruleset);
+      const workOutcome = (() => {
+        const unit = granted.units.find((candidate) => candidate.type === asUnitTypeId('worker'));
+        if (unit === undefined) return undefined;
+        const applied = applyCommand(
+          granted,
+          ROME,
+          { type: 'StartWork', unitId: unit.id, kind: GATED_IMPROVEMENT },
+          ruleset,
+        );
+        return applied.ok ? applied.value.state : undefined;
+      })();
+
+      // The planner's own answer, kept as the `Result` so the check below can assert *what* the
+      // refusal names rather than only which member it is: "refused" and "refused for the right
+      // reason, naming the tech" are different claims, and only the second one is the gate.
+      const plannedBefore =
+        worker === undefined
+          ? undefined
+          : planStartWork(before, ruleset, ROME, worker.id, GATED_IMPROVEMENT);
+      const plannerBefore =
+        plannedBefore === undefined
+          ? 'no-worker'
+          : plannedBefore.ok
+            ? 'ACCEPTED'
+            : plannedBefore.error.kind;
+      const plannerNamesTech =
+        plannedBefore !== undefined &&
+        !plannedBefore.ok &&
+        plannedBefore.error.kind === 'improvement-tech-required' &&
+        plannedBefore.error.tech === BRONZE_WORKING;
+
+      return [
+        check(
+          worker !== undefined,
+          'the fixture really has a worker to give the job to — a world that forgot one would ' +
+            'otherwise satisfy every assertion below for the wrong reason',
+        ),
+        check(
+          missing === BRONZE_WORKING,
+          "the gate's verdict for the improvement names bronze-working as the missing tech (got " +
+            `${String(missing)})`,
+        ),
+        check(
+          workOutcome !== undefined,
+          'and once bronze-working is known the applier accepts StartWork and the job starts (got ' +
+            `${workOutcome === undefined ? 'refused' : 'accepted'})`,
+        ),
+        check(
+          workOutcome !== undefined &&
+            workOutcome.units.some(
+              (unit) => unit.work !== undefined && unit.work.kind === GATED_IMPROVEMENT,
+            ),
+          'and the accepted command really started work: the state records the job on the worker ' +
+            `(got ${JSON.stringify(workOutcome?.units.map((unit) => unit.work))})`,
+        ),
+        check(
+          // No `as never`: `improvement-tech-required` is a real member of `GameError`, so the
+          // comparison is checked rather than cast.
+          plannerBefore === 'improvement-tech-required' && plannerNamesTech,
+          '`planStartWork` refuses the job with the typed improvement-tech-required error, NAMING ' +
+            'bronze-working, before the tech is known — so a worker cannot start a job its owner ' +
+            'could never finish, and the generator (`unitActions` filters through this same ' +
+            `evaluator) does not offer it either (got ${plannerBefore})`,
+        ),
+      ];
+    },
+  });
+
+  /* ---- 16d. The scenarios themselves -------------------------------- */
+
+  /**
+   * The five M5 scenarios, run. **All five pass**, and they are all asserted as passes: the
+   * two that used to fail were failing *deliberately*, as the evidence for the wiring gap
+   * `resources.ts` named — the applier accepted a tech-gated item the menu would not offer.
+   * M5's integration wave closed the gap (the planner asks `productionGate`; `planStartWork`
+   * asks `unmetTechFor`), so those assertions now hold and are asserted as properties of the
+   * shipped engine rather than as evidence of a debt. Not one of them lost strength: each
+   * still requires the typed refusal *and* the tech it names, which the old expectations did
+   * not (they asserted only that the refusal was missing).
+   */
+  describe('the M5 scenarios', () => {
+    it('research timing, the beaker carry and banked beakers all hold', () => {
+      const timing = runScenario(researchTimingScenario);
+      expect(failures(timing.assertions)).toEqual([]);
+      expect(timing.passed).toBe(true);
+
+      const banked = runScenario(bankedBeakersScenario);
+      expect(failures(banked.assertions)).toEqual([]);
+      expect(banked.passed).toBe(true);
+    });
+
+    it('an unmet prerequisite is refused, by name', () => {
+      const result = runScenario(prerequisiteRefusalScenario);
+
+      expect(failures(result.assertions)).toEqual([]);
+      expect(result.passed).toBe(true);
+    });
+
+    it('a completed tech unlocks exactly its own rows, run against the gated variant', () => {
+      const result = runScenarioAgainst(unlockScenario, GATED_RULESET);
+
+      expect(failures(result.assertions)).toEqual([]);
+      expect(result.passed).toBe(true);
+    });
+
+    it('the tech gate refuses in the generator AND the applier, and accepts both after', () => {
+      const result = runScenarioAgainst(gatedItemScenario, GATED_RULESET);
+      const text = failures(result.assertions).join('\n');
+
+      // Every assertion holds, and the strongest of them is the applier one: the refusal is
+      // the gate's own typed `tech-required`, naming the tech whose row gates the item. A
+      // scenario that only checked "refused" would pass if the applier refused for the wrong
+      // reason, which is exactly the disagreement this pair of gates exists to prevent.
+      expect(text).not.toMatch(/the city's production menu offers neither/);
+      expect(text).not.toMatch(/the gate's verdict for the observatory is tech-required/);
+      expect(text).not.toMatch(/and for the legion it names bronze-working/);
+      expect(text).not.toMatch(/and the gate is open for the observatory/);
+      expect(text).not.toMatch(/before the tech the APPLIER refuses/);
+      expect(text).not.toMatch(/after the tech the same command is accepted/);
+      expect(failures(result.assertions)).toEqual([]);
+      expect(result.passed).toBe(true);
+    });
+
+    it('the two gates compose, and the resource row carries its own tech gate', () => {
+      const result = runScenarioAgainst(composedGateScenario, GATED_RULESET);
+      const text = failures(result.assertions).join('\n');
+
+      // Three verdicts, one unit, three states of knowledge: the tech the deposit's row demands,
+      // the same tech once the nearer cause has not changed, and finally open. Every one of them
+      // is read off `productionGate`, which is the one implementation of the verdict.
+      expect(text).not.toMatch(/with nothing known the gate names a TECH/);
+      expect(text).not.toMatch(/knowing bronze-working changes nothing/);
+      expect(text).not.toMatch(/once iron-working is known the deposit becomes connectable/);
+      expect(text).not.toMatch(/and the COMPOSITE unit/);
+      // Nothing here fails — including the applier, whose refusal is now asserted to *be* the
+      // gate's verdict rather than merely a refusal. Every verdict this scenario pins holds
+      // under the gated ruleset.
+      expect(failures(result.assertions)).toEqual([]);
+      expect(result.passed).toBe(true);
+    });
+
+    it('the improvement gate refuses in the gate AND the planner, and accepts after', () => {
+      const result = runScenarioAgainst(gatedImprovementScenario, GATED_RULESET);
+      const text = failures(result.assertions).join('\n');
+
+      expect(text).not.toMatch(/the fixture really has a worker/);
+      expect(text).not.toMatch(/the gate's verdict for the improvement names bronze-working/);
+      expect(text).not.toMatch(/`planStartWork` refuses the job/);
+      expect(text).not.toMatch(/the applier accepts StartWork/);
+      expect(failures(result.assertions)).toEqual([]);
+      expect(result.passed).toBe(true);
+    });
+  });
+
+  /* ---- 16e. The M5 assertions discriminate -------------------------- */
+
+  describe('the M5 scenario assertions discriminate (they are not decoration)', () => {
+    it('the timing assertions fail when research runs AFTER the money loop', () => {
+      // The counterfactual `turn.ts` and `tech.ts` explicitly reject: steps 4 and 5 exchanged.
+      // Every step is still the engine's own exported function, so the difference between the
+      // two runs is the order and nothing else.
+      const swapped = replayWithResearchAfterTheMoneyLoop(
+        researchSetup([], POTTERY),
+        RULESET,
+        TIMING_RUN,
+      );
+
+      // First, that the counterfactual is the world we think it is: the same two techs, at the
+      // same two completions. The *remainder* is what moves — pottery is charged before its
+      // turn's collection lands in the swapped order, so 1 is carried rather than 3.
+      expect(
+        techLines(swapped.events).map((line) => `${String(line.tech)}:${String(line.beakers)}`),
+      ).toEqual(['pottery:1', 'alphabet:0']);
+      expect(swapped.state.turn).toBe(8);
+
+      timingCounterfactual = swapped;
+      let result;
+      try {
+        result = runScenario({
+          name: 'm5-research-timing-with-research-run-after-the-split',
+          settings: DUEL_SETTINGS,
+          setup: researchSetup([], POTTERY),
+          run: TIMING_RUN,
+          assert: assertOf(researchTimingScenario),
+        });
+      } finally {
+        timingCounterfactual = undefined;
+      }
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      // The two assertions that agree with the real run still hold, because the completion
+      // *turns* do not move between the two orders: the last turn's collection cannot change a
+      // completion that already happened. That is exactly why the assertion that pins the
+      // *remainder* is the one that has to catch this.
+      expect(text).toMatch(/after 3 turns \(state turn 4\) pottery is NOT known/);
+      expect(text).toMatch(/it IS known after the 4th turn/);
+      // ...and what does catch it is the *remainder*: the swapped order let pottery spend the
+      // collection it should not have seen, so the remainder it reports is the pool minus the
+      // price rather than the pool minus the price plus that turn's collection. The end-of-run
+      // pool is the same in both orders, which is worth knowing: an assertion about the final
+      // pool alone would not have caught this, and the remainder is the number that shows the
+      // order.
+      expect(text).toMatch(/and exactly 1 beaker is carried past the completion/);
+    });
+
+    it('the banking assertions fail when an unresearched pool is spent or reset', () => {
+      // A world whose beakers were drained while nothing was selected: the pool the scenario
+      // pins (11) is gone, while the `nothing-being-researched` step still answers for the
+      // player — so the failure is specifically about the pool surviving rather than about a
+      // world that no longer exists.
+      const variant: Scenario = {
+        name: 'm5-bankers-whose-pool-was-drained',
+        settings: DUEL_SETTINGS,
+        setup: (b) => researchSetup([], undefined)(b).setPools(0, { beakers: 3 }),
+        run: endTurns(4),
+        assert: (after, ruleset) => {
+          const drained: GameState = {
+            ...after,
+            players: after.players.map((player) =>
+              player.id === ROME ? { ...player, beakers: 0 } : player,
+            ),
+          };
+          return assertOf(bankedBeakersScenario)(drained, ruleset);
+        },
+      };
+
+      const result = runScenario(variant);
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      expect(text).toMatch(/3 banked \+ 4 turns x 2 = 11 beakers, all still banked/);
+      // The half that is *not* about the pool still holds, so the failure is about the number
+      // rather than about an assertion that can never pass.
+      expect(text).not.toMatch(/and no tech was researched at all/);
+      expect(text).not.toMatch(/the pipeline's own step answers nothing-being-researched/);
+    });
+
+    it('the prerequisite assertions fail when the prerequisite is granted first', () => {
+      // The same world with pottery already known: `alphabet` becomes selectable, so every
+      // refusal the scenario pins must break — and the assertions are the *same* ones.
+      const variant: Scenario = {
+        name: 'm5-alphabet-with-its-prerequisite-known',
+        settings: DUEL_SETTINGS,
+        setup: researchSetup([POTTERY], undefined),
+        run: [],
+        assert: assertOf(prerequisiteRefusalScenario),
+      };
+
+      const result = runScenario(variant);
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      expect(text).toMatch(/planSetResearch\(alphabet\) is refused, not accepted/);
+      expect(text).toMatch(/the refusal names the ONE missing prerequisite: pottery/);
+      expect(text).toMatch(/and the APPLIER returns the same typed refusal/);
+      // The two-prerequisite case is untouched by this variant: literature still needs both
+      // rows, so its assertion must still hold. A variant that broke *everything* would be
+      // evidence of nothing in particular.
+      expect(text).not.toMatch(/literature — which requires alphabet AND ceremonial burial/);
+    });
+
+    it('the unlock assertions fail when a tech unlocks a row it should not', () => {
+      // A catalog where the observatory is gated on bronze-working instead of pottery: the exact
+      // set for bronze-working now holds three rows, so the "exactly two" assertions break while
+      // every other assertion in the scenario still holds.
+      const widened = rulesetOf(
+        {
+          ...GATED_CATALOG,
+          buildings: GATED_CATALOG.buildings.map((row) =>
+            row.id === GATED_BUILDING ? { ...row, requiresTech: BRONZE_WORKING } : row,
+          ),
+        },
+        'the widened fixture catalog',
+      );
+
+      const result = runScenarioAgainst(unlockScenario, widened);
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      expect(text).toMatch(/bronze-working unlocks exactly the legion and the prospecting row/);
+      expect(text).toMatch(/and the set holds exactly two rows, counted rather than inferred/);
+      // The observatory really is unlocked now, so its own assertion fails too — while the grant
+      // still selects nothing.
+      expect(text).not.toMatch(/and granting knowledge selects nothing/);
+    });
+
+    it('the item-gate assertions fail when the item loses its tech requirement', () => {
+      // An observatory with its `requiresTech` removed is offered from turn 1 and its gate is
+      // never `tech-required`, so both "before" assertions must fail — which is what proves the
+      // menu and the gate were consulting the requirement rather than merely agreeing with a
+      // world where nothing is gated.
+      const ungated = rulesetOf(
+        {
+          ...GATED_CATALOG,
+          buildings: GATED_CATALOG.buildings.map((row) =>
+            row.id === GATED_BUILDING ? withoutTechRequirement(row) : row,
+          ),
+        },
+        'the ungated fixture catalog',
+      );
+
+      const result = runScenarioAgainst(gatedItemScenario, ungated);
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      expect(text).toMatch(
+        /the city's production menu offers neither the observatory nor the legion/,
+      );
+      expect(text).toMatch(
+        /the gate's verdict for the observatory is tech-required, NAMING pottery/,
+      );
+      // The "after" half still holds — an ungated item is *easier* to build — so the failure is
+      // about the missing gate rather than about a world that could not be assembled.
+      expect(text).not.toMatch(/after the tech the same command is accepted/);
+    });
+
+    it('the composition assertions fail when the resource row loses its own tech', () => {
+      // `saltpetre` with its `requiresTech` removed: the item is then gated only by its own row,
+      // so the "knowing the ancients is still not enough" assertion — the one that shows the
+      // *resource's* row carrying a tech gate — must break while the rest still holds.
+      const unlockedResource = rulesetOf(
+        {
+          ...GATED_CATALOG,
+          resources: GATED_CATALOG.resources.map((row) =>
+            row.id === LOCKED_RESOURCE ? withoutTechRequirement(row) : row,
+          ),
+        },
+        'the ungated-resource fixture catalog',
+      );
+
+      // The world this variant makes, read directly first, so what follows is about a measured
+      // difference rather than about which assertion happened to break. The unit declares only
+      // the resource, so the tech gate it meets is the resource row's own: with the requirement
+      // in place a player who knows bronze-working is refused for `iron-working`, and without it
+      // the road already reaching the deposit is enough.
+      const item = { kind: 'unit', id: GATED_UNIT_RESOURCE_ONLY } as const;
+      const ungatedWorld = buildGatedWorld([BRONZE_WORKING], unlockedResource);
+      const gatedWorld = buildGatedWorld([BRONZE_WORKING], GATED_RULESET);
+
+      expect(connectedIds(gatedWorld, GATED_RULESET, ROME)).not.toContain(String(LOCKED_RESOURCE));
+      expect(connectedIds(ungatedWorld, unlockedResource, ROME)).toContain(String(LOCKED_RESOURCE));
+      expect(productionGate(gatedWorld, GATED_RULESET, ROME, item)).toEqual({
+        kind: 'tech-required',
+        tech: IRON_WORKING,
+      });
+      expect(productionGate(ungatedWorld, unlockedResource, ROME, item)).toEqual({ kind: 'open' });
+
+      const result = runScenarioAgainst(composedGateScenario, unlockedResource);
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      // Every verdict the resource row's own tech was responsible for inverts: the gate sees
+      // `open` where it named a tech, and both connection assertions see a deposit that is
+      // reachable one tech too early. The applier's refusal is the one that follows, because the
+      // command is now accepted.
+      expect(text).toMatch(/with nothing known the gate names a TECH/);
+      expect(text).toMatch(/knowing bronze-working changes nothing/);
+      expect(text).toMatch(/and the deposit really is unconnected in that state/);
+      // What still holds is the item's *own* branch, which this variant did not touch: the
+      // composite unit is still refused for the tech it declares.
+      expect(text).not.toMatch(
+        /the COMPOSITE unit — which declares the resource \*and\* its own iron-working/,
+      );
+    });
+
+    it('the improvement assertions fail when the improvement loses its tech requirement', () => {
+      const ungated = rulesetOf(
+        {
+          ...GATED_CATALOG,
+          improvements: GATED_CATALOG.improvements.map((row) =>
+            row.id === GATED_IMPROVEMENT ? withoutTechRequirement(row) : row,
+          ),
+        },
+        'the ungated-improvement fixture catalog',
+      );
+
+      const result = runScenarioAgainst(gatedImprovementScenario, ungated);
+
+      expect(result.passed).toBe(false);
+      const text = failures(result.assertions).join('\n');
+      expect(text).toMatch(/the gate's verdict for the improvement names bronze-working/);
+      // The accepted half is untouched: an ungated improvement is easier to start, so the
+      // failure must be about the missing refusal and nothing else.
+      expect(text).not.toMatch(/once bronze-working is known the applier accepts StartWork/);
+      expect(text).not.toMatch(/the fixture really has a worker/);
+    });
   });
 });

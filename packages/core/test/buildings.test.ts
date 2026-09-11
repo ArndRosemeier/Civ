@@ -39,6 +39,7 @@ import { describe, expect, it } from 'vitest';
 // this is evidence about the content, not a dependency of the engine on it.
 import { CATALOG, validateRuleset } from '@civts/rules';
 import { hashValue } from '@civts/testing';
+import { cityProductionOptions } from '../src/actions.js';
 import {
   MIN_GROWTH_FOOD,
   applyEffectPct,
@@ -65,12 +66,17 @@ import {
   asBuildingId,
   asCityId,
   asPlayerId,
+  asTechId,
   asTerrainId,
   asTileIndex,
   asUnitTypeId,
   type BuildingId,
+  type TechId,
 } from '../src/ids.js';
 import type { BuildingEffect, GameMap, RulesetView, TerrainDef } from '../src/map.js';
+import { applyProduction } from '../src/production.js';
+import { productionGate } from '../src/resources.js';
+import type { TechDef } from '../src/tech.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { DEFAULT_RATES, SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
 import type { UnitDef } from '../src/units.js';
@@ -207,6 +213,12 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: `techs` is required on every player and is never absent — "knows nothing" is
+  // an empty list, unlike `researching`, which is *absent* when nothing is being
+  // researched. This file is about effects and wonders, so its fixture players know
+  // no techs; the section that asks about a tech-gated building row supplies them
+  // through `overrides`.
+  techs: [],
   ...overrides,
 });
 
@@ -783,5 +795,173 @@ describe('the shipped catalog’s wonder obeys the same rules', () => {
     const rivalAfter = after.cities[1];
     if (rivalAfter === undefined) throw new Error('the pass lost the second city');
     expect(mayStartBuilding(after, rows, rivalAfter, wonder)).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M5 gating — a tech-gated building, in the menu and in the pass
+ * ------------------------------------------------------------------ */
+
+/**
+ * The M5 fixture tech rows: two **placeholder** rows of ours (the costs are arbitrary —
+ * no rule here reads one, because a requirement is a membership test on
+ * `player.techs`). `BRONZE` gates the row below; `UNUSED_TECH` gates nothing, which is
+ * the control the contract asks for.
+ */
+const BRONZE = asTechId('bronze-working');
+const UNUSED_TECH = asTechId('ceremonial-burial');
+
+const TECHS: readonly TechDef[] = [
+  { id: BRONZE, name: 'Bronze Working', era: 'ancient', cost: 6, requires: [] },
+  { id: UNUSED_TECH, name: 'Ceremonial Burial', era: 'ancient', cost: 6, requires: [] },
+];
+
+/**
+ * The one gated building row, and it has an id of its own rather than being a second
+ * `library`: an id is the key a catalog is looked up by, so two rows sharing one would
+ * make "the row for `library`" depend on catalog order. Its cost, maintenance and
+ * effects are the library's, so a difference between the two rows below is the tech
+ * and nothing else.
+ */
+const OBSERVATORY: BuildingDef & { readonly requiresTech: TechId } = {
+  ...LIBRARY,
+  id: asBuildingId('observatory'),
+  name: 'Observatory',
+  requiresTech: BRONZE,
+};
+
+/** `RULESET` plus a place for the tech catalog to live, and the one gated row. */
+const TECH_RULESET: RulesetView & { readonly techs: readonly TechDef[] } = {
+  ...RULESET,
+  buildings: [...CATALOG_ROWS, OBSERVATORY],
+  techs: TECHS,
+};
+
+describe('M5 gating — the pass and the menu ask the same gate for a building', () => {
+  const P0 = asPlayerId(0);
+  const CITY = asCityId(0);
+
+  /**
+   * A player who knows exactly `techs`, with one city queueing `row` and 25 shields
+   * banked. The city is the yield tests' own — centre tile 5, two worked grassland
+   * tiles, so **3 shields a turn** — and 40 + 3 covers even the wonder's cost of 30,
+   * so nothing in this section is waiting on affordability rather than on the tech.
+   */
+  const queueing = (row: BuildingDef, techs: readonly TechId[] = []): GameState =>
+    board({
+      players: [player(0, { techs: [...techs] }), player(1)],
+      cities: [
+        city(0, 0, 5, {
+          population: 3,
+          workedTiles: [...WORKED],
+          shields: 40,
+          production: { kind: 'building', id: row.id },
+        }),
+      ],
+    });
+
+  it('names the missing tech, and neither the menu nor the pass will have the building', () => {
+    const state = queueing(OBSERVATORY);
+
+    // The typed verdict names the tech — the row's own `requiresTech`, read through the
+    // same gate the menu and the completion pass ask.
+    expect(
+      productionGate(state, TECH_RULESET, P0, { kind: 'building', id: OBSERVATORY.id }),
+    ).toEqual({ kind: 'tech-required', tech: BRONZE });
+
+    // Generator: not offered.
+    const offered = cityProductionOptions(state, TECH_RULESET, CITY).map(
+      (item) => `${item.kind}:${item.id}`,
+    );
+    expect(offered).not.toContain(`building:${OBSERVATORY.id}`);
+
+    // Applier: the item waits — no event, no building, the pool keeps every shield
+    // (40 banked + 3 earned), and the city is still building it.
+    const outcome = applyProduction(state, TECH_RULESET);
+    expect(outcome.events).toEqual([]);
+    expect(outcome.state.cities[0]?.buildings).toEqual([]);
+    expect(outcome.state.cities[0]?.shields).toBe(43);
+    expect(outcome.state.cities[0]?.production).toEqual({
+      kind: 'building',
+      id: OBSERVATORY.id,
+    });
+  });
+
+  it('builds the same building, for the same city, once the tech is known', () => {
+    const after = queueing(OBSERVATORY, [BRONZE]);
+
+    // Control: one field of the player differs. The verdict is open, the menu offers
+    // it, and the pass builds it and charges the row's cost.
+    expect(
+      productionGate(after, TECH_RULESET, P0, { kind: 'building', id: OBSERVATORY.id }),
+    ).toEqual({ kind: 'open' });
+    const offered = cityProductionOptions(after, TECH_RULESET, CITY).map(
+      (item) => `${item.kind}:${item.id}`,
+    );
+    expect(offered).toContain(`building:${OBSERVATORY.id}`);
+
+    const outcome = applyProduction(after, TECH_RULESET);
+    expect(outcome.events).toEqual([
+      {
+        type: 'CityProduced',
+        cityId: CITY,
+        owner: P0,
+        item: { kind: 'building', id: OBSERVATORY.id },
+        shields: 43 - OBSERVATORY.cost,
+      },
+    ]);
+    expect(outcome.state.cities[0]?.buildings.map(String)).toEqual([String(OBSERVATORY.id)]);
+    expect(outcome.state.cities[0]?.shields).toBe(43 - OBSERVATORY.cost);
+    expect(outcome.state.cities[0]?.production).toBeUndefined();
+  });
+
+  it('gates nothing on a tech no row declares', () => {
+    // Knowing a tech no row mentions changes no verdict and completes nothing…
+    const unused = queueing(OBSERVATORY, [UNUSED_TECH]);
+    expect(
+      productionGate(unused, TECH_RULESET, P0, { kind: 'building', id: OBSERVATORY.id }),
+    ).toEqual({ kind: 'tech-required', tech: BRONZE });
+    expect(applyProduction(unused, TECH_RULESET).events).toEqual([]);
+
+    // …while a row that declares nothing is offered and built by a player who knows
+    // nothing at all.
+    const plain = queueing(GRANARY);
+    expect(productionGate(plain, TECH_RULESET, P0, { kind: 'building', id: GRANARY.id })).toEqual({
+      kind: 'open',
+    });
+    expect(applyProduction(plain, TECH_RULESET).events.map((event) => event.type)).toEqual([
+      'CityProduced',
+    ]);
+  });
+
+  it('agrees row by row: every building the menu offers is one the pass completes', () => {
+    // The keystone property, read over the whole catalog rather than one row: a
+    // know-nothing player, an affordable queue holding each row in turn. Every row
+    // except the gated one is offered *and* completed; the gated one is neither, on
+    // exactly the same board.
+    const rows = [...CATALOG_ROWS, OBSERVATORY];
+    expect(rows.length).toBe(8);
+
+    let gated = 0;
+    for (const row of rows) {
+      const state = queueing(row);
+      const item: ProductionItem = { kind: 'building', id: row.id };
+      const offered = cityProductionOptions(state, TECH_RULESET, CITY).some(
+        (option) => option.kind === item.kind && option.id === item.id,
+      );
+      const outcome = applyProduction(state, TECH_RULESET);
+      const built = outcome.state.cities[0]?.buildings.some((id) => id === row.id) ?? false;
+
+      expect([row.id, offered, built]).toEqual([
+        row.id,
+        !(row === OBSERVATORY),
+        !(row === OBSERVATORY),
+      ]);
+      if (row === OBSERVATORY) gated += 1;
+    }
+
+    // The sweep really did contain the gated row — a catalog with none would pass this
+    // test vacuously.
+    expect(gated).toBe(1);
   });
 });

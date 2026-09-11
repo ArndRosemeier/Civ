@@ -34,9 +34,19 @@
  * fact about a player, so it belongs with the one field that already names the
  * player the picture is drawn for. It is asserted to be *totally* read (a viewer no
  * player carries prints no gold, and an uncountable treasury prints 0, never
- * `NaN`), and god mode's header is asserted to gain nothing at all. Beakers and
- * luxuries are deliberately **not** in the header: they do nothing until M5 and M9,
- * and a bare number there would imply otherwise.
+ * `NaN`), and god mode's header is asserted to gain nothing at all.
+ *
+ * **M5 — and the M4b sentence is now half wrong, deliberately recorded rather than
+ * quietly edited.** M4b said beakers and luxuries were kept out of the header
+ * because "they do nothing until M5 and M9". Beakers buy tech as of M5, so the pool
+ * and the tech it is banked toward are not inert, and the header carries a second
+ * viewer field — `research=<id> <banked>/<cost>`, or `research=idle banked=<n>`. This
+ * file's fixtures therefore gained a `techs` row set on the ruleset and `techs: []` on
+ * every player literal, and the field is asserted *totally* the same way gold is: a
+ * viewer no player carries prints neither field, an uncountable pool prints 0, and a
+ * selected tech this ruleset cannot price says so rather than printing a fraction.
+ * **Luxuries stay out**, and that half of the M4b sentence is still exactly true:
+ * they do nothing until M9, and a header number is a claim that it means something.
  *
  * **M4c.** `GameMap` gained `resources`, so the hand-built maps below carry
  * `resources: []` — a migration, not a relaxation: the field is required, and a
@@ -54,6 +64,7 @@ import { describe, expect, it } from 'vitest';
 import {
   asPlayerId,
   asResourceId,
+  asTechId,
   asTerrainId,
   asTileIndex,
   asUnitId,
@@ -67,6 +78,9 @@ import {
   type TerrainRole,
 } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
+// M5: the *type* of a tech row, so the fixture's `techs` list below is checked
+// against the same shape `tech.ts` reads structurally.
+import type { TechDef } from '../src/tech.js';
 import {
   civPlayers,
   newGame,
@@ -154,12 +168,45 @@ const IMPROVEMENTS: readonly ImprovementDef[] = [
   },
 ];
 
-/** The ruleset as the engine sees it in M2: terrain *and* a unit catalog. */
-const RULESET: RulesetView = {
+/**
+ * M5: the two tech rows the header's `research=` field is asserted against.
+ *
+ * Placeholder content, like every number in this file: `pottery` is a root and
+ * `alphabet` requires it, which is all the header needs (an id it can price and an
+ * id it cannot).
+ */
+const POTTERY: TechDef = {
+  id: asTechId('pottery'),
+  name: 'Pottery',
+  era: 'ancient',
+  cost: 5,
+  requires: [],
+};
+
+const ALPHABET: TechDef = {
+  id: asTechId('alphabet'),
+  name: 'Alphabet',
+  era: 'ancient',
+  cost: 7,
+  requires: [asTechId('pottery')],
+};
+
+/**
+ * The ruleset as the engine sees it in M2: terrain *and* a unit catalog — plus, since
+ * M5, the tech rows.
+ *
+ * `RulesetView` deliberately does **not** declare `techs` (`tech.ts` reads the field
+ * structurally, so a view written before M5 is still a view the engine can run a game
+ * from), and `renderField` therefore has to name the field on the intersection: that
+ * is how a hand-built view states "this ruleset ships a tree", and a cast would hide
+ * the next shape change instead of failing on it.
+ */
+const RULESET: RulesetView & { readonly techs: readonly TechDef[] } = {
   terrains: TERRAINS,
   units: [SETTLER, WORKER],
   improvements: IMPROVEMENTS,
   fidelity: 'tuned',
+  techs: [POTTERY, ALPHABET],
 };
 
 /**
@@ -213,12 +260,20 @@ const GRID_4x4: readonly TerrainRole[] = [
  */
 const GOLD = 7;
 
+/**
+ * M5: `techs: []` — an empty *list*, not a missing key, because `PlayerState.techs`
+ * arrived in schema version 7 as a required field and "knows nothing" is what every
+ * fixture here means. `researching` is left out entirely: absence is what "researching
+ * nothing" means, and a key holding `undefined` could not survive a JSON round trip
+ * (`tech.ts` states the rule where it writes the field).
+ */
 const player = (index: number, tile: number): PlayerState => ({
   id: asPlayerId(index),
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  techs: [],
   // M4b: `RATE_TOTAL` is 10, so 7/3/0 is a legal split (any other sum is refused by
   // the command layer) and an arbitrary one — `describe` reads the treasury alone,
   // and nothing here is presented as a sourced rate.
@@ -337,6 +392,7 @@ const barbarianPlayer = (index: number, tile: number): PlayerState => ({
   color: '#3f3f46',
   startingTile: asTileIndex(tile),
   kind: 'barbarian',
+  techs: [],
   treasury: GOLD,
   rates: { tax: 7, science: 3, luxury: 0 },
   beakers: 0,
@@ -953,7 +1009,7 @@ describe('describe with a viewer', () => {
 
   it('renders the explored tiles and ? for the rest', () => {
     expect(describeState(FOGGED, RULESET, { viewer: asPlayerId(0) })).toMatchInlineSnapshot(`
-      "CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=7
+      "CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=7 research=idle banked=0
       view: x 0..3, y 0..3 (4x4 of 4x4)
         |0
         |0123
@@ -1039,20 +1095,88 @@ describe('describe with a viewer', () => {
     expect(describeState(moved, RULESET)).not.toBe(describeState(FOGGED, RULESET));
   });
 
-  it('names the viewer, its gold, and explains ? in the legend, and only then', () => {
+  it('names the viewer, its gold and its research, and explains ? only then', () => {
     const seen = describeState(FOGGED, RULESET, { viewer: asPlayerId(0) });
     const god = describeState(FOGGED, RULESET);
 
+    // M5: the header carries the research field as well as gold, so the pinned line
+    // moved — and the assertion is *stronger* than the M4b one it replaces, because
+    // the field is asserted twice: on the whole line, and on its own by the
+    // research-specific test below.
     expect(seen.split('\n')[0]).toBe(
-      `CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=${String(GOLD)}`,
+      `CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=${String(GOLD)} ` +
+        'research=idle banked=0',
     );
     expect(seen).toContain('? unexplored');
     expect(god).not.toContain('viewer=');
-    // M4b: with no viewer there is no player whose money this could be, so god
-    // mode's header gains nothing at all — it stays byte-identical to what this
+    // M4b: with no viewer there is no player whose money or research this could be,
+    // so god mode's header gains nothing at all — it stays byte-identical to what this
     // renderer printed before either option existed.
     expect(god).not.toContain('gold=');
+    expect(god).not.toContain('research=');
     expect(god).not.toContain('unexplored');
+  });
+
+  it('shows what the viewer is researching, and what the pool has reached', () => {
+    // M5. The field is read from the state through `tech.ts` (`researchingOf` and
+    // `techCostOf`), so the two figures are the ones the turn pipeline will compare:
+    // the id is the one the REPL's `research <techId>` spells, and the denominator is
+    // the price the research step charges.
+    const researching = (beakers: number, tech: string | undefined): GameState => ({
+      ...FOGGED,
+      players: [
+        {
+          ...player(0, 5),
+          beakers,
+          ...(tech === undefined ? {} : { researching: asTechId(tech) }),
+        },
+        player(1, 10),
+      ],
+    });
+
+    expect(describeState(researching(0, 'pottery'), RULESET, { viewer: asPlayerId(0) })).toContain(
+      'research=pottery 0/5',
+    );
+    // Progress is shown as banked/cost, not as a percentage or a turn estimate: both
+    // are figures the engine published, and a "2 turns" guess would be a fourth
+    // number nothing computed.
+    expect(describeState(researching(3, 'alphabet'), RULESET, { viewer: asPlayerId(0) })).toContain(
+      'research=alphabet 3/7',
+    );
+    // A pool that already covers the cost keeps printing both numbers, so a reader
+    // can see that the next turn's research step will complete it.
+    expect(describeState(researching(9, 'pottery'), RULESET, { viewer: asPlayerId(0) })).toContain(
+      'research=pottery 9/5',
+    );
+    // No key is "idle": the field still says what is banked, because beakers are no
+    // longer inert and a hidden pool would be a hidden decision.
+    expect(describeState(researching(4, undefined), RULESET, { viewer: asPlayerId(0) })).toContain(
+      'research=idle banked=4',
+    );
+  });
+
+  it('reads the research field totally: no such tech, no such player, no such pool', () => {
+    // A tech row this ruleset cannot price is *not* a free tech and not a fraction:
+    // the field says so in words rather than printing a number nobody could act on.
+    const uncosted: GameState = {
+      ...FOGGED,
+      players: [{ ...player(0, 5), beakers: 2, researching: asTechId('telegraph') }, player(1, 10)],
+    };
+    const header = describeState(uncosted, RULESET, { viewer: asPlayerId(0) }).split('\n')[0] ?? '';
+    expect(header).toContain('research=telegraph (uncosted) banked=2');
+
+    // A pool the engine cannot count reads as 0, exactly as an uncountable treasury
+    // does: `research=idle banked=NaN` in the agent's primary view would be worse
+    // than a conservative zero.
+    for (const beakers of [Number.NaN, 2.5, Number.POSITIVE_INFINITY]) {
+      const broken: GameState = {
+        ...FOGGED,
+        players: [{ ...player(0, 5), beakers }, player(1, 10)],
+      };
+      expect(describeState(broken, RULESET, { viewer: asPlayerId(0) })).toContain(
+        'research=idle banked=0',
+      );
+    }
   });
 
   it('reads the viewer gold totally: a player the state does not have, and a broken number', () => {

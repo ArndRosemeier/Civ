@@ -14,6 +14,12 @@
 export { canonicalize } from './canonical.js';
 export { fnv1a64, hashValue } from './hash.js';
 
+// The test tiers (M5's A5 criterion). Exported from the package rather than declared in
+// each suite, so "which tier is this run?" has one answer that every test file and the
+// `package.json` scripts read: a per-file `process.env` read would be as many statements
+// of the rule as there are suites, and the two that disagreed would do so silently.
+export { FULL_TIER, FULL_TIER_VALUE, TIER_ENV, FULL_TIER_COMMAND } from './tier.js';
+
 export {
   createScenarioBuilder,
   defineScenario,

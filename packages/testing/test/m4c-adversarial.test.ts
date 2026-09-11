@@ -84,18 +84,27 @@
  *   caught it" — is kept here only to say that it is what happened: the acceptance
  *   evidence still does not mention food, and this file (with `growth.test.ts` and
  *   `scenarios.test.ts`) is what would catch a regression.
- * - **FINDING 2 (defensive asymmetry, unreachable — reported as "no finding" with
- *   the proof): the resource gate is re-checked at completion for buildings but not
- *   for units.** `production.ts` calls `mayStartBuilding` before completing a
- *   building (which is what makes the wonder race safe) but completes a queued
- *   *unit* without asking `resourceGate` again. Section 3 proves this is
- *   unreachable through the command layer: in M4c nothing removes a road
- *   (`withoutImprovement` has no caller outside tests — checked) and nothing
- *   destroys a city, so a player's connected set is monotonically non-decreasing
- *   under play and a gate that was open when the item was queued is still open when
- *   it completes. A hand-built or hand-edited save that acquired the queued item
- *   *and* lost the road would complete it, so the asymmetry deserves a one-line
- *   comment in `production.ts`; it is not a defect this milestone can reach.
+ * - **FINDING 2 (defensive asymmetry, unreachable in M4c — CLOSED IN M5).** As
+ *   written in M4c: the resource gate was re-checked at completion for buildings
+ *   but not for units. `production.ts` called `mayStartBuilding` before completing
+ *   a building (which is what makes the wonder race safe) but completed a queued
+ *   *unit* without asking `resourceGate` again. Section 3 proved it was unreachable
+ *   through the command layer: in M4c nothing removes a road (`withoutImprovement`
+ *   has no caller outside tests — checked) and nothing destroys a city, so a
+ *   player's connected set is monotonically non-decreasing under play and a gate
+ *   that was open when the item was queued is still open when it completes. Only a
+ *   hand-built or hand-edited save that acquired the queued item *and* lost the road
+ *   could complete it.
+ *   **M5 removed the asymmetry rather than commenting it.** The completion pass now
+ *   asks `resources.ts`' `productionGate` for units and buildings alike, with the
+ *   decision M4c deferred now made explicitly: the item waits, nothing is charged,
+ *   shields stay banked and the item is requeued. M5 is also where the gap stopped
+ *   being merely theoretical — tech gating narrowed the gate on a dimension the
+ *   player can *lose* access to in principle, and the same wave fixed a live
+ *   generator/applier disagreement (`planSetProduction` asked only the resource
+ *   gate, so `applyCommand` accepted orders `cityProductionOptions` refused). This
+ *   note is kept in its original form above so the reasoning is auditable, with the
+ *   resolution recorded beside it.
  * - **No other finding.** The keystone held in both directions on every state
  *   swept, including the resource-gated production path; the multipliers were exact
  *   on all 256 building subsets and the compound rule is discriminating; the wonder
@@ -204,6 +213,11 @@ import {
   type UnitTypeId,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type BuildingSpec } from '@civts/rules';
+
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
 import { createScenarioBuilder, hashValue, type ScenarioBuilder } from '../src/index.js';
 import { loadGoldens } from '../src/goldens.js';
 
@@ -376,6 +390,15 @@ const cmdKey = (cmd: Command): string => {
       return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(
         cmd.rates.luxury,
       )}`;
+    // M5. `SetResearch` is the third planner-only setter and, like `SetRates`, is
+    // yielded by no generator — choosing a tech is a setting, reached through
+    // `planSetResearch` — so the sweeps below never see this key. It is keyed anyway
+    // because the switch is exhaustive on purpose: a variant this comparator cannot
+    // name would make two different commands compare equal, and the key carries the
+    // tech id for the same "never drop the payload" reason the M4a work keys carry the
+    // improvement kind.
+    case 'SetResearch':
+      return `SetResearch ${String(cmd.tech)}`;
   }
 };
 
@@ -886,24 +909,31 @@ const keystoneSweep = (
 };
 
 describe('1. keystone — the generators, the applier and the production gate agree', () => {
-  it('holds over played games, with the resource-gated production path swept exhaustively', () => {
-    const { failures, totals } = keystoneSweep([1, 2, 3, 5, 8, 13], 5);
+  // Full tier: 10.8 s — the M4c keystone property with the gated-production path swept exhaustively.
+  // The word that moved it here is "exhaustively": the sweep enumerates the gate's outcomes per item,
+  // which multiplies out over a played game.
+  it.skipIf(!FULL_TIER)(
+    'holds over played games, with the resource-gated production path swept exhaustively',
+    () => {
+      const { failures, totals } = keystoneSweep([1, 2, 3, 5, 8, 13], 5);
 
-    console.log('m4c keystone totals:', JSON.stringify(totals));
-    expect(failures).toEqual([]);
+      console.log('m4c keystone totals:', JSON.stringify(totals));
+      expect(failures).toEqual([]);
 
-    // Non-vacuity: the sweep has to have walked a real game and reached both sides
-    // of the resource gate, or "the gate agrees" is a statement about nothing.
-    expect(totals.states).toBeGreaterThanOrEqual(24);
-    expect(totals.legalYielded).toBeGreaterThan(500);
-    expect(totals.generatorApplied).toBeGreaterThan(500);
-    expect(totals.movesAccepted).toBeGreaterThan(0);
-    expect(totals.workAccepted).toBeGreaterThan(0);
-    expect(totals.productionCandidates).toBeGreaterThan(500);
-    expect(totals.productionAccepted).toBeGreaterThan(0);
-    expect(totals.productionOffered).toBeGreaterThan(0);
-    expect(totals.gatedBlocks).toBeGreaterThan(0);
-  }, 300_000);
+      // Non-vacuity: the sweep has to have walked a real game and reached both sides
+      // of the resource gate, or "the gate agrees" is a statement about nothing.
+      expect(totals.states).toBeGreaterThanOrEqual(24);
+      expect(totals.legalYielded).toBeGreaterThan(500);
+      expect(totals.generatorApplied).toBeGreaterThan(500);
+      expect(totals.movesAccepted).toBeGreaterThan(0);
+      expect(totals.workAccepted).toBeGreaterThan(0);
+      expect(totals.productionCandidates).toBeGreaterThan(500);
+      expect(totals.productionAccepted).toBeGreaterThan(0);
+      expect(totals.productionOffered).toBeGreaterThan(0);
+      expect(totals.gatedBlocks).toBeGreaterThan(0);
+    },
+    300_000,
+  );
 
   /**
    * The other side of the gate, on boards where it is **open**: hand-built worlds
@@ -912,33 +942,39 @@ describe('1. keystone — the generators, the applier and the production gate ag
    * gated unit is offered and one whose is refused. That is the resource-gated
    * production path under the keystone rather than beside it.
    */
-  it('holds where one player has iron connected and the other does not', () => {
-    const start = (seed: number): GameState =>
-      withArmy(
-        built(
-          settled()
-            .setTile(8, 5, 'hills')
-            .addResource(8, 5, STRATEGIC)
-            .addImprovement(6, 5, ROAD)
-            .addImprovement(7, 5, ROAD)
-            .setTreasury(0, STARTING_TREASURY)
-            .setTreasury(1, STARTING_TREASURY)
-            .setRates(1, { tax: 5, science: 5, luxury: 0 }),
-        ),
-        2 + (seed % 3),
-      );
+  // Full tier: 3.6 s — the same keystone property in a two-player asymmetric board. It is a played
+  // sweep, and its cost is the sweep's, not the board's.
+  it.skipIf(!FULL_TIER)(
+    'holds where one player has iron connected and the other does not',
+    () => {
+      const start = (seed: number): GameState =>
+        withArmy(
+          built(
+            settled()
+              .setTile(8, 5, 'hills')
+              .addResource(8, 5, STRATEGIC)
+              .addImprovement(6, 5, ROAD)
+              .addImprovement(7, 5, ROAD)
+              .setTreasury(0, STARTING_TREASURY)
+              .setTreasury(1, STARTING_TREASURY)
+              .setRates(1, { tax: 5, science: 5, luxury: 0 }),
+          ),
+          2 + (seed % 3),
+        );
 
-    const { failures, totals } = keystoneSweep([4, 9, 16, 25], 4, start);
+      const { failures, totals } = keystoneSweep([4, 9, 16, 25], 4, start);
 
-    console.log('m4c gated keystone totals:', JSON.stringify(totals));
-    expect(failures).toEqual([]);
-    // Both sides of the gate were really swept: the world has one connected player
-    // and one unconnected one at every state.
-    expect(totals.gatedOpens).toBeGreaterThan(0);
-    expect(totals.gatedBlocks).toBeGreaterThan(0);
-    expect(totals.productionOffered).toBeGreaterThan(totals.gatedBlocks);
-    expect(totals.states).toBeGreaterThanOrEqual(16);
-  }, 300_000);
+      console.log('m4c gated keystone totals:', JSON.stringify(totals));
+      expect(failures).toEqual([]);
+      // Both sides of the gate were really swept: the world has one connected player
+      // and one unconnected one at every state.
+      expect(totals.gatedOpens).toBeGreaterThan(0);
+      expect(totals.gatedBlocks).toBeGreaterThan(0);
+      expect(totals.productionOffered).toBeGreaterThan(totals.gatedBlocks);
+      expect(totals.states).toBeGreaterThanOrEqual(16);
+    },
+    300_000,
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -3347,35 +3383,40 @@ describe('7. determinism — in-process and in a fresh process', () => {
     );
   }, 180_000);
 
-  it('reproduces the same line in a fresh process', () => {
-    const recording = recordGame(17, 70);
-    const expected = replay(recording);
+  // Full tier: determinism across a fresh process, named by the standing requirement.
+  it.skipIf(!FULL_TIER)(
+    'reproduces the same line in a fresh process',
+    () => {
+      const recording = recordGame(17, 70);
+      const expected = replay(recording);
 
-    const result = spawnSync(process.execPath, [tsxCliPath(), '-e', childScript(recording)], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      timeout: 120_000,
-    });
-    expect(
-      result.status,
-      `the fresh process failed:\n${result.stderr}${
-        result.error === undefined ? '' : result.error.message
-      }`,
-    ).toBe(0);
+      const result = spawnSync(process.execPath, [tsxCliPath(), '-e', childScript(recording)], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        timeout: 120_000,
+      });
+      expect(
+        result.status,
+        `the fresh process failed:\n${result.stderr}${
+          result.error === undefined ? '' : result.error.message
+        }`,
+      ).toBe(0);
 
-    const lines = result.stdout
-      .split('\n')
-      .filter((candidate) => candidate.startsWith('RESULT '))
-      .map((candidate) => candidate.slice('RESULT '.length).trim());
-    expect(lines).toHaveLength(1);
+      const lines = result.stdout
+        .split('\n')
+        .filter((candidate) => candidate.startsWith('RESULT '))
+        .map((candidate) => candidate.slice('RESULT '.length).trim());
+      expect(lines).toHaveLength(1);
 
-    const observed = lines[0] ?? '';
-    console.log(`fresh process: ${observed} | in-process: ${replayLine(expected)}`);
-    // The whole line, not only the hash: a hash collision could hide a different
-    // connected set, and the resource and improvement paths are what M4c added.
-    expect(observed).toBe(replayLine(expected));
-    expect(expected.improvements).toBeGreaterThan(0);
-  }, 180_000);
+      const observed = lines[0] ?? '';
+      console.log(`fresh process: ${observed} | in-process: ${replayLine(expected)}`);
+      // The whole line, not only the hash: a hash collision could hide a different
+      // connected set, and the resource and improvement paths are what M4c added.
+      expect(observed).toBe(replayLine(expected));
+      expect(expected.improvements).toBeGreaterThan(0);
+    },
+    180_000,
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -3401,9 +3442,24 @@ describe('8. goldens: still a real gate, and what covers what', () => {
     // The M4c pins, recomputed here without the harness and without the
     // regeneration env var: SCHEMA_VERSION 6, the map's `resources` list inside the
     // hashed input, and nothing else moved.
-    expect(computed).toEqual(['b348542b99463975', '282dc8ea55459c0f', '549641adc3c31b67']);
-    expect(stored.entries.map((entry) => entry.hash)).toEqual(computed);
-    expect(SCHEMA_VERSION).toBe(6);
+    //
+    // **M5 moved all three of these once more** (`SCHEMA_VERSION` 6 -> 7:
+    // `PlayerState.techs`, required on every player row and empty for a fresh game),
+    // through the harness's own opt-in path and with a rehash note, and added a fourth
+    // entry — the *played* golden, which this file cannot recompute because it holds no
+    // command script. The three values below are the M5 ones, and the assertion is
+    // unchanged in strength: the file must hold exactly the scenarios it names, value
+    // for value, or the gate is red.
+    expect(computed).toEqual(['7f8b0949114fe6f3', 'acc2e281926ead8f', '659c0d9dd790708d']);
+    const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
+    expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
+    expect(stored.entries.map((entry) => entry.name)).toEqual([
+      'tiny-civs2-seed1',
+      'tiny-civs2-seed42',
+      'tiny-civs2-seed1337',
+      'played-civs2-seed42',
+    ]);
+    expect(SCHEMA_VERSION).toBe(7);
     expect(stored.nodeMajor).toBe(Number(process.versions.node.split('.')[0]));
 
     // The field is really inside the digest, which is what makes the rehash an M4c

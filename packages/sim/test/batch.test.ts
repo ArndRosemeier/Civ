@@ -35,6 +35,10 @@ import {
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
 import { describe, expect, it } from 'vitest';
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
 
 import {
   DO_NOTHING_POLICY,
@@ -269,7 +273,11 @@ describe('BatchResult — what it does not claim', () => {
  * ------------------------------------------------------------------ */
 
 describe('runBatch — at scale, headlessly', () => {
-  it(
+  // Full tier: a 50-game batch on real content was 2.6 s of the fast tier, and it is a *batch* —
+  // the thing the standing requirement sends here. It is the only test that runs the shipped
+  // registry at that width, so it is what catches an aggregate that only breaks at scale
+  // (per-civilization rows, ordering, the stop-reason histogram).
+  it.skipIf(!FULL_TIER)(
     BATCH_TEST_NAME,
     () => {
       const seeds = Array.from({ length: 50 }, (_, index) => 100 + index);

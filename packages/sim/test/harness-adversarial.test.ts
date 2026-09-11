@@ -204,7 +204,7 @@ import {
   type Unit,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Catalog, type Ruleset } from '@civts/rules';
-import { canonicalize, hashValue } from '@civts/testing';
+import { FULL_TIER, canonicalize, hashValue } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -446,23 +446,28 @@ describe('1. determinism at scale', () => {
     );
   }, 120_000);
 
-  it('reproduces the same hash, metrics and stop reason in a fresh npx tsx -e process', () => {
-    const seed = 5;
-    const turns = 12;
-    const local = runSimulation(optionsFor(seed, [SIMPLE_POLICY, SIMPLE_POLICY], turns));
-    const line = (result: SimulationResult): string =>
-      [
-        result.finalHash,
-        hashValue(result.metrics),
-        String(result.metrics.length),
-        String(result.turnsPlayed),
-        result.stoppedBecause,
-      ].join(' ');
+  // Full tier: it spawns a fresh `npx tsx` process, which the standing requirement lists among the
+  // full tier's reasons for existing — determinism ACROSS PROCESSES, which is exactly the property an
+  // in-process repeat cannot test. 1.45 s here, and worth every one of them in the full tier.
+  it.skipIf(!FULL_TIER)(
+    'reproduces the same hash, metrics and stop reason in a fresh npx tsx -e process',
+    () => {
+      const seed = 5;
+      const turns = 12;
+      const local = runSimulation(optionsFor(seed, [SIMPLE_POLICY, SIMPLE_POLICY], turns));
+      const line = (result: SimulationResult): string =>
+        [
+          result.finalHash,
+          hashValue(result.metrics),
+          String(result.metrics.length),
+          String(result.turnsPlayed),
+          result.stoppedBecause,
+        ].join(' ');
 
-    // The child is a *fresh process* with nothing shared but the files on disk: no
-    // module state, no warm caches, no in-process RNG. Its whole job is to print one
-    // line a comparison can be made against.
-    const child = `
+      // The child is a *fresh process* with nothing shared but the files on disk: no
+      // module state, no warm caches, no in-process RNG. Its whole job is to print one
+      // line a comparison can be made against.
+      const child = `
 import { validateRuleset, CATALOG } from '@civts/rules';
 import { DEFAULT_SETTINGS } from '@civts/core';
 import { runSimulation, SIMPLE_POLICY } from '@civts/sim';
@@ -486,29 +491,31 @@ console.log('RESULT ' + [
 ].join(' '));
 `;
 
-    const spawned = spawnSync('npx', ['tsx', '-e', child], {
-      cwd: fileURLToPath(new URL('../../../', import.meta.url)),
-      encoding: 'utf8',
-      timeout: 180_000,
-    });
-    expect(
-      spawned.status,
-      `the fresh process failed:\n${spawned.stderr}${
-        spawned.error === undefined ? '' : spawned.error.message
-      }`,
-    ).toBe(0);
+      const spawned = spawnSync('npx', ['tsx', '-e', child], {
+        cwd: fileURLToPath(new URL('../../../', import.meta.url)),
+        encoding: 'utf8',
+        timeout: 180_000,
+      });
+      expect(
+        spawned.status,
+        `the fresh process failed:\n${spawned.stderr}${
+          spawned.error === undefined ? '' : spawned.error.message
+        }`,
+      ).toBe(0);
 
-    const observed = spawned.stdout
-      .split('\n')
-      .filter((candidate) => candidate.startsWith('RESULT '))
-      .map((candidate) => candidate.slice('RESULT '.length).trim());
-    expect(observed).toHaveLength(1);
+      const observed = spawned.stdout
+        .split('\n')
+        .filter((candidate) => candidate.startsWith('RESULT '))
+        .map((candidate) => candidate.slice('RESULT '.length).trim());
+      expect(observed).toHaveLength(1);
 
-    console.log(`fresh process: ${String(observed[0])} | in-process: ${line(local)}`);
-    // The whole line, not only the hash: a hash collision cannot hide a different row
-    // count or a different stop reason.
-    expect(observed[0]).toBe(line(local));
-  }, 240_000);
+      console.log(`fresh process: ${String(observed[0])} | in-process: ${line(local)}`);
+      // The whole line, not only the hash: a hash collision cannot hide a different row
+      // count or a different stop reason.
+      expect(observed[0]).toBe(line(local));
+    },
+    240_000,
+  );
 
   it('is not moved by the insertion order of its inputs’ object keys', () => {
     // Same values, same key *presence*, different insertion order — at the top level
@@ -1470,97 +1477,104 @@ describe('3. invariants actually fire', () => {
     expect(checkInvariants(contextFor(elsewhere, undefined, []), CORE_INVARIANTS)).toEqual([]);
   }, 120_000);
 
-  it('FINDING A (fixed): the shipped batch holds, and every run reaches the same horizon', () => {
-    // This was the headline defect. Seed 6 on `tiny`/20 turns with the shipped policies is
-    // not a hand-built corruption — it is ordinary play — and `city-food-box-within-threshold`
-    // used to stop it, because the check compared an end-of-turn food box against an
-    // end-of-turn threshold while the frozen turn order runs growth *before* production (a
-    // granary completed in the production step lowers the threshold after the box was
-    // filled). The invariant now states two bounds, the unconditional bare one and the
-    // reduced one that yields when the turn's events moved a growth-food building — see its
-    // doc comment in `src/invariants.ts`.
-    //
-    // The command this is measured against, which is the shipped CLI's:
-    //
-    //   npx tsx packages/headless/src/cli.ts sim --seeds 1..50 --map-size tiny --turns 20
-    //   → was "5 INVARIANT VIOLATIONS in 5 of 50 runs": seeds 6, 17, 29, 38, 39, all at
-    //     turn 12, all `city-food-box-within-threshold`; exit 1, and a report whose own
-    //     horizon caveat said the sums mixed horizons.
-    //   → is now exit 0, 0 violations, horizon 21..21, and no caveat line.
-    const seed = 6; // the first seed that used to stop
-    const settings: Settings = { ...DEFAULT_SETTINGS, seed, mapSize: 'tiny', civCount: 2 };
-    const result = runSimulation({
-      seed,
-      settings,
-      ruleset: RULESET,
-      policies: [SIMPLE_POLICY, SIMPLE_POLICY],
-      maxTurns: 20,
-    });
+  // Full tier: 17.5 s — the largest single-cost test in the suite, and a *batch sweep* over real
+  // play. It is the S4 evidence that the shipped content survives the harness at scale, so it
+  // must keep running somewhere; the fast tier cannot afford it, and the full tier must not lose it.
+  it.skipIf(!FULL_TIER)(
+    'FINDING A (fixed): the shipped batch holds, and every run reaches the same horizon',
+    () => {
+      // This was the headline defect. Seed 6 on `tiny`/20 turns with the shipped policies is
+      // not a hand-built corruption — it is ordinary play — and `city-food-box-within-threshold`
+      // used to stop it, because the check compared an end-of-turn food box against an
+      // end-of-turn threshold while the frozen turn order runs growth *before* production (a
+      // granary completed in the production step lowers the threshold after the box was
+      // filled). The invariant now states two bounds, the unconditional bare one and the
+      // reduced one that yields when the turn's events moved a growth-food building — see its
+      // doc comment in `src/invariants.ts`.
+      //
+      // The command this is measured against, which is the shipped CLI's:
+      //
+      //   npx tsx packages/headless/src/cli.ts sim --seeds 1..50 --map-size tiny --turns 20
+      //   → was "5 INVARIANT VIOLATIONS in 5 of 50 runs": seeds 6, 17, 29, 38, 39, all at
+      //     turn 12, all `city-food-box-within-threshold`; exit 1, and a report whose own
+      //     horizon caveat said the sums mixed horizons.
+      //   → is now exit 0, 0 violations, horizon 21..21, and no caveat line.
+      const seed = 6; // the first seed that used to stop
+      const settings: Settings = { ...DEFAULT_SETTINGS, seed, mapSize: 'tiny', civCount: 2 };
+      const result = runSimulation({
+        seed,
+        settings,
+        ruleset: RULESET,
+        policies: [SIMPLE_POLICY, SIMPLE_POLICY],
+        maxTurns: 20,
+      });
 
-    console.log(
-      `shipped content now holds: seed ${String(seed)} played ${String(result.turnsPlayed)} turns, ` +
-        `stopped because "${result.stoppedBecause}", ${String(result.violations.length)} violations`,
-    );
+      console.log(
+        `shipped content now holds: seed ${String(seed)} played ${String(result.turnsPlayed)} turns, ` +
+          `stopped because "${result.stoppedBecause}", ${String(result.violations.length)} violations`,
+      );
 
-    expect(result.violations).toEqual([]);
-    expect(result.turnsPlayed).toBe(20);
-    expect(result.finalState.turn).toBe(21);
-    expect(result.stoppedBecause).toBe('max-turns');
+      expect(result.violations).toEqual([]);
+      expect(result.turnsPlayed).toBe(20);
+      expect(result.finalState.turn).toBe(21);
+      expect(result.stoppedBecause).toBe('max-turns');
 
-    // The consequence a balance loop cares about, over the WHOLE seed range the finding was
-    // measured on: `BatchResult.aggregates` folds rows from every run, so runs that stop on
-    // different turns make a mean over a "20-turn batch" a mean over games of different
-    // lengths. A uniform horizon is what makes the aggregate mean what it says, and it is
-    // asserted here rather than assumed.
-    const seeds: number[] = [];
-    for (let value = 1; value <= 50; value += 1) seeds.push(value);
-    const batchStart = nowNs();
-    const batch = runBatch({
-      seeds,
-      settings: { ...DEFAULT_SETTINGS, mapSize: 'tiny', civCount: 2 },
-      ruleset: RULESET,
-      policies: [SIMPLE_POLICY, SIMPLE_POLICY],
-      maxTurns: 20,
-    });
-    const batchMs = ms(batchStart, nowNs());
+      // The consequence a balance loop cares about, over the WHOLE seed range the finding was
+      // measured on: `BatchResult.aggregates` folds rows from every run, so runs that stop on
+      // different turns make a mean over a "20-turn batch" a mean over games of different
+      // lengths. A uniform horizon is what makes the aggregate mean what it says, and it is
+      // asserted here rather than assumed.
+      const seeds: number[] = [];
+      for (let value = 1; value <= 50; value += 1) seeds.push(value);
+      const batchStart = nowNs();
+      const batch = runBatch({
+        seeds,
+        settings: { ...DEFAULT_SETTINGS, mapSize: 'tiny', civCount: 2 },
+        ruleset: RULESET,
+        policies: [SIMPLE_POLICY, SIMPLE_POLICY],
+        maxTurns: 20,
+      });
+      const batchMs = ms(batchStart, nowNs());
 
-    const horizons = batch.runs.map((run) => run.turnsPlayed);
-    const metricTurns = batch.runs.map((run) =>
-      run.metrics.reduce((last, row) => Math.max(last, row.turn), 0),
-    );
-    console.log(
-      `  batch of ${String(batch.runs.length)} runs: horizons [${[...new Set(horizons)].join(', ')}], ` +
-        `final sampled turns [${[...new Set(metricTurns)].join(', ')}], ` +
-        `${String(batch.runs.flatMap((run) => run.violations).length)} violations, ` +
-        `wall time ${(batchMs / 1000).toFixed(2)} s ` +
-        `(${(batchMs / batch.runs.length).toFixed(0)} ms per run)`,
-    );
+      const horizons = batch.runs.map((run) => run.turnsPlayed);
+      const metricTurns = batch.runs.map((run) =>
+        run.metrics.reduce((last, row) => Math.max(last, row.turn), 0),
+      );
+      console.log(
+        `  batch of ${String(batch.runs.length)} runs: horizons [${[...new Set(horizons)].join(', ')}], ` +
+          `final sampled turns [${[...new Set(metricTurns)].join(', ')}], ` +
+          `${String(batch.runs.flatMap((run) => run.violations).length)} violations, ` +
+          `wall time ${(batchMs / 1000).toFixed(2)} s ` +
+          `(${(batchMs / batch.runs.length).toFixed(0)} ms per run)`,
+      );
 
-    expect(batch.runs).toHaveLength(50);
-    expect(batch.runs.flatMap((run) => run.violations)).toEqual([]);
-    // One horizon: every run played exactly `maxTurns` turns...
-    expect([...new Set(horizons)]).toEqual([20]);
-    expect(batch.runs.every((run) => run.stoppedBecause === 'max-turns')).toBe(true);
-    // ...and every run's last sampled row describes the same turn, which is the number
-    // every "by turn N" figure in the report is summed at.
-    expect([...new Set(metricTurns)]).toEqual([21]);
+      expect(batch.runs).toHaveLength(50);
+      expect(batch.runs.flatMap((run) => run.violations)).toEqual([]);
+      // One horizon: every run played exactly `maxTurns` turns...
+      expect([...new Set(horizons)]).toEqual([20]);
+      expect(batch.runs.every((run) => run.stoppedBecause === 'max-turns')).toBe(true);
+      // ...and every run's last sampled row describes the same turn, which is the number
+      // every "by turn N" figure in the report is summed at.
+      expect([...new Set(metricTurns)]).toEqual([21]);
 
-    // Which is what makes the aggregates comparable, stated as the property they rest on:
-    // every run contributed the SAME number of rows (20 turns x 2 civilizations), and every
-    // aggregate's `count` is the whole set of them. A run truncated by a violation would
-    // contribute fewer rows and every mean in the report would silently become a mean over
-    // games of different lengths — the FINDING A consequence, asserted rather than assumed.
-    const rowsPerRun = batch.runs.map((run) => run.metrics.length);
-    expect([...new Set(rowsPerRun)]).toEqual([20 * 2]);
-    const totalRows = rowsPerRun.reduce((total, count) => total + count, 0);
-    expect(totalRows).toBe(2000);
-    expect(batch.aggregates.every((aggregate) => aggregate.count === totalRows)).toBe(true);
-    // No run stopped early for any reason...
-    expect([...new Set(batch.runs.map((run) => run.stoppedBecause))]).toEqual(['max-turns']);
-    // ...so a bounded wall time is the last claim: the acceptance line is "a batch of 50+
-    // games runs headlessly in a bounded time", and the printed figure is the evidence.
-    expect(batchMs).toBeLessThan(600_000);
-  }, 240_000);
+      // Which is what makes the aggregates comparable, stated as the property they rest on:
+      // every run contributed the SAME number of rows (20 turns x 2 civilizations), and every
+      // aggregate's `count` is the whole set of them. A run truncated by a violation would
+      // contribute fewer rows and every mean in the report would silently become a mean over
+      // games of different lengths — the FINDING A consequence, asserted rather than assumed.
+      const rowsPerRun = batch.runs.map((run) => run.metrics.length);
+      expect([...new Set(rowsPerRun)]).toEqual([20 * 2]);
+      const totalRows = rowsPerRun.reduce((total, count) => total + count, 0);
+      expect(totalRows).toBe(2000);
+      expect(batch.aggregates.every((aggregate) => aggregate.count === totalRows)).toBe(true);
+      // No run stopped early for any reason...
+      expect([...new Set(batch.runs.map((run) => run.stoppedBecause))]).toEqual(['max-turns']);
+      // ...so a bounded wall time is the last claim: the acceptance line is "a batch of 50+
+      // games runs headlessly in a bounded time", and the printed figure is the evidence.
+      expect(batchMs).toBeLessThan(600_000);
+    },
+    240_000,
+  );
 
   it('FINDING A (non-vacuity): both bounds fire BY NAME, and the exemption is now only the completion case', () => {
     // The test above proves the food-box check is *silent* on shipped content. Silence is

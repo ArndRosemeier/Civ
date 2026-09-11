@@ -66,6 +66,15 @@
  *   allowed to write a negative or fractional number into a city's output — the
  *   same reading `economy.ts` takes of a maintenance it cannot read and
  *   `production.ts` of a cost it cannot price.
+ * - **M5: a building row that declares `requiresTech` is gated elsewhere, and
+ *   deliberately not here.** `mayStartBuilding` below answers the M4c question this
+ *   module owns — "is this row unique in the world, and does this city lack it?" —
+ *   and adding a tech test to it would be a second implementation of a question
+ *   `resources.ts`' `productionGate` already answers for every kind of item, free to
+ *   disagree with the menu and the completion pass that ask *that*. A tech-gated
+ *   building is refused by both of them (and, once the owed wiring lands, by
+ *   `commands.ts`' `planSetProduction`); nothing here reads the field, which is also
+ *   why no row below claims it.
  * - **Every number this module adds is a placeholder of ours.** `MIN_GROWTH_FOOD`
  *   is the only constant here, and it is unsourced and chosen to be playable — see
  *   its own note. The magnitudes of the effects (`pct`, `amount`) are *content*,

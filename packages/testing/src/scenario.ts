@@ -218,12 +218,50 @@
  * assignment asked: what M4c extends here is the **builder**, not the frozen
  * `Scenario` interface.
  *
+ * M5 extends the builder the same way, and **the frozen `Scenario` interface is
+ * untouched for the fifth time**: no field is added, no signature changes,
+ * `build()` still returns `Result<GameState, SetupError>`, and `runScenario` /
+ * `runScenarioAgainst` are byte-identical. M5's acceptance evidence is a world with
+ * a *pre-history of knowledge* — "a tech-gated item is refused before the tech is
+ * known and accepted after" is two worlds, and "the beaker remainder carried into
+ * the next tech" is a world that already knows one tech — and no M2-M4c method can
+ * state either: `techs`/`researching` are `PlayerState` fields with no writer here,
+ * and `setPools` states beakers against a player who knows nothing. Two methods
+ * close that gap:
+ *
+ * - **`grantTech(playerIndex, tech)` gives a civilization a tech it did not
+ *   research.** It is the DSL's `addImprovement`: a *world* fact stated outright
+ *   rather than a rule re-implemented, and the builder keeps the field's contract
+ *   itself (sorted by id, unique — the order `PlayerState.techs` fixes, because the
+ *   list is inside every state hash). Prerequisites are deliberately **not**
+ *   required: a hand-built world has no pre-history, and a story that hands a
+ *   civilization `iron-working` without `masonry` is a story about a state the
+ *   engine then reads *correctly* (nothing demotes a tech it knows). Refused only
+ *   for a player index that was never added, an id this ruleset defines no row for
+ *   (nothing could price or gate on it), and the barbarian player — which has no
+ *   economy, is skipped by the research step and can never complete a tech.
+ * - **`setResearching(playerIndex, tech)` states what a civilization is working
+ *   on.** The engine's own rule is asked rather than restated: `techDef` must
+ *   resolve the id (**unknown-tech**) and `prerequisitesOf` must all be known
+ *   (**unmet-prerequisite**), which is the `unknown-tech` / `unmet-prerequisite`
+ *   half of `tech.ts`' `researchProblem` and the same pair of faults the command
+ *   layer refuses. The builder does **not** re-check "already known" or "nothing
+ *   being researched": both are *legal* declarations — `SetResearch` accepts a tech
+ *   the player already has queued (idempotence, like `SetRates`) and a selection is
+ *   a selection whatever it replaced — so refusing them here would refuse a world
+ *   the command layer can produce. The key is written only when a tech is named,
+ *   never as `undefined`, matching `PlayerState.researching`'s "absence is what 'not
+ *   researching' means".
+ *
  * The one other edit is a *migration*, not an extension: `describeGameError`'s
  * message table gained the two error members M4c added to `GameError`
  * (`resource-not-connected` and `wonder-already-built`). Without those case labels
  * a scenario that hits the new refusals — which is exactly what the resource
  * evidence does — reports `unrecognised error` and throws away the one thing that
- * makes the refusal useful, so the table follows the union it describes.
+ * makes the refusal useful, so the table follows the union it describes. M5 adds
+ * the same three labels for the three members it added (`unknown-tech`,
+ * `tech-already-known`, `tech-prerequisites-unmet`) and the `SetResearch` spelling
+ * to `describeCommand`, for the identical reason.
  *
  * Failure channels — the frozen signature is narrower than the builder's needs,
  * so the split is stated here rather than discovered by a caller:
@@ -308,10 +346,13 @@ import {
   itemCostOf,
   loadSettings,
   ok,
+  prerequisitesOf,
   ratesProblem,
   resourceCatalog,
   resourceDef,
   seedRng,
+  techCatalog,
+  techDef,
   tileIndex,
   unitCatalog,
   unitDef,
@@ -336,6 +377,7 @@ import {
   type Settings,
   type SettingsIssue,
   type SetupError,
+  type TechId,
   type TerrainId,
   type TerrainRole,
   type TileIndex,
@@ -475,6 +517,37 @@ export interface ScenarioBuilder {
    * player.
    */
   setPools(playerIndex: number, pools: PoolSetup): ScenarioBuilder;
+  /**
+   * Give a civilization a tech it did not research (M5) — the world fact a
+   * gating scenario needs, and the DSL's `addImprovement` for knowledge.
+   *
+   * `techs` is kept in the contract's order (sorted by id, unique) because it is
+   * inside every state hash. Prerequisites are **not** required: a hand-built
+   * world has no pre-history (the same reason `addUnit` places a unit with full
+   * movement and `addCity` states a whole city), and a state that knows a tech
+   * without its prerequisites is one the engine reads correctly — nothing demotes
+   * a tech a player already has. Refused at the call for a player index that was
+   * never added, an id this ruleset defines no row for, and the barbarian player,
+   * which can never complete a tech (the research step skips it).
+   */
+  grantTech(playerIndex: number, tech: TechId): ScenarioBuilder;
+  /**
+   * State what a civilization is researching (M5) — the second M5 field, and the
+   * only way a scenario can say "this tech completes on turn N" from a beaker pool
+   * it also states with `setPools`.
+   *
+   * The engine's own research rule is asked rather than restated: the id must
+   * resolve (`techDef`) and every direct prerequisite must be known
+   * (`prerequisitesOf`), so an authoring mistake is reported here rather than
+   * becoming a player the pipeline reports as `stuck` forever. Refused for the
+   * barbarian player for the same reason `grantTech` is.
+   *
+   * There is deliberately no "clear the research" spelling: "not researching" *is*
+   * the absence of the key, and `withoutResearching` (the engine's one clearer) is
+   * the pipeline's, not a scenario's — a scenario that wants a player with nothing
+   * queued simply never calls this.
+   */
+  setResearching(playerIndex: number, tech: TechId): ScenarioBuilder;
   build(): Result<GameState, SetupError>;
 }
 
@@ -621,6 +694,10 @@ const describeCommand = (command: Command, map: GameMap): string => {
       return `StartWork by unit ${String(command.unitId)} on improvement "${command.kind}"`;
     case 'CancelWork':
       return `CancelWork by unit ${String(command.unitId)}`;
+    // M5's one new command. It names the tech, so a refused `SetResearch` reads as
+    // "which tech" rather than as "some command was refused".
+    case 'SetResearch':
+      return `SetResearch on tech "${command.tech}"`;
     // Unreachable for today's union; kept total so a command added elsewhere
     // degrades to a vague message instead of breaking this module's build.
     default:
@@ -698,6 +775,22 @@ const describeGameError = (error: GameError): string => {
         `wonder-already-built (city ${String(error.cityId)} may not start "${error.building}"` +
         `${error.holder === undefined ? '' : `, which city ${String(error.holder)} already holds`})`
       );
+    // M5's third gating dimension, on both paths that decide a build. Each names the
+    // tech, because "which one is missing?" is the question a scenario author is asking
+    // and the whole reason the refusal is typed rather than an `invalid-argument`. They
+    // are listed here rather than left to the `default` below, so a scenario asserting a
+    // tech gate reads a sentence about the gate instead of "unrecognised error".
+    case 'tech-required':
+      return (
+        `tech-required (${describeItem(error.item)} requires "${error.tech}", which player ` +
+        `${String(error.owner)} has not researched for city ${String(error.cityId)})`
+      );
+    case 'improvement-tech-required':
+      return (
+        `improvement-tech-required ("${error.improvement}" requires "${error.tech}", which the ` +
+        `player has not researched, at tile ${String(error.tile)} where unit ` +
+        `${String(error.unitId)} stands)`
+      );
     // M4a's worker refusals. Each names the improvement and the tile or role that
     // decided it, because "why can this worker not dig here?" is the question a
     // scenario author is asking.
@@ -719,6 +812,19 @@ const describeGameError = (error: GameError): string => {
       );
     case 'already-improved':
       return `already-improved (tile ${String(error.tile)} already carries "${error.improvement}")`;
+    // M5's three research refusals. Each names the tech and, where there is one, the
+    // fix: "pick a tech the catalog describes", "you already have it" and "research
+    // these first" are three different instructions, and the third is the only one
+    // that needs a list to be actionable.
+    case 'unknown-tech':
+      return `unknown-tech ("${error.tech}" is not researchable in this ruleset)`;
+    case 'tech-already-known':
+      return `tech-already-known (this player already knows "${error.tech}")`;
+    case 'tech-prerequisites-unmet':
+      return (
+        `tech-prerequisites-unmet ("${error.tech}" requires ${error.missing.join(', ')}, which the ` +
+        'player does not know)'
+      );
     case 'invalid-argument':
       return `invalid-argument (${error.detail})`;
     default:
@@ -763,6 +869,12 @@ interface UnitPlacement {
  * the same shape with a zero treasury for the barbarian player — so a scenario
  * that says nothing about money still gets a state with all four fields and the
  * state keeps one shape for every player.
+ *
+ * M5 adds the two knowledge fields, resolved the same way: `techs` starts as the
+ * empty array `newGame` writes (never absent — the field is required and part of
+ * every hash) and `researching` starts **absent**, which is exactly what
+ * "nothing is being researched" means. Both are accumulated by `grantTech` /
+ * `setResearching`.
  */
 interface PlayerPlacement {
   readonly name: string;
@@ -771,6 +883,10 @@ interface PlayerPlacement {
   rates: Rates;
   beakers: number;
   luxuries: number;
+  /** M5: the techs this player already knows, kept sorted and unique. */
+  techs: TechId[];
+  /** M5: what it is researching; absent means nothing, never a key holding `undefined`. */
+  researching: TechId | undefined;
 }
 
 /** A goody hut the scenario asked for, in the coordinates it was written in. */
@@ -855,6 +971,23 @@ interface BuilderWorld {
  * escalation for M2/M3.
  */
 const cityName = (id: CityId): string => `City ${String(Number(id) + 1)}`;
+
+/**
+ * `ids` sorted by id (UTF-16 code-unit order) and deduplicated — **the order
+ * `PlayerState.techs` fixes**, imposed by the builder for the same reason
+ * `withImprovement` imposes the improvement order: the list is inside every state
+ * hash, so knowledge written in the order a scenario happened to name it would be a
+ * different save from the same knowledge.
+ *
+ * `tech.ts` keeps its own copy of this normalisation private (`normalizeTechs`), and
+ * it is repeated rather than exported for the same reason `PLAYER_COLORS` and the
+ * barbarian name are: the builder must produce the shape the engine writes, and
+ * reaching into a module's private helper is not how that is done. The duplicate is
+ * two lines and is compared against the engine's own output in the M5 scenario
+ * tests, so a divergence is caught rather than assumed away.
+ */
+const normalizedTechs = (ids: readonly TechId[]): readonly TechId[] =>
+  [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
 /**
  * The worked tiles an explicit `addCity(..., { workedTiles })` asked for, checked
@@ -1125,8 +1258,50 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
       rates: placed.rates,
       beakers: placed.beakers,
       luxuries: placed.luxuries,
+      // M5: the knowledge fields, one shape for every player. `techs` is always an
+      // array (`newGame` writes `[]` and `PlayerState.techs` is required), and the
+      // list is **normalised here** — sorted by id and deduplicated — because it is
+      // inside every state hash and `grantTech` may be called in any order.
+      techs: normalizedTechs(placed.techs),
+      // The key is written only when a tech is named. `{ researching: undefined }`
+      // is a state `canonicalize` refuses (and `exactOptionalPropertyTypes` rejects),
+      // so absence is the only honest spelling of "not researching" here as
+      // everywhere else.
+      ...(placed.researching === undefined ? {} : { researching: placed.researching }),
     };
   });
+
+  // M5: the research selection is re-checked here, against the normalised `techs`
+  // list `build()` actually writes. `setResearching` checks it at the call for a
+  // better message at the offending line, and `grantTech` deliberately does not
+  // require prerequisites (see the interface note) — so a scenario that selects a
+  // tech *before* granting its prerequisite would otherwise build a state whose
+  // player is stuck forever, which is a world the command layer cannot produce. The
+  // rule is the engine's own (`techDef` + `prerequisitesOf`: the same two reads
+  // `researchProblem` makes), asked a second time rather than restated.
+  for (const player of players) {
+    const selected = player.researching;
+    if (selected === undefined) continue;
+
+    const def = techDef(world.ruleset, selected);
+    if (def === undefined) {
+      throw new Error(
+        `scenario builder: player ${String(Number(player.id))} ("${player.name}") is researching ` +
+          `"${selected}", which this ruleset does not define`,
+      );
+    }
+    const missing = prerequisitesOf(world.ruleset, selected).filter(
+      (required) => !player.techs.includes(required),
+    );
+    if (missing.length > 0) {
+      throw new Error(
+        `scenario builder: player ${String(Number(player.id))} ("${player.name}") is researching ` +
+          `"${selected}" without ${missing.join(', ')}; the pipeline's research step reports that ` +
+          'as `stuck` and nothing would ever complete, so the world is one the command layer ' +
+          'cannot produce',
+      );
+    }
+  }
 
   // The civilizations decide `civCount`; the rest of the patch layers over the
   // defaults exactly as it does for the CLI (defaults -> patch -> parse).
@@ -1355,6 +1530,33 @@ export const createScenarioBuilder = (
     return placed;
   };
 
+  /**
+   * The player a `grantTech`/`setResearching` call is about, checked exactly as
+   * `moneyPlayer` checks one — and for the same reason, one field over.
+   *
+   * Barbarians are refused because their knowledge is inert: `applyResearch` skips
+   * every non-civilization outright, so a barbarian's `techs` can never grow and its
+   * `researching` is never read. A scenario that could state them would be a scenario
+   * that *looks* like it is measuring research while measuring nothing, which is the
+   * outcome the loud authoring error exists to prevent.
+   */
+  const knowledgePlayer = (method: string, playerIndex: number): PlayerPlacement => {
+    checkPlayerIndex(method, playerIndex);
+    const placed = world.players[playerIndex];
+    if (placed === undefined) {
+      // Unreachable: `checkPlayerIndex` has already proved the index is in range.
+      throw new Error(`scenario builder: ${method} needs a player index that names a player`);
+    }
+    if (placed.kind !== 'civ') {
+      throw new Error(
+        `scenario builder: ${method}(${String(playerIndex)}, ...) names the barbarian player ` +
+          `("${placed.name}"), which never researches anything — the pipeline's research step ` +
+          'skips every non-civilization, so the value would be a fact no rule reads',
+      );
+    }
+    return placed;
+  };
+
   const builder: ScenarioBuilder = {
     addPlayer(name) {
       if (name.trim() === '') {
@@ -1369,6 +1571,10 @@ export const createScenarioBuilder = (
         rates: DEFAULT_RATES,
         beakers: 0,
         luxuries: 0,
+        // M5: a civilization starts knowing nothing and researching nothing — the
+        // values `newGame` writes for every player.
+        techs: [],
+        researching: undefined,
       });
       return builder;
     },
@@ -1392,6 +1598,10 @@ export const createScenarioBuilder = (
         rates: DEFAULT_RATES,
         beakers: 0,
         luxuries: 0,
+        // Inert, exactly like the money fields: the research step skips barbarians, so
+        // an empty list and no selection are the only values that mean anything.
+        techs: [],
+        researching: undefined,
       });
       return builder;
     },
@@ -1437,6 +1647,73 @@ export const createScenarioBuilder = (
       checkCount('setPools', 'luxuries', luxuries, 0);
       placed.beakers = beakers;
       placed.luxuries = luxuries;
+      return builder;
+    },
+
+    grantTech(playerIndex, tech) {
+      const placed = knowledgePlayer('grantTech', playerIndex);
+
+      // An id this ruleset defines no row for would be knowledge nothing can price,
+      // gate on or report: `techDef` would answer `undefined`, `techUnlocks` would
+      // find no row to attribute, and a scenario asserting "iron-working unlocked
+      // the legion" would be asserting about a tech the engine cannot see. Reported
+      // here, where the author wrote the id, exactly as `addImprovement` reports an
+      // unknown kind.
+      if (techDef(world.ruleset, tech) === undefined) {
+        const researchable = techCatalog(world.ruleset)
+          .map((row) => row.id)
+          .join(', ');
+        throw new Error(
+          `scenario builder: the ruleset defines no tech "${tech}"` +
+            (researchable === ''
+              ? ' (it defines no techs at all, so nothing can be researched or gated)'
+              : ` (it defines: ${researchable})`),
+        );
+      }
+
+      // Prerequisites are deliberately NOT required — see the interface's note: this
+      // states a world with a pre-history, and a tech already known is never
+      // demoted. Only the *shape* of the field is the builder's business, and
+      // `build()` normalises it.
+      placed.techs.push(tech);
+      return builder;
+    },
+
+    setResearching(playerIndex, tech) {
+      const placed = knowledgePlayer('setResearching', playerIndex);
+
+      // The engine's own statement of the rule, asked rather than restated: the id
+      // must resolve, and every DIRECT prerequisite must be known. This is the
+      // `unknown-tech` / `unmet-prerequisite` half of `researchProblem`, which is
+      // what `planSetResearch` refuses a `SetResearch` with — so the builder and the
+      // command layer cannot disagree about which selections are possible. The
+      // "already known" and "nothing being researched" halves are legal selections
+      // the command layer accepts (a redundant `SetResearch` is idempotent, like
+      // `SetRates`), so they are not refused here.
+      const def = techDef(world.ruleset, tech);
+      if (def === undefined) {
+        const researchable = techCatalog(world.ruleset)
+          .map((row) => row.id)
+          .join(', ');
+        throw new Error(
+          `scenario builder: setResearching(${String(playerIndex)}, "${tech}") names a tech this ` +
+            'ruleset does not define, so the player could never complete it' +
+            (researchable === '' ? ' (it defines no techs)' : ` (it defines: ${researchable})`),
+        );
+      }
+      const missing = prerequisitesOf(world.ruleset, tech).filter(
+        (required) => !placed.techs.includes(required),
+      );
+      if (missing.length > 0) {
+        throw new Error(
+          `scenario builder: setResearching(${String(playerIndex)}, "${tech}") is refused by the ` +
+            `engine's own rule — "${tech}" requires ${missing.join(', ')}, which this player does ` +
+            'not know; grant the prerequisite with grantTech first, or the player would be stuck ' +
+            'researching a tech the pipeline refuses forever',
+        );
+      }
+
+      placed.researching = tech;
       return builder;
     },
 

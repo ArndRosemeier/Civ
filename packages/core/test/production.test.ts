@@ -26,6 +26,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { hashValue } from '@civts/testing';
+import { cityProductionOptions } from '../src/actions.js';
 import { availableBuildings, mayStartBuilding } from '../src/buildings.js';
 import type { BuildingDef, City, ProductionItem } from '../src/cities.js';
 import { applyEconomy } from '../src/economy.js';
@@ -33,15 +34,20 @@ import {
   asBuildingId,
   asCityId,
   asPlayerId,
+  asTechId,
   asTerrainId,
   asTileIndex,
+  asUnitId,
   asUnitTypeId,
   type BuildingId,
+  type TechId,
 } from '../src/ids.js';
 import type { GameMap, RulesetView, TerrainDef } from '../src/map.js';
 import { applyProduction, itemCostOf } from '../src/production.js';
+import { productionGate } from '../src/resources.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { DEFAULT_RATES, SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
+import type { TechDef } from '../src/tech.js';
 import type { UnitDef } from '../src/units.js';
 
 /* ------------------------------------------------------------------ *
@@ -125,6 +131,11 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: `techs` is required on every player and never absent — "knows nothing" is an
+  // empty list. This file is about shields and completions, so its fixture players
+  // have researched nothing; the one section that asks about a *tech*-gated row
+  // passes the tech it needs through `overrides`.
+  techs: [],
   ...overrides,
 });
 
@@ -342,5 +353,144 @@ describe('a shield effect reaches the shield pool', () => {
     for (const each of first.state.cities) {
       expect(Number.isInteger(each.shields)).toBe(true);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M5 gating — the pass asks the same gate the menu does
+ * ------------------------------------------------------------------ */
+
+/**
+ * The M5 fixture tech rows: two **placeholder** rows of ours (the costs are arbitrary —
+ * nothing in this file researches anything, and a tech requirement is a membership
+ * test on `player.techs`). `BRONZE` gates the row below; `UNUSED` gates nothing, which
+ * is the control the contract asks for.
+ */
+const BRONZE = asTechId('bronze-working');
+const UNUSED = asTechId('ceremonial-burial');
+
+const TECHS: readonly TechDef[] = [
+  { id: BRONZE, name: 'Bronze Working', era: 'ancient', cost: 6, requires: [] },
+  { id: UNUSED, name: 'Ceremonial Burial', era: 'ancient', cost: 6, requires: [] },
+];
+
+/** A unit row that declares a tech, written as an intersection (see `tech.ts`). */
+const LEGION: UnitDef & { readonly requiresTech: TechId } = {
+  ...WARRIOR,
+  id: asUnitTypeId('legion'),
+  requiresTech: BRONZE,
+};
+
+const TECH_RULESET: RulesetView & { readonly techs: readonly TechDef[] } = {
+  ...RULESET,
+  units: [WARRIOR, LEGION],
+  techs: TECHS,
+};
+
+describe('M5 gating — a tech-gated unit waits, and completes once the tech is known', () => {
+  const P0 = asPlayerId(0);
+  const CITY = asCityId(0);
+  const legion: ProductionItem = { kind: 'unit', id: LEGION.id };
+  const warrior: ProductionItem = { kind: 'unit', id: WARRIOR.id };
+
+  /** The item's name as the menu reports it, so an absence can be named in a failure. */
+  const key = (item: ProductionItem): string => `${item.kind}:${item.id}`;
+
+  /**
+   * Player 0's three-citizen city (the fixture `bigCity`, 3 shields a turn) building
+   * the legion with 5 shields banked: 8 covers the row's cost of 4 on turn one, so
+   * the *only* thing that stops the completion is the tech.
+   */
+  const queued = (techs: readonly TechId[]): GameState =>
+    board([bigCity(0, 0, 5, { shields: 5, production: legion })], {
+      players: [player(0, { techs: [...techs] }), player(1)],
+    });
+
+  it('names the missing tech, and neither the menu nor the pass will have the unit', () => {
+    const state = queued([]);
+
+    // The typed verdict, naming the tech — the same one `resources.ts` hands a
+    // planner, asked here of the item the city is building.
+    expect(productionGate(state, TECH_RULESET, P0, legion)).toEqual({
+      kind: 'tech-required',
+      tech: BRONZE,
+    });
+
+    // Generator: the item is not on the menu…
+    expect(cityProductionOptions(state, TECH_RULESET, CITY).map(key)).not.toContain(key(legion));
+
+    // …and the applier does not have it either: nothing is produced, nothing is
+    // charged, the item stays where it is and the shields stay banked (5 + 3 earned).
+    const outcome = applyProduction(state, TECH_RULESET);
+    expect(outcome.events).toEqual([]);
+    expect(outcome.state.units).toEqual([]);
+    expect(outcome.state.cities[0]?.production).toEqual(legion);
+    expect(outcome.state.cities[0]?.shields).toBe(8);
+
+    // The state it was handed is untouched, like every other refusal in this file.
+    expect(state.cities[0]?.shields).toBe(5);
+  });
+
+  it('completes the same unit, for the same city, once the tech is known', () => {
+    const after = queued([BRONZE]);
+
+    // Control: one field of the player differs, and now the verdict is open, the item
+    // is offered, and the same pass produces it.
+    expect(productionGate(after, TECH_RULESET, P0, legion)).toEqual({ kind: 'open' });
+    expect(cityProductionOptions(after, TECH_RULESET, CITY).map(key)).toContain(key(legion));
+
+    const outcome = applyProduction(after, TECH_RULESET);
+    expect(outcome.events).toEqual([
+      {
+        type: 'CityProduced',
+        cityId: CITY,
+        owner: P0,
+        item: legion,
+        shields: 8 - LEGION.cost,
+        unitId: asUnitId(0),
+        tile: asTileIndex(5),
+      },
+    ]);
+    expect(outcome.state.units.map((unit) => unit.type)).toEqual([LEGION.id]);
+    expect(outcome.state.cities[0]?.shields).toBe(8 - LEGION.cost);
+    // The cost left the pool and the item left the queue: "absent", not `undefined`.
+    expect(outcome.state.cities[0]?.production).toBeUndefined();
+    expect(Object.keys(outcome.state.cities[0] ?? {})).not.toContain('production');
+  });
+
+  it('gates nothing on a tech no row declares, and nothing on a row that declares none', () => {
+    // A tech in the catalog that no row mentions: knowledge of it changes no verdict
+    // and completes nothing.
+    const unused = queued([UNUSED]);
+    expect(productionGate(unused, TECH_RULESET, P0, legion)).toEqual({
+      kind: 'tech-required',
+      tech: BRONZE,
+    });
+    expect(applyProduction(unused, TECH_RULESET).events).toEqual([]);
+
+    // And the row that declares nothing is built by a player who knows nothing at all.
+    const plain = board([bigCity(0, 0, 5, { shields: 5, production: warrior })]);
+    expect(productionGate(plain, TECH_RULESET, P0, warrior)).toEqual({ kind: 'open' });
+    expect(applyProduction(plain, TECH_RULESET).events.map((event) => event.type)).toEqual([
+      'CityProduced',
+    ]);
+  });
+
+  it('produces a gated item the tech now allows on the turn it becomes affordable', () => {
+    // The waiting response is "later", not "never": one shield short of the cost on
+    // turn one the item waits for affordability — the same waiting response the gate
+    // gives — and the next turn's shields finish it.
+    const poor = board([bigCity(0, 0, 5, { shields: 0, production: legion })], {
+      players: [player(0, { techs: [BRONZE] }), player(1)],
+    });
+    const first = applyProduction(poor, TECH_RULESET);
+    expect(first.events).toEqual([]);
+    expect(first.state.cities[0]?.shields).toBe(3);
+    expect(first.state.units).toEqual([]);
+
+    // 3 shields banked + 3 earned = 6, which covers the legion's cost of 4.
+    const second = applyProduction(first.state, TECH_RULESET);
+    expect(second.events.map((event) => event.type)).toEqual(['CityProduced']);
+    expect(second.state.cities[0]?.shields).toBe(6 - LEGION.cost);
   });
 });

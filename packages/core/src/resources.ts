@@ -57,6 +57,58 @@
  *   contentment is modelled, because it is not, and a luxury that quietly changed
  *   a yield or a mood would be exactly the kind of claim this project's provenance
  *   rule exists to prevent.
+ * - **M5: a resource row may declare `requiresTech`, and this is where that is
+ *   honoured.** M5's Gating section gives units, buildings, improvements and
+ *   resources an optional `requiresTech` — for a resource, "when the resource
+ *   becomes visible and connectable". A resource whose row declares a tech the
+ *   player does not know is therefore **not connected**, and the filter that says
+ *   so sits inside `connected`, the one implementation of "which resources does
+ *   this player have?". Every consumer — the production gate below, a luxury count,
+ *   the REPL — inherits that answer instead of re-deciding it. What the field does
+ *   *not* mean is worth stating, because the contract's word "visible" has no
+ *   second meaning in this engine: there is no per-player resource-visibility
+ *   layer (fog is per-*tile*, `fog.ts`), so connectability is the whole of it.
+ * - **M5: a production item's tech requirement is the third gating dimension, and
+ *   it is stated beside the resource gate.** `productionGate` is that verdict —
+ *   `open`, `tech-required` (naming the tech) or `blocked` (naming the resource) —
+ *   and it is the one function the planner and the applier are meant to ask, which
+ *   is the arrangement M4c established for `resourceGate` so that a generator and
+ *   an applier cannot disagree about what an item needs. Under it, `unmetTechFor` is
+ *   the generic read (any spec row, one player), `requiredTechOf` resolves a
+ *   production item to the tech its own row declares, and `unmetItemTech` adds the
+ *   second way an item can be tech-gated: the resource it requires is itself locked
+ *   behind a tech. The *rule* those compose is `tech.ts`' `requiresTechOf` +
+ *   `unmetTechRequirement` — the one read of the field and the one test of "is this
+ *   requirement met?" — so this module adds no second opinion about either.
+ * - **Wiring note: who asks the gate — all three askers, since M5's integration.** Three
+ *   askers exist and they ask *this* verdict rather than a copy of it: `planSetProduction`
+ *   (`commands.ts`, the evaluator `applyCommand` refuses with and therefore the one the
+ *   keystone invariant is about), `cityProductionOptions` (`actions.ts`), which is what a
+ *   city may be *set* to build, and the completion pass in `applyProduction`
+ *   (`production.ts`), which is what a city may actually *produce*. That is the
+ *   one-rule-three-askers arrangement this module was built for, so the generator and the
+ *   applier cannot disagree about a unit or a building row that declares a tech — the
+ *   property `actions.test.ts`' production-options sweep asserts in both directions.
+ *
+ *   **This bullet used to describe an owed patch, and the patch landed.** Until M5's
+ *   integration wave `planSetProduction` asked `resourceGate` alone, so `applyCommand`
+ *   accepted a tech-gated unit or building the menu would not offer: a live
+ *   generator/applier disagreement on the third gating dimension, and one no play test
+ *   could surface while no shipped row declares `requiresTech`. It is closed — the
+ *   planner asks this verdict and refuses with the typed `tech-required` naming the tech,
+ *   and the exhaustive `GameError` renderers (`headless/src/repl.ts`,
+ *   `testing/src/scenario.ts`) render it.
+ *
+ *   The **improvement** kind's one asker is `planStartWork` (`commands.ts`), which
+ *   decides whether a worker may start — and it asks `unmetTechFor` on the improvement's
+ *   own row, refusing with `improvement-tech-required`. So a tech-gated improvement
+ *   cannot be started by a player who lacks the tech, and `unitActions` (which filters
+ *   through that same evaluator) does not offer it either.
+ *
+ *   The *resource* dimension never needed such wiring, because it is enforced inside
+ *   `connected`: a unit that requires a resource whose own row is locked behind an
+ *   unknown tech is refused by `applyCommand` with the same typed
+ *   `resource-not-connected` a missing road produces.
  * - **This module adds no numbers of its own.** Every yield comes from a catalog
  *   row (`ResourceDef.yields`), every path length is whatever the map has, and the
  *   only constants below are the zeros a tile starts from. Nothing here is a tuned
@@ -69,8 +121,15 @@
  * function is a pure read of the state, the ruleset or both.
  */
 
-import type { ProductionItem } from './cities.js';
-import type { PlayerId, ResourceId, TileIndex } from './ids.js';
+// A runtime import of the building *rule*, and only its lookup: `buildingRow` is
+// `buildings.ts`' one "find the row with this id", which `cities.ts`' `buildingDef`
+// delegates to. It is imported from `buildings.ts` rather than from `cities.ts`
+// because `cities.ts` imports *this* module at runtime (`tileYieldsWithResources`),
+// so an edge back into it would be a cycle; `buildings.ts` is a leaf. The catalog
+// itself is read off the view below, exactly as `tech.ts` reads it.
+import { buildingRow } from './buildings.js';
+import type { BuildingDef, ProductionItem } from './cities.js';
+import type { PlayerId, ResourceId, TechId, TileIndex } from './ids.js';
 import {
   improvementCatalog,
   improvementsAt,
@@ -85,7 +144,12 @@ import {
   type TerrainYields,
   type TileResource,
 } from './map.js';
-import type { GameState } from './state.js';
+import type { GameState, PlayerState } from './state.js';
+// Runtime import of the M5 tech *rule*, not of a copy of it: `requiresTechOf` is
+// the one read of a row's `requiresTech` and `unmetTechRequirement` the one test of
+// "does this player still need it?", and the gate below composes exactly those two.
+// `tech.ts` imports this module not at all, so the edge is one-way.
+import { requiresTechOf, unmetTechRequirement } from './tech.js';
 import { unitDef } from './units.js';
 
 /**
@@ -135,6 +199,17 @@ const storedResources = (state: GameState): readonly TileResource[] => {
   // narrows each entry honestly.
   return Array.from<unknown>(field).filter(isTileResource);
 };
+
+/**
+ * The player row `playerId` names, or `undefined` when the state holds none.
+ *
+ * The same linear scan `commands.ts`' `playerById` performs, kept local because the
+ * two live in different layers: this module needs to know *that* a player exists
+ * before asking anything about its techs or its cities, and one helper here is what
+ * keeps `connected` and the M5 gate below from each writing their own `find`.
+ */
+const playerOf = (state: GameState, playerId: PlayerId): PlayerState | undefined =>
+  state.players.find((candidate) => candidate.id === playerId);
 
 /**
  * The improvement ids this ruleset calls a **road**: every catalog row whose
@@ -229,6 +304,13 @@ const reachableTiles = (
  * reasons for the same true answer, and every caller wants "nothing connected"
  * rather than a failure channel it would have to invent.
  *
+ * Since M5 it also answers with nothing for a resource whose own row declares a
+ * `requiresTech` this player does not know: the resource is not *connectable* yet,
+ * whatever the roads say (see the module note, and `unmetTechFor` below, which is
+ * the read that decides it). That is one clause inside this single walk rather than
+ * a second "is it unlocked?" question asked by each consumer, which is what keeps
+ * two answers to one question from existing at all.
+ *
  * The result is a `Set<ResourceId>`, which is what the frozen signature asks for:
  * membership is the question every consumer actually has (`isConnected`,
  * `resourceGate`), and a set cannot report the same resource twice when two roads
@@ -246,7 +328,7 @@ export const connected = (
 ): ReadonlySet<ResourceId> => {
   const result = new Set<ResourceId>();
 
-  const player = state.players.find((candidate) => candidate.id === playerId);
+  const player = playerOf(state, playerId);
   if (player === undefined || player.kind === 'barbarian') return result;
 
   const centres: TileIndex[] = [];
@@ -258,6 +340,14 @@ export const connected = (
   const reached = reachableTiles(state, centres, roadKinds(ruleset));
 
   for (const entry of storedResources(state)) {
+    // M5: a row that demands a tech this player has not researched is not
+    // connectable, so it is not connected — no matter how good the road is. The
+    // rule asked here is `tech.ts`' `unmetTechRequirement` through `unmetTech`, not a
+    // second test written here, and the player is already resolved above.
+    if (unmetTech(player, requiresTechOf(resourceDef(ruleset, entry.resource))) !== undefined) {
+      continue;
+    }
+
     if (reached.has(Number(entry.tile))) {
       result.add(entry.resource);
       continue;
@@ -340,6 +430,179 @@ export const resourceGate = (
   return connected(state, ruleset, playerId).has(required)
     ? { kind: 'open' }
     : { kind: 'blocked', resource: required };
+};
+
+/* ------------------------------------------------------------------ *
+ * M5 gating — `requiresTech`, beside the resource gate
+ * ------------------------------------------------------------------ */
+
+/**
+ * The missing tech for a player and an **already-read** requirement: `undefined` when
+ * nothing is required or the player knows it, the id otherwise.
+ *
+ * This is the one place the two special cases of an id-keyed read are decided, and
+ * both are decided the same way `connected` decides the missing-player case — by
+ * answering what is true rather than by failing:
+ *
+ * - **a row that declares nothing** needs nothing, whoever is asking;
+ * - **a player the state does not hold knows no techs**, so a requirement it cannot
+ *   be shown to have researched is reported as missing rather than as satisfied. That
+ *   also covers the barbarians, who never research (their `techs` is empty), which is
+ *   the same "no economy, no connections" answer M4c gives them.
+ *
+ * Everything else — what the field is, and whether a player satisfies it — is
+ * `tech.ts`', inherited through `requiresTechOf` and `unmetTechRequirement` rather
+ * than reimplemented: the absent-player branch above is a *totality* decision about
+ * an id this state cannot resolve, not a second reading of "knows the tech".
+ */
+const unmetTech = (
+  player: PlayerState | undefined,
+  required: TechId | undefined,
+): TechId | undefined => {
+  if (required === undefined) return undefined;
+  if (player === undefined) return required;
+  return unmetTechRequirement(player, required);
+};
+
+/**
+ * The tech `playerId` still needs before `row` becomes available, or `undefined`.
+ *
+ * The generic, player-resolving form: any spec row of any of the four kinds M5's
+ * gating section names — a unit row, a building row, an improvement row, a resource
+ * row — asked for one player. A caller that already resolved its row (an
+ * improvement through `improvementDef`, a resource through `resourceDef`) passes it
+ * straight in, which is what keeps "which tech does this need?" from being answered
+ * by each spec kind separately.
+ *
+ * A row that is not an object, or whose `requiresTech` is not a string, requires
+ * nothing: that is `requiresTechOf`'s judgement, inherited rather than restated, and
+ * it is the honest answer — a requirement this engine cannot name is not one it can
+ * check.
+ */
+export const unmetTechFor = (
+  state: GameState,
+  playerId: PlayerId,
+  row: unknown,
+): TechId | undefined => unmetTech(playerOf(state, playerId), requiresTechOf(row));
+
+/**
+ * The building catalog of a view, read the way `tech.ts` reads it: a view without
+ * the optional field ships no rows.
+ *
+ * Not `cities.ts`' `buildingCatalog`, and the reason is mechanical rather than
+ * editorial: `cities.ts` imports *this* module at runtime
+ * (`tileYieldsWithResources`), so importing it back would make a cycle, and this
+ * module's whole job is to stay a leaf of the graph that anything may ask. The
+ * judgement is the same one that function makes — no field, no buildings — and the
+ * lookup of a row within it is `buildings.ts`' `buildingRow`, which `cities.ts`
+ * delegates to, so "find the row with this id" still has one implementation.
+ */
+const buildingRowsOf = (ruleset: RulesetView): readonly BuildingDef[] => ruleset.buildings ?? [];
+
+/**
+ * The tech a **production item's own row** declares, or `undefined` when the row
+ * declares none (or this ruleset defines no such row).
+ *
+ * The row is resolved once, here, for both kinds of item — a unit through `unitDef`,
+ * a building through the catalog lookup above — so `requiresTech` and
+ * `requiresResource` are read off the same row rather than each growing its own
+ * resolution. Buildings are included deliberately, unlike `requiredResourceOf`: M5's
+ * gating section names buildings, and nothing in `BuildingEffect` is involved — the
+ * field is on the row, not in the effects union.
+ */
+export const requiredTechOf = (ruleset: RulesetView, item: ProductionItem): TechId | undefined => {
+  const row =
+    item.kind === 'unit'
+      ? unitDef(ruleset, item.id)
+      : buildingRow(buildingRowsOf(ruleset), item.id);
+  return requiresTechOf(row);
+};
+
+/**
+ * The tech `playerId` still needs before `item` may be built at all, or `undefined`.
+ *
+ * There are exactly two ways a production item can be tech-gated, and both are
+ * named here because both are facts about the *item* rather than about the city
+ * doing the building:
+ *
+ * 1. **the item's own row declares `requiresTech`** — a swordsman that needs Iron
+ *    Working. `tech.ts`' rule decides it, so a player who has researched it is not
+ *    gated.
+ * 2. **the item declares none, but the resource it requires does.** A unit that
+ *    needs iron, where iron itself becomes connectable only once a tech is known,
+ *    is unbuildable for that player however many roads it has. Answering "nothing is
+ *    missing" there would be false, and it is exactly the case a reader is most
+ *    likely to miss.
+ *
+ * The item's own requirement is asked first, so when both are unmet the reported
+ * tech is the closer cause. Neither branch is a second rule: both are
+ * `tech.ts`' `unmetTechRequirement`, the first reading the item's row and the second
+ * the row of the resource the item requires.
+ */
+export const unmetItemTech = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  item: ProductionItem,
+): TechId | undefined => {
+  const player = playerOf(state, playerId);
+
+  const own = requiredTechOf(ruleset, item);
+  if (own !== undefined) return unmetTech(player, own);
+
+  const resource = requiredResourceOf(ruleset, item);
+  if (resource === undefined) return undefined;
+  return unmetTech(player, requiresTechOf(resourceDef(ruleset, resource)));
+};
+
+/**
+ * The verdict on whether `playerId` may build `item` — **the third gating dimension,
+ * stated in the same place as the second**.
+ *
+ * M4c decided availability with one verdict, `ResourceGate`, because a boolean would
+ * leave the caller unable to say *which* resource was missing. M5 adds a second way
+ * to be unavailable, so the verdict gains a second member rather than a second
+ * function: `tech-required` **names the tech**, which is the whole reason it is a
+ * member and not a reused `blocked` — "research Bronze Working" and "connect iron"
+ * are different instructions, and a caller (the AI ranking choices, the UI greying a
+ * button, the typed refusal in `commands.ts`) has to be able to tell them apart
+ * without parsing prose.
+ *
+ * **Order, and it is observable: the tech is asked first.** When an item is both
+ * tech-gated and resource-blocked, the resource is usually blocked *because* of the
+ * tech (see `unmetItemTech`'s second branch), so naming the tech names the cause a
+ * player can act on. The two are never both reported: one verdict answers one
+ * command.
+ *
+ * `resourceGate` is still the resource half and is asked here rather than restated,
+ * so M4c's connection rule keeps its one implementation and a `blocked` verdict
+ * means exactly what it meant before M5.
+ */
+export type ProductionGate =
+  | { readonly kind: 'open' }
+  | { readonly kind: 'tech-required'; readonly tech: TechId }
+  | { readonly kind: 'blocked'; readonly resource: ResourceId };
+
+/**
+ * May `playerId` build `item`? The one gate for a production item's availability,
+ * and the function a planner and an applier are both meant to ask — that is what
+ * makes "the generator and the applier cannot disagree" true by construction rather
+ * than by review (see the wiring note in the module doc: `planSetProduction` asks
+ * `resourceGate` alone today).
+ *
+ * The result is a plain data verdict, so it is as hashable, loggable and testable as
+ * anything else in the engine, and a caller that only wants a boolean asks
+ * `.kind === 'open'` — the same reading `ResourceGate` has always had.
+ */
+export const productionGate = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  item: ProductionItem,
+): ProductionGate => {
+  const tech = unmetItemTech(state, ruleset, playerId, item);
+  if (tech !== undefined) return { kind: 'tech-required', tech };
+  return resourceGate(state, ruleset, playerId, item);
 };
 
 /**

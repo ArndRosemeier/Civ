@@ -133,6 +133,16 @@
  *   `planSetRates` decide, each shared with `applyCommand` so a generator cannot
  *   advertise what the applier refuses. `actions.ts` yields **no** `SetRates` and
  *   says why (a 66-triple choice space is a query, like M3's two setters).
+ * - **`SetResearch` (M5) is the same shape as `SetRates`, one milestone later.** It
+ *   writes the actor's own `researching` and nothing else: `techs` grows only when a
+ *   tech completes (the pipeline's step), the beaker pool is untouched by a
+ *   selection, and no event is emitted. Its legality is `planSetResearch` — the
+ *   seventh evaluator in the keystone sweep, and a *decision* rather than an
+ *   enumeration for exactly the reason `SetRates` is (the tree is content, and
+ *   "every tech this ruleset ships" is the router's business, not the player's move
+ *   set). The research *rule* lives in `tech.ts`: this layer maps its typed answer to
+ *   the matching `GameError` and adds nothing of its own, so the planner, the
+ *   applier and the pipeline's research step cannot disagree about legality.
  *
  * M4c adds the resource gate, and it is a *refusal inside an existing evaluator*
  * rather than a new command:
@@ -158,14 +168,17 @@
  *   `cityProductionOptions` (which filters through this function) and
  *   `production.ts`' completion pass, so the planner cannot offer a wonder another
  *   city has finished and the completion pass cannot create a second copy of one.
- * - **Refusing the *order* is the whole enforcement point in M4c.** Nothing in
- *   `production.ts`'s completion pass re-checks the gate, so a city that legally
- *   queued a swordsman and then lost the road completes it: the gate is a rule
- *   about what may be *set*, and M4c's contract states it in exactly that place
- *   ("a unit ... may only be produced by a city whose owner has that resource
- *   connected"). Widening it to completion would need a decision the contract does
- *   not make — whether a half-built unit's shields are lost, kept or refunded —
- *   and inventing one here would be worse than the gap.
+ * - **The gate is asked BOTH when the order is set and when it completes (M5).**
+ *   `production.ts`'s completion pass asks `resources.ts`' `productionGate` for
+ *   units and buildings alike. M4c stated the gate only as a rule about what may
+ *   be *set*, on the reasoning that widening it would need a decision the contract
+ *   did not make — whether a half-built unit's shields are lost, kept or refunded.
+ *   M5 made that decision: the item WAITS, nothing is charged, shields stay banked
+ *   and the item is requeued, and the refusal says which requirement is unmet. This
+ *   is also what closed a live generator/applier disagreement: `planSetProduction`
+ *   asked only the resource gate, so `applyCommand` accepted orders that
+ *   `cityProductionOptions` refused. Both now ask the one verdict, because the
+ *   keystone invariant is BOTH directions.
  */
 
 // `buildingCatalog` here, with `buildings.ts`' rule, because `planSetProduction` is
@@ -208,6 +221,7 @@ import {
   type CityId,
   type PlayerId,
   type ResourceId,
+  type TechId,
   type TileIndex,
   type UnitId,
   type UnitTypeId,
@@ -223,14 +237,28 @@ import {
   type TerrainRole,
 } from './map.js';
 import { itemCostOf } from './production.js';
-// Runtime import of the resource *rule*, not of a second copy of it: `SetProduction`
-// must ask the one implementation of "is this resource connected for this player?"
-// (`resources.ts`) and refuse with the answer. A connection walk written here
-// instead would be a second statement of M4c's rule, free to drift from the one
-// the generator and any future consumer read.
-import { resourceGate } from './resources.js';
+// Runtime import of the resource *rule* and of M5's tech gate, not of a second copy of
+// either: `SetProduction` must ask the one implementation of "is this resource
+// connected for this player?" (`resources.ts`) and refuse with the answer. A connection
+// walk written here instead would be a second statement of M4c's rule, free to drift
+// from the one the generator and any future consumer read.
+//
+// M5: the *verdict* asked here is `productionGate`, which composes the resource half
+// with the tech half (`unmetItemTech`) in one place — so the three askers of "may this
+// be built" (this planner, `actions.ts`' menu and `production.ts`' completion pass) ask
+// one function with three answers rather than three functions that agree by review.
+// `unmetTechFor` is imported for `planStartWork`'s gate below, where the gated row is an
+// *improvement* rather than a production item: same rule, same read, and no second
+// reading of `requiresTech` in this file.
+import { productionGate, unmetTechFor } from './resources.js';
 import { err, ok, type Result } from './result.js';
 import type { GameState, PlayerState, Rates } from './state.js';
+// Runtime import of the M5 research *rule*, not of a second copy of it:
+// `SetResearch` must refuse with the same reason the pipeline's research step acts
+// on, and `tech.ts` is where cost, prerequisites, "already known" and the two writers
+// of the `researching` key are written down once. `tech.ts` imports this module's
+// `GameEvent` **type-only**, so the edge is one-way at runtime.
+import { researchProblem, withResearching } from './tech.js';
 import { advanceTurn } from './turn.js';
 import {
   unitById,
@@ -278,7 +306,28 @@ export type Command =
    * collects at the new rates, and that is the whole of "affects future turns
    * only, never the current one".
    */
-  | { readonly type: 'SetRates'; readonly rates: Rates };
+  | { readonly type: 'SetRates'; readonly rates: Rates }
+  /**
+   * Choose what the acting player researches (M5). No `playerId`: a player chooses
+   * its own research and nothing else, which removes the only way a caller could
+   * pick somebody else's tech.
+   *
+   * Legal only for the actor, only for a tech **it does not already know**, whose
+   * direct prerequisites it satisfies, and which the ruleset defines — all four
+   * stated once in `tech.ts`' `researchProblem`, which this command's planner and the
+   * turn pipeline's research step both consult, so the command layer has no rule of
+   * its own to drift. It writes **only** `researching`: `techs` grows when the tech
+   * actually completes (the pipeline's job), and the beaker pool is never touched —
+   * selecting a tech is not progress toward it.
+   *
+   * Emits no event, on the M3 setters' precedent: the payload is the record of the
+   * change. `actions.ts` yields **no** `SetResearch` — it is a setting reachable
+   * through `planSetResearch`, exactly like `SetWorkedTiles`, `SetProduction` and
+   * `SetRates`, because "every tech in the tree" is a content list rather than an
+   * action list and a generator that yielded it would be advertising a choice board
+   * as if it were the player's whole move set.
+   */
+  | { readonly type: 'SetResearch'; readonly tech: TechId };
 
 /**
  * Every way a command can be refused, as a *reason* rather than a message
@@ -377,6 +426,36 @@ export type GameError =
       readonly resource: ResourceId;
     }
   /**
+   * M5: the item is **tech-gated** and this player does not know the tech — either
+   * the item's own row declares `requiresTech` (a legion that needs Bronze Working)
+   * or the resource the item requires is itself locked behind one (`resources.ts`'
+   * `unmetItemTech` names both ways, and decides which is reported).
+   *
+   * This member exists because M5's gating section says gating "must be enforced in
+   * the **same place** production and build legality are already decided, so the
+   * generator and the applier cannot disagree", and that place is
+   * `planSetProduction`: the menu (`cityProductionOptions`) and the completion pass
+   * (`applyProduction`) both ask `productionGate`, and before this member existed
+   * the planner asked only the *resource* half — so `applyCommand` accepted a
+   * tech-gated item the menu would not offer, a live generator/applier
+   * disagreement on the third gating dimension. The `tech` field is what makes the
+   * refusal renderable as "research Bronze Working" rather than as "pick something
+   * else", which is the same argument `resource-not-connected`' resource carries.
+   *
+   * It is a member of its own rather than a reuse of the `SetResearch` refusals
+   * (`unknown-tech`, `tech-already-known`, `tech-prerequisites-unmet`), because
+   * those are answers about *a research choice* and this is an answer about *a
+   * build*: a caller routing on `kind` must not confuse "you cannot research that"
+   * with "you cannot build that yet".
+   */
+  | {
+      readonly kind: 'tech-required';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      readonly item: ProductionItem;
+      readonly tech: TechId;
+    }
+  /**
    * M4c: the item is a **wonder** another city already holds. Wonders are globally
    * unique — "once any city anywhere holds it, no other city may start it" — so the
    * `SetProduction` that would queue one is refused rather than left to be dropped
@@ -422,7 +501,9 @@ export type GameError =
    * *fix* is the same — pick an improvement the catalog describes.
    */
   | { readonly kind: 'unknown-improvement'; readonly improvement: ImprovementId }
-  /** The improvement cannot be built on this terrain role: a mine needs rock. */
+  /**
+   * The improvement cannot be built on this terrain role: a mine needs rock.
+   */
   | {
       readonly kind: 'improvement-not-allowed';
       readonly unitId: UnitId;
@@ -435,6 +516,57 @@ export type GameError =
       readonly kind: 'already-improved';
       readonly tile: TileIndex;
       readonly improvement: ImprovementId;
+    }
+  /**
+   * M5: the improvement's **catalog row declares `requiresTech`** and this player does
+   * not know it. M5's gating section names improvements alongside units, buildings and
+   * resources, and says the gate must live where build legality is already decided —
+   * for an improvement that place is `planStartWork`, the one evaluator
+   * `applyCommand` refuses with and `actions.ts`' `unitActions` advertises with.
+   *
+   * It is its own member rather than a reuse of `'tech-required'` (the production
+   * one) because the two refusals carry different facts: a *city* and a production
+   * item there, a *worker*, its tile and an improvement here. A caller cannot route
+   * on one `kind` with two payloads.
+   */
+  | {
+      readonly kind: 'improvement-tech-required';
+      readonly unitId: UnitId;
+      readonly tile: TileIndex;
+      readonly improvement: ImprovementId;
+      readonly tech: TechId;
+    }
+  /**
+   * M5: `SetResearch` naming a tech this ruleset cannot research — an id no row
+   * defines, or a row whose `cost` is not a usable number of beakers (see
+   * `tech.ts`' `techCostOf`). The two are one error kind for the same reason
+   * `unknown-production-item` and `unknown-improvement` are: both mean "this ruleset
+   * cannot research that", and the fix is the same — pick a tech the catalog
+   * describes.
+   */
+  | { readonly kind: 'unknown-tech'; readonly tech: TechId }
+  /**
+   * M5: the player already knows this tech. Distinct from `unknown-tech` (the fix is
+   * "pick a tech you do not have", not "pick a real tech") and from the
+   * prerequisite refusal below, because "you already have it" and "you cannot have it
+   * yet" are different answers to a UI.
+   */
+  | { readonly kind: 'tech-already-known'; readonly tech: TechId }
+  /**
+   * M5: a direct prerequisite of the tech is not known yet. `missing` lists them in
+   * canonical order so a UI can render "requires Bronze Working" from the refusal
+   * alone — the same reasoning as `resource-not-connected`'s named resource, and the
+   * reason this is its own member rather than an `invalid-argument`: the tech is
+   * perfectly real and researchable later, so the answer is "research something else
+   * first", not "that is not a tech".
+   *
+   * `missing` is never empty: a refusal that named nothing would be a refusal with no
+   * reason in it.
+   */
+  | {
+      readonly kind: 'tech-prerequisites-unmet';
+      readonly tech: TechId;
+      readonly missing: readonly TechId[];
     }
   | { readonly kind: 'invalid-argument'; readonly detail: string };
 
@@ -668,6 +800,27 @@ export type GameEvent =
       readonly type: 'TreasuryShortfall';
       readonly playerId: PlayerId;
       readonly unpaid: number;
+    }
+  /**
+   * M5: `playerId` finished researching `tech`, so it is now in `techs` and
+   * `researching` has been **cleared** (the key is gone, not `undefined`).
+   *
+   * Emitted by the research step of the turn pipeline (`tech.ts`), never by
+   * `SetResearch` — selecting a tech is a setting. `cost` is what the completion
+   * charged and `beakers` is what **remains** in the pool afterwards (the carried
+   * remainder), both carried on the event so a consumer can check the carry-over rule
+   * from the event stream alone without diffing the state: the same reading M4b's
+   * `UpkeepPaid` takes of a bill, where the derived numbers exist precisely so the
+   * formula can be re-checked rather than trusted.
+   */
+  | {
+      readonly type: 'TechResearched';
+      readonly playerId: PlayerId;
+      readonly tech: TechId;
+      /** Beakers the completion charged. */
+      readonly cost: number;
+      /** Beakers left in the pool afterwards: the remainder carried forward. */
+      readonly beakers: number;
     };
 
 /**
@@ -1195,11 +1348,26 @@ export const planSetProduction = (
   const cost = itemCostOf(ruleset, item);
   if (cost === undefined) return err({ kind: 'unknown-production-item', item });
 
-  // M4c's gate. `resourceGate` answers `open` for every item that demands nothing
-  // (every building, and every unit whose row omits `requiresResource`), so this
-  // is not a check that only applies to some items — it is the gate, read for all
-  // of them.
-  const gate = resourceGate(state, ruleset, city.owner, item);
+  // M4c's gate and M5's third dimension, asked as the **one verdict**
+  // (`productionGate`), never as its two halves: `open`, `tech-required` naming the
+  // missing tech, or `blocked` naming the missing resource. Asking the verdict rather
+  // than `resourceGate` is what makes this function agree with the two other askers —
+  // the menu (`actions.ts`' `cityProductionOptions`) and the completion pass
+  // (`production.ts`) — so a tech-gated item is refused here exactly where it is
+  // absent from the menu, which is the keystone property on the production path.
+  // `productionGate` answers `open` for every item that demands nothing, so this is
+  // not a check that only applies to some items — it is the gate, read for all of
+  // them.
+  const gate = productionGate(state, ruleset, city.owner, item);
+  if (gate.kind === 'tech-required') {
+    return err({
+      kind: 'tech-required',
+      cityId,
+      owner: city.owner,
+      item,
+      tech: gate.tech,
+    });
+  }
   if (gate.kind === 'blocked') {
     return err({
       kind: 'resource-not-connected',
@@ -1299,10 +1467,15 @@ export interface StartWorkPlan {
  * 5. the improvement is one this ruleset can build (`unknown-improvement`), and
  *    its `allowedRoles` contains that role (`improvement-not-allowed`) — a mine
  *    needs rock, irrigation needs flat land;
- * 6. the tile does not already carry it (`already-improved`) — building it twice
+ * 6. **M5: the improvement's row declares no tech this player lacks**
+ *    (`improvement-tech-required`, naming it) — the third gating dimension, stated in
+ *    this one place so the applier and `actions.ts`' worker menu cannot disagree, and
+ *    asked after the row resolves because "what does this row require?" is a question
+ *    about a row that exists;
+ * 7. the tile does not already carry it (`already-improved`) — building it twice
  *    is a typed refusal rather than a silent no-op, the reading M3 fixed for
  *    buildings;
- * 7. the worker has movement left (`not-enough-movement`, `needed: 1`) —
+ * 8. the worker has movement left (`not-enough-movement`, `needed: 1`) —
  *    affordability is checked last, as `planMove` does, so the reason reported is
  *    about the job rather than about the turn's movement whenever both are wrong.
  *
@@ -1364,6 +1537,29 @@ export const planStartWork = (
 
   const turnsLeft = workTurnsOf(improvement.turns);
   if (turnsLeft === undefined) return err({ kind: 'unknown-improvement', improvement: kind });
+
+  // M5's third gating dimension, asked of the row that declares it and of the one read
+  // of the field (`tech.ts`' `requiresTechOf`, through `resources.ts`' `unmetTechFor`).
+  // Asked *here* rather than in `actions.ts` because this function is where "may this
+  // worker build this here?" is decided — `applyCommand` refuses with it and
+  // `unitActions` advertises with it — so the generator and the applier cannot
+  // disagree about a tech-gated improvement, and a menu that greys the job out and an
+  // applier that refuses it are the same verdict rather than two careful ones.
+  //
+  // The order is the one below the terrain checks and above `already-improved`: the
+  // tech is a fact about the *row*, and the two checks before it (does the row exist,
+  // is its turn count usable) ask whether there is a row to read a requirement off at
+  // all — a row this ruleset cannot build is `unknown-improvement`, not "gated".
+  const gateTech = unmetTechFor(state, playerId, improvement);
+  if (gateTech !== undefined) {
+    return err({
+      kind: 'improvement-tech-required',
+      unitId,
+      tile,
+      improvement: kind,
+      tech: gateTech,
+    });
+  }
 
   if (!improvement.allowedRoles.includes(terrain.role)) {
     return err({
@@ -1498,6 +1694,78 @@ export const planSetRates = (
     player,
     rates: { tax: rates.tax, science: rates.science, luxury: rates.luxury },
   });
+};
+
+/** What `planSetResearch` decided: the player whose research moves, and the tech. */
+export interface SetResearchPlan {
+  readonly player: PlayerState;
+  readonly tech: TechId;
+}
+
+/**
+ * Decide whether `playerId` may research `tech` — the one place `SetResearch`'s
+ * legality is stated, called by `applyCommand` to refuse and by a UI that wants to
+ * grey out a tech in the tree before the player clicks it.
+ *
+ * Two checks, and the *research rule itself is neither of them*: the actor must exist
+ * (`unknown-player`, the same opening every command has), and then `tech.ts`'
+ * `researchProblem` must find nothing wrong — which is where "unknown to this
+ * ruleset", "already known" and "a prerequisite is missing" are decided, once, for
+ * this planner and for the turn pipeline's research step alike. The mapping below is
+ * the whole of the command layer's contribution:
+ *
+ * | `ResearchProblem`      | `GameError`                  |
+ * |------------------------|------------------------------|
+ * | `unknown-tech`         | `unknown-tech`               |
+ * | `already-known`        | `tech-already-known`         |
+ * | `unmet-prerequisite`   | `tech-prerequisites-unmet`   |
+ * | `nothing-being-researched` | *not reachable here*     |
+ *
+ * The last row is not reachable because it answers a different question: "what is this
+ * player researching?" (`currentResearch`) rather than "may it research this?". It is
+ * mapped to a compile-time impossibility instead of a `default` branch, so adding a
+ * member to `ResearchProblem` without deciding what the command layer says about it
+ * fails the typecheck rather than silently becoming `invalid-argument`.
+ *
+ * Selecting a tech the player is **already researching** is legal and changes nothing
+ * observable: like `SetRates`' idempotence, the value the player already has is a value
+ * the player may ask for, and refusing it would make a UI's "confirm" button wrong. It
+ * still costs a revision, because it is still a command.
+ *
+ * A barbarian actor is legal too, and inert — the same shape `SetRates` takes. The
+ * contract's rule is "only for the actor, only for a tech it does not already know,
+ * whose prerequisites it satisfies, and which the ruleset defines"; there is no
+ * `kind` check in it, and the pipeline skips barbarians (`applyResearch`), so their
+ * research never advances and nothing about the game changes.
+ */
+export const planSetResearch = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  tech: TechId,
+): Result<SetResearchPlan, GameError> => {
+  const player = playerById(state, playerId);
+  if (player === undefined) return err({ kind: 'unknown-player', playerId });
+
+  const problem = researchProblem(ruleset, player, tech);
+  if (problem === undefined) return ok({ player, tech });
+
+  switch (problem.kind) {
+    case 'unknown-tech':
+      return err({ kind: 'unknown-tech', tech });
+    case 'already-known':
+      return err({ kind: 'tech-already-known', tech });
+    case 'unmet-prerequisite':
+      return err({ kind: 'tech-prerequisites-unmet', tech, missing: problem.missing });
+    case 'nothing-being-researched':
+      // Unreachable: `researchProblem` answers "may this *candidate* be researched?"
+      // and never reports the state of a player's current research. Written out so
+      // that a new `ResearchProblem` member cannot slip through unmapped.
+      return err({
+        kind: 'invalid-argument',
+        detail: 'nothing-being-researched cannot block a candidate tech',
+      });
+  }
 };
 
 /**
@@ -1772,6 +2040,30 @@ export const applyCommand = (
       // record of the change (see the `GameEvent` note above).
       const players = state.players.map((player) =>
         player.id === plan.value.player.id ? { ...player, rates: plan.value.rates } : player,
+      );
+
+      return ok({ state: { ...state, revision: state.revision + 1, players }, events: [] });
+    }
+
+    case 'SetResearch': {
+      const plan = planSetResearch(state, ruleset, playerId, cmd.tech);
+      if (!plan.ok) return err(plan.error);
+
+      // M5. Only `researching` moves, and only on the actor's own row. `techs` is
+      // untouched — a tech becomes known when it *completes* (`tech.ts` appends it),
+      // never when it is selected — and the beaker pool is untouched, because
+      // choosing what to research is not progress toward it.
+      //
+      // The key is written through `tech.ts`' `withResearching`, the one writer of
+      // this field besides the pipeline's `withoutResearching`. That is what keeps
+      // "absent, never `undefined`" true by construction instead of by care: there is
+      // no `researching:` assignment anywhere in this file to get wrong.
+      //
+      // No event, on the M3 setters' precedent (see the `GameEvent` note above): the
+      // command's payload *is* the record of the change, and the `TechResearched`
+      // event belongs to the pipeline step that actually finishes a tech.
+      const players = state.players.map((player) =>
+        player.id === plan.value.player.id ? withResearching(player, plan.value.tech) : player,
       );
 
       return ok({ state: { ...state, revision: state.revision + 1, players }, events: [] });

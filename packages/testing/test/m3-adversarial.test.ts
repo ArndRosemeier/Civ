@@ -215,6 +215,11 @@ import {
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
+
 import { loadGoldens } from '../src/goldens.js';
 import { createScenarioBuilder, hashValue, type ScenarioBuilder } from '../src/index.js';
 
@@ -325,6 +330,15 @@ const cmdKey = (cmd: Command): string => {
     // prevent.
     case 'SetRates':
       return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
+    // M5, and the third planner-only setter: `SetResearch` is yielded by no generator
+    // (`actions.ts` offers no such command — selecting a tech is a setting, reached
+    // through `planSetResearch`), so this key never appears in the sweeps below. It is
+    // keyed anyway because the switch is deliberately exhaustive: an unkeyed variant
+    // would be a silently equal pair of different commands, and the key carries the
+    // tech because "research pottery" and "research bronze working" are different
+    // commands.
+    case 'SetResearch':
+      return `SetResearch ${String(cmd.tech)}`;
   }
 };
 
@@ -887,7 +901,9 @@ const deepSweep = (rec: Recorder, seeds: readonly number[], turns: number): Deep
 };
 
 describe('keystone — the generators and the applier agree, deep into a played game', () => {
-  it(
+  // Full tier: 1.55 s — the keystone property deep into a played game, which is a long run by
+  // construction. The shallower version of the same property stays in the fast tier.
+  it.skipIf(!FULL_TIER)(
     'holds after cities, production and huts exist, with settlers that can found',
     { timeout: 180_000 },
     () => {
@@ -2698,18 +2714,21 @@ const runGoldenHarness = (corrupt: boolean): GoldenHarnessRun => {
  * a persisted-shape change *and* a board change, so every hash moves for two
  * independent reasons — and M4c's takes it 5 -> 6: `GameMap.resources`, the sorted
  * sparse resource pair list `generateWorld` now fills, which is both a new hashed
- * key and a board change (placement consumes RNG draws). All four were deliberate,
- * contract-mandated rehashes regenerated through the harness's own opt-in path; the
- * M4c values below are the ones `packages/testing/goldens/state.json` now stores.
+ * key and a board change (placement consumes RNG draws). **M5's takes it 6 -> 7**:
+ * `PlayerState.techs`, required on every player row and empty for a game that has
+ * researched nothing — a pure shape change, so every hash moved for exactly one reason.
+ * All five were deliberate, contract-mandated rehashes regenerated through the
+ * harness's own opt-in path; the M5 values below are the ones
+ * `packages/testing/goldens/state.json` now stores.
  *
  * A hash that moves *without* a shape change is a semantic bug and must not be
  * re-pinned — that is the whole point of writing the digits down rather than
  * comparing the file against itself.
  */
 const PINNED_GOLDENS: readonly { readonly name: string; readonly hash: string }[] = [
-  { name: 'tiny-civs2-seed1', hash: 'b348542b99463975' },
-  { name: 'tiny-civs2-seed42', hash: '282dc8ea55459c0f' },
-  { name: 'tiny-civs2-seed1337', hash: '549641adc3c31b67' },
+  { name: 'tiny-civs2-seed1', hash: '7f8b0949114fe6f3' },
+  { name: 'tiny-civs2-seed42', hash: 'acc2e281926ead8f' },
+  { name: 'tiny-civs2-seed1337', hash: '659c0d9dd790708d' },
 ];
 
 describe('goldens — still a gate, still refusing to auto-write', () => {
@@ -2724,40 +2743,64 @@ describe('goldens — still a gate, still refusing to auto-write', () => {
 
     // M3 changed the persisted shape once, at its foundation commit, M4a changed it
     // once more (`improvements`, SCHEMA_VERSION 4), M4b changed it again (the four
-    // money fields plus M4b's starting worker, SCHEMA_VERSION 5), and M4c changed it
-    // a fourth time (`GameMap.resources`, SCHEMA_VERSION 6). All four moved every hash
-    // deliberately, through the harness's opt-in path, and each is recorded in its
-    // milestone's `rehash:` note. Nothing else may move them.
+    // money fields plus M4b's starting worker, SCHEMA_VERSION 5), M4c changed it
+    // a fourth time (`GameMap.resources`, SCHEMA_VERSION 6), and **M5 changed it a fifth
+    // time** (`PlayerState.techs`, required on every player row and empty for a fresh
+    // game, SCHEMA_VERSION 7). All five moved every hash deliberately, through the
+    // harness's own opt-in path, and each is recorded in its milestone's `rehash:` note.
+    // Nothing else may move them.
     expect(computed).toEqual(PINNED_GOLDENS.map((entry) => entry.hash));
     // Named as well as positional: a pin is only meaningful if the hash is the one
-    // the scenario the name describes produces.
-    expect(stored.entries).toEqual(PINNED_GOLDENS);
-    // And the store agrees with the build, which is the gate the harness runs.
-    expect(stored.entries.map((entry) => entry.hash)).toEqual(computed);
-  });
-
-  it('fails on a wrong hash and leaves the file on disk untouched', { timeout: 180_000 }, () => {
-    const healthy = runGoldenHarness(false);
+    // the scenario the name describes produces. M5 also added a **fourth** entry — the
+    // played golden, which this file cannot recompute (it holds no command script) and
+    // which is `golden.test.ts`'s to judge — so the file is compared as "exactly the
+    // three scenarios this file owns, plus exactly the one it does not", which is as
+    // strong as the old whole-file equality: a missing entry and a stray entry both fail.
+    expect(stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'))).toEqual(
+      PINNED_GOLDENS,
+    );
     expect(
-      healthy.status,
-      `the copied harness should pass:\n${healthy.stdout}${healthy.stderr}`,
-    ).toBe(0);
-    expect(healthy.fileUnchanged).toBe(true);
-
-    const broken = runGoldenHarness(true);
-    expect(broken.status, 'a corrupted golden did not fail the run').not.toBe(0);
-    // The failure has to be the *gate* failing, with the pair a human needs, not
-    // a crash in the copy. The "actual" half is the pinned seed-1 hash, so this
-    // checks the message names what this build really produced rather than any
-    // 16 hex characters.
-    expect(broken.stdout).toContain('golden state hashes differ');
-    expect(broken.stdout).toContain('deadbeefdeadbeef');
-    const seedOne = PINNED_GOLDENS.find((entry) => entry.name === 'tiny-civs2-seed1');
-    expect(seedOne, 'the pinned set has no seed-1 entry').toBeDefined();
-    if (seedOne !== undefined) expect(broken.stdout).toContain(seedOne.hash);
-    expect(broken.stdout).toContain('rehash: <reason>');
-    // And it did not "fix" the file for itself: a golden that rewrites itself
-    // cannot fail, and therefore cannot detect anything.
-    expect(broken.fileUnchanged, 'the golden harness rewrote the file it was checking').toBe(true);
+      stored.entries.filter((entry) => !entry.name.startsWith('tiny-civs2-')).map((e) => e.name),
+    ).toEqual(['played-civs2-seed42']);
+    // And the store agrees with the build, which is the gate the harness runs.
+    expect(
+      stored.entries
+        .filter((entry) => entry.name.startsWith('tiny-civs2-'))
+        .map((entry) => entry.hash),
+    ).toEqual(computed);
   });
+
+  // Full tier: 5.8 s, and it runs the golden harness in a *subprocess* with a corrupted hash to prove
+  // the writer refuses to auto-write. The fast tier keeps the in-process golden assertions, so a
+  // regression in the comparison still reddens the fast gate; only the subprocess refusal check defers.
+  it.skipIf(!FULL_TIER)(
+    'fails on a wrong hash and leaves the file on disk untouched',
+    { timeout: 180_000 },
+    () => {
+      const healthy = runGoldenHarness(false);
+      expect(
+        healthy.status,
+        `the copied harness should pass:\n${healthy.stdout}${healthy.stderr}`,
+      ).toBe(0);
+      expect(healthy.fileUnchanged).toBe(true);
+
+      const broken = runGoldenHarness(true);
+      expect(broken.status, 'a corrupted golden did not fail the run').not.toBe(0);
+      // The failure has to be the *gate* failing, with the pair a human needs, not
+      // a crash in the copy. The "actual" half is the pinned seed-1 hash, so this
+      // checks the message names what this build really produced rather than any
+      // 16 hex characters.
+      expect(broken.stdout).toContain('golden state hashes differ');
+      expect(broken.stdout).toContain('deadbeefdeadbeef');
+      const seedOne = PINNED_GOLDENS.find((entry) => entry.name === 'tiny-civs2-seed1');
+      expect(seedOne, 'the pinned set has no seed-1 entry').toBeDefined();
+      if (seedOne !== undefined) expect(broken.stdout).toContain(seedOne.hash);
+      expect(broken.stdout).toContain('rehash: <reason>');
+      // And it did not "fix" the file for itself: a golden that rewrites itself
+      // cannot fail, and therefore cannot detect anything.
+      expect(broken.fileUnchanged, 'the golden harness rewrote the file it was checking').toBe(
+        true,
+      );
+    },
+  );
 });

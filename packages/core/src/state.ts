@@ -28,6 +28,12 @@
  *   the game and the money loop needs no side table. Barbarians carry them too,
  *   inert, for the same reason they carry an `explored` row: one shape for every
  *   player, and `PlayerId` stays an index into `players`.
+ * - **Knowledge is state too (M5).** `techs` (a sorted, unique list) and the
+ *   optional `researching` key live on `PlayerState` for the same reason the money
+ *   fields do: research is a property of a player, it is hashed with the state, and
+ *   it survives a save without a side table. `newGame` writes `techs: []` for every
+ *   player and **omits** `researching` — absence is what "not researching" means,
+ *   never a key holding `undefined` (see `PlayerState.techs`).
  * - **Resources ride on the map, not on the state (M4c).** `newGame` stores the
  *   generated `GameMap` verbatim, so the resources `generateWorld` placed come
  *   with it — there is no second list here and nothing for setup to re-derive.
@@ -54,7 +60,14 @@ import { visibleTiles, withExplored } from './fog.js';
 // business). The import is erased, so the type-only edge cannot become a runtime
 // cycle — `improvements.ts` imports `GameState` from here the same way.
 import type { TileImprovement } from './improvements.js';
-import { asPlayerId, asTileIndex, asUnitId, type PlayerId, type TileIndex } from './ids.js';
+import {
+  asPlayerId,
+  asTileIndex,
+  asUnitId,
+  type PlayerId,
+  type TechId,
+  type TileIndex,
+} from './ids.js';
 import {
   TERRAIN_BY_ROLE,
   TERRAIN_ROLES,
@@ -103,8 +116,16 @@ import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js'
  *   so the goldens were regenerated through the harness's documented path
  *   (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a `rehash:` line
  *   (INTERFACES.md M4c, "Resources" and "Migration owners").
+ * - 7 — M5: `PlayerState` gains `techs` (the techs a player knows, sorted by id and
+ *   unique) and `researching` (the tech being researched, an **optional** key that is
+ *   absent when nothing is being researched). Additive again — two new `PlayerState`
+ *   keys, no `GameState` key and no map key — but the state's shape is still what
+ *   `canonicalize` hashes, so every golden hash moves and the version records it.
+ *   Regenerated intentionally, through the harness's documented path
+ *   (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a `rehash:` line
+ *   (INTERFACES.md M5, "Research").
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** What a player *is*: a civilization, or the barbarians. */
 export type PlayerKind = 'civ' | 'barbarian';
@@ -196,10 +217,16 @@ export interface PlayerState {
    */
   readonly rates: Rates;
   /**
-   * M4b: beakers banked so far. **Inert in M4b** — nothing spends them until M5
-   * (research) — so this number accumulates and does nothing. It is in the state
-   * rather than omitted because the split produces it every turn and a channel that
-   * silently discards its output is worse than one that visibly banks it.
+   * M4b: beakers banked so far. M4b left this **inert** — nothing spent them, so
+   * the number accumulated and did nothing — and **M5 spends it**: the research step
+   * of the turn pipeline (`tech.ts`) completes the tech being researched when this
+   * pool covers its cost, subtracting the cost and leaving the remainder in the pool.
+   *
+   * It has exactly one *writer* (the money loop's science split) and exactly one
+   * *spender* (research), which is what makes the pool unambiguous; the reading that
+   * follows from the frozen step order — research reads the pool the *previous*
+   * turn's split left, so a tech completes at the start of a turn from beakers banked
+   * at the end of the last one — is argued out in full at the top of `tech.ts`.
    */
   readonly beakers: number;
   /**
@@ -207,6 +234,43 @@ export interface PlayerState {
    * (happiness). Same reasoning as `beakers`.
    */
   readonly luxuries: number;
+  /**
+   * M5: the techs this player knows, **sorted by id (UTF-16 code-unit order) and
+   * unique** — the order is part of the contract because the list is inside every
+   * state hash, so the same knowledge written in a different order would be a
+   * different save.
+   *
+   * Required and never absent: "knows nothing" is `techs: []`, an *empty array*, the
+   * same way "no cities" is an empty `cities` list. `newGame` writes `[]` for every
+   * player, barbarians included — one shape for every row of `players`, exactly as
+   * M4b gave them all a `treasury` — even though barbarians can never research
+   * anything.
+   *
+   * Every reader goes through `tech.ts`' `knownTechs`, which normalises what it reads
+   * (so a hand-written or older save cannot present an unsorted list as canonical) and
+   * treats a missing or malformed field as "knows nothing" rather than throwing inside
+   * a legality check.
+   */
+  readonly techs: readonly TechId[];
+  /**
+   * M5: the tech this player is researching, or **an absent key** when nothing is
+   * being researched.
+   *
+   * Optional, never `ProductionItem | undefined`-style union, and the distinction is
+   * load-bearing rather than stylistic — the same argument `City.production` records:
+   * with `exactOptionalPropertyTypes` on, `researching?: TechId` makes *absence* the
+   * only way to spell "not researching", so `{ ..., researching: undefined }` is a
+   * compile error. The other spelling compiles and yields a state `hashValue` throws
+   * on, because `canonicalize` refuses `undefined` by design: a key holding `undefined`
+   * cannot survive a JSON save/load round trip, so such a state was never genuinely
+   * serialisable. That bug class has blocked hashing three times; the type is what
+   * stops a fourth.
+   *
+   * The two writers are `tech.ts`' `withResearching` (set by `SetResearch`) and
+   * `withoutResearching` (removed on completion) — one place each, so neither the
+   * command layer nor the pipeline can write `undefined` into it by accident.
+   */
+  readonly researching?: TechId;
 }
 
 export interface GameState {
@@ -559,6 +623,12 @@ export const newGame = (
     rates: DEFAULT_RATES,
     beakers: 0,
     luxuries: 0,
+    // M5: a new civilization knows no techs. `[]` rather than an absent field, for
+    // the reason `cities` and `improvements` are empty arrays: the key is part of
+    // every state hash, and "knows nothing" is a real value, not a missing one.
+    // `researching` is deliberately **not** written here: a new player is
+    // researching nothing, and that is the *absence* of the key (see `PlayerState`).
+    techs: [],
   }));
 
   // M3: barbarians are a player, appended after the civilizations, so that
@@ -588,6 +658,11 @@ export const newGame = (
     rates: DEFAULT_RATES,
     beakers: 0,
     luxuries: 0,
+    // M5: one shape for every player, barbarians included — an empty tech list they
+    // can never add to, because `applyResearch` skips them exactly as the money loop
+    // does. The field is present rather than absent for the same reason `explored`
+    // gives them a row of nothing rather than a missing row.
+    techs: [],
   };
   const players: readonly PlayerState[] = [...civs, barbarians];
 

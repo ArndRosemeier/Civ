@@ -26,13 +26,17 @@ import { canonicalize, hashValue } from '@civts/testing';
 import {
   asPlayerId,
   asResourceId,
+  asTechId,
   asTerrainId,
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  type ResourceId,
+  type TechId,
 } from '../src/ids.js';
 import { asImprovementId } from '../src/improvements.js';
 import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
+import { requiredResourceOf, requiredTechOf, unmetTechFor } from '../src/resources.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import {
   DEFAULT_RATES,
@@ -41,6 +45,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+import type { TechDef } from '../src/tech.js';
 import {
   UNIT_ROLES,
   unitById,
@@ -145,6 +150,11 @@ const player = (index: number, tile: number): PlayerState => ({
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: every player carries its known techs, and "knows nothing" is an empty list
+  // rather than an absent key. The unit kind may declare a `requiresTech` (M5's
+  // "Gating"), so the final section of this file needs a player who knows one — it
+  // builds that player from this fixture plus one change.
+  techs: [],
 });
 
 const unit = (id: number, owner: number, tile: number, movementLeft: number): Unit => ({
@@ -375,5 +385,114 @@ describe('withWork / withoutWork — a unit’s job, in M4a’s shape', () => {
       ),
     };
     expect(hashValue(advanced)).not.toBe(hashValue(board));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M5 gating — a unit row's tech, read beside its resource
+ * ------------------------------------------------------------------ */
+
+/**
+ * The M5 fixture tech rows: two **placeholder** rows of ours (the costs are arbitrary
+ * and unread — a requirement is a membership test on `player.techs`). `BRONZE` gates
+ * the row below; `UNUSED_TECH` gates nothing, which is the control the contract asks
+ * for and the reason it is in the catalog at all.
+ */
+const BRONZE = asTechId('bronze-working');
+const UNUSED_TECH = asTechId('ceremonial-burial');
+
+const TECHS: readonly TechDef[] = [
+  { id: BRONZE, name: 'Bronze Working', era: 'ancient', cost: 6, requires: [] },
+  { id: UNUSED_TECH, name: 'Ceremonial Burial', era: 'ancient', cost: 6, requires: [] },
+];
+
+/**
+ * Two gated unit rows, declared as intersections because `requiresTech` is read
+ * *structurally* (`tech.ts`' `requiresTechOf`) and `UnitDef` deliberately does not
+ * declare it: `legion` demands a tech and nothing else, `swordsman` demands a tech
+ * **and** a resource, so the two dimensions can be told apart on one row.
+ */
+const LEGION: UnitDef & { readonly requiresTech: TechId } = {
+  ...WARRIOR,
+  id: asUnitTypeId('legion'),
+  requiresTech: BRONZE,
+};
+const SWORDSMAN: UnitDef & {
+  readonly requiresTech: TechId;
+  readonly requiresResource: ResourceId;
+} = {
+  ...WARRIOR,
+  id: asUnitTypeId('swordsman'),
+  requiresTech: BRONZE,
+  requiresResource: asResourceId('iron'),
+};
+
+/** The fixture catalog plus the two gated rows, and somewhere for techs to live. */
+const TECH_RULESET: RulesetView & { readonly techs: readonly TechDef[] } = {
+  ...RULESET,
+  units: [...DEFS, LEGION, SWORDSMAN],
+  techs: TECHS,
+};
+
+describe('M5 gating — a unit row may declare a tech', () => {
+  const P0 = asPlayerId(0);
+  const legion = { kind: 'unit', id: LEGION.id } as const;
+  const swordsman = { kind: 'unit', id: SWORDSMAN.id } as const;
+
+  it('is read off the row the catalog lookup returns, and off no other', () => {
+    // The requirement is where the *lookup* says the row is: `unitDef` resolves the
+    // item, and the tech is a field of the row it returns. A view whose catalog does
+    // not define the row has no requirement to report, which is the honest answer
+    // rather than an error.
+    expect(requiredTechOf(TECH_RULESET, legion)).toBe(BRONZE);
+    expect(unitDef(TECH_RULESET, LEGION.id)).toBe(LEGION);
+    expect(
+      requiredTechOf(TECH_RULESET, { kind: 'unit', id: asUnitTypeId('nope') }),
+    ).toBeUndefined();
+    expect(requiredTechOf(RULESET, legion)).toBeUndefined();
+
+    // Every row that declares nothing is ungated — the other half of the sweep, over
+    // the rows this file's own catalog ships.
+    for (const def of TECH_RULESET.units) {
+      if (def === LEGION || def === SWORDSMAN) continue;
+      expect(requiredTechOf(TECH_RULESET, { kind: 'unit', id: def.id })).toBeUndefined();
+    }
+  });
+
+  it('keeps the tech requirement and the resource requirement apart', () => {
+    // Two fields, two reads, one row: `swordsman` demands both, `legion` only a tech.
+    expect(requiredTechOf(TECH_RULESET, swordsman)).toBe(BRONZE);
+    expect(requiredResourceOf(TECH_RULESET, swordsman)).toBe(asResourceId('iron'));
+    expect(requiredTechOf(TECH_RULESET, legion)).toBe(BRONZE);
+    expect(requiredResourceOf(TECH_RULESET, legion)).toBeUndefined();
+    expect(requiredResourceOf(TECH_RULESET, { kind: 'unit', id: WARRIOR.id })).toBeUndefined();
+
+    // A tech no row declares leaves both answers exactly where they were.
+    expect(requiredTechOf(TECH_RULESET, legion)).toBe(BRONZE);
+    expect(unmetTechFor(STATE, P0, LEGION)).toBe(BRONZE);
+  });
+
+  it('sees the tech a player knows, on the board this file already builds', () => {
+    // The fixture player knows nothing, which is what `techs: []` means…
+    expect(STATE.players[0]?.techs).toEqual([]);
+    expect(unmetTechFor(STATE, P0, LEGION)).toBe(BRONZE);
+    expect(unmetTechFor(STATE, P0, SWORDSMAN)).toBe(BRONZE);
+
+    // …and the control: one field changed, and the row is satisfied. The same board,
+    // the same rows, no other difference.
+    const knower: GameState = {
+      ...STATE,
+      players: STATE.players.map((p) => (p.id === P0 ? { ...p, techs: [BRONZE, UNUSED_TECH] } : p)),
+    };
+    expect(unmetTechFor(knower, P0, LEGION)).toBeUndefined();
+    expect(unmetTechFor(knower, P0, SWORDSMAN)).toBeUndefined();
+
+    // Knowing a tech that gates nothing satisfies nothing: the two rows are gated by
+    // `BRONZE` alone, so a player holding only the unused row is still refused.
+    const knowsUnused: GameState = {
+      ...STATE,
+      players: STATE.players.map((p) => (p.id === P0 ? { ...p, techs: [UNUSED_TECH] } : p)),
+    };
+    expect(unmetTechFor(knowsUnused, P0, LEGION)).toBe(BRONZE);
   });
 });

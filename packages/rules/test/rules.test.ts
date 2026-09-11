@@ -7,6 +7,7 @@ import {
   asBuildingId,
   asImprovementId,
   asResourceId,
+  asTechId,
   asTerrainId,
   asUnitTypeId,
   isPlaceholder,
@@ -21,15 +22,18 @@ import {
 import {
   CATALOG,
   CITED_EXAMPLE,
+  ERAS,
   IMPROVEMENT_KINDS,
   provenanceSections,
   summarizeProvenance,
   validateRuleset,
   type BuildingSpec,
   type Catalog,
+  type EraId,
   type ImprovementSpec,
   type ProvenanceSection,
   type ResourceSpec,
+  type TechSpec,
   type UnitSpec,
 } from '../src/index.js';
 
@@ -42,6 +46,8 @@ const BUILDINGS = CATALOG.buildings;
 const IMPROVEMENTS = CATALOG.improvements;
 /** The catalog's resource rows. M4c's generation places these. */
 const RESOURCES = CATALOG.resources;
+/** The catalog's tech rows. M5's research spends beakers on these. */
+const TECHS = CATALOG.techs;
 
 /**
  * The catalog with one unit row replaced. Written as a function rather than a
@@ -89,6 +95,42 @@ const withResourceRow = (id: string, patch: Partial<ResourceSpec>): Catalog => (
   ...CATALOG,
   resources: RESOURCES.map((r) => (r.id === id ? { ...r, ...patch } : r)),
 });
+
+/**
+ * The catalog with one tech row replaced — the tech counterpart of the four helpers
+ * above.
+ *
+ * `patch` is `Partial<TechSpec>`, which allows **any** `era` string and **any**
+ * `requires` list, so the unknown-era and unknown-prerequisite cases reach validation
+ * the way a JSON catalog would rather than through a cast — and the cycle cases use
+ * only ids this catalog really ships, which is *more* realistic than a fabricated
+ * one: the defect a play test cannot surface is a graph that looks perfectly normal
+ * row by row.
+ */
+const withTech = (id: string, patch: Partial<TechSpec>): Catalog => ({
+  ...CATALOG,
+  techs: TECHS.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+});
+
+/**
+ * The catalog with **two** tech rows replaced, which is what a cycle needs: one
+ * edited row cannot close a loop through a third row's edges.
+ */
+const withTechs = (patches: readonly (readonly [string, Partial<TechSpec>])[]): Catalog => ({
+  ...CATALOG,
+  techs: TECHS.map((t) => {
+    const patch = patches.find(([id]) => id === t.id);
+    return patch === undefined ? t : { ...t, ...patch[1] };
+  }),
+});
+
+/** The cycle ids a rejected catalog reported, or `undefined` if it was accepted. */
+const cycleOf = (catalog: Catalog): readonly string[] | undefined => {
+  const r = validateRuleset(catalog, 'tuned');
+  if (r.ok) return undefined;
+  const cycle = r.error.find((e) => e.kind === 'tech-cycle');
+  return cycle?.kind === 'tech-cycle' ? cycle.cycle.map(String) : undefined;
+};
 
 /**
  * The fields of one raw effect row — the shape a **JSON catalog** has, where
@@ -166,8 +208,12 @@ describe('ruleset validation', () => {
   });
 
   it('reports an empty catalog', () => {
+    // Every section spelled out, `techs` included: a `Catalog` that *omits* a
+    // section would not compile, which is the point of the field being required —
+    // "ships none" is written as `[]`, and validation rejects it like any other
+    // empty catalog.
     const r = validateRuleset(
-      { terrains: [], units: [], buildings: [], improvements: [], resources: [] },
+      { terrains: [], units: [], buildings: [], improvements: [], resources: [], techs: [] },
       'tuned',
     );
     expect(r.ok).toBe(false);
@@ -1168,6 +1214,375 @@ describe('improvement catalog', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * M5 — the tech tree
+ * ------------------------------------------------------------------ */
+
+describe('tech catalog', () => {
+  it('ships a tree, not a token row', () => {
+    // The milestone's own bar: enough techs that early choices matter, across at
+    // least two eras. Asserted as a *shape* rather than a count, so a retune that
+    // adds rows does not have to edit a number here — but a tree that collapsed to
+    // one row would fail.
+    expect(TECHS.length).toBeGreaterThanOrEqual(8);
+    const eras = new Set(TECHS.map((t) => t.era));
+    expect(eras.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it('has unique ids, a name on every row, and a cost of at least one beaker', () => {
+    const ids = TECHS.map((t) => t.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const tech of TECHS) {
+      expect(tech.name).not.toBe('');
+      expect(Number.isInteger(tech.cost)).toBe(true);
+      expect(tech.cost).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('uses only eras from the ordered vocabulary, and orders ERAS earliest first', () => {
+    // `ERAS` is the order the era check reads, so it is pinned by value: a list
+    // silently reordered would make "a tech may not sit in an earlier era than
+    // something it requires" mean something else while still passing every other
+    // test in this file.
+    expect([...ERAS]).toEqual(['ancient', 'medieval', 'industrial', 'modern']);
+    for (const tech of TECHS) {
+      expect(ERAS).toContain(tech.era);
+    }
+  });
+
+  it('never makes a tech earlier than something it requires', () => {
+    const rank = (era: EraId): number => ERAS.findIndex((known) => known === era);
+    for (const tech of TECHS) {
+      for (const required of tech.requires) {
+        const row = TECHS.find((t) => t.id === required);
+        expect(row, `${String(tech.id)} requires an unknown tech`).toBeDefined();
+        if (row === undefined) continue;
+        expect(
+          rank(tech.era),
+          `${String(tech.id)} (${tech.era}) must not precede ${String(row.id)} (${row.era})`,
+        ).toBeGreaterThanOrEqual(rank(row.era));
+      }
+    }
+  });
+
+  it('is honest about provenance: every row is a placeholder that says the value is ours', () => {
+    for (const tech of TECHS) {
+      expect(tech.provenance.kind).toBe('placeholder');
+      // The detail has to carry the claim, not just the kind: an unsourced number
+      // presented without saying so is the half-truth PLAN.md §6.2 exists to stop.
+      if (tech.provenance.kind === 'placeholder') {
+        expect(tech.provenance.note).toContain('unsourced');
+        expect(tech.provenance.note).toContain('playable');
+      }
+    }
+  });
+
+  it('refuses placeholder tech rows in cited-only mode, naming the rows', () => {
+    const r = validateRuleset(CATALOG, 'cited-only');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const techRows = r.error.filter(
+        (e) => e.kind === 'placeholder-in-cited-only' && e.catalog === 'techs',
+      );
+      expect(techRows.length).toBe(TECHS.length);
+    }
+  });
+
+  it('requires provenance by type — a spec without one does not compile', () => {
+    expectTypeOf<TechSpec['provenance']>().toEqualTypeOf<Provenance>();
+    expectTypeOf<TechSpec['era']>().toEqualTypeOf<EraId>();
+  });
+
+  it('reports an empty tech catalog the way it reports any empty catalog', () => {
+    const r = validateRuleset({ ...CATALOG, techs: [] }, 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({ kind: 'empty-catalog', catalog: 'techs' });
+    }
+  });
+
+  it('rejects a duplicate tech id', () => {
+    const r = validateRuleset({ ...CATALOG, techs: [...TECHS, ...TECHS] }, 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const dupes = r.error.filter((e) => e.kind === 'duplicate-id');
+      expect(dupes.length).toBeGreaterThan(0);
+      for (const d of dupes) expect(d.catalog).toBe('techs');
+    }
+  });
+
+  it('rejects a cost below 1, and a non-integer cost', () => {
+    const free = validateRuleset(withTech('pottery', { cost: 0 }), 'tuned');
+    expect(free.ok).toBe(false);
+    if (!free.ok) {
+      expect(free.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'techs',
+        id: asTechId('pottery'),
+        field: 'cost',
+        detail: 'must be >= 1',
+      });
+    }
+
+    const fractional = validateRuleset(withTech('pottery', { cost: 2.5 }), 'tuned');
+    expect(fractional.ok).toBe(false);
+    if (!fractional.ok) expect(fieldsOf(fractional.error)).toContain('cost');
+  });
+
+  it('rejects an unknown era, naming the eras it knows', () => {
+    const r = validateRuleset(withTech('pottery', { era: 'bronze-age' as EraId }), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const era = r.error.find((e) => e.kind === 'invalid-value' && e.field === 'era');
+      expect(era?.kind).toBe('invalid-value');
+      if (era?.kind === 'invalid-value') {
+        expect(era.id).toBe(asTechId('pottery'));
+        expect(era.detail).toContain('ancient');
+        expect(era.detail).toContain('modern');
+      }
+    }
+  });
+
+  it('rejects a requires that names a tech the catalog does not define', () => {
+    const r = validateRuleset(withTech('alphabet', { requires: [asTechId('mithril')] }), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'techs',
+        id: asTechId('alphabet'),
+        field: 'requires',
+        detail: 'names tech "mithril", which this catalog does not define',
+      });
+    }
+  });
+
+  it('rejects a tech placed in an earlier era than something it requires', () => {
+    // A row the era check exists for: `steam-power` is `modern` in the shipped tree
+    // and requires `engineering` and `banking` (both `industrial`), so moving *it* to
+    // `ancient` makes the requirement come from the future. Everything else about
+    // every row is untouched, which is what makes this a check on ordering rather
+    // than on the rows.
+    const r = validateRuleset(withTech('steam-power', { era: 'ancient' }), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const era = r.error.find((e) => e.kind === 'invalid-value' && e.field === 'era');
+      expect(era?.kind).toBe('invalid-value');
+      if (era?.kind === 'invalid-value') {
+        expect(era.catalog).toBe('techs');
+        expect(era.id).toBe(asTechId('steam-power'));
+        // The detail names both ends and the row responsible, so the refusal is
+        // actionable without a lookup.
+        expect(era.detail).toContain('ancient');
+        expect(era.detail).toContain('industrial');
+        expect(era.detail).toContain('engineering');
+      }
+    }
+  });
+
+  it('accepts a requirement in the same era — only *earlier* is wrong', () => {
+    // Both rows are `ancient`, so the requirement does not come from the future and
+    // the era check has nothing to say. Pinned from this side because the rule is
+    // "not earlier than" — an ordering relation, not "strictly later" — and a check
+    // written the other way would reject most of the shipped tree.
+    const r = validateRuleset(
+      withTech('the-wheel', { requires: [asTechId('warrior-code')] }),
+      'tuned',
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('converts validation of the shipped catalog: the tree comes back out', () => {
+    const r = validateRuleset(CATALOG, 'tuned');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // Carried through *unchanged and by identity*: the research step reads this
+      // list, and a validated ruleset that dropped or copied it would be a second
+      // answer to "what does this tech cost?".
+      expect(r.value.techs).toBe(CATALOG.techs);
+      expect(r.value.techs.length).toBe(TECHS.length);
+    }
+  });
+});
+
+describe('the tech tree is a tree', () => {
+  /** Every catalog tech id, in catalog order. */
+  const ids = TECHS.map((t) => t.id);
+
+  /** The rows a tech requires, resolved (a `requires` naming nothing is reported separately). */
+  const requiresOf = (id: string): readonly string[] =>
+    TECHS.find((t) => String(t.id) === id)?.requires.map(String) ?? [];
+
+  /**
+   * The techs reachable from the roots by repeatedly taking anything whose
+   * prerequisites are all reached — which is the exact walk a player does.
+   *
+   * Returns the reached ids **in the order the walk found them**, so a caller can
+   * also assert that the tree has real breadth (three roots, several branches)
+   * rather than one long chain that happens to cover every row.
+   */
+  const reachableFromRoots = (): readonly string[] => {
+    const reached = new Set<string>();
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const id of ids) {
+        const key = String(id);
+        if (reached.has(key)) continue;
+        if (requiresOf(key).every((required) => reached.has(required))) {
+          reached.add(key);
+          grew = true;
+        }
+      }
+    }
+    return [...reached];
+  };
+
+  it('has at least two roots, so the first research decision is a real choice', () => {
+    const roots = TECHS.filter((t) => t.requires.length === 0);
+    expect(roots.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('reaches every tech from the roots — no orphan on the tree', () => {
+    // The reachability proof the milestone asks for. `validateRuleset` already
+    // rejects a cycle and an unknown prerequisite, so what is left to prove is that
+    // the *edges* connect: a row whose prerequisites can never be met (a parent with
+    // a parent that does not exist, or a branch hanging off nothing) would leave
+    // research permanently stuck on part of the tree without any single row looking
+    // wrong.
+    const reached = reachableFromRoots();
+    expect([...reached].sort()).toEqual([...ids].sort());
+
+    // And the order the walk found them in is a *topological* order: by the time a
+    // row is reached, everything it requires was reached earlier, which is exactly
+    // what a player's research sequence has to be. A leaf (like `electricity`, the
+    // last row of the tree) is not a defect — it is the end of a branch.
+    const seen = new Set<string>();
+    for (const id of reached) {
+      for (const required of requiresOf(id)) {
+        expect(seen.has(required), `${id} was reached before its prerequisite ${required}`).toBe(
+          true,
+        );
+      }
+      seen.add(id);
+    }
+    // The tree has a top: at least one row that nothing requires, or the "tree" would
+    // be a cycle-free set of rows with no goal in it.
+    const leaves = ids.filter(
+      (id) => !ids.some((other) => requiresOf(String(other)).includes(String(id))),
+    );
+    expect(leaves.length).toBeGreaterThanOrEqual(1);
+    expect(leaves.length).toBeLessThan(ids.length);
+  });
+
+  it('is wide enough that early choices matter: several rows share a prerequisite', () => {
+    // "Early choices matter" made checkable: at least one tech of the earliest era is
+    // required by two or more *different* later rows, so choosing which branch to
+    // open with is a decision with consequences rather than a queue.
+    const early = TECHS.filter((t) => t.era === ERAS[0]);
+    const fanOut = early.filter(
+      (t) => ids.filter((other) => requiresOf(String(other)).includes(String(t.id))).length >= 2,
+    );
+    expect(fanOut.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('is a DAG: no tech requires itself, directly or through other rows', () => {
+    // The property the cycle check exists for, stated independently of the
+    // validator: walking prerequisites from every row terminates without revisiting
+    // a row on the current path.
+    const walk = (id: string, path: readonly string[]): boolean => {
+      if (path.includes(id)) return false;
+      return requiresOf(id).every((required) => walk(required, [...path, id]));
+    };
+    for (const id of ids) {
+      expect(walk(String(id), []), `${String(id)} participates in a cycle`).toBe(true);
+    }
+  });
+});
+
+describe('the tech prerequisite cycle check', () => {
+  it('accepts the shipped tree — the check is not vacuous noise', () => {
+    expect(cycleOf(CATALOG)).toBeUndefined();
+  });
+
+  it('rejects a self-loop, naming the tech twice', () => {
+    const cycle = cycleOf(withTech('pottery', { requires: [asTechId('pottery')] }));
+    expect(cycle).toEqual(['pottery', 'pottery']);
+  });
+
+  it('rejects a two-row cycle and names the loop in order', () => {
+    // The exact defect a play test cannot surface as an error: both rows look
+    // ordinary, each prerequisite exists, both costs are plausible — and the game
+    // simply never lets research past them.
+    const cycle = cycleOf(
+      withTechs([
+        ['pottery', { requires: [asTechId('alphabet')] }],
+        ['alphabet', { requires: [asTechId('pottery')] }],
+      ]),
+    );
+    expect(cycle).toBeDefined();
+    expect(cycle?.length).toBe(3);
+    expect(cycle?.[0]).toBe(cycle?.[2]);
+    expect(new Set(cycle?.slice(0, 2))).toEqual(new Set(['pottery', 'alphabet']));
+  });
+
+  it('reports the cycle as its own error kind, with the loop in the message', () => {
+    const r = validateRuleset(
+      withTechs([
+        ['pottery', { requires: [asTechId('alphabet')] }],
+        ['alphabet', { requires: [asTechId('pottery')] }],
+      ]),
+      'tuned',
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+
+    const cycle = r.error.find((e) => e.kind === 'tech-cycle');
+    expect(cycle?.kind).toBe('tech-cycle');
+    if (cycle?.kind !== 'tech-cycle') return;
+    expect(cycle.catalog).toBe('techs');
+    expect(cycle.cycle.length).toBe(3);
+    // The detail names the loop, which is what makes the refusal actionable rather
+    // than "somewhere in this catalog there is a cycle".
+    expect(cycle.detail).toContain(' -> ');
+    for (const id of cycle.cycle.slice(0, 2)) expect(cycle.detail).toContain(String(id));
+  });
+
+  it('rejects a longer cycle through several rows', () => {
+    // potter -> alphabet -> mathematics -> pottery
+    const cycle = cycleOf(
+      withTechs([
+        ['pottery', { requires: [asTechId('mathematics')] }],
+        ['alphabet', { requires: [asTechId('pottery')] }],
+        ['mathematics', { requires: [asTechId('alphabet')] }],
+      ]),
+    );
+    expect(cycle).toBeDefined();
+    expect(cycle?.length).toBe(4);
+    expect(new Set(cycle?.slice(0, 3))).toEqual(new Set(['pottery', 'alphabet', 'mathematics']));
+  });
+
+  it('is not confused by a diamond, which is a tree with two paths to one row', () => {
+    // The shape most likely to look like a cycle to a careless check: two branches
+    // that rejoin. A cycle check that flagged "already visited" instead of "on the
+    // current path" would reject this perfectly ordinary tree.
+    expect(validateRuleset(CATALOG, 'tuned').ok).toBe(true);
+    const r = validateRuleset(
+      withTech('education', { requires: [asTechId('banking'), asTechId('currency')] }),
+      'tuned',
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('does not follow a requires that names nothing when looking for a cycle', () => {
+    // An unknown prerequisite is `invalid-value`'s business, reported once against the
+    // row that named it. Claiming a *cycle* as well would be two errors for one defect,
+    // and the wrong one first.
+    const cycle = cycleOf(withTech('alphabet', { requires: [asTechId('mithril')] }));
+    expect(cycle).toBeUndefined();
+  });
+});
+
 describe('terrain role coverage', () => {
   it('accepts the full catalog: every engine role is provided', () => {
     const r = validateRuleset(CATALOG, 'tuned');
@@ -1235,14 +1650,15 @@ describe('terrain role coverage', () => {
 });
 
 describe('provenance summary', () => {
-  it('counts every row exactly once, terrain, unit, building, improvement and resource alike', () => {
+  it('counts every row exactly once, terrain, unit, building, improvement, resource and tech alike', () => {
     const s = summarizeProvenance(CATALOG);
     expect(s.total).toBe(
       CATALOG.terrains.length +
         UNITS.length +
         BUILDINGS.length +
         IMPROVEMENTS.length +
-        RESOURCES.length,
+        RESOURCES.length +
+        TECHS.length,
     );
     expect(s.cited + s.placeholder).toBe(s.total);
     // The improvement rows are counted, not merely present: the report's sections
@@ -1260,7 +1676,8 @@ describe('provenance summary', () => {
         UNITS.length +
         BUILDINGS.length +
         IMPROVEMENTS.length +
-        RESOURCES.length,
+        RESOURCES.length +
+        TECHS.length,
     );
   });
 
@@ -1284,6 +1701,7 @@ describe('provenance summary', () => {
         ...BUILDINGS.map((b) => b.id),
         ...IMPROVEMENTS.map((i) => i.id),
         ...RESOURCES.map((r) => r.id),
+        ...TECHS.map((t) => t.id),
       ]);
     });
 
@@ -1300,6 +1718,7 @@ describe('provenance summary', () => {
         'buildings',
         'improvements',
         'resources',
+        'techs',
       ]);
       expect(total).toBe(summary.total);
       expect(placeholder).toBe(summary.placeholder);
@@ -1323,6 +1742,12 @@ describe('provenance summary', () => {
       // the report forgot would show up here as a total that is too small.
       expect(sectionOf(CATALOG, 'resources')?.summary.total).toBe(RESOURCES.length);
       expect(sectionOf(CATALOG, 'resources')?.summary.placeholder).toBe(RESOURCES.length);
+      // M5's rows, same function, same renderer: the tech catalog is the sixth
+      // section. This is the assertion that would have caught the M2 F4 defect for
+      // the tree — a `Catalog` section added without a matching section here shows
+      // up as a summary that counts rows the table never lists.
+      expect(sectionOf(CATALOG, 'techs')?.summary.total).toBe(TECHS.length);
+      expect(sectionOf(CATALOG, 'techs')?.summary.placeholder).toBe(TECHS.length);
     });
 
     it('counts a cited unit row as cited, not as a missing row', () => {
@@ -1340,7 +1765,8 @@ describe('provenance summary', () => {
           UNITS.length +
           BUILDINGS.length +
           IMPROVEMENTS.length +
-          RESOURCES.length,
+          RESOURCES.length +
+          TECHS.length,
       );
       expect(summary.cited).toBe(1);
       expect(summary.placeholder).toBe(summary.total - 1);
@@ -1353,6 +1779,7 @@ describe('provenance summary', () => {
       expect(sectionOf(cited, 'buildings')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'improvements')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'resources')?.summary.cited).toBe(0);
+      expect(sectionOf(cited, 'techs')?.summary.cited).toBe(0);
     });
   });
 });

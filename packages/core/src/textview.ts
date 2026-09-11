@@ -58,10 +58,20 @@
  *   that would be a claim about a player who does not exist. God mode (no
  *   `viewer`) prints no gold at all: there is no player whose money it would be,
  *   and the no-`viewer` output stays exactly what it was before this field
- *   existed. `beakers` and `luxuries` are deliberately **not** printed here: they
- *   do nothing until M5 and M9 (INTERFACES.md M4b, "Be honest about inertness"),
- *   and a number in a header is a claim that it means something — the REPL, which
- *   can afford the sentence, is where the inertness is spelled out.
+ *   existed.
+ * - **The viewer's research is the second such field, and the sentence M4b wrote
+ *   about it is now stale** (M5). That note said `beakers` and `luxuries` were
+ *   deliberately not printed because "they do nothing until M5 and M9". Half of that
+ *   is no longer true: beakers buy tech, and the pool is spent by the research step
+ *   of the turn, so a player reading a map with no idea what their beakers are doing
+ *   is a player who cannot plan. The field is ` research=<techId> <banked>/<cost>`
+ *   when something is selected and ` research=idle banked=<n>` when nothing is, and
+ *   both figures come from `tech.ts` (`researchingOf`/`techCostOf`) — the same read
+ *   the turn pipeline spends against, so the header cannot promise a cost the engine
+ *   would not charge. **`luxuries` stays out, and for the original reason**: they
+ *   still do nothing until M9, and a header number is a claim that it means
+ *   something. The REPL, which can afford the sentence, is where that is spelled
+ *   out.
  */
 
 import type { PlayerId, ResourceId, TerrainId, UnitTypeId } from './ids.js';
@@ -75,6 +85,12 @@ import {
   type TerrainRole,
 } from './map.js';
 import { civPlayers, type GameState } from './state.js';
+// M5's two reads of the research fields (`researchingOf`, `techCostOf`), so the
+// header's `research=` field states a cost the turn pipeline will actually charge.
+// A value import of `tech.ts` rather than a second read of `PlayerState` here: the
+// key's absence-is-idle rule and the "a row with no usable cost is not a price" rule
+// each have one implementation, and this module must not grow a second.
+import { researchingOf, techCostOf } from './tech.js';
 import { unitDef, type UnitWork } from './units.js';
 
 export interface Viewport {
@@ -224,14 +240,48 @@ const stripEnd = (line: string): string => line.replace(/ +$/, '');
  * two-civilization game is simply a wrong count (INTERFACES.md M3, "State shape":
  * anything that means "how many civilizations" must use `civPlayers`).
  */
-const headerLine = (state: GameState, viewer: PlayerId | undefined): string =>
+const headerLine = (state: GameState, ruleset: RulesetView, viewer: PlayerId | undefined): string =>
   `CivTS state: seed=${String(state.seed)} turn=${String(state.turn)} ` +
   `revision=${String(state.revision)} map=${state.settings.mapSize}` +
   `(${String(state.map.width)}x${String(state.map.height)}) ` +
   `civs=${String(civPlayers(state).length)}` +
   // God mode has no viewer, so it says nothing extra: the no-`viewer` header is
   // byte-for-byte what it was before this option existed.
-  (viewer === undefined ? '' : ` viewer=${String(viewer)}${goldField(state, viewer)}`);
+  (viewer === undefined
+    ? ''
+    : ` viewer=${String(viewer)}${goldField(state, viewer)}${researchField(state, ruleset, viewer)}`);
+
+/**
+ * The viewer's research as a header field — ` research=pottery 3/5`, or
+ * ` research=idle banked=3` when nothing is selected — or `''` when the state has no
+ * player with that id, exactly as `goldField` answers for a missing player.
+ *
+ * The two figures are `tech.ts`' own reads: `researchingOf` decides what is selected
+ * (absence of the key is "idle", which is what the field says) and `techCostOf`
+ * decides the price, so a ruleset that cannot price the selected tech says so rather
+ * than printing a fraction or a 0 that would read like a free tech. Both numbers are
+ * printed with the totality guard this module uses everywhere (`Number.isInteger`), for
+ * the reason `goldField` states: an agent's primary view must not print `NaN` for a
+ * field a hand-built state or an older save happens to be missing.
+ *
+ * The id is printed raw rather than as a display name, because the id is the token the
+ * REPL's `research <techId>` command spells — the same reason the legend names
+ * resources by catalog id. God mode prints no field at all, like gold.
+ */
+const researchField = (state: GameState, ruleset: RulesetView, viewer: PlayerId): string => {
+  const player = state.players.find((candidate) => candidate.id === viewer);
+  if (player === undefined) return '';
+
+  const beakers = player.beakers;
+  const banked = Number.isInteger(beakers) ? beakers : 0;
+  const tech = researchingOf(player);
+  if (tech === undefined) return ` research=idle banked=${String(banked)}`;
+
+  const cost = techCostOf(ruleset, tech);
+  return cost === undefined
+    ? ` research=${tech} (uncosted) banked=${String(banked)}`
+    : ` research=${tech} ${String(banked)}/${String(cost)}`;
+};
 
 /**
  * The viewer's gold as a header field (` gold=10`), or `''` when the state has no
@@ -512,16 +562,17 @@ const workLine = (
  *
  * With `options.viewer`, the same geometry is drawn from that player's explored
  * row: unexplored tiles become `?` (including their start markers and their
- * huts), the legend gains `? unexplored`, the header names the viewer and — since
- * M4b — that viewer's gold:
+ * huts), the legend gains `? unexplored`, and the header names the viewer, that
+ * viewer's gold (M4b) and — since M5 — what that viewer is researching and how far
+ * the pool has come:
  *
  * ```
- * CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=10
+ * CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=10 research=idle banked=0
  * ```
  *
  * Nothing else changes, and with no `viewer` the output is exactly what it was
  * before the option existed (PLAN.md 8.1: the agent's primary eyes, in both
- * modes) — god mode has no player, so it has no gold to print.
+ * modes) — god mode has no player, so it has no gold and no research to print.
  */
 export const describe = (
   state: GameState,
@@ -626,7 +677,7 @@ export const describe = (
   const labelWidth = Math.max(String(view.y0 + view.height - 1).length, 1);
   const gutter = ' '.repeat(labelWidth + 1);
 
-  const lines: string[] = [headerLine(state, viewer), viewLine(view, map)];
+  const lines: string[] = [headerLine(state, ruleset, viewer), viewLine(view, map)];
   lines.push(stripEnd(`${gutter}|${tensRuler(view)}`));
   lines.push(stripEnd(`${gutter}|${unitsRuler(view)}`));
 

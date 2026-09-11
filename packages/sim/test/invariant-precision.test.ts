@@ -62,6 +62,10 @@ import {
   type RulesetView,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
 import {
   CORE_INVARIANTS,
   SIMPLE_POLICY,
@@ -434,69 +438,83 @@ const sweep = (options: {
 };
 
 describe('the widened bound is quiet on real play', () => {
-  it('holds across 200 seeds with the reduced bound live tens of thousands of times', () => {
-    // A different configuration from `invariants.test.ts`'s 200-seed sweep (that one is
-    // `tiny` with two civilizations; this one is `duel` with three), so the two sweeps
-    // are two experiments rather than one repeated.
-    const { results, coverage } = sweep({
-      seeds: Array.from({ length: 200 }, (_, index) => index + 1),
-      mapSize: 'duel',
-      civCount: 3,
-      maxTurns: 20,
-    });
+  // Full tier: 44.4 s. A 200-seed sweep with a deliberately reduced threshold live, which is how the
+  // bound is shown to be *load-bearing* rather than decorative. A sweep this wide cannot be in a gate
+  // anyone runs between edits, and dropping it to ten seeds would weaken the very claim it makes.
+  it.skipIf(!FULL_TIER)(
+    'holds across 200 seeds with the reduced bound live tens of thousands of times',
+    () => {
+      // A different configuration from `invariants.test.ts`'s 200-seed sweep (that one is
+      // `tiny` with two civilizations; this one is `duel` with three), so the two sweeps
+      // are two experiments rather than one repeated.
+      const { results, coverage } = sweep({
+        seeds: Array.from({ length: 200 }, (_, index) => index + 1),
+        mapSize: 'duel',
+        civCount: 3,
+        maxTurns: 20,
+      });
 
-    // Every violation of every turn of every game, by name: the false-positive net.
-    expect(
-      results.flatMap((result) => result.violations).map((violation) => violation.invariant),
-    ).toEqual([]);
-    // ...and no run was truncated, so no aggregate folded over this batch is a mean over
-    // games of different lengths (the FINDING A consequence).
-    expect(coverage.allReached).toBe(true);
+      // Every violation of every turn of every game, by name: the false-positive net.
+      expect(
+        results.flatMap((result) => result.violations).map((violation) => violation.invariant),
+      ).toEqual([]);
+      // ...and no run was truncated, so no aggregate folded over this batch is a mean over
+      // games of different lengths (the FINDING A consequence).
+      expect(coverage.allReached).toBe(true);
 
-    // Non-vacuity, in three parts: the runs really played and reported, the reduced bound
-    // was really claimed (not skipped by the exemption), and the growth-food completions
-    // the exemption exists for really happened.
-    expect(coverage.runs).toBe(200);
-    expect(coverage.metricRows).toBe(200 * 20 * 3);
-    expect(coverage.reducedCities).toBeGreaterThan(1000);
-    expect(coverage.reducedBoundChecks).toBeGreaterThan(1000);
-    expect(coverage.growthFoodCompletions).toBeGreaterThan(100);
+      // Non-vacuity, in three parts: the runs really played and reported, the reduced bound
+      // was really claimed (not skipped by the exemption), and the growth-food completions
+      // the exemption exists for really happened.
+      expect(coverage.runs).toBe(200);
+      expect(coverage.metricRows).toBe(200 * 20 * 3);
+      expect(coverage.reducedCities).toBeGreaterThan(1000);
+      expect(coverage.reducedBoundChecks).toBeGreaterThan(1000);
+      expect(coverage.growthFoodCompletions).toBeGreaterThan(100);
 
-    console.log(
-      `invariant-precision sweep: ${String(coverage.runs)} runs, ${String(coverage.metricRows)} ` +
-        `metric rows, ${String(coverage.reducedBoundChecks)} city-turns with the reduced bound live ` +
-        `(of ${String(coverage.reducedCities)} on a lowered threshold), ` +
-        `${String(coverage.growthFoodCompletions)} growth-food completions, ` +
-        `${String(coverage.shortfallLines)} shortfall lines, 0 violations`,
-    );
-  }, 600_000);
+      console.log(
+        `invariant-precision sweep: ${String(coverage.runs)} runs, ${String(coverage.metricRows)} ` +
+          `metric rows, ${String(coverage.reducedBoundChecks)} city-turns with the reduced bound live ` +
+          `(of ${String(coverage.reducedCities)} on a lowered threshold), ` +
+          `${String(coverage.growthFoodCompletions)} growth-food completions, ` +
+          `${String(coverage.shortfallLines)} shortfall lines, 0 violations`,
+      );
+    },
+    600_000,
+  );
 
-  it('holds on real turns whose owner actually reported a shortfall', () => {
-    // The clause that changed, on turns where it can bite: the same seeds run long enough
-    // that treasuries really do go short. Without this, the sweep above would be evidence
-    // about a branch the shipped play of a 20-turn tiny game never enters.
-    const { results, coverage } = sweep({
-      seeds: Array.from({ length: 12 }, (_, index) => index + 1),
-      mapSize: 'tiny',
-      civCount: 2,
-      maxTurns: 40,
-    });
+  // Full tier: 5.1 s, and it is not independently runnable — it reads the same 200-seed sweep the test
+  // above builds. Leaving it in the fast tier would run that whole sweep here instead, which is the
+  // slowest possible way to skip a test.
+  it.skipIf(!FULL_TIER)(
+    'holds on real turns whose owner actually reported a shortfall',
+    () => {
+      // The clause that changed, on turns where it can bite: the same seeds run long enough
+      // that treasuries really do go short. Without this, the sweep above would be evidence
+      // about a branch the shipped play of a 20-turn tiny game never enters.
+      const { results, coverage } = sweep({
+        seeds: Array.from({ length: 12 }, (_, index) => index + 1),
+        mapSize: 'tiny',
+        civCount: 2,
+        maxTurns: 40,
+      });
 
-    expect(
-      results.flatMap((result) => result.violations).map((violation) => violation.invariant),
-    ).toEqual([]);
-    expect(coverage.allReached).toBe(true);
+      expect(
+        results.flatMap((result) => result.violations).map((violation) => violation.invariant),
+      ).toEqual([]);
+      expect(coverage.allReached).toBe(true);
 
-    // Non-vacuity: shortfalls really happened, so the turns the old exemption muted are
-    // in this batch. A sweep with no shortfall line would prove nothing about the clause.
-    expect(coverage.shortfallLines).toBeGreaterThan(0);
-    expect(coverage.reducedBoundChecks).toBeGreaterThan(0);
+      // Non-vacuity: shortfalls really happened, so the turns the old exemption muted are
+      // in this batch. A sweep with no shortfall line would prove nothing about the clause.
+      expect(coverage.shortfallLines).toBeGreaterThan(0);
+      expect(coverage.reducedBoundChecks).toBeGreaterThan(0);
 
-    console.log(
-      `invariant-precision shortfall sweep: ${String(coverage.runs)} runs of ` +
-        `${String(40)} turns, ${String(coverage.shortfallLines)} shortfall lines, ` +
-        `${String(coverage.reducedBoundChecks)} city-turns with the reduced bound live, ` +
-        `0 violations`,
-    );
-  }, 600_000);
+      console.log(
+        `invariant-precision shortfall sweep: ${String(coverage.runs)} runs of ` +
+          `${String(40)} turns, ${String(coverage.shortfallLines)} shortfall lines, ` +
+          `${String(coverage.reducedBoundChecks)} city-turns with the reduced bound live, ` +
+          `0 violations`,
+      );
+    },
+    600_000,
+  );
 });

@@ -125,6 +125,10 @@ import {
 import { CATALOG, type TerrainSpec } from '@civts/rules';
 import { canonicalize, fnv1a64, hashValue } from '../src/index.js';
 import { goldensPath, loadGoldens } from '../src/goldens.js';
+// The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
+// they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
+// boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
+import { FULL_TIER } from '@civts/testing';
 
 /* ------------------------------------------------------------------ *
  * Shared fixtures.
@@ -462,7 +466,10 @@ describe('adversarial: determinism', () => {
     }
   });
 
-  it('a fresh node process reproduces the same hashes', () => {
+  // Full tier: determinism across a fresh node process, named by the standing requirement. The
+  // in-process half of the same claim stays in the fast tier, so a determinism regression still
+  // reddens the fast gate — it just cannot distinguish "same process" from "same everything".
+  it.skipIf(!FULL_TIER)('a fresh node process reproduces the same hashes', () => {
     // FAILS IF: generation, hashing or the ruleset adapter depends on anything
     // per-process (module instance, cwd, locale, insertion order, ambient state).
     const stdout = runFreshProcess(freshProcessScript(HASH_CASES), 120_000);
@@ -734,7 +741,9 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
     expect(hashValue(clone)).toBe(hashValue(state));
   });
 
-  it('gives distinct hashes to distinct seeds across a sweep', () => {
+  // Full tier: a seed SWEEP whose whole point is that many seeds produce many distinct hashes. A
+  // three-seed version would pass for the wrong reason, so the width is the assertion.
+  it.skipIf(!FULL_TIER)('gives distinct hashes to distinct seeds across a sweep', () => {
     // FAILS IF: the seed stops reaching the generator (all seeds one world), or
     // the digest is coarse enough to collide inside 60 samples.
     const hashes = new Set<string>();

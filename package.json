@@ -12,11 +12,12 @@
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "test": "vitest run --reporter=dot",
+    "test:full": "CIVTS_TEST_TIER=full vitest run --reporter=dot",
     "rules:provenance": "tsx packages/headless/src/cli.ts provenance",
     "map": "tsx packages/headless/src/cli.ts map",
     "play": "tsx packages/headless/src/cli.ts play",
     "verify": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test",
-    "verify:full": "pnpm verify"
+    "verify:full": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test:full"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",

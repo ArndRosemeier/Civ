@@ -299,6 +299,9 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: required, and "knows nothing" is the empty array rather than an absent key.
+  // It sits *before* the spread so a test that wants a known techs list still can.
+  techs: [],
   ...overrides,
 });
 

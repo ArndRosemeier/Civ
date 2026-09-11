@@ -63,7 +63,7 @@ import { canonicalize, hashValue } from '@civts/testing';
  * The sections, and permutations of them
  * ------------------------------------------------------------------ */
 
-type Section = 'terrains' | 'units' | 'buildings' | 'improvements' | 'resources';
+type Section = 'terrains' | 'units' | 'buildings' | 'improvements' | 'resources' | 'techs';
 
 /** Declared in the catalog's own field order, which is also the reading order below. */
 const SECTIONS: readonly Section[] = [
@@ -72,6 +72,11 @@ const SECTIONS: readonly Section[] = [
   'buildings',
   'improvements',
   'resources',
+  // M5's tech tree is the sixth catalog section, and it is a section here rather than a
+  // special case for the reason this file exists: its rows reach the validated ruleset,
+  // so their *order* is part of the identity a replay compares. Seventeen shipped rows
+  // make the three arrangements below distinct, so the non-vacuity guard holds.
+  'techs',
 ];
 
 const validated = (catalog: Catalog, label: string): Ruleset => {
@@ -186,6 +191,8 @@ const arranged = (catalog: Catalog, section: Section, order: readonly number[]):
       return { ...catalog, improvements: arrange(catalog.improvements, order) };
     case 'resources':
       return { ...catalog, resources: arrange(catalog.resources, order) };
+    case 'techs':
+      return { ...catalog, techs: arrange(catalog.techs, order) };
   }
 };
 
@@ -209,6 +216,8 @@ const rowsOf = (catalog: Catalog, section: Section): readonly unknown[] => {
       return catalog.improvements;
     case 'resources':
       return catalog.resources;
+    case 'techs':
+      return catalog.techs;
   }
 };
 
@@ -234,21 +243,29 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     expect(hashOf(CATALOG, 'the shipped catalog again')).toBe(SHIPPED_HASH);
   });
 
-  it('is e69bfbaab6d3bba4, and 0b6d39501ac57528 with resources and units reversed', () => {
+  it('is c06c522342e59cfc, and b6d9de8d3bed6ba0 with resources and units reversed', () => {
     // These two numbers are the requirement's own measured fact, and pinning them is
     // what ties the property below to the real catalog. **If this assertion fails, the
     // catalog's content or order moved**: that is either an intentional content change
     // (in which case re-measure both numbers *and* expect the golden state hashes to
     // have moved with them, which is a deliberate rehash) or an inadvertent reorder
     // (which is the bug this file exists to catch, and is not a rehash at all).
-    expect(SHIPPED_HASH).toBe('e69bfbaab6d3bba4');
+    //
+    // **They were re-measured exactly once, for M5, and both halves of that rule held.**
+    // The cause is a *content* change, not a reorder: the validated ruleset gained
+    // `techs` (sixth section, seventeen rows), so `hashValue` sees a key it did not see
+    // before. The previous pins were `e69bfbaab6d3bba4` and `0b6d39501ac57528`; the
+    // golden state hashes moved in the same wave and were rehashed through the harness's
+    // opt-in path, which is the corroboration the paragraph above asks for. No row was
+    // reordered, and the arrangement property below is asserted unchanged.
+    expect(SHIPPED_HASH).toBe('c06c522342e59cfc');
     const reversedUnits = arranged(CATALOG, 'units', reverseOrder(CATALOG.units.length));
     const reversedBoth = arranged(
       reversedUnits,
       'resources',
       reverseOrder(CATALOG.resources.length),
     );
-    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('0b6d39501ac57528');
+    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('b6d9de8d3bed6ba0');
   });
 });
 
@@ -328,7 +345,7 @@ describe('row order is part of the ruleset identity, in every catalog section', 
       expect(hashOf(one, `${section} shuffled`)).not.toBe(allHash);
     }
 
-    // Undoing every one of them returns the shipped identity: all five permutations
+    // Undoing every one of them returns the shipped identity: all six permutations
     // compose back to the shipped catalog and to nothing else.
     const undone = SECTIONS.reduce((catalog, section) => {
       const order = shuffleOrder(CATALOG[section].length, 0x2);
@@ -353,6 +370,7 @@ describe('a catalog rebuilt row for row has the shipped identity', () => {
       buildings: CATALOG.buildings.map((row) => ({ ...row })),
       improvements: CATALOG.improvements.map((row) => ({ ...row })),
       resources: CATALOG.resources.map((row) => ({ ...row })),
+      techs: CATALOG.techs.map((row) => ({ ...row })),
     };
     // Non-vacuity: the rebuild really is a different object graph.
     expect(rebuilt.terrains).not.toBe(CATALOG.terrains);

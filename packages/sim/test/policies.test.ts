@@ -59,7 +59,7 @@ import {
   type UnitId,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Catalog, type Ruleset } from '@civts/rules';
-import { canonicalize, hashValue } from '@civts/testing';
+import { FULL_TIER, canonicalize, hashValue } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -617,12 +617,22 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
     // decision this policy makes was among them, so a permutation of the *catalog*
     // could have changed one. `SetProduction` and `StartWork` are the two FINDING C
     // named as inheriting content order.
+    //
+    // `SetResearch` is M5's addition to this list and it is a *migration*, not a
+    // weakening: the policy now makes a sixth kind of decision (which tech to research
+    // — see `chooseResearch`), so the set this test demands is strictly larger than
+    // before, and the same comparison above is what proves the new decision is a
+    // function of the tech **content** rather than of the tree's row order. (The probe
+    // permutes terrains, units, buildings, improvements and resources; the tech rows
+    // are deliberately untouched by `ROW_ORDERS`, so what this pins for M5 is that a
+    // research choice does not move when the *other* catalogs do.)
     expect(comparisons).toBe(6);
     expect(sawCommands.size).toBeGreaterThan(0);
     expect([...sawCommands].sort()).toEqual([
       'FoundCity',
       'MoveUnit',
       'SetProduction',
+      'SetResearch',
       'SetWorkedTiles',
       'StartWork',
     ]);
@@ -680,7 +690,10 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
     expect(String(mustRow(byId, 0).kind)).not.toBe(String(mustRow(byKind, 0).kind));
   });
 
-  it(
+  // Full tier: 4.6 s — a tournament-style sweep of row-order permutations, the kind of batch the
+  // standing requirement moves here. It is the evidence that catalog order is not an input to a played
+  // game, and the fast tier keeps its cheap sibling (FINDING C (engine), a single reversal).
+  it.skipIf(!FULL_TIER)(
     'PLAYS THE SAME GAME — one hash, one metrics sequence — under the neutral row orders',
     { timeout: 120_000 },
     () => {

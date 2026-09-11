@@ -63,11 +63,30 @@
  *   next collection. Every number is read from the state or computed by an engine
  *   function — `playerIncome`, `playerUpkeep`, `unitSupport` — never re-derived
  *   here.
- * - **Beakers and luxuries are labelled inert, in the output, every time.** M4b
- *   banks them and nothing spends or reads them: research is M5, happiness is M9.
- *   A transcript that printed "2 beakers" beside a treasury would imply a research
- *   system that does not exist, so every economy line says out loud that they do
- *   nothing yet. That is a deliberate wart in the prose, not an oversight.
+ * - **One channel is inert, and it is named where it is printed (M5).** M4b said
+ *   out loud that *both* beakers and luxuries did nothing, because nothing read
+ *   them: research was M5 and happiness is M9. **Half of that sentence is now
+ *   false.** Beakers buy tech, so every place they are printed says what they do
+ *   and what they are banked toward; luxuries still do nothing, so
+ *   `LUXURY_CAVEAT` is quoted, unchanged and from one constant, wherever they
+ *   appear. Leaving the old wording in one of those places would be exactly the
+ *   doc drift that made M4c's growth-food hole invisible: prose asserting a limit
+ *   the engine no longer has.
+ * - **The research surface (M5) is the same arrangement once more, and the first one
+ *   with a *tree* in it.** `research <techId>` parses one word,
+ *   builds one `SetResearch` and hands it to `applyCommand`; `tech` prints the
+ *   tree — what is known, what is available now, what each costs, and for every
+ *   tech that is not available, the reason, as the engine's own typed answer
+ *   (`planSetResearch`, the same evaluator `applyCommand` refuses with). Nothing
+ *   here re-decides whether a tech may be researched, and the tree is never
+ *   filtered into a "menu of legal research" that could disagree with the
+ *   refusals: the blocked rows are printed *with* their reason, which is the
+ *   whole point of the view. The current research (tech, pool, cost, progress)
+ *   travels with the reader the way money does — a `research:` line under every
+ *   view and in the banner — because the pool is spent on the turn it is filled
+ *   and a figure the agent has to ask for is one it notices too late. That line
+ *   is `researchStep`, the pipeline's own read of the player, so a view cannot
+ *   predict a completion the pipeline would not make.
  * - **The transcript is a pure function of (state, lines, flags).** Numbers are
  *   the only variable content and they come from the state; nothing reads the
  *   clock, and the prompt/echo are written for every line whether the input
@@ -94,6 +113,7 @@ import {
   asBuildingId,
   asCityId,
   asImprovementId,
+  asTechId,
   asUnitId,
   asUnitTypeId,
   buildingCatalog,
@@ -102,6 +122,7 @@ import {
   cityById,
   cityGrowthTarget,
   cityMaintenance,
+  cityProductionOptions,
   cityRadius,
   cityYields,
   civPlayers,
@@ -117,16 +138,25 @@ import {
   isExplored,
   isWonder,
   itemCostOf,
+  knownTechs,
   maintenanceOf,
   ok,
   planFoundCity,
   planSetProduction,
   planSetRates,
+  planSetResearch,
   planSetWorkedTiles,
   planStartWork,
   playerIncome,
   playerUpkeep,
+  prerequisitesOf,
+  productionGate,
+  researchingOf,
+  researchStep,
   resourceDef,
+  techCatalog,
+  techCostOf,
+  techDef,
   terrainAtIndex,
   tileIndex,
   unitById,
@@ -135,6 +165,7 @@ import {
   unitMoveOptions,
   unitsOnTile,
   unitSupport,
+  unmetTechFor,
   visibleTiles,
   workSummary,
   type Command,
@@ -153,10 +184,14 @@ import {
   type PlayerState,
   type ProductionItem,
   type Rates,
+  type ResearchProblem,
+  type ResearchStep,
   type ResourceId,
   type Result,
   type RulesetView,
   type SetupError,
+  type TechDef,
+  type TechId,
   type TerrainDef,
   type TileIndex,
   type Unit,
@@ -217,6 +252,7 @@ Commands inside a session (also documented by "help"):
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
   work <unitId> <improve>    cancel <unitId>
   rates <tax> <science> <luxury>
+  research <techId>          tech
   end   units   state   save <path>   help   quit
 `;
 
@@ -516,21 +552,74 @@ const legalWorkLines = (context: ErrorContext): readonly string[] => {
 };
 
 /**
- * Every item `cityId` may be set to build, as `planSetProduction` answers it —
- * so an id no catalog defines and a building the city already has are excluded by
- * the engine, not by the REPL.
+ * Every item `cityId` may be set to build — **the engine's own menu**, not a list
+ * this file derived.
+ *
+ * `cityProductionOptions` is `planSetProduction` *and* `productionGate` asked once per
+ * catalog row (`actions.ts` says why: the gate is what the production pass asks when
+ * the item comes up, so a menu built without it would advertise a build the city can
+ * never finish). Asking that one function rather than repeating its conjuncts here is
+ * the point: M5 added the *tech* dimension to the gate, and a second copy of the rule
+ * in this file would have gone on offering tech-gated units as if the milestone had
+ * not happened. The same function is what the city view's own build list uses, so the
+ * lesson under a refusal and the `city` view cannot disagree either.
  */
 const buildableItems = (
   state: GameState,
   ruleset: RulesetView,
-  playerId: PlayerId,
   cityId: CityId,
-): readonly ProductionItem[] => {
-  const items: readonly ProductionItem[] = [
+): readonly ProductionItem[] => cityProductionOptions(state, ruleset, cityId);
+
+/**
+ * The items this city's owner may *not* build for want of a technology (M5), with the
+ * tech each one waits on.
+ *
+ * A reading of the **planner's own typed refusal** — `planSetProduction` returns
+ * `tech-required` naming the tech, because it asks `productionGate` — rather than a
+ * second application of the gate. That is the strongest form of the one-rule rule this
+ * file follows everywhere else: the lesson and the refusal are the same verdict, so
+ * the list cannot name a tech the engine would not name, and it cannot go on naming one
+ * after the gate opens.
+ *
+ * **Migrated when the wiring landed.** This function used to ask `productionGate`
+ * directly, because `planSetProduction` did not ask it yet: a `build` of a tech-gated
+ * item was *accepted* by the engine and the city banked shields forever, so the note was
+ * the only thing telling a player why nothing arrived. Now the applier refuses that
+ * order outright (with `tech-required`), and the note is a lesson under somebody else's
+ * refusal — "what am I *not* allowed to build here, and why".
+ */
+const techLockedItems = (
+  state: GameState,
+  ruleset: RulesetView,
+  city: City,
+): readonly { readonly item: ProductionItem; readonly tech: TechId }[] => {
+  const candidates: readonly ProductionItem[] = [
     ...unitCatalog(ruleset).map((def): ProductionItem => ({ kind: 'unit', id: def.id })),
     ...buildingCatalog(ruleset).map((def): ProductionItem => ({ kind: 'building', id: def.id })),
   ];
-  return items.filter((item) => planSetProduction(state, ruleset, playerId, cityId, item).ok);
+
+  return candidates.flatMap((item) => {
+    const planned = planSetProduction(state, ruleset, city.owner, city.id, item);
+    if (planned.ok) return [];
+    return planned.error.kind === 'tech-required' ? [{ item, tech: planned.error.tech }] : [];
+  });
+};
+
+/** The note that has to travel with a `build` the tech gate refuses (see `techLockedItems`). */
+const itemTechNote = (
+  state: GameState,
+  ruleset: RulesetView,
+  city: City | undefined,
+  item: ProductionItem,
+): string => {
+  if (city === undefined) return '';
+  const gate = productionGate(state, ruleset, city.owner, item);
+  if (gate.kind !== 'tech-required') return '';
+  return (
+    ` - NOTE: this item needs ${techLabel(ruleset, gate.tech)}, which ` +
+    `${playerLabel(state, city.owner)} has not researched, so the city will bank shields ` +
+    `and not finish it until you "research ${gate.tech}"`
+  );
 };
 
 /** An item as prose with its cost: `unit "Settler" (cost 3 shields)`. */
@@ -547,7 +636,7 @@ const legalBuildLines = (context: ErrorContext): readonly string[] => {
   const city = contextCity(context);
   if (city === undefined) return yourCitiesLines(context);
 
-  const items = buildableItems(context.state, context.ruleset, context.playerId, city.id);
+  const items = buildableItems(context.state, context.ruleset, city.id);
   // Units and buildings on their own lines: ten items on one line is a wall, and
   // the split is the same distinction `build` asks the player to spell out.
   const labels = (kind: ProductionItem['kind']): string =>
@@ -568,8 +657,26 @@ const legalBuildLines = (context: ErrorContext): readonly string[] => {
           .filter((line): line is string => line !== undefined)
           .join('; ') + '.';
 
+  // M5: what the tech gate is holding back, named one item at a time — the same
+  // `productionGate` verdict the production pass will ask, so this line cannot
+  // advertise an item as merely "later" when nothing will ever finish it.
+  const locked = techLockedItems(context.state, context.ruleset, city);
+  const lockedLines =
+    locked.length === 0
+      ? []
+      : [
+          `  legal: locked behind a tech you have not researched: ${locked
+            .map(
+              ({ item, tech }) =>
+                `${itemLabel(context.ruleset, item)} needs ${techLabel(context.ruleset, tech)} ` +
+                `("research ${tech}")`,
+            )
+            .join('; ')}.`,
+        ];
+
   return [
     `  legal: ${cityLabel(context.state, city.id)} may be set to build ${inventory}`,
+    ...lockedLines,
     `  legal: "build ${String(city.id)} unit:<id>" or "build ${String(city.id)} building:<id>".`,
   ];
 };
@@ -614,7 +721,15 @@ const legalFoundLines = (context: ErrorContext): readonly string[] => {
  */
 const startableImprovements = (context: ErrorContext, unitId: UnitId): readonly ImprovementDef[] =>
   improvementCatalog(context.ruleset).filter(
-    (def) => planStartWork(context.state, context.ruleset, context.playerId, unitId, def.id).ok,
+    (def) =>
+      planStartWork(context.state, context.ruleset, context.playerId, unitId, def.id).ok &&
+      // M5: `planStartWork` now asks the tech gate itself (`improvement-tech-required`),
+      // so this conjunct is a **no-op by construction** — it is kept as the belt to that
+      // brace, and it is deliberately the engine's own statement of the tech dimension
+      // (`unmetTechFor`) rather than a second reading here. The locked rows are not
+      // dropped silently either way: `startableLines` names every one of them, with the
+      // tech and the command that unlocks it.
+      unmetTechFor(context.state, context.playerId, def) === undefined,
   );
 
 /** What one unit could start right now, as the lesson under a refusal about it. */
@@ -622,15 +737,38 @@ const startableLines = (context: ErrorContext, unitId: UnitId | undefined): read
   if (unitId === undefined) return [];
 
   const ready = startableImprovements(context, unitId);
+  // M5: the improvements this ruleset defines but the actor cannot start *anywhere*
+  // for want of a tech, named with the command that unlocks them. `unmetTechFor` is
+  // the engine's own gate (the one `resources.ts` states for all four catalog kinds),
+  // so this line cannot invent a requirement.
+  const locked = improvementCatalog(context.ruleset).flatMap((def) => {
+    const tech = unmetTechFor(context.state, context.playerId, def);
+    return tech === undefined ? [] : [{ def, tech }];
+  });
+  const lockedLine =
+    locked.length === 0
+      ? []
+      : [
+          `  legal: locked behind a tech for you: ${locked
+            .map(
+              ({ def, tech }) =>
+                `${improvementLabel(context.ruleset, def.id)} needs ` +
+                `${techLabel(context.ruleset, tech)} ("research ${tech}")`,
+            )
+            .join('; ')}.`,
+        ];
+
   if (ready.length === 0) {
     return [
       '  legal: that unit can start no job where it stands right now: a worker must be idle,',
       '  have movement left, and stand where this ruleset allows the improvement.',
+      ...lockedLine,
     ];
   }
   return [
     `  legal: ${unitLabel(context.state, context.ruleset, unitId)} can start ` +
       `${ready.map((def) => improvementLabel(context.ruleset, def.id)).join(', ')}.`,
+    ...lockedLine,
   ];
 };
 
@@ -655,6 +793,263 @@ const legalWorkerLines = (context: ErrorContext): readonly string[] => {
       .map((unit) => unitLabel(context.state, context.ruleset, unit.id))
       .join('; ')}.`,
   ];
+};
+
+/* ------------------------------------------------------------------ *
+ * M5 - the tech tree as the reader meets it.
+ *
+ * The tree is *content*, not a menu of legal actions, so the `tech` view
+ * prints every row — known, available and blocked — and the blocked ones
+ * carry the engine's own typed reason (`planSetResearch`, the evaluator
+ * `applyCommand` refuses with). A view that showed only what may be
+ * researched today would hide the prerequisites, which is the one thing a
+ * player planning two moves ahead needs to see.
+ *
+ * The "legal:" lines under a refused `research` are built the same way as
+ * every other lesson in this file: by *asking* the engine's planner, one
+ * candidate at a time, never by restating `tech.ts`' rule here.
+ * ------------------------------------------------------------------ */
+
+/** `"Pottery" (pottery)` — the catalog's name, and the id a command spells. */
+const techLabel = (ruleset: RulesetView, id: TechId): string => {
+  const def = techDef(ruleset, id);
+  return def === undefined ? `"${id}"` : `"${def.name}" (${id})`;
+};
+
+/**
+ * `requires pottery, bronze-working`, or `no prerequisites` — a tech's own rows, in
+ * the order the ruleset states them, **by id**.
+ *
+ * Ids rather than display names because every one of them is selectable with
+ * `research <techId>` and every row of the tree already leads with its own name, so a
+ * name here would be a third spelling of the same row (the row's `name`, its `id`, and
+ * the prerequisite's `name`) with nothing added. The *reason* lines below the blocked
+ * rows spell the names out, which is where a reader needs them.
+ *
+ * `prerequisitesOf` is the engine's read of the edge, so a view cannot print a
+ * prerequisite the research rule does not enforce.
+ */
+const prerequisitesLabel = (ruleset: RulesetView, id: TechId): string => {
+  const required = prerequisitesOf(ruleset, id);
+  if (required.length === 0) return 'no prerequisites';
+  return `requires ${required.join(', ')}`;
+};
+
+/** `7 beakers`, or the honest answer for a row the engine cannot price. */
+const techPriceLabel = (ruleset: RulesetView, id: TechId): string => {
+  const cost = techCostOf(ruleset, id);
+  return cost === undefined ? 'no usable beaker cost in this ruleset' : `${String(cost)} beakers`;
+};
+
+/** `cost 7 beakers` — the same figure, in the form a candidate line wants it. */
+const techCostLabel = (ruleset: RulesetView, id: TechId): string =>
+  techCostOf(ruleset, id) === undefined
+    ? 'no usable beaker cost in this ruleset'
+    : `cost ${techPriceLabel(ruleset, id)}`;
+
+/**
+ * The techs `playerId` may start researching right now, asked of
+ * `planSetResearch` one catalog row at a time — the same evaluator the applier
+ * refuses with, so this list cannot advertise a tech the engine would reject, and
+ * it excludes a tech already known without this file having an opinion about what
+ * "known" means.
+ */
+const researchableTechs = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): readonly TechDef[] =>
+  techCatalog(ruleset).filter((def) => planSetResearch(state, ruleset, playerId, def.id).ok);
+
+/** One tech as a candidate: `"Pottery" (pottery), cost 5 beakers`. */
+const researchableLabel = (ruleset: RulesetView, id: TechId): string =>
+  `${techLabel(ruleset, id)}, ${techCostLabel(ruleset, id)}`;
+
+/**
+ * The lesson behind a refused `research`: what the actor could research instead,
+ * or — when nothing is researchable — the rule that is stopping it.
+ */
+const legalResearchLines = (context: ErrorContext): readonly string[] => {
+  const ready = researchableTechs(context.state, context.ruleset, context.playerId);
+  if (ready.length === 0) {
+    return [
+      '  legal: no tech in this ruleset can be started by you right now - every row is either',
+      '  already known to you or still waiting on its own prerequisites.',
+    ];
+  }
+  return [
+    '  legal: researchable now: ' +
+      ready.map((def) => researchableLabel(context.ruleset, def.id)).join('; ') +
+      '.',
+    '  legal: "research <techId>" chooses one; "tech" prints the whole tree, including what is',
+    '  blocked and by which prerequisite.',
+  ];
+};
+
+/**
+ * The `tech` verb: the whole tree, grouped by what it means to the actor.
+ *
+ * Three groups, and every row in exactly one of them, because that is what makes
+ * the view answer the question a player actually has — *what can I do now, and what
+ * is in my way?* The grouping is the planner's verdict (`planSetResearch`) plus the
+ * player's own `techs` list, so a row cannot appear as available here and be refused
+ * by `research` there: one evaluator, asked once per row.
+ *
+ * The reasons printed under `blocked` are the engine's own error kinds, named in the
+ * engine's own vocabulary, with the fix spelled out — "research <prerequisite>
+ * first" — rather than a second opinion about the tree.
+ */
+const techReport = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
+  const player = playerStateOf(state, playerId);
+  const catalog = techCatalog(ruleset);
+  const known = player === undefined ? [] : knownTechs(player);
+  const knownSet = new Set<string>(known);
+  const selected = player === undefined ? undefined : researchingOf(player);
+
+  const knownRows: TechDef[] = [];
+  const available: TechDef[] = [];
+  const blocked: { readonly def: TechDef; readonly reason: string }[] = [];
+
+  for (const def of catalog) {
+    if (knownSet.has(def.id)) {
+      knownRows.push(def);
+      continue;
+    }
+    const plan = planSetResearch(state, ruleset, playerId, def.id);
+    if (plan.ok) {
+      available.push(def);
+      continue;
+    }
+    blocked.push({ def, reason: researchRefusalReason(ruleset, plan.error) });
+  }
+
+  const lines: string[] = [
+    `tech: ${String(catalog.length)} tech(s) in this ruleset; ${playerLabel(state, playerId)} knows ` +
+      `${String(known.length)} of them`,
+    researchStanding(state, ruleset, playerId),
+  ];
+
+  const row = (def: TechDef): string =>
+    `  ${def.id} "${def.name}" (${def.era}, ${techPriceLabel(ruleset, def.id)}, ` +
+    `${prerequisitesLabel(ruleset, def.id)})`;
+
+  lines.push(
+    knownRows.length === 0
+      ? 'known (0): none yet - every tech in this ruleset is still ahead of you'
+      : `known (${String(knownRows.length)}):`,
+    ...knownRows.map(row),
+  );
+  lines.push(
+    available.length === 0
+      ? 'available now (0): nothing can be started right now'
+      : `available now (${String(available.length)}):`,
+    ...available.map((def) => `${row(def)}${selected === def.id ? ' <- researching' : ''}`),
+  );
+  lines.push(
+    blocked.length === 0 ? 'blocked (0): nothing' : `blocked (${String(blocked.length)}):`,
+    ...blocked.map(({ def, reason }) => `${row(def)} - ${reason}`),
+  );
+
+  return lines.join('\n');
+};
+
+/**
+ * The three ways a tech is not researchable, each as **one clause naming what the
+ * player has to act on** — shared by the tree's blocked rows and by the prose under a
+ * refused `research` line, so the two surfaces cannot describe one refusal
+ * differently. A blocked row that said only "not available" would be a refusal with
+ * the reason filed off.
+ */
+const unknownTechReason = (id: TechId): string =>
+  `this ruleset cannot research "${id}": no row defines it, or its cost is not a whole number of beakers`;
+
+const alreadyKnownReason = (ruleset: RulesetView, id: TechId): string =>
+  `you already know ${techLabel(ruleset, id)}`;
+
+const unmetPrerequisitesReason = (ruleset: RulesetView, missing: readonly TechId[]): string => {
+  const first = missing[0];
+  const fix = first === undefined ? '"tech" prints the tree' : `"research ${first}" comes first`;
+  return (
+    `needs ${missing.map((id) => techLabel(ruleset, id)).join(', ')}, which you do not ` +
+    `know yet (${fix})`
+  );
+};
+
+/**
+ * A `SetResearch` refusal, in one clause, from the engine's typed `GameError`.
+ *
+ * `planSetResearch` maps `tech.ts`' `researchProblem` onto exactly the three kinds
+ * below plus `unknown-player`, and this function is only ever handed its answer, so
+ * the final branch is unreachable: it names the error instead of inventing a lesson
+ * for it, which keeps a future member printing something true rather than throwing.
+ * Written as guards rather than a `switch` so it stays a *prose* mapper and not a
+ * second exhaustive reading of the `GameError` union (that one is `formatGameError`).
+ */
+const researchRefusalReason = (ruleset: RulesetView, error: GameError): string => {
+  if (error.kind === 'unknown-tech') return unknownTechReason(error.tech);
+  if (error.kind === 'tech-already-known') return alreadyKnownReason(ruleset, error.tech);
+  if (error.kind === 'tech-prerequisites-unmet') {
+    return unmetPrerequisitesReason(ruleset, error.missing);
+  }
+  return `refused: ${error.kind}`;
+};
+
+/** The same three situations, as `researchStep` reports them on the pipeline's behalf. */
+const researchProblemReason = (ruleset: RulesetView, problem: ResearchProblem): string => {
+  if (problem.kind === 'unknown-tech') return unknownTechReason(problem.tech);
+  if (problem.kind === 'already-known') return alreadyKnownReason(ruleset, problem.tech);
+  if (problem.kind === 'unmet-prerequisite') {
+    return unmetPrerequisitesReason(ruleset, problem.missing);
+  }
+  return 'nothing is being researched';
+};
+
+/**
+ * What the acting player is researching, in one line — **the pipeline's own read of
+ * the state** (`researchStep`), so the view and the turn agree about whether the pool
+ * covers the cost, and a completion cannot be predicted here that step 4 would not
+ * make.
+ *
+ * Every member of `ResearchStep` is a situation a reader has to be able to tell
+ * apart: nothing selected (the pool is simply banked), accumulating (`n of cost, m to
+ * go`), already affordable (the tech completes at the *start of the next turn*,
+ * because research reads the pool the last money loop filled), and stuck — a
+ * selection this ruleset cannot price, which is the one case that would otherwise
+ * look like a game that had stopped.
+ */
+const researchStanding = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
+  const step: ResearchStep = researchStep(state, ruleset, playerId);
+  const pool = playerStateOf(state, playerId)?.beakers ?? 0;
+
+  switch (step.kind) {
+    case 'nothing-being-researched':
+      return (
+        `research: nothing being researched - ${String(wholeNumber(pool))} ` +
+        `${plural(wholeNumber(pool), 'beaker')} banked ("research <techId>"; "tech" lists the tree)`
+      );
+    case 'accumulating':
+      return (
+        `research: researching ${techLabel(ruleset, step.tech)} - ${String(step.beakers)}/` +
+        `${String(step.cost)} beakers, ${String(step.needed)} to go`
+      );
+    case 'completed':
+      // `step.beakers` on this member is the remainder that *stays* in the pool, not
+      // the pool itself (`tech.ts` says so where the union is declared), so the
+      // fraction is printed from the pool and the carry-over is named separately. The
+      // first draft printed `step.beakers/cost` and read "1/5 beakers: covered", which
+      // is exactly the kind of line a reader would take for a bug.
+      return (
+        `research: researching ${techLabel(ruleset, step.tech)} - ` +
+        `${String(wholeNumber(pool))}/${String(step.cost)} beakers: the pool covers it, so the ` +
+        `next "end" completes it and carries ${String(step.beakers)} ` +
+        `${plural(step.beakers, 'beaker')} past it`
+      );
+    case 'stuck':
+      return (
+        `research: stuck on "${step.tech}" - ${researchProblemReason(ruleset, step.problem)}; ` +
+        '"research <techId>" replaces it, and "tech" prints the tree'
+      );
+  }
 };
 
 /* ------------------------------------------------------------------ *
@@ -746,6 +1141,29 @@ const buildCatalogueHint = (ruleset: RulesetView): string => {
   return `buildable here: ${[...units, ...buildings].join('; ')}`;
 };
 
+/**
+ * What a ruleset can research at all, as prose for a hint — every catalog row whose
+ * cost `techCostOf` accepts.
+ *
+ * The same evaluator `planSetResearch` gates on, so a hint under a refused `research`
+ * line cannot advertise an id the engine would refuse for the same reason it refused
+ * the one that was typed. The ids are the tokens a command spells, so they are
+ * printed as ids rather than as prose names.
+ */
+const techCatalogueHint = (ruleset: RulesetView): string => {
+  const rows = techCatalog(ruleset)
+    .filter((def) => techCostOf(ruleset, def.id) !== undefined)
+    // The price comes back out of `techCostOf` rather than off the row, so the hint
+    // and the engine's price cannot drift (`tech.ts` is the one place a row's cost
+    // becomes a *chargeable* number, and a row could carry one this rejects).
+    .map((def) => `"${def.id}" (${techPriceLabel(ruleset, def.id)})`);
+
+  if (rows.length === 0) {
+    return 'this ruleset ships no researchable tech: its tech catalog is empty or unpriced';
+  }
+  return `researchable in this ruleset: ${rows.join('; ')}`;
+};
+
 /* ------------------------------------------------------------------ *
  * M4b - the economy, as the reader sees it.
  *
@@ -760,10 +1178,14 @@ const buildCatalogueHint = (ruleset: RulesetView): string => {
  * about what a player earns or owes. Nothing here is a rule; it is all
  * rendering.
  *
- * `beakers` and `luxuries` are printed with the sentence that they DO NOTHING
- * yet, every single time. That is not padding: M4b banks them and nothing reads
- * them (research is M5, happiness is M9), and a bare "2 beakers" beside a
- * treasury would imply a research system the engine does not have.
+ * `beakers` and `luxuries` are printed with an honest sentence every single
+ * time, and as of M5 the two sentences are **different**, because the two channels
+ * are no longer the same thing. Beakers buy tech (`tech.ts`), so they are printed
+ * with what they are banked toward and how far the pool is from the cost; luxuries
+ * still do nothing (happiness is M9), so `LUXURY_CAVEAT` is quoted in full wherever
+ * they appear. Leaving the M4b sentence — "beakers and luxuries DO NOTHING yet" — on
+ * a beaker line would be a lie the engine's own turn pipeline contradicts, and a
+ * stale claim in the output is how a real hole stays invisible.
  * ------------------------------------------------------------------ */
 
 /**
@@ -783,13 +1205,27 @@ const playerStateOf = (state: GameState, id: PlayerId): PlayerState | undefined 
   state.players.find((player) => player.id === id);
 
 /**
- * The sentence that has to travel with the two inert channels, quoted in full
- * wherever they are printed (M4b, "Be honest about inertness"). One constant so
- * that "beakers do nothing" cannot be said in one place and quietly dropped in
- * another.
+ * The sentence that has to travel with the one inert channel, quoted in full
+ * wherever luxuries are printed.
+ *
+ * M4b wrote one constant for *two* inert pools ("beakers and luxuries DO NOTHING
+ * yet"). M5 made half of that sentence false — beakers now buy tech — so the
+ * constant was split rather than edited: this half is still exactly true (happiness
+ * is M9, and nothing reads `luxuries`), and the beaker half is now
+ * `researchStanding`'s job, because what beakers do depends on what the player has
+ * selected. One constant per claim, so the next milestone cannot leave a stale half
+ * behind in one of the five places it is printed.
  */
-const INERT_CHANNELS =
-  'beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)';
+const LUXURY_CAVEAT = 'luxuries DO NOTHING yet: nothing reads them until M9 (happiness)';
+
+/**
+ * What the science share of commerce does, for a line that has just printed a
+ * beaker figure and cannot show the running total (`IncomeCollected` is per player
+ * per turn; the standing line is elsewhere).
+ */
+const BEAKER_RULE =
+  'beakers now buy tech: they are banked toward the tech you selected and spent on the ' +
+  'turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree)';
 
 /** `tax 6 / science 4 / luxury 0 (sum 10 of 10)` — the split, spelled out. */
 const ratesLabel = (rates: Rates): string => {
@@ -840,7 +1276,7 @@ const economyLine = (state: GameState, playerId: PlayerId): string => {
         wholeNumber(player.rates.science) +
         wholeNumber(player.rates.luxury),
     )} of ${String(RATE_TOTAL)}), ${String(wholeNumber(player.beakers))} beakers, ` +
-    `${String(wholeNumber(player.luxuries))} luxuries - ${INERT_CHANNELS}\n` +
+    `${String(wholeNumber(player.luxuries))} luxuries - ${LUXURY_CAVEAT}\n` +
     `  ${String(support.units)} unit(s) against ${String(support.free)} supported free ` +
     `(${String(support.supported)} billable at ${String(support.gold)} gold); upkeep is what empties a treasury\n`
   );
@@ -857,10 +1293,11 @@ const economyLine = (state: GameState, playerId: PlayerId): string => {
  * unit's support before the bill is drawn. Saying "a projection from this state"
  * is the precise claim; saying "you will collect 4 gold" would not be.
  *
- * Beakers and luxuries are shown as accumulated pools *and* as a per-turn flow,
- * each with the inertness sentence, because those are the two ways a reader could
- * mistake them for a system: "I have 12 beakers" and "I earn 2 a turn" both sound
- * like research.
+ * Beakers are shown as a pool *and* as a per-turn flow, and the standing research
+ * line is printed under them, because those are the three claims a reader could
+ * confuse: "I have 12 beakers", "I earn 2 a turn" and "the tech I selected costs 7"
+ * are different facts about one system. Luxuries keep M4b's sentence verbatim,
+ * because for them it is still exactly true.
  */
 const economyDetailLines = (
   state: GameState,
@@ -880,9 +1317,10 @@ const economyDetailLines = (
   return [
     `economy: ${String(wholeNumber(player.treasury))} gold, rates ${ratesLabel(player.rates)}, ` +
       `${String(wholeNumber(player.beakers))} beakers, ${String(wholeNumber(player.luxuries))} luxuries`,
-    `  ${INERT_CHANNELS} - they only pile up, and nothing in this build spends or reads them.`,
-    `  gold is the only channel that acts today: it pays upkeep, and a treasury that cannot pay`,
-    `  is paid for by disbanding units (highest id first) rather than by going negative.`,
+    `  ${BEAKER_RULE}.`,
+    `  ${LUXURY_CAVEAT}: they only pile up, and this build neither spends nor reads them.`,
+    `  gold pays upkeep, and a treasury that cannot pay is paid for by disbanding units`,
+    `  (highest id first) rather than by going negative.`,
     `economy: at these rates this state collects ${String(income.gold)} gold, ` +
       `${String(income.beakers)} ${plural(income.beakers, 'beaker')} and ` +
       `${String(income.luxuries)} ${plural(income.luxuries, 'luxury', 'luxuries')} a turn`,
@@ -890,6 +1328,7 @@ const economyDetailLines = (
       `gold of upkeep (${String(upkeep.maintenance)} maintenance + ${String(upkeep.unitSupport)} ` +
       `unit support for ${String(support.units)} unit(s), ${String(support.free)} free)`,
     `  - a projection from this state, because growth and production run before the bill is drawn.`,
+    researchStanding(state, ruleset, playerId),
   ];
 };
 
@@ -907,7 +1346,8 @@ const bannerEconomyLines = (state: GameState, playerId: PlayerId): string => {
   return (
     `economy: ${poolsOf(player)}, rates ${ratesLabel(player.rates)}, ` +
     `${String(cities)} ${plural(cities, 'city', 'cities')}\n` +
-    `  ${INERT_CHANNELS}.\n` +
+    `  ${BEAKER_RULE}.\n` +
+    `  ${LUXURY_CAVEAT}.\n` +
     `  "rates <tax> <science> <luxury>" moves the sliders (they must sum to ` +
     `${String(RATE_TOTAL)}); gold pays upkeep, and a treasury that cannot pay disbands units.\n`
   );
@@ -1137,6 +1577,32 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         ...legalBuildLines(context),
       ].join('\n');
 
+    case 'tech-required':
+      // M5's third gating dimension, and the same shape of sentence as
+      // `resource-not-connected`: the item is real and settable once the technology is
+      // known, so the answer is "research Iron Working", not "pick something else".
+      // The tech is named by name *and* id, with the command that gets it, because a
+      // refusal a player cannot act on is a dead end.
+      //
+      // This is the applier's own typed refusal (`planSetProduction` asks
+      // `productionGate`), so the line and the menu cannot disagree — and the
+      // "locked behind a tech" note in the build lesson below is now a *reading of this
+      // same refusal* rather than a report about a build the engine used to accept.
+      return [
+        `error: tech-required - ${cityLabel(context.state, error.cityId)} cannot build ` +
+          `${itemLabel(context.ruleset, error.item)}: it requires ` +
+          `${techLabel(context.ruleset, error.tech)}, which ${playerLabel(
+            context.state,
+            error.owner,
+          )} has not researched.`,
+        `  to get there: "research ${error.tech}" (${techPriceLabel(
+          context.ruleset,
+          error.tech,
+        )}). Beakers are split from commerce by the rates, so a city with commerce and a`,
+        '  science rate banks the beakers that buy it.',
+        ...legalBuildLines(context),
+      ].join('\n');
+
     case 'wonder-already-built': {
       // `holder` is **absent** (never a key holding `undefined`) for a state the
       // rule cannot produce, where the lookup found no holder at all. Saying "the
@@ -1218,6 +1684,28 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         `  whole number of at least 1. ${improvementCatalogueHint(context.ruleset)}.`,
       ].join('\n');
 
+    case 'improvement-tech-required':
+      // M5's gate on the worker path, and the same sentence shape as the production
+      // one above: the improvement is real and startable once the technology is known
+      // (`planStartWork` asks `unmetTechFor`, so this is the applier's own typed
+      // refusal), so the answer names the tech and the command that gets it.
+      return [
+        `error: improvement-tech-required - ${unitLabel(
+          context.state,
+          context.ruleset,
+          error.unitId,
+        )} cannot start ${improvementLabel(context.ruleset, error.improvement)}: it requires ` +
+          `${techLabel(context.ruleset, error.tech)}, which ${playerLabel(
+            context.state,
+            context.playerId,
+          )} has not researched.`,
+        `  to get there: "research ${error.tech}" (${techPriceLabel(
+          context.ruleset,
+          error.tech,
+        )}).`,
+        ...startableLines(context, error.unitId),
+      ].join('\n');
+
     case 'improvement-not-allowed': {
       const terrain = terrainDefAt(context.state, context.ruleset, error.tile);
       const what =
@@ -1244,6 +1732,41 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         '  building it twice is refused rather than quietly ignored: the tile keeps what it',
         '  has, and the worker keeps the turns it would have spent.',
         ...startableLines(context, context.unitId),
+      ].join('\n');
+
+    /* ---------------- M5: research and the tech tree ---------------- */
+
+    case 'unknown-tech':
+      return [
+        `error: unknown-tech - this ruleset has no researchable tech "${error.tech}": no tech row`,
+        '  carries that id, or the row that does carries no whole number of beakers to charge.',
+        `  ${techCatalogueHint(context.ruleset)}.`,
+        ...legalResearchLines(context),
+      ].join('\n');
+
+    case 'tech-already-known':
+      return [
+        `error: tech-already-known - ${playerLabel(context.state, context.playerId)} already knows`,
+        `  ${techLabel(context.ruleset, error.tech)}, so there is nothing to research.`,
+        ...legalResearchLines(context),
+      ].join('\n');
+
+    case 'tech-prerequisites-unmet':
+      return [
+        `error: tech-prerequisites-unmet - ${techLabel(context.ruleset, error.tech)} needs ` +
+          `${error.missing.map((id) => techLabel(context.ruleset, id)).join(', ')}, which ` +
+          `${playerLabel(context.state, context.playerId)} does not know yet.`,
+        `  it costs ${techPriceLabel(context.ruleset, error.tech)}, and a prerequisite is known`,
+        '  only once its own research completes, so the tree is climbed from the roots.',
+        ...error.missing.map(
+          (id) =>
+            `  to get there: "research ${id}" (${techPriceLabel(context.ruleset, id)}${
+              prerequisitesOf(context.ruleset, id).length === 0
+                ? ''
+                : `, but only once ${prerequisitesOf(context.ruleset, id).join(', ')} is known`
+            }).`,
+        ),
+        ...legalResearchLines(context),
       ].join('\n');
   }
 };
@@ -1396,7 +1919,11 @@ const cityDetailText = (state: GameState, ruleset: RulesetView, city: City): str
     lines.push(
       `  shields ${String(city.shields)}; building ${itemLabel(ruleset, item)} ` +
         `(cost ${cost === undefined ? '? (unpriceable)' : String(cost)}; ` +
-        `${cost === undefined ? '?' : String(Math.max(0, cost - city.shields))} more to go)`,
+        `${cost === undefined ? '?' : String(Math.max(0, cost - city.shields))} more to go)` +
+        // M5: an item the tech gate refuses is shown as the item it is *and* as the
+        // reason it will not finish. Without this the view would report a build in
+        // progress that the production pass is going to skip forever.
+        itemTechNote(state, ruleset, city, item),
     );
   }
 
@@ -1563,7 +2090,7 @@ export const COMMAND_SUMMARY =
   'move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | ' +
   'work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | ' +
   'work <unitId> <improvementId> | cancel <unitId> | ' +
-  'rates <tax> <science> <luxury> | ' +
+  'rates <tax> <science> <luxury> | research <techId> | tech | ' +
   'end | units | state | save <path> | help | quit';
 
 const HELP = `commands:
@@ -1603,20 +2130,31 @@ const HELP = `commands:
                           of ours): that many tenths of every city's commerce go to gold,
                           beakers and luxuries, and the remainder of each division goes to
                           gold. It changes FUTURE collections only - nothing already banked
-                          is recomputed. BE WARNED: beakers and luxuries DO NOTHING yet.
-                          Research is M5 and happiness is M9, so those two channels only pile
-                          up; gold is the one that acts, because it pays upkeep.
+                          is recomputed. Beakers buy tech (see "research"); LUXURIES DO
+                          NOTHING yet, because happiness is M9, so that one channel only
+                          piles up. Gold pays upkeep.
+  research <techId>       choose what to research. <techId> is a tech id ("tech" lists
+                          them). A tech may be chosen when this ruleset defines it, you do
+                          not already know it, and you know all of its prerequisites; a
+                          refusal names which of those is missing and what you may research
+                          instead. Beakers collected from your science rate are banked and
+                          spent by the research step of "end", so a tech completes on the
+                          turn the pool covers its cost and the remainder is carried.
+  tech                    print the tech tree: every tech this ruleset defines, its era, its
+                          cost in beakers and its prerequisites, grouped into what you know,
+                          what you may research now, and what is blocked - each blocked row
+                          naming the prerequisite that is missing.
   end                     end the turn: every unit's work advances, every city grows and
-                          produces, every player collects income and pays upkeep (a
-                          treasury that cannot pay disbands units), every unit refills its
-                          movement, turn advances. An improvement finished this turn counts
-                          towards this turn, and a unit produced this turn costs support
-                          from this turn.
+                          produces, research advances, every player collects income and pays
+                          upkeep (a treasury that cannot pay disbands units), every unit
+                          refills its movement, turn advances. An improvement finished this
+                          turn counts towards this turn, and a unit produced this turn costs
+                          support from this turn.
   units                   list the units you can see, with position, movement left and
                           what each one is doing.
   state                   print seed, turn, revision, map size, RNG, your gold, rates,
-                          beakers and luxuries, what your units are doing and the state
-                          hash.
+                          beakers and luxuries, your research, what your units are doing and
+                          the state hash.
   save <path>             write the state to <path> as canonical JSON (parent
                           directories are created).
   help                    print this text.
@@ -1630,8 +2168,10 @@ notes:
     the "cities:" line under it, and a unit in the middle of a job is named on the
     "work:" line under that.
   - the "economy:" line printed under every view is your own money: gold, the three rates
-    and the two pools that do nothing yet. Your gold is also in the header of every view,
-    as "gold=" beside "viewer=".
+    and the beakers you have banked; the "research:" line under it says what those beakers
+    are banked toward, its cost and how much is still to come. Luxuries still do nothing
+    (happiness is M9). Your gold is also in the header of every view, as "gold=" beside
+    "viewer=".
   - a refused command prints the typed reason and the choices that were legal, and never
     changes the state.
   - every command goes through the engine's command API; the REPL never edits state.
@@ -1639,7 +2179,12 @@ notes:
 
 const promptFor = (playerId: PlayerId): string => `p${String(playerId)}> `;
 
-const bannerText = (state: GameState, playerId: PlayerId, god: boolean): string =>
+const bannerText = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  god: boolean,
+): string =>
   `CivTS play - seed ${String(state.seed)}, ${state.settings.mapSize} map ` +
   `${String(state.map.width)}x${String(state.map.height)}, ` +
   // `civPlayers`, never `players.length`: M3 appends the barbarian player, so the
@@ -1654,6 +2199,9 @@ const bannerText = (state: GameState, playerId: PlayerId, god: boolean): string 
   // session that never mentions the treasury is a session whose player finds out
   // what upkeep costs by being bankrupted by it.
   bannerEconomyLines(state, playerId) +
+  // M5: what you are researching (nothing, at the start of a game) and how to
+  // change it, stated once before the first command for the same reason.
+  `${researchStanding(state, ruleset, playerId)}\n` +
   `commands: ${COMMAND_SUMMARY}\n\n`;
 
 /**
@@ -1694,7 +2242,12 @@ const idList = (ids: readonly UnitId[]): string =>
  * is the only place events become prose, so a caller that wants them as data
  * reads `CommandOutcome.events` instead.
  */
-const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: RulesetView): string => {
+const outcomeText = (
+  outcome: CommandOutcome,
+  command: Command,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): string => {
   const lines = outcome.events.map((event): string => {
     switch (event.type) {
       case 'UnitMoved':
@@ -1802,15 +2355,29 @@ const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: Ruleset
       // accounted for — and a ledger with a suppressed line in it can only be
       // guessed at. So these lines say their zero out loud rather than vanishing.
       //
-      // `beakers`/`luxuries` carry the inertness sentence here too: this is the
-      // line a reader meets every single turn, and "collected 2 beakers" with no
-      // caveat is exactly the implication M4b's provenance rule forbids.
+      // `beakers`/`luxuries` carry their own sentence here too: this is the line a
+      // reader meets every single turn, and "collected 2 beakers" with no caveat is
+      // exactly the implication M4b's honesty rule forbids. Since M5 the two
+      // sentences differ, because the two channels do: beakers are read by the
+      // research step and luxuries by nothing at all.
       case 'IncomeCollected':
         return (
           `ok: ${playerLabel(outcome.state, event.playerId)} collected ${String(event.gold)} gold, ` +
           `${String(event.beakers)} ${plural(event.beakers, 'beaker')} and ` +
           `${String(event.luxuries)} ${plural(event.luxuries, 'luxury', 'luxuries')} from its ` +
-          `cities at its rates - ${INERT_CHANNELS}`
+          `cities at its rates - ${BEAKER_RULE}; ${LUXURY_CAVEAT}`
+        );
+
+      // M5: the one event that spends the pool. It carries the price and the
+      // remainder, so the line can state the carry-over rule from the event alone
+      // (`tech.ts` puts both on the payload for exactly this reason) and name the
+      // tech through the *ruleset*, never through the id.
+      case 'TechResearched':
+        return (
+          `ok: ${playerLabel(outcome.state, event.playerId)} finished researching ` +
+          `${techLabel(ruleset, event.tech)} for ${String(event.cost)} ` +
+          `${plural(event.cost, 'beaker')}; ${String(event.beakers)} ` +
+          `${plural(event.beakers, 'beaker')} left in the pool`
         );
 
       case 'UpkeepPaid':
@@ -1857,7 +2424,7 @@ const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: Ruleset
   // Rendering the command that was applied is therefore the only honest report of
   // what happened — otherwise the session would answer a `build` with nothing but
   // "revision 5", and the player would have to guess whether it took.
-  const effect = appliedCommandText(command, outcome, ruleset);
+  const effect = appliedCommandText(command, outcome, ruleset, playerId);
   const all = effect === undefined ? lines : [...lines, effect];
 
   const revision = `revision ${String(outcome.state.revision)}`;
@@ -1874,6 +2441,7 @@ const appliedCommandText = (
   command: Command,
   outcome: CommandOutcome,
   ruleset: RulesetView,
+  playerId: PlayerId,
 ): string | undefined => {
   switch (command.type) {
     case 'MoveUnit':
@@ -1914,7 +2482,15 @@ const appliedCommandText = (
       const stored = city === undefined ? 0 : city.shields;
       return (
         `ok: ${cityLabel(outcome.state, command.cityId)} production set to ` +
-        `${pricedItemLabel(ruleset, command.item)}; ${String(stored)} shields stored`
+        `${pricedItemLabel(ruleset, command.item)}; ${String(stored)} shields stored` +
+        // M5's third gate, reported rather than silently obeyed. `planSetProduction`
+        // does not ask the tech gate *yet* (the wiring is owed in `resources.ts` and
+        // named there), so an acceptance here is possible for an item
+        // `productionGate` refuses — and the city would then bank shields forever
+        // without a word about why. The note is the gate's own verdict, not a second
+        // legality rule: the REPL never refuses this command, it says what will
+        // happen to it.
+        itemTechNote(outcome.state, ruleset, city, command.item)
       );
     }
 
@@ -1930,6 +2506,23 @@ const appliedCommandText = (
         'the treasury and the two pools are exactly what they were, and no turn already' +
         ' collected is recomputed'
       );
+
+    // M5: `SetResearch` emits no event (the same reading as the three setters above —
+    // the payload *is* the record), so the report has to say what was chosen, what it
+    // costs and where the pool stands. The figures are read from the state the command
+    // produced, so the line cannot disagree with the pool the next `end` will spend.
+    case 'SetResearch': {
+      const banked = wholeNumber(playerStateOf(outcome.state, playerId)?.beakers ?? 0);
+      const cost = techCostOf(ruleset, command.tech);
+      const toGo = cost === undefined ? undefined : Math.max(0, cost - banked);
+      return (
+        `ok: ${playerLabel(outcome.state, playerId)} is now researching ` +
+        `${techLabel(ruleset, command.tech)} - ${techCostLabel(ruleset, command.tech)}, ` +
+        `${String(banked)} banked` +
+        (toGo === undefined ? '' : `, ${String(toGo)} to go`) +
+        '; "end" spends the pool, so it completes on the turn the pool covers the cost'
+      );
+    }
   }
 
   // Reached only when every member above was handled, which is what makes the tail
@@ -2045,6 +2638,13 @@ export const createSession = (options: SessionOptions): ReplSession => {
     // things a command was probably about, and it is one line: the detail is a
     // `state` away.
     write(economyLine(state, playerId));
+    // M5: research, beside the economy, for the same reason and with the same
+    // arrival time. The pool is spent on the `end` that fills it, and a tech can
+    // complete on a turn the player did not ask about it — so the running total, the
+    // cost and the remainder are printed rather than offered. The line is
+    // `researchStep`'s, the pipeline's own read, so it cannot predict a completion
+    // the turn would not make.
+    write(`${researchStanding(state, ruleset, playerId)}\n`);
   };
 
   const malformed = (detail: string, hint: string): LineOutcome => {
@@ -2137,6 +2737,27 @@ export const createSession = (options: SessionOptions): ReplSession => {
             )
             .join('  ');
 
+    // M5: what this player knows and what the tree offers next, in the state view.
+    // Three lines at most, and each one is an engine read: the known ids are
+    // `knownTechs` (canonical order, the same list the save's hash covers) and the
+    // counts are `planSetResearch`'s verdicts, so "3 available, 12 blocked" cannot
+    // disagree with what a `research` line would accept. The whole tree, with costs
+    // and prerequisites, is the `tech` verb's job — this is the summary a player
+    // wants beside the ledger.
+    const me = playerStateOf(state, playerId);
+    const known = me === undefined ? [] : knownTechs(me);
+    const catalog = techCatalog(ruleset);
+    const available = catalog.filter(
+      (def) => planSetResearch(state, ruleset, playerId, def.id).ok,
+    ).length;
+    const techLines = [
+      `tech: ${String(known.length)}/${String(catalog.length)} known` +
+        (known.length === 0 ? ' (none yet)' : `: ${known.join(', ')}`),
+      `tech: ${String(available)} researchable now, ` +
+        `${String(Math.max(0, catalog.length - known.length - available))} blocked; ` +
+        '"tech" prints the tree with costs and prerequisites',
+    ];
+
     return (
       [
         `state: seed=${String(state.seed)} turn=${String(state.turn)} ` +
@@ -2148,6 +2769,9 @@ export const createSession = (options: SessionOptions): ReplSession => {
         // answered by the engine's own evaluators rather than by a second reading
         // of the economy rules here.
         ...economyDetailLines(state, ruleset, playerId),
+        // M5: research, directly under the ledger it is paid from, because the pool
+        // on the economy line and the cost on these lines are the same story.
+        ...techLines,
         `you: ${String(mine)} unit(s), explored ${String(explored)}/${String(size)} tiles, ` +
           `${String(seeing)} visible right now`,
         `jobs: ${jobs}`,
@@ -2197,7 +2821,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
     }
 
     state = result.value.state;
-    write(`${outcomeText(result.value, command, ruleset)}\n`);
+    write(`${outcomeText(result.value, command, ruleset, playerId)}\n`);
     return { kind: 'applied', command, outcome: result.value };
   };
 
@@ -2476,6 +3100,45 @@ export const createSession = (options: SessionOptions): ReplSession => {
         return applied({ type: 'SetRates', rates: { tax, science, luxury } });
       }
 
+      /* ---------------- M5: research ---------------- */
+
+      case 'research': {
+        if (args.length !== 1) {
+          return malformed(
+            `"research" needs 1 argument: research <techId> (got ${String(args.length)})`,
+            'example: research pottery  ("tech" lists every tech id, its cost and whether you ' +
+              'may start it)',
+          );
+        }
+        const tech = args[0] ?? '';
+        if (tech === '') {
+          return malformed(
+            '"research" needs a tech id',
+            'example: research pottery  ("tech" lists every tech id)',
+          );
+        }
+
+        // The id is handed to the engine exactly as typed, in whatever case, and
+        // without being checked against the catalog first: "is this a tech I may
+        // research?" is `tech.ts`' `researchProblem`, reached through
+        // `planSetResearch`, and the refusal below is the engine's own typed answer
+        // (`unknown-tech`, `tech-already-known`, `tech-prerequisites-unmet`). A
+        // lookup here would be this file's second opinion about the tree — and the
+        // very thing the `tech` view exists to render instead.
+        return applied({ type: 'SetResearch', tech: asTechId(tech) });
+      }
+
+      case 'tech': {
+        if (args.length > 0) {
+          return malformed(
+            `"tech" takes no arguments (got "${args.join(' ')}") - it prints the whole tree`,
+            'usage: tech  (then "research <techId>" chooses one)',
+          );
+        }
+        write(`${techReport(state, ruleset, playerId)}\n`);
+        return { kind: 'inspected', command: word };
+      }
+
       case 'move': {
         if (args.length !== 3) {
           return malformed(
@@ -2531,7 +3194,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
     }
   };
 
-  write(bannerText(state, playerId, god));
+  write(bannerText(state, ruleset, playerId, god));
   view();
 
   return {

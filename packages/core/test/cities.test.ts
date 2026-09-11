@@ -212,6 +212,10 @@ const player = (index: number, tile: number, kind: 'civ' | 'barbarian' = 'civ'):
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: knowledge is a required field on `PlayerState` — "knows nothing" is an empty
+  // array, never an absent key — so a hand-built player literal states it, barbarians
+  // included: they can never research, and the empty list is what says so.
+  techs: [],
 });
 
 const at = (x: number, y: number): number => tileIndex(WIDTH, x, y);

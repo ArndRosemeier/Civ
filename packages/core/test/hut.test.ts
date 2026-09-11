@@ -169,6 +169,9 @@ const civ = (id: number, tile: number): PlayerState => ({
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: knowledge is required on every player row, and a hand-built literal says
+  // "knows nothing" with an empty array rather than by leaving the key out.
+  techs: [],
 });
 
 /** The player a hut's band belongs to: a player identity with no homeland. */
@@ -186,6 +189,10 @@ const BARBARIANS: PlayerState = {
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: one shape for every row of `players`, so barbarians carry a techs list too —
+  // empty, and it stays empty, because the research step skips them exactly as the
+  // money loop does.
+  techs: [],
 };
 
 const unit = (id: number, type: UnitTypeId, owner: number, tile: number): Unit => ({

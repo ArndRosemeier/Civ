@@ -654,13 +654,19 @@ describe('generateWorld — row order is part of the ruleset identity', () => {
     return result.value;
   };
 
-  type Section = 'terrains' | 'units' | 'buildings' | 'improvements' | 'resources';
+  type Section = 'terrains' | 'units' | 'buildings' | 'improvements' | 'resources' | 'techs';
   const SECTIONS: readonly Section[] = [
     'terrains',
     'units',
     'buildings',
     'improvements',
     'resources',
+    // M5's tech tree is the sixth section of the validated ruleset, so it is covered by
+    // "row order is part of the ruleset identity" like the other five. It changes no
+    // *world* here — nothing in `generateWorld` reads the tree — and that is exactly why
+    // it belongs in this loop: the identity is what a replay compares, and a reordered
+    // tree must move it even when the map it produces is identical.
+    'techs',
   ];
 
   /**
@@ -677,7 +683,9 @@ describe('generateWorld — row order is part of the ruleset identity', () => {
           ? { ...catalog, buildings: [...catalog.buildings].reverse() }
           : section === 'improvements'
             ? { ...catalog, improvements: [...catalog.improvements].reverse() }
-            : { ...catalog, resources: [...catalog.resources].reverse() };
+            : section === 'resources'
+              ? { ...catalog, resources: [...catalog.resources].reverse() }
+              : { ...catalog, techs: [...catalog.techs].reverse() };
 
   const SHIPPED = validated(CATALOG, 'the shipped catalog');
   const SHIPPED_HASH = hashValue(SHIPPED);

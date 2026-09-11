@@ -83,6 +83,7 @@ import {
   planCancelWork,
   planSetProduction,
   planSetRates,
+  planSetResearch,
   planSetWorkedTiles,
   planStartWork,
   type Command,
@@ -93,6 +94,7 @@ import {
   asCityId,
   asPlayerId,
   asResourceId,
+  asTechId,
   asTerrainId,
   asTileIndex,
   asUnitId,
@@ -124,6 +126,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+import { researchingOf, type TechDef } from '../src/tech.js';
 import { advanceTurn } from '../src/turn.js';
 import {
   unitCatalog,
@@ -297,6 +300,45 @@ const RULESET: RulesetView = {
   fidelity: 'tuned',
 };
 
+/**
+ * Three rows of a tech tree (M5): two roots and one second-tier row behind
+ * `bronze-working`. The research sweep below walks every one of them plus ids no row
+ * defines, from boards where one of them is already known — so all four answers
+ * (`unknown-tech`, `tech-already-known`, `unmet-prerequisite`, and the legal one) are
+ * exercised rather than merely reachable.
+ */
+const TECHS: readonly TechDef[] = [
+  { id: asTechId('pottery'), name: 'Pottery', era: 'ancient', cost: 5, requires: [] },
+  {
+    id: asTechId('bronze-working'),
+    name: 'Bronze Working',
+    era: 'ancient',
+    cost: 6,
+    requires: [],
+  },
+  {
+    id: asTechId('masonry'),
+    name: 'Masonry',
+    era: 'ancient',
+    cost: 9,
+    requires: [asTechId('bronze-working')],
+  },
+];
+
+/**
+ * The engine's view of the ruleset, with M5's tree beside it.
+ *
+ * `RulesetView` does not declare `techs` — M5's gating workstream owns that field and
+ * `map.ts` is not this workstream's file — so the tree arrives as a local *extension*
+ * of the view: the shape the field will take when it is declared, and the shape
+ * `tech.ts` reads structurally.
+ */
+interface TechView extends RulesetView {
+  readonly techs: readonly TechDef[];
+}
+
+const TECH_RULESET: TechView = { ...RULESET, techs: TECHS };
+
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
 const player = (index: number, startingTile: number): PlayerState => ({
@@ -313,6 +355,12 @@ const player = (index: number, startingTile: number): PlayerState => ({
   rates: DEFAULT_RATES,
   beakers: 0,
   luxuries: 0,
+  // M5: a fixture player knows no techs and is researching nothing. `techs` is
+  // spelled out — it is required on `PlayerState`, and "knows nothing" is `[]` — and
+  // `researching` is deliberately **absent**, because that absence is what "not
+  // researching anything" means. A board that cares spells the key out where it is
+  // built (`TECH_BOARD` below does).
+  techs: [],
 });
 
 /** A city with M3's shape and playable defaults; every field is spelled out. */
@@ -624,6 +672,12 @@ const commandKey = (cmd: Command): string => {
       return `CancelWork:${String(Number(cmd.unitId))}`;
     case 'SetRates':
       return `SetRates:${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
+    // M5: the key carries the tech id, not just the command name — two `SetResearch`
+    // commands naming different techs are different commands, and a key that dropped
+    // the id would call them equal, which is the false equivalence this comparator
+    // exists to prevent (the same reason the M4a keys carry their payload).
+    case 'SetResearch':
+      return `SetResearch:${String(cmd.tech)}`;
   }
 };
 
@@ -1974,5 +2028,251 @@ describe('cityProductionOptions — wonders (M4c)', () => {
       P0,
     );
     expect(lost).toEqual({ checked: 20, accepted: 16, offered: 16 });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M5 — the research evaluator, the seventh, and what it does *not* advertise
+ * ------------------------------------------------------------------ */
+
+/**
+ * The research candidate universe: every tech the ruleset defines, plus four ids no
+ * row defines — including a *near miss* (`'Pottery'`, `'pottery '`), because ids are
+ * exact and a UI that sent a display name instead of an id must be refused rather
+ * than silently matched.
+ *
+ * Unlike M4b's rate space this universe is finite and small, and that is the point
+ * the `SetResearch` decision rests on: the tree is *content*, so the whole of it can
+ * be walked here, and the router — not the generator — is what renders it.
+ */
+const researchCommands = (): readonly Command[] => [
+  ...TECHS.map((tech): Command => ({ type: 'SetResearch', tech: tech.id })),
+  { type: 'SetResearch', tech: asTechId('mithril') },
+  { type: 'SetResearch', tech: asTechId('') },
+  { type: 'SetResearch', tech: asTechId('Pottery') },
+  { type: 'SetResearch', tech: asTechId('pottery ') },
+];
+
+/** What one research sweep measured, so a caller can prove it was not vacuous. */
+interface ResearchTotals {
+  readonly checked: number;
+  readonly accepted: number;
+  readonly refused: number;
+  readonly yielded: number;
+}
+
+/**
+ * M5's half of the keystone property — the seventh generator, `planSetResearch`.
+ *
+ * For every candidate tech:
+ *
+ * - the applier's verdict must be the plan evaluator's, with the *same* typed
+ *   refusal (so a tech refused as `tech-already-known` by one and `unknown-tech` by
+ *   the other fails here);
+ * - an accepted one must write exactly that tech onto the actor and must leave
+ *   everything else in the state alone — reference-identical `units`, `cities`,
+ *   `map`, `rng` and `turn` — because choosing a tech is a setting, not a
+ *   transaction, and `techs`/`beakers` are untouched by it; and
+ * - an accepted one must **not** be advertised, which is the opposite of what the
+ *   movement and work sweeps claim and the whole content of the "the tree is
+ *   content, not an action list" decision. The same assertion is made on the
+ *   generator directly, so it holds for *every* player the sweep walks.
+ */
+const assertResearchAgreement = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): ResearchTotals => {
+  const yielded = [...legalActions(state, ruleset, playerId)];
+  expect(yielded.some((cmd) => cmd.type === 'SetResearch')).toBe(false);
+  const keys = new Set(yielded.map(commandKey));
+
+  let checked = 0;
+  let accepted = 0;
+
+  for (const cmd of researchCommands()) {
+    checked += 1;
+    if (cmd.type !== 'SetResearch') throw new Error(`not a research command: ${cmd.type}`);
+    const applied = applyCommand(state, playerId, cmd, ruleset);
+    const planned = planSetResearch(state, ruleset, playerId, cmd.tech);
+
+    expect(applied.ok).toBe(planned.ok);
+    if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+
+    if (applied.ok) {
+      accepted += 1;
+      const after = applied.value.state;
+      const actor = after.players.find((each) => each.id === playerId);
+      expect(actor === undefined ? undefined : researchingOf(actor)).toBe(cmd.tech);
+      // Nothing else moved: same arrays, same map, same turn, one more revision.
+      expect(after.units).toBe(state.units);
+      expect(after.cities).toBe(state.cities);
+      expect(after.map).toBe(state.map);
+      expect(after.rng).toBe(state.rng);
+      expect(after.turn).toBe(state.turn);
+      expect(after.revision).toBe(state.revision + 1);
+      expect(applied.value.events).toEqual([]);
+      // And the tech list and the pools are untouched: a selection is not progress.
+      const before = state.players.find((each) => each.id === playerId);
+      expect(actor?.techs).toEqual(before?.techs);
+      expect(actor?.beakers).toBe(before?.beakers);
+      expect(keys.has(commandKey(cmd))).toBe(false);
+    }
+  }
+
+  return { checked, accepted, refused: checked - accepted, yielded: keys.size };
+};
+
+/** `STATE` with player 0 knowing `techs` — the boards the sweep walks, one per answer. */
+const stateWithTechs = (techs: readonly TechDef['id'][]): GameState => ({
+  ...STATE,
+  players: STATE.players.map((player) =>
+    player.id === P0 ? { ...player, techs: [...techs] } : player,
+  ),
+});
+
+/** A real generated board — the state shape the engine actually ships — with M5's tree. */
+const GENERATED_TECH_RULESET: TechView = { ...GEN_RULESET, techs: TECHS };
+
+const generatedTechBoard = (seed: number): GameState => {
+  const generated = newGame(seed, SETTINGS, GENERATED_TECH_RULESET);
+  if (!generated.ok) {
+    throw new Error(`newGame(${String(seed)}) failed: ${JSON.stringify(generated.error)}`);
+  }
+  return generated.value;
+};
+
+describe('SetResearch is a decision, never an advertisement (M5)', () => {
+  const UNIVERSE = researchCommands().length;
+
+  it('agrees with the applier over the whole catalog and beyond, for every board', () => {
+    // The universe: three real rows plus four ids no row defines. On a board that
+    // knows nothing, the two roots are accepted and the second-tier row is refused
+    // for its missing prerequisite — so the sweep checks a legal verdict, an
+    // `unmet-prerequisite`, and an `unknown-tech`, not just a count.
+    const knowsNothing = assertResearchAgreement(STATE, TECH_RULESET, P0);
+    expect(knowsNothing).toEqual({
+      checked: UNIVERSE,
+      accepted: 2,
+      refused: UNIVERSE - 2,
+      yielded: [...legalActions(STATE, TECH_RULESET, P0)].length,
+    });
+    // The walk is not vacuous: it checked the whole universe for each board below.
+    expect(knowsNothing.checked).toBe(UNIVERSE);
+
+    // One root known: that root is now `tech-already-known`, the *other* root is
+    // still legal, and the second-tier row is still refused — it wants
+    // `bronze-working`, which is a different root. So knowing one root does not open
+    // the branch behind the other, which is the whole of what "prerequisites" means.
+    const knowsPottery = stateWithTechs([asTechId('pottery')]);
+    expect(assertResearchAgreement(knowsPottery, TECH_RULESET, P0).accepted).toBe(1);
+
+    // The prerequisite known: the second-tier row opens, so the sweep accepts both
+    // rows the player does *not* have — the maximum this tree allows from one root,
+    // and one more than the board that knows the other root instead.
+    const knowsBronze = stateWithTechs([asTechId('bronze-working')]);
+    expect(assertResearchAgreement(knowsBronze, TECH_RULESET, P0).accepted).toBe(2);
+
+    // Everything known: nothing is researchable, and every candidate is refused. The
+    // sweep still walks all seven.
+    const knowsAll = stateWithTechs(TECHS.map((tech) => tech.id));
+    expect(assertResearchAgreement(knowsAll, TECH_RULESET, P0)).toEqual({
+      checked: UNIVERSE,
+      accepted: 0,
+      refused: UNIVERSE,
+      yielded: [...legalActions(knowsAll, TECH_RULESET, P0)].length,
+    });
+  });
+
+  it('refuses every candidate for an actor the state does not have', () => {
+    // `unknown-player` from both sides, with the same error — so the accepted count
+    // is zero and the walk is still checking a real verdict rather than skipping.
+    expect(assertResearchAgreement(STATE, TECH_RULESET, asPlayerId(99))).toEqual({
+      checked: UNIVERSE,
+      accepted: 0,
+      refused: UNIVERSE,
+      yielded: 0,
+    });
+  });
+
+  it('agrees on a generated board, and refuses for its barbarian player', () => {
+    // The tree's legality has no board in it beyond the actor's own knowledge, which
+    // is exactly why it is swept on a real `newGame` board as well as the hand-built
+    // ones: a map, a set of cities or a ruleset's other catalogs must not be able to
+    // change it.
+    const board = generatedTechBoard(4);
+    const civs = board.players.filter((player) => player.kind === 'civ');
+    expect(civs.length).toBe(2);
+
+    for (const civ of civs) {
+      // A new civilization knows nothing, so both roots are legal and the second-tier
+      // row is not.
+      const totals = assertResearchAgreement(board, GENERATED_TECH_RULESET, civ.id);
+      expect(totals.checked).toBe(UNIVERSE);
+      expect(totals.accepted).toBe(2);
+      expect(totals.refused).toBe(UNIVERSE - 2);
+    }
+
+    // The barbarian actor: the command is legal (the frozen rule has no `kind` in
+    // it), and it is accepted for exactly the two roots — before a settled civ has
+    // researched anything, a barbarian is in the same state as a civilization. What
+    // makes it inert is the *pipeline*, not the command (`applyResearch` skips
+    // barbarians), and that is `commands.test.ts`' assertion.
+    const barbarian = board.players.find((player) => player.kind === 'barbarian');
+    expect(barbarian).toBeDefined();
+    if (barbarian !== undefined) {
+      expect(assertResearchAgreement(board, GENERATED_TECH_RULESET, barbarian.id).accepted).toBe(2);
+    }
+  });
+
+  it('never advertises a research choice, for any player of any board', () => {
+    // Stated once, on the generator's own output, so the property does not depend on
+    // the counts above being right: no `legalActions` output may contain a
+    // `SetResearch` — not for a civilization, not for the barbarians, not on a
+    // generated board, not for an actor that does not exist.
+    const boards: readonly GameState[] = [STATE, CITY_STATE, SHARED_STATE, generatedTechBoard(4)];
+    for (const board of boards) {
+      const ids = [...board.players.map((player) => player.id), asPlayerId(99)];
+      for (const id of ids) {
+        const yielded = [...legalActions(board, TECH_RULESET, id)];
+        expect(yielded.every((cmd) => cmd.type !== 'SetResearch')).toBe(true);
+      }
+    }
+  });
+
+  it('applies a legal research choice the generator does not advertise, and reads it next turn', () => {
+    // The decision, one concrete command deep: legal, invisible to the generator, and
+    // observable a turn later in the state the pipeline wrote.
+    const funded: GameState = {
+      ...STATE,
+      players: STATE.players.map((player) =>
+        player.id === P0 ? { ...player, beakers: 5 } : player,
+      ),
+    };
+
+    const applied = applyCommand(
+      funded,
+      P0,
+      { type: 'SetResearch', tech: asTechId('pottery') },
+      TECH_RULESET,
+    );
+    expect(applied.ok).toBe(true);
+    if (!applied.ok) return;
+    expect(applied.value.events).toEqual([]);
+    expect(
+      [...legalActions(funded, TECH_RULESET, P0)].some((cmd) => cmd.type === 'SetResearch'),
+    ).toBe(false);
+
+    const turn = advanceTurn(applied.value.state, TECH_RULESET);
+    expect(turn.events).toContainEqual({
+      type: 'TechResearched',
+      playerId: P0,
+      tech: asTechId('pottery'),
+      cost: 5,
+      beakers: 0,
+    });
+    expect([...(turn.state.players.find((player) => player.id === P0)?.techs ?? [])]).toEqual([
+      asTechId('pottery'),
+    ]);
   });
 });

@@ -122,7 +122,11 @@ const MAP: GameMap = {
 /**
  * A civilization. M3 added `kind`; these hand-built players are all civs, and M4b
  * added the four money fields (`treasury`, `rates`, `beakers`, `luxuries`) that
- * every `PlayerState` now carries.
+ * every `PlayerState` now carries. M5 added `techs`, which is an empty *list* here —
+ * "knows nothing" — and leaves `researching` out entirely, because absence is what
+ * "researching nothing" means and a key holding `undefined` could not survive a JSON
+ * round trip (`tech.ts` says so where it writes the field). The header field M5 added
+ * reads both of those through `tech.ts`, which is why the fixtures have to state them.
  *
  * The money values are **identical for every player this factory builds**, and
  * deliberately so: several tests below compare two rendered views byte for byte
@@ -139,6 +143,7 @@ const player = (index: number, tile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  techs: [],
   // M4b: `RATE_TOTAL` is 10, so 7/3/0 is a legal split (the command layer refuses
   // any other sum) and an arbitrary one — nothing in this file reads the rates, and
   // no rate value here is presented as sourced from Civ 3.
