@@ -242,12 +242,64 @@ hide nothing, because the gate state was fully diagnosable from disk.
 - A bankruptcy-driven building loss emits **no event**, so it is a silent state change
   the REPL can only show after the fact. A `BuildingLost` event is owed.
 
+## S — `@civts/sim`, the simulation harness — **DONE** (commits `b925b4b`, `51b196f`)
+
+Built on the principal's instruction that *systems must be simulation friendly so
+they can be tested and balanced*. Delivered as a first-class package rather than
+test scaffolding, because M5, M6 and M7 all sit on it.
+
+- [x] `CORE_INVARIANTS`: 21 named predicates returning violation strings, taking the **previous**
+      state so conservation is expressible at all — M3's economy logic lifted here, not reimplemented
+- [x] `runSimulation`: a game is a pure function of (seed, settings, ruleset, policies)
+- [x] `Policy` as **the AI seam**, each drawing from its own RNG stream, never `state.rng`
+- [x] per-turn per-civilization metrics, computed only from engine exports
+- [x] order-independent batch aggregation, and ruleset overrides for sweeping one knob
+- [x] `civts sim` CLI and `scripts/balance-sweep.ts` demonstrating the measure-and-compare loop
+- [x] goldens coverage gap: still open, scheduled for M5
+
+**Why the policy RNG separation is load-bearing, not stylistic:** if the AI drew
+from the world's RNG, changing the AI would change the world, and two strategies
+could not be compared on the same seed — which is the entire point of having
+policies. Pinned by a test that swaps a random-drawing policy for a do-nothing one
+and shows the world RNG trajectory is byte-identical while the game differs.
+
+### Findings from verifying the harness (all fixed, none tolerated)
+
+1. The food-box invariant was **one turn too strict and fired on shipped content**,
+   5 of 50 seeds. Growth runs before production (frozen order), so a granary
+   completing that turn lowers the threshold after the box was filled. The state is
+   legal; the check was wrong. A false positive here was not cosmetic — it truncated
+   5 runs to turn 12 while the other 45 reached 20, so **batch aggregates were
+   silently mixing horizons**, which is worse than a red test.
+2. **Two cities on one tile was caught by nothing at all** — all 20 invariants
+   returned empty. Added `city-tile-unique`.
+3. **Catalog row order silently changed the game.** Resolved by establishing that the
+   ruleset hash *covers* row order, so a reordered catalog is a different ruleset by
+   identity — which makes replay safe, but only once checked. Coupling is now
+   explicit and tested; arbitrary row picks (`hut.ts`) are canonical; the id/kind
+   conflation in the improvement pair order is fixed.
+4. Two **gate holes** the verifier found rather than assumed: the determinism lint
+   guard covered `packages/core/src` only, leaving the package that must be
+   deterministic *outside* it, and `scripts/` was never typechecked.
+
+### Limits worth remembering
+
+- Measured, not assumed: **the goldens cover no M3/M4 mechanic at hash level**
+  (a golden state is `newGame`, so no city exists and growth never runs). Fixed in M5.
+- The invariant registry costs ~0.15 ms/turn; a 50-game batch runs in ~12s. A harness
+  too slow to batch is a harness nobody uses for balance.
+- `behaviour-probe.ts` proves changes are behaviour-preserving by comparing recorded
+  runs against a git worktree of the pre-change commit — including *proving the
+  changed paths were reached*, since a comparison that never enters the changed code
+  proves nothing.
+
 ## M5 — Technology — **NEXT**
 
 - [ ] a tech tree with prerequisites, costs and era progression
 - [ ] research accumulates beakers (inert since M4b) and completes techs
 - [ ] techs gate units, buildings, improvements and resources
 - [ ] a played, city-bearing golden world (see the M4c finding above)
+- [ ] balance evidence for the tech curve produced by the harness, not by eye
 
 ## Later milestones
 
