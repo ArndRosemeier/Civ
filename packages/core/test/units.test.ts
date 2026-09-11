@@ -27,7 +27,13 @@ import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '..
 import { asImprovementId } from '../src/improvements.js';
 import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
+import {
+  DEFAULT_RATES,
+  SCHEMA_VERSION,
+  STARTING_TREASURY,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 import {
   UNIT_ROLES,
   unitById,
@@ -121,6 +127,13 @@ const player = (index: number, tile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M4b: the money fields live on every player, so a hand-built player literal has
+  // to carry them. The engine's own constants are used rather than literals so the
+  // fixture cannot drift from what `newGame` assembles.
+  treasury: STARTING_TREASURY,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 });
 
 const unit = (id: number, owner: number, tile: number, movementLeft: number): Unit => ({

@@ -113,6 +113,38 @@
  *   case labels in the two message tables below, so that a refused worker command
  *   reads as `<verb>: <reason>` rather than as an unrecognised error.
  *
+ * M4b extends the builder for the third time, and the reason is the same one
+ * again — the milestone's acceptance evidence is not expressible without it:
+ *
+ * - **`setTreasury(playerIndex, gold)` states a starting balance.** The money loop
+ *   only ever *moves* a treasury, so "does this player go bankrupt on turn 3?"
+ *   depends entirely on where it starts, and a scenario that could not say
+ *   "start with 5 gold" could not stage a bankruptcy at all. The value must be an
+ *   integer `>= 0`: the engine never lets a treasury go below zero (`economy.ts`'
+ *   bankruptcy floors it at 0 and reports a `TreasuryShortfall`), so a hand-built
+ *   world carrying a negative one would be a world the command layer cannot
+ *   produce. The default is `STARTING_TREASURY`, exactly as `newGame` sets it.
+ * - **`setRates(playerIndex, rates)` states how that player's commerce divides.**
+ *   The rule is not restated here: `ratesProblem` — the function `planSetRates`
+ *   refuses with, so a slider UI and this builder give the same reason — is asked,
+ *   and a triple that is not three integers `>= 0` summing to `RATE_TOTAL` throws
+ *   at the call, naming the actual sum. The default is `DEFAULT_RATES`, again as
+ *   `newGame` leaves it.
+ * - **`setPools(playerIndex, { beakers, luxuries })` states the two inert pools.**
+ *   They accumulate and nothing spends them until M5/M9, so their only observable
+ *   role today is that the split's other two channels are *accounted for*; a
+ *   scenario that wants "the pools started at 4 and grew by exactly the split"
+ *   needs a way to state the start. Both default to 0.
+ *
+ * The three are one mechanical change to the world with three names rather than
+ * one `setMoney(..., partial)` because each validates a different rule and each
+ * failure is a different mistake by the author. Barbarians are refused by all
+ * three: `applyEconomy` skips them ("barbarians have no economy"), so a barbarian
+ * treasury would be a number nothing reads — a hand-built world that *looks* like
+ * it is measuring money and is not. Every civilization gets all four fields
+ * (`treasury`, `rates`, `beakers`, `luxuries`) whether or not a scenario mentions
+ * them, so `PlayerState` has one shape and the state stays hashable.
+ *
  * Failure channels — the frozen signature is narrower than the builder's needs,
  * so the split is stated here rather than discovered by a caller:
  *
@@ -169,9 +201,12 @@
  */
 
 import {
+  DEFAULT_RATES,
   MAP_DIMENSIONS,
   MIN_CITY_DISTANCE,
+  RATE_TOTAL,
   SCHEMA_VERSION,
+  STARTING_TREASURY,
   TERRAIN_BY_ROLE,
   applyCommand,
   asCityId,
@@ -191,6 +226,7 @@ import {
   itemCostOf,
   loadSettings,
   ok,
+  ratesProblem,
   seedRng,
   tileIndex,
   unitCatalog,
@@ -209,6 +245,7 @@ import {
   type PlayerKind,
   type PlayerState,
   type ProductionItem,
+  type Rates,
   type Result,
   type RulesetView,
   type Settings,
@@ -263,6 +300,17 @@ export interface CitySetup {
   readonly workedTiles?: readonly TileIndex[];
 }
 
+/**
+ * The two inert pools a `setPools` call may state (M4b). Both optional: an
+ * omitted field keeps the value the builder already holds for that player (0
+ * unless an earlier call set it), which is what makes the method usable for
+ * "raise the luxuries and leave the beakers alone".
+ */
+export interface PoolSetup {
+  readonly beakers?: number;
+  readonly luxuries?: number;
+}
+
 /** The world under construction. Every method returns the builder, so `setup` can chain. */
 export interface ScenarioBuilder {
   addPlayer(name: string): ScenarioBuilder;
@@ -291,6 +339,29 @@ export interface ScenarioBuilder {
   addUnit(playerIndex: number, type: UnitTypeId, at: readonly [number, number]): ScenarioBuilder;
   /** State a city outright (M3) — the only way a scenario can have a queue at all. */
   addCity(playerIndex: number, at: readonly [number, number], options?: CitySetup): ScenarioBuilder;
+  /**
+   * State a civilization's starting gold (M4b). The money loop only ever *moves* a
+   * treasury, so this is the only way a scenario can say "on the brink", "solvent"
+   * or "already broke". Must be an integer `>= 0` (the engine never lets one go
+   * negative); defaults to `STARTING_TREASURY`, as `newGame` leaves it. Refused for
+   * the barbarian player, which has no economy.
+   */
+  setTreasury(playerIndex: number, gold: number): ScenarioBuilder;
+  /**
+   * State a civilization's tax/science/luxury split (M4b). The rule — three
+   * integers `>= 0` summing to `RATE_TOTAL` — is the engine's own
+   * (`ratesProblem`), and a triple that breaks it throws here with the actual sum.
+   * Defaults to `DEFAULT_RATES`. Refused for the barbarian player (its rates are
+   * inert).
+   */
+  setRates(playerIndex: number, rates: Rates): ScenarioBuilder;
+  /**
+   * State the two inert pools (M4b): `beakers` and `luxuries`, which accumulate
+   * and are spent by nothing until M5/M9. Each must be an integer `>= 0`; an
+   * omitted field keeps what it had (0 at the start). Refused for the barbarian
+   * player.
+   */
+  setPools(playerIndex: number, pools: PoolSetup): ScenarioBuilder;
   build(): Result<GameState, SetupError>;
 }
 
@@ -552,10 +623,24 @@ interface UnitPlacement {
   readonly y: number;
 }
 
-/** A player the scenario asked for: its name and whether it is a civilization. */
+/**
+ * A player the scenario asked for: its name, whether it is a civilization, and
+ * (M4b) the money fields it starts with.
+ *
+ * `treasury`/`rates`/`beakers`/`luxuries` are resolved to the numbers the state
+ * will carry the moment the player is added — `newGame`'s own starting values
+ * (`STARTING_TREASURY`, `DEFAULT_RATES`, two zero pools) for a civilization, and
+ * the same shape with a zero treasury for the barbarian player — so a scenario
+ * that says nothing about money still gets a state with all four fields and the
+ * state keeps one shape for every player.
+ */
 interface PlayerPlacement {
   readonly name: string;
   readonly kind: PlayerKind;
+  treasury: number;
+  rates: Rates;
+  beakers: number;
+  luxuries: number;
 }
 
 /** A goody hut the scenario asked for, in the coordinates it was written in. */
@@ -814,6 +899,15 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
       // `kind` is part of the persisted shape and is therefore spelled out rather
       // than defaulted (`civPlayers` and `hut.ts` read it).
       kind: placed.kind,
+      // M4b: the money fields, every player, every time — `PlayerState` has one
+      // shape and `treasury`/`rates`/`beakers`/`luxuries` are part of every state
+      // hash. The values are resolved at the moment the player was added (a
+      // `setTreasury`/`setRates`/`setPools` call is the only writer), so a
+      // scenario's `setup` reads top to bottom like the world it describes.
+      treasury: placed.treasury,
+      rates: placed.rates,
+      beakers: placed.beakers,
+      luxuries: placed.luxuries,
     };
   });
 
@@ -996,12 +1090,50 @@ export const createScenarioBuilder = (
     }
   };
 
+  /**
+   * The player a `setTreasury`/`setRates`/`setPools` call is about, checked twice:
+   * the index has to name a player that was added, and that player has to be a
+   * *civilization*.
+   *
+   * The second half is a rule of the engine's, not a convenience: `applyEconomy`
+   * skips every non-civilization outright ("barbarians have no economy"), so a
+   * barbarian's `treasury`/`beakers`/`luxuries` are numbers nothing ever reads and
+   * its `rates` are never consulted. A scenario that could state them would be a
+   * scenario that *looks* like it is measuring money while measuring nothing, so
+   * the honest answer is a loud authoring error at the call.
+   */
+  const moneyPlayer = (method: string, playerIndex: number): PlayerPlacement => {
+    checkPlayerIndex(method, playerIndex);
+    const placed = world.players[playerIndex];
+    if (placed === undefined) {
+      // Unreachable: `checkPlayerIndex` has already proved the index is in range.
+      throw new Error(`scenario builder: ${method} needs a player index that names a player`);
+    }
+    if (placed.kind !== 'civ') {
+      throw new Error(
+        `scenario builder: ${method}(${String(playerIndex)}, ...) names the barbarian player ` +
+          `("${placed.name}"), which has no economy at all — it collects nothing, pays nothing ` +
+          'and its rates are never read, so the value would be a number no rule touches',
+      );
+    }
+    return placed;
+  };
+
   const builder: ScenarioBuilder = {
     addPlayer(name) {
       if (name.trim() === '') {
         throw new Error('scenario builder: addPlayer needs a non-empty name');
       }
-      world.players.push({ name, kind: 'civ' });
+      // M4b: the money fields `newGame` writes, so a scenario that says nothing
+      // about money still describes a state the engine can produce.
+      world.players.push({
+        name,
+        kind: 'civ',
+        treasury: STARTING_TREASURY,
+        rates: DEFAULT_RATES,
+        beakers: 0,
+        luxuries: 0,
+      });
       return builder;
     },
 
@@ -1015,7 +1147,60 @@ export const createScenarioBuilder = (
             '(a hut band is owned by the first player of that kind), as there is in a `newGame` world',
         );
       }
-      world.players.push({ name, kind: 'barbarian' });
+      // Zero gold and the default rates, exactly as `newGame` leaves a barbarian:
+      // the fields are present (one shape for every player) and inert.
+      world.players.push({
+        name,
+        kind: 'barbarian',
+        treasury: 0,
+        rates: DEFAULT_RATES,
+        beakers: 0,
+        luxuries: 0,
+      });
+      return builder;
+    },
+
+    setTreasury(playerIndex, gold) {
+      const placed = moneyPlayer('setTreasury', playerIndex);
+      if (!Number.isInteger(gold) || gold < 0) {
+        throw new Error(
+          `scenario builder: setTreasury needs an integer gold >= 0 (got ${String(gold)}); the ` +
+            'engine never lets a treasury go below zero — bankruptcy floors it at 0 and reports ' +
+            'the unpaid part in a TreasuryShortfall event — so a negative balance is not a state ' +
+            'the command layer can produce',
+        );
+      }
+      placed.treasury = gold;
+      return builder;
+    },
+
+    setRates(playerIndex, rates) {
+      const placed = moneyPlayer('setRates', playerIndex);
+      // The engine's own statement of the rule, asked rather than restated: this
+      // is the same function `planSetRates` refuses a `SetRates` with, so the
+      // builder and the command layer cannot disagree about what a rate triple is.
+      const problem = ratesProblem(rates);
+      if (problem !== undefined) {
+        throw new Error(
+          `scenario builder: setRates(${String(playerIndex)}, ...) is not a legal split — ` +
+            `${problem}; the three rates are tenths of the commerce split and must sum to ` +
+            `exactly RATE_TOTAL = ${String(RATE_TOTAL)}`,
+        );
+      }
+      // A fresh object with exactly the three fields, exactly as `planSetRates`
+      // writes it: a foreign payload's extra keys must not reach the hashed state.
+      placed.rates = { tax: rates.tax, science: rates.science, luxury: rates.luxury };
+      return builder;
+    },
+
+    setPools(playerIndex, pools) {
+      const placed = moneyPlayer('setPools', playerIndex);
+      const beakers = pools.beakers ?? placed.beakers;
+      const luxuries = pools.luxuries ?? placed.luxuries;
+      checkCount('setPools', 'beakers', beakers, 0);
+      checkCount('setPools', 'luxuries', luxuries, 0);
+      placed.beakers = beakers;
+      placed.luxuries = luxuries;
       return builder;
     },
 

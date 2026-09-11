@@ -47,6 +47,30 @@
  * - Provenance: nothing here blesses a number as Civ 3's. Every turn count and
  *   yield delta is read from the shipped catalog rows through `improvementDef`; the
  *   only literals are structural (which step of the sweep does what).
+ *
+ * Migrated for M4b (docs/INTERFACES.md M4b) by the F6 rule — this file's author had
+ * finished before the milestone's contract landed. Three things needed it:
+ *
+ * 1. `cmdKey` gained `SetRates`, keyed by the triple. Without that case the switch
+ *    is not exhaustive and the file does not compile, which is the property that
+ *    switch exists for.
+ * 2. The golden-coverage test used to close the gap "the goldens pin M4a's shape and
+ *    nothing about workers, because every golden scenario is a `newGame` state". M4b
+ *    gives every civilization a **starting worker**, so those states do now contain
+ *    workers, and the gap is narrower than it was: the goldens cover `newGame`'s
+ *    worker placement (one per civilization, pinned by count) and still cover no
+ *    *behaviour* — no unit carries a `work` job and no tile carries an improvement in
+ *    any golden state. The boundary is written out at its new width rather than
+ *    deleted.
+ * 3. `withWorkers`' doc comment claimed `newGame` places "no worker", which was true
+ *    until M4b. The helper is kept — the sweeps want *several* workers per
+ *    civilization, not one — and its comment now says what it is for instead of
+ *    describing a board that no longer exists.
+ *
+ * Nothing else in the file moved, and in particular no sweep was weakened: this is
+ * still the only place where `StartWork`/`CancelWork` completeness over played games
+ * is checked, and the M2 keystone's new enumeration of those two families (M4b) does
+ * not replace it — that one walks hand-built candidate lists, this one walks games.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -185,10 +209,19 @@ const goldenState = (seed: number): GameState => {
 };
 
 /**
- * `newGame` places one settler per civilization and no worker, so every work
- * sweep has to put a worker on the board. `spawnUnit` is the engine's own "a unit
- * comes into being" (production and hut rewards go through it), so a state with an
- * injected worker is a state the engine can genuinely reach — not a shaped object.
+ * Extra workers on top of the ones the board already has.
+ *
+ * MIGRATED (M4b): `newGame` used to place one settler per civilization and no
+ * worker, so this helper *was* how every work sweep got a worker at all. It no
+ * longer is — M4b's starting units hand each civilization a worker on turn one
+ * (`STARTING_UNIT_ROLES`) — and the helper is kept, rather than deleted, because
+ * the sweeps want several workers *per* civilization (two workers finishing the
+ * same pair in one turn, one worker per terrain kind, a job that outlives its
+ * unit): a fixed count on top of the starting pair is the honest way to say that,
+ * and the starting worker is checked where it belongs, in the golden-state test
+ * below. `spawnUnit` is the engine's own "a unit comes into being" (production and
+ * hut rewards go through it), so a state with an injected worker is a state the
+ * engine can genuinely reach — not a shaped object.
  */
 const withWorkers = (state: GameState, perPlayer: number): GameState => {
   let current = state;
@@ -254,6 +287,12 @@ const cmdKey = (cmd: Command): string => {
       return `StartWork ${String(cmd.unitId)} ${String(cmd.kind)}`;
     case 'CancelWork':
       return `CancelWork ${String(cmd.unitId)}`;
+    // M4b. Keyed by the *triple*, for the M4a reason: two `SetRates` naming
+    // different splits are different commands, and a key that dropped the numbers
+    // would call them equal — the exact false equivalence this comparator exists to
+    // prevent.
+    case 'SetRates':
+      return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
   }
 };
 
@@ -2029,21 +2068,35 @@ describe('6. goldens: what they cover, and what they do not', () => {
     expect(() => hashValue({ ...state, units: [{ ...firstUnit, work: undefined }] })).toThrow();
   });
 
-  it('covers M4a’s shape but not its behaviour — the gap, stated rather than assumed', () => {
-    // The golden scenarios hash `newGame` states: they pin the *shape* M4a added
-    // (the `improvements` key, schemaVersion 4) and nothing about workers. This
-    // documents that boundary where a reader will see it, so "the goldens are
-    // green" is never mistaken for "M4a works". If a golden scenario ever gains a
-    // worker or a built improvement, this fails and a human learns the coverage
-    // changed — which is exactly when a rehash note is owed anyway.
+  it('covers the shape but not the behaviour of work — the gap, stated rather than assumed', () => {
+    // The golden scenarios hash `newGame` states: they pin the *shape* (`the
+    // `improvements` key, `SCHEMA_VERSION`) and nothing about jobs. This documents
+    // that boundary where a reader will see it, so "the goldens are green" is never
+    // mistaken for "work works". If a golden scenario ever gains a *built*
+    // improvement or a unit holding a job, this fails and a human learns the
+    // coverage changed — which is exactly when a rehash note is owed anyway.
+    //
+    // MIGRATED (M4b): the boundary is narrower than it was, and it is written out at
+    // its new width instead of being deleted. M4b's starting units give every
+    // civilization a worker, so a golden state *does* now contain workers — that
+    // half of the old gap is closed, and closed by a `newGame` behaviour the goldens
+    // therefore cover — while the half that remains open is the behaviour: no unit
+    // carries a `work` job and no tile carries an improvement in any golden state.
     for (const seed of [1, 42, 1337]) {
       const state = goldenState(seed);
       expect(state.improvements).toEqual([]);
       expect(state.units.length).toBeGreaterThan(0);
+
       const workers = state.units.filter(
         (unit) => RULESET.units.find((def) => def.id === unit.type)?.role === 'worker',
       );
-      expect(workers).toEqual([]);
+      // One starting worker per civilization, and no more: the count is pinned so
+      // that "the goldens contain workers" cannot quietly become "the goldens
+      // contain whatever the fixture happened to build".
+      expect(workers).toHaveLength(state.players.filter((player) => player.kind === 'civ').length);
+      expect(workers.every((unit) => unit.work === undefined)).toBe(true);
+      // …and no unit at all — worker, settler or otherwise — holds a job.
+      expect(state.units.filter((unit) => unit.work !== undefined)).toEqual([]);
     }
   });
 });
@@ -2078,9 +2131,13 @@ describe('6. goldens: what they cover, and what they do not', () => {
  *   across processes, and the golden gate's refusal to auto-write:
  *   `packages/testing/test/{m2,m3}-adversarial.test.ts`.
  * - The state hashes themselves: `packages/testing/test/golden.test.ts` with
- *   `packages/testing/goldens/state.json` — which pin M4a's *shape*
- *   (`improvements`, `SCHEMA_VERSION` 4) and, by construction, nothing about
- *   workers, because every golden scenario is a `newGame` state.
+ *   `packages/testing/goldens/state.json` — which pin the *shape*
+ *   (`improvements`, `SCHEMA_VERSION`) and, by construction, nothing about *jobs*,
+ *   because every golden scenario is a `newGame` state. M4b narrows the gap this
+ *   note used to describe: those states now contain a starting worker per
+ *   civilization (`STARTING_UNIT_ROLES`), so `newGame`'s worker placement is
+ *   covered by the goldens, while no unit holds a `work` job and no tile carries an
+ *   improvement in any of them.
  *
  * **Checked only here (a one-off check that leaves no test behind would not be
  * verification, so each of these is a test in this file):**

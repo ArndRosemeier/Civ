@@ -64,7 +64,14 @@ import { applyProduction, itemCost, itemCostOf } from '../src/production.js';
 import { isOk, type Result } from '../src/result.js';
 import { nextBelow, seedRng } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
+import {
+  DEFAULT_RATES,
+  RATE_TOTAL,
+  SCHEMA_VERSION,
+  STARTING_TREASURY,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 import { advanceTurn } from '../src/turn.js';
 import {
   spawnUnit,
@@ -255,6 +262,13 @@ const player = (
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(startingTile),
   kind,
+  // M4b: every fixture spells its money fields out, like every other field. These
+  // are the values `newGame` uses; a board that cares about income, upkeep or a
+  // shortfall overrides them where it is built (see the economy sections below).
+  treasury: STARTING_TREASURY,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 });
 
 const unit = (
@@ -339,6 +353,43 @@ const CITY_STATE: GameState = withCities(STATE, [CITY]);
 const P0 = asPlayerId(0);
 const P1 = asPlayerId(1);
 
+/**
+ * The money events (M4b) the pipeline emits for one civilization, with the amounts
+ * spelled out: income as `[gold, beakers, luxuries]` and upkeep as
+ * `[gold, maintenance, unitSupport, units, freeUnits]`.
+ *
+ * Every civilization gets both events every turn, zeros included, in player-id
+ * order — that is what makes a turn's event list a ledger a consumer can rebuild a
+ * treasury from (`economy.ts`), and it is why the tests below name a second
+ * player's pair rather than asserting "and nothing else".
+ */
+const ledger = (
+  index: number,
+  income: readonly [number, number, number],
+  upkeep: readonly [number, number, number, number, number],
+): readonly GameEvent[] => [
+  {
+    type: 'IncomeCollected',
+    playerId: asPlayerId(index),
+    gold: income[0],
+    beakers: income[1],
+    luxuries: income[2],
+  },
+  {
+    type: 'UpkeepPaid',
+    playerId: asPlayerId(index),
+    gold: upkeep[0],
+    maintenance: upkeep[1],
+    unitSupport: upkeep[2],
+    units: upkeep[3],
+    freeUnits: upkeep[4],
+  },
+];
+
+/** A civilization that collected nothing and owed nothing, with `units` units. */
+const idleLedger = (index: number, units: number): readonly GameEvent[] =>
+  ledger(index, [0, 0, 0], [0, 0, 0, units, 4]);
+
 const move = (unitId: number, to: number): Command => ({
   type: 'MoveUnit',
   unitId: asUnitId(unitId),
@@ -361,6 +412,11 @@ const setProduction = (cityId: number, item: ProductionItem): Command => ({
 
 const unitItem = (id: string): ProductionItem => ({ kind: 'unit', id: asUnitTypeId(id) });
 const buildingItem = (id: string): ProductionItem => ({ kind: 'building', id: asBuildingId(id) });
+
+const setRates = (tax: number, science: number, luxury: number): Command => ({
+  type: 'SetRates',
+  rates: { tax, science, luxury },
+});
 
 const END_TURN: Command = { type: 'EndTurn' };
 
@@ -393,6 +449,13 @@ const detailOf = <T>(result: Result<T, GameError>): string => {
   const error = refusedAs(result, 'invalid-argument');
   if (error.kind !== 'invalid-argument') throw new Error('unreachable');
   return error.detail;
+};
+
+/** A player that must be there: a fixture that lacks it is a broken test, not a case. */
+const playerOf = (state: GameState, index: number): PlayerState => {
+  const found = state.players.find((each) => each.id === asPlayerId(index));
+  if (found === undefined) throw new Error(`the fixture has no player ${String(index)}`);
+  return found;
 };
 
 const withMovement = (state: GameState, unitId: number, movementLeft: number): GameState => ({
@@ -761,7 +824,14 @@ describe('applyCommand — EndTurn', () => {
     expect(movementLeftOf(outcome.state, 0)).toBe(SETTLER.movement);
     expect(movementLeftOf(outcome.state, 1)).toBe(SCOUT.movement);
     expect(movementLeftOf(outcome.state, 2)).toBe(WARRIOR.movement);
-    expect(outcome.events).toEqual([{ type: 'TurnEnded', playerId: P0, turn: 2 }]);
+    expect(outcome.events).toEqual([
+      // Two units of player 0's and one of player 1's, all inside the free
+      // allowance, and no cities: the ledger is two pairs of zeros. It is emitted
+      // anyway, for the reason the helper above gives.
+      ...ledger(0, [0, 0, 0], [0, 0, 0, 2, 4]),
+      ...ledger(1, [0, 0, 0], [0, 0, 0, 1, 4]),
+      { type: 'TurnEnded', playerId: P0, turn: 2 },
+    ]);
   });
 
   it('restores movement that a move spent, keeping the unit where it stands', () => {
@@ -793,7 +863,14 @@ describe('applyCommand — EndTurn', () => {
     expect(movementLeftOf(outcome.state, 0)).toBe(0); // unresolvable: left alone
     expect(tileOf(outcome.state, 0)).toBe(5);
     expect(movementLeftOf(outcome.state, 1)).toBe(SCOUT.movement); // resolvable: refilled
-    expect(outcome.events).toEqual([{ type: 'TurnEnded', playerId: P0, turn: 2 }]);
+    // The ghost is *counted* by the money loop — it is a unit its owner has, and
+    // support is about the unit, not about a catalog row it might not match (the
+    // refill's totality and this count are the same idea applied twice).
+    expect(outcome.events).toEqual([
+      ...idleLedger(0, 2),
+      ...idleLedger(1, 0),
+      { type: 'TurnEnded', playerId: P0, turn: 2 },
+    ]);
     // Nothing was mutated in place: the input keeps its spent movement.
     expect(movementLeftOf(withGhost, 1)).toBe(1);
   });
@@ -1346,6 +1423,159 @@ describe('applyCommand — SetProduction', () => {
 /* ------------------------------------------------------------------ *
  * M3 — the plan evaluators are the appliers' decisions
  * ------------------------------------------------------------------ */
+
+describe('applyCommand — SetRates', () => {
+  it('stores the three rates and touches nothing else', () => {
+    const outcome = mustOk(apply(STATE, P0, setRates(2, 5, 3)));
+
+    expect(playerOf(outcome.state, 0).rates).toEqual({ tax: 2, science: 5, luxury: 3 });
+    // Every other field of the actor is carried over untouched — including the
+    // money pools: a rate is a setting, and setting it collects nothing.
+    const before = playerOf(STATE, 0);
+    const after = playerOf(outcome.state, 0);
+    expect(after.treasury).toBe(before.treasury);
+    expect(after.beakers).toBe(before.beakers);
+    expect(after.luxuries).toBe(before.luxuries);
+    expect(after.name).toBe(before.name);
+    expect(after.color).toBe(before.color);
+    expect(after.startingTile).toBe(before.startingTile);
+    expect(after.kind).toBe(before.kind);
+    // The other player is not the actor and is not touched.
+    expect(playerOf(outcome.state, 1).rates).toEqual(playerOf(STATE, 1).rates);
+    expect(outcome.state.units).toBe(STATE.units);
+    expect(outcome.state.cities).toBe(STATE.cities);
+    expect(outcome.state.revision).toBe(STATE.revision + 1);
+    // No event: M3's setter precedent — the payload is the record of the change,
+    // and M4b's frozen event list has no member for a rate.
+    expect(outcome.events).toEqual([]);
+  });
+
+  it('accepts every triple of non-negative integers summing to RATE_TOTAL', () => {
+    // The whole legal space, which is also what `planSetRates` must accept: the
+    // enumerating generators do not yield rates (see `actions.ts`), so the plan
+    // evaluator is where legality is stated, and it is stated for all 66.
+    let seen = 0;
+    for (let tax = 0; tax <= RATE_TOTAL; tax += 1) {
+      for (let science = 0; tax + science <= RATE_TOTAL; science += 1) {
+        const outcome = apply(STATE, P0, setRates(tax, science, RATE_TOTAL - tax - science));
+        expect(outcome.ok, `${String(tax)}/${String(science)}`).toBe(true);
+        seen += 1;
+      }
+    }
+    expect(seen).toBe(((RATE_TOTAL + 1) * (RATE_TOTAL + 2)) / 2);
+  });
+
+  it('is idempotent: setting the rates a player already has is still a legal command', () => {
+    // Unlike `SetWorkedTiles`, which refuses "the same set" as a no-op, a rate is a
+    // slider: the value the player already has is a value the player may ask for,
+    // and refusing it would make a UI's "apply" button wrong. It is still a command,
+    // so it still costs a revision.
+    const outcome = mustOk(
+      apply(STATE, P0, setRates(DEFAULT_RATES.tax, DEFAULT_RATES.science, DEFAULT_RATES.luxury)),
+    );
+
+    expect(playerOf(outcome.state, 0).rates).toEqual(DEFAULT_RATES);
+    expect(outcome.state.revision).toBe(STATE.revision + 1);
+  });
+
+  it('refuses a rate that is not an integer >= 0, naming the field and the rule', () => {
+    for (const [cmd, field] of [
+      [setRates(-1, 5, 6), 'tax'],
+      [setRates(1.5, 4, 4.5), 'tax'],
+      [setRates(5, -1, 6), 'science'],
+      [setRates(5, 4.5, 0.5), 'science'],
+      [setRates(6, 4, -1), 'luxury'],
+      [setRates(0.5, 4.5, 5), 'tax'],
+    ] as readonly (readonly [Command, string])[]) {
+      expect(refusedAs(apply(STATE, P0, cmd), 'invalid-argument').kind).toBe('invalid-argument');
+      const detail = detailOf(apply(STATE, P0, cmd));
+      expect(detail, field).toContain(field);
+      expect(detail, field).toMatch(/integer|>= 0/);
+    }
+  });
+
+  it('refuses rates that do not sum to RATE_TOTAL, with the actual sum in the message', () => {
+    // Three parts of three is nine, not ten: the message has to say so, because the
+    // caller (a slider UI, an AI) is the thing that got it wrong.
+    const nine = detailOf(apply(STATE, P0, setRates(3, 3, 3)));
+    expect(nine).toContain(`exactly ${String(RATE_TOTAL)}`);
+    expect(nine).toContain('= 9');
+    expect(nine).toContain('tax 3');
+    expect(nine).toContain('science 3');
+    expect(nine).toContain('luxury 3');
+
+    expect(detailOf(apply(STATE, P0, setRates(0, 0, 0)))).toContain('= 0');
+    expect(detailOf(apply(STATE, P0, setRates(4, 4, 4)))).toContain('= 12');
+  });
+
+  it('refuses an actor the state does not have, and leaves the state alone', () => {
+    expect(refusedAs(apply(STATE, asPlayerId(7), setRates(1, 1, 8)), 'unknown-player')).toEqual({
+      kind: 'unknown-player',
+      playerId: asPlayerId(7),
+    });
+    expect(STATE.revision).toBe(0);
+    // Another player's rates are still its own to set: the command is not "yours
+    // only", it is "the actor's only", which is why the *actor* is what it writes.
+    expect(playerOf(mustOk(apply(STATE, P1, setRates(1, 1, 8))).state, 1).rates).toEqual({
+      tax: 1,
+      science: 1,
+      luxury: 8,
+    });
+  });
+
+  it('is legal for a barbarian actor too, whose rates nothing reads', () => {
+    // The command writes a setting on whoever acts; barbarians have no economy, so
+    // their rates are inert (their treasury is not even collected into). Refusing
+    // would be a rule the frozen contract does not state.
+    const withBarbarians: GameState = {
+      ...STATE,
+      players: [...STATE.players, player(2, 8, 'barbarian')],
+    };
+
+    const outcome = mustOk(apply(withBarbarians, asPlayerId(2), setRates(1, 1, 8)));
+    expect(playerOf(outcome.state, 2).rates).toEqual({ tax: 1, science: 1, luxury: 8 });
+  });
+
+  it('never rewrites money already banked — a rate is read, not recomputed', () => {
+    // "Changing rates affects future turns only, never the current one." This engine
+    // has no moment *after* a turn's collection: the money loop is the last step of
+    // the turn (`turn.ts`), and the state carries no pending-rates field to defer
+    // with. What the rule can and does mean here is that a rate change collects
+    // nothing, refunds nothing and recomputes nothing: every pool is exactly what it
+    // was, and the *next* money loop reads the new rates.
+    const rich: GameState = {
+      ...STATE,
+      players: [
+        { ...playerOf(STATE, 0), treasury: 12, beakers: 7, luxuries: 3 },
+        playerOf(STATE, 1),
+      ],
+    };
+
+    const changed = mustOk(apply(rich, P0, setRates(0, 10, 0))).state;
+    const actor = playerOf(changed, 0);
+    expect(actor.treasury).toBe(12);
+    expect(actor.beakers).toBe(7);
+    expect(actor.luxuries).toBe(3);
+
+    // And the change is read by the collection that comes next: the same board with
+    // a city, closed under the new rates, banks nothing but beakers. The fixture city
+    // has 2 commerce (its centre plus the one tile it works), so an all-science rate
+    // turns all of it into beakers — against the 2 gold and 1 beaker the default
+    // 6/4/0 rates would have given it.
+    const withCity = withCities(changed, [CITY]);
+    const closed = advanceTurn(withCity, RULESET);
+    expect(closed.events).toContainEqual({
+      type: 'IncomeCollected',
+      playerId: P0,
+      gold: 0,
+      beakers: 2,
+      luxuries: 0,
+    });
+    // The 12 gold of the past is still 12 gold: only the new collection moved.
+    expect(playerOf(closed.state, 0).treasury).toBe(12);
+    expect(playerOf(closed.state, 0).beakers).toBe(7 + 2);
+  });
+});
 
 describe('the city plan evaluators agree with applyCommand', () => {
   /**
@@ -2417,7 +2647,10 @@ describe('turn.ts — the single definition of a turn', () => {
     ]);
     expect(outcome.state.turn).toBe(board.turn + 1);
 
-    // Events follow the pipeline: work, then growth, then production.
+    // Events follow the pipeline: work, then growth, then production, then the
+    // money loop — whose two pairs sit last, after the unit the city just built is
+    // already on the board (four units, and the income of a three-commerce city at
+    // the default 6/4/0 rates: two gold and one beaker, the remainder to gold).
     expect(outcome.events).toStrictEqual([
       {
         type: 'WorkCompleted',
@@ -2435,6 +2668,8 @@ describe('turn.ts — the single definition of a turn', () => {
         unitId: asUnitId(4),
         tile: asTileIndex(13),
       },
+      ...ledger(0, [2, 1, 0], [0, 0, 0, 4, 6]),
+      ...idleLedger(1, 1),
     ]);
   });
 
@@ -2453,6 +2688,10 @@ describe('turn.ts — the single definition of a turn', () => {
 
     expect(outcome.events).toStrictEqual([
       { type: 'WorkCompleted', unitId: asUnitId(3), kind: MINE.id, tile: asTileIndex(1) },
+      // The city's commerce is unchanged by the work step (a mine adds shields), so
+      // the ledger is the same three-commerce split as the order board's.
+      ...ledger(0, [2, 1, 0], [0, 0, 0, 3, 6]),
+      ...idleLedger(1, 1),
     ]);
 
     // The worker is idle again and refilled, so it can start the next job next turn
@@ -2467,8 +2706,10 @@ describe('turn.ts — the single definition of a turn', () => {
     const outcome = advanceTurn(pending, RULESET);
 
     // The counterfactual to the test above, one turn of work short: nothing
-    // completes, nothing is built, and the city stores one shield less.
-    expect(outcome.events).toEqual([]);
+    // completes, nothing is built, and the city stores one shield less. The only
+    // events are the money loop's — which is the point: a step that changes nothing
+    // says nothing, and the *ledger* still reports both civilizations.
+    expect(outcome.events).toEqual([...ledger(0, [2, 1, 0], [0, 0, 0, 3, 6]), ...idleLedger(1, 1)]);
     expect(workOf(outcome.state, 3)).toStrictEqual({
       kind: MINE.id,
       tile: asTileIndex(WORKER_TILE),
@@ -2499,8 +2740,24 @@ describe('turn.ts — the single definition of a turn', () => {
     const outcome = advanceTurn(reversed, RULESET);
 
     expect(
-      outcome.events.map((event) => (event.type === 'WorkCompleted' ? Number(event.unitId) : -1)),
+      outcome.events.flatMap((event) =>
+        event.type === 'WorkCompleted' ? [Number(event.unitId)] : [],
+      ),
     ).toEqual([3, 4]);
+    // Work first, then the ledger — the money loop never runs in the middle of
+    // another step.
+    expect(outcome.events.map((event) => event.type)).toEqual([
+      'WorkCompleted',
+      'WorkCompleted',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
+    ]);
+    expect(outcome.events.slice(2)).toStrictEqual([
+      ...ledger(0, [2, 1, 0], [0, 0, 0, 4, 6]),
+      ...idleLedger(1, 1),
+    ]);
     // Both improvements landed, in the state's own `(tile, kind)` order rather than
     // in completion order — the hash must be a function of the pairs, not of who
     // finished first.
@@ -2527,6 +2784,10 @@ describe('turn.ts — the single definition of a turn', () => {
 
     expect(outcome.events).toStrictEqual([
       { type: 'WorkCompleted', unitId: asUnitId(3), kind: IRRIGATION.id, tile: asTileIndex(1) },
+      // This board holds one unit — the ghost — and no cities, so nothing is owed
+      // and nothing is collected. The pair is still emitted, with zeros.
+      ...idleLedger(0, 1),
+      ...idleLedger(1, 0),
     ]);
     expect(outcome.state.improvements).toStrictEqual([
       { tile: asTileIndex(1), kind: IRRIGATION.id },
@@ -2574,7 +2835,7 @@ describe('turn.ts — the single definition of a turn', () => {
 
     const outcome = advanceTurn(board, RULESET);
 
-    expect(outcome.events).toEqual([]);
+    expect(outcome.events).toEqual([...idleLedger(0, 1), ...idleLedger(1, 0)]);
     expect(workOf(outcome.state, 3)).toStrictEqual(job);
     expect(outcome.state.improvements).toEqual([]);
     expect(outcome.state.turn).toBe(board.turn + 1);

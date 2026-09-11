@@ -28,6 +28,15 @@
  * what it is doing and how many turns are left — because the picture has no way to
  * draw a *unit*, let alone its job. The line follows the same fog rule (`describe`
  * with a `viewer`), and it is absent when nothing is being worked.
+ *
+ * **M4b.** `PlayerState` gained `treasury`/`rates`/`beakers`/`luxuries`, and the
+ * viewer's gold joins the header as a `gold=` field beside `viewer=` — money is a
+ * fact about a player, so it belongs with the one field that already names the
+ * player the picture is drawn for. It is asserted to be *totally* read (a viewer no
+ * player carries prints no gold, and an uncountable treasury prints 0, never
+ * `NaN`), and god mode's header is asserted to gain nothing at all. Beakers and
+ * luxuries are deliberately **not** in the header: they do nothing until M5 and M9,
+ * and a bare number there would imply otherwise.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -171,13 +180,29 @@ const GRID_4x4: readonly TerrainRole[] = [
  * "State shape") is a deliberate omission here, because these tests are about a
  * *picture* and a barbarian would only add a start marker nobody asked for. The
  * generated-game cases at the bottom cover the real player list.
+ *
+ * M4b gave `PlayerState` its four money fields. The treasury is the same number
+ * for every player this factory builds, because the viewer tests below compare two
+ * rendered views byte for byte while swapping which player sits where, and a
+ * per-index treasury would break those comparisons for a reason that has nothing
+ * to do with what the picture shows. `GOLD` is what the header's `gold=` field is
+ * asserted against.
  */
+const GOLD = 7;
+
 const player = (index: number, tile: number): PlayerState => ({
   id: asPlayerId(index),
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M4b: `RATE_TOTAL` is 10, so 7/3/0 is a legal split (any other sum is refused by
+  // the command layer) and an arbitrary one — `describe` reads the treasury alone,
+  // and nothing here is presented as a sourced rate.
+  treasury: GOLD,
+  rates: { tax: 7, science: 3, luxury: 0 },
+  beakers: 0,
+  luxuries: 0,
 });
 
 /** One settler per player, on its own start tile — what `newGame` places. */
@@ -245,6 +270,12 @@ const withHuts = (state: GameState, huts: readonly number[]): GameState => ({
  * pointing at a hut, not a homeland. Its id is the next player index, which is
  * exactly the digit it must **not** be painted as — see the ruling test at the
  * bottom of this file.
+ *
+ * M4b: barbarians carry the money fields too, inert. `newGame` gives them the same
+ * numbers a civilization starts with (`state.ts`: one shape for every player, so
+ * `PlayerId` stays an index into `players`), and the field is required, so a
+ * fixture that omitted it would only typecheck through a cast — which would hide
+ * the next shape change instead of failing on it.
  */
 const barbarianPlayer = (index: number, tile: number): PlayerState => ({
   id: asPlayerId(index),
@@ -252,6 +283,10 @@ const barbarianPlayer = (index: number, tile: number): PlayerState => ({
   color: '#3f3f46',
   startingTile: asTileIndex(tile),
   kind: 'barbarian',
+  treasury: GOLD,
+  rates: { tax: 7, science: 3, luxury: 0 },
+  beakers: 0,
+  luxuries: 0,
 });
 
 /** The glyph columns of every grid row, without the row-number gutter. */
@@ -753,7 +788,7 @@ describe('describe with a viewer', () => {
 
   it('renders the explored tiles and ? for the rest', () => {
     expect(describeState(FOGGED, RULESET, { viewer: asPlayerId(0) })).toMatchInlineSnapshot(`
-      "CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0
+      "CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=7
       view: x 0..3, y 0..3 (4x4 of 4x4)
         |0
         |0123
@@ -837,16 +872,45 @@ describe('describe with a viewer', () => {
     expect(describeState(moved, RULESET)).not.toBe(describeState(FOGGED, RULESET));
   });
 
-  it('names the viewer and explains ? in the legend, and only then', () => {
+  it('names the viewer, its gold, and explains ? in the legend, and only then', () => {
     const seen = describeState(FOGGED, RULESET, { viewer: asPlayerId(0) });
     const god = describeState(FOGGED, RULESET);
 
     expect(seen.split('\n')[0]).toBe(
-      'CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0',
+      `CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=${String(GOLD)}`,
     );
     expect(seen).toContain('? unexplored');
     expect(god).not.toContain('viewer=');
+    // M4b: with no viewer there is no player whose money this could be, so god
+    // mode's header gains nothing at all — it stays byte-identical to what this
+    // renderer printed before either option existed.
+    expect(god).not.toContain('gold=');
     expect(god).not.toContain('unexplored');
+  });
+
+  it('reads the viewer gold totally: a player the state does not have, and a broken number', () => {
+    // A viewer id no player carries has no gold to name, and inventing `gold=0`
+    // would be a claim about a player who does not exist. The rest of the header
+    // still names the viewer, which is what the fog tests below rely on.
+    const stranger = describeState(FOGGED, RULESET, { viewer: asPlayerId(7) });
+    expect(stranger.split('\n')[0]).toContain('viewer=7');
+    expect(stranger.split('\n')[0]).not.toContain('gold');
+
+    // A treasury the engine cannot count (a state from before M4b, a hand-built
+    // object, a JSON round trip with a fractional value) renders as 0 rather than
+    // as `gold=NaN`: the header is the agent's primary view, and a NaN there is
+    // worse than a conservative zero.
+    const broken = (treasury: number): GameState => ({
+      ...FOGGED,
+      players: [{ ...player(0, 5), treasury }, player(1, 10)],
+    });
+    for (const value of [Number.NaN, 2.5, Number.POSITIVE_INFINITY]) {
+      expect(describeState(broken(value), RULESET, { viewer: asPlayerId(0) })).toContain('gold=0');
+    }
+    // …and a whole number is printed verbatim, not clamped or rounded.
+    expect(describeState(broken(0), RULESET, { viewer: asPlayerId(0) })).toContain('gold=0');
+    expect(describeState(broken(1234), RULESET, { viewer: asPlayerId(0) })).toContain('gold=1234');
+    expect(describeState(broken(-3), RULESET, { viewer: asPlayerId(0) })).toContain('gold=-3');
   });
 
   it('treats a viewer with no explored row as seeing nothing', () => {

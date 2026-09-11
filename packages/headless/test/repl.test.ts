@@ -21,6 +21,13 @@
  *   what a unit is *doing* shows up wherever a unit shows up — the `units:` line,
  *   the `units` table and the `state` view. `work` keeps M3's city reading (the
  *   second argument tells the two apart) and both readings are pinned.
+ * - **M4b: `rates`, and an economy the reader cannot miss.** `rates <tax> <science>
+ *   <luxury>` builds one `SetRates`; a bad triple is refused by the engine's own
+ *   `ratesProblem`, and the lesson under it names legal triples that `planSetRates`
+ *   accepted before they were printed. Gold, the three rates and the two inert
+ *   pools are then shown in the banner, under every view and in `state`, and every
+ *   one of the four money events has its own pinned line — including which units
+ *   bankruptcy disbanded and why.
  *
  * The synthetic 4x4 map is deliberate: small enough that the expected transcript
  * stays readable, and it puts every interesting case next to the unit —
@@ -36,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_SETTINGS,
+  RATE_TOTAL,
   SCHEMA_VERSION,
   asBuildingId,
   asCityId,
@@ -50,14 +58,20 @@ import {
   indexToX,
   indexToY,
   newGame,
+  playerIncome,
+  playerUpkeep,
   seedRng,
   tileIndex,
+  unitSupport,
+  type BuildingDef,
   type City,
   type GameError,
   type GameEvent,
   type GameState,
+  type Rates,
   type RulesetView,
   type TerrainId,
+  type Unit,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 import { canonicalize, hashValue } from '@civts/testing';
@@ -119,6 +133,14 @@ const syntheticState = (): GameState => ({
       color: '#d12f2f',
       startingTile: tileIndex(WIDTH, 0, 0),
       kind: 'civ',
+      // M4b: every `PlayerState` carries the money fields. These are the values
+      // `newGame` starts a civilization with (`state.ts` calls them placeholders,
+      // which is what they are: nothing here is claimed to be a Civ 3 number).
+      // 10 gold is deliberately enough to matter and small enough to be spent.
+      treasury: 10,
+      rates: { tax: 6, science: 4, luxury: 0 },
+      beakers: 0,
+      luxuries: 0,
     },
     {
       id: asPlayerId(1),
@@ -126,6 +148,10 @@ const syntheticState = (): GameState => ({
       color: '#2f6fd1',
       startingTile: tileIndex(WIDTH, 0, 1),
       kind: 'civ',
+      treasury: 10,
+      rates: { tax: 6, science: 4, luxury: 0 },
+      beakers: 0,
+      luxuries: 0,
     },
   ],
   nextUnitId: 2,
@@ -270,6 +296,13 @@ const appliedEvents = (outcome: LineOutcome): readonly GameEvent[] => {
 };
 
 /**
+ * Player 0's rates, straight out of the engine's state — the same field `SetRates`
+ * writes and the money loop reads, never a copy the REPL kept. `undefined` only for
+ * a state with no player 0 at all, which no fixture here builds.
+ */
+const ratesOf = (capture: Capture): Rates | undefined => capture.session.state.players[0]?.rates;
+
+/**
  * The regression this whole file exists to keep: rendering an applied command must
  * be **complete**.
  *
@@ -344,6 +377,36 @@ const expectNoBlankEventLines = (text: string): void => {
 };
 
 /**
+ * The money loop's two lines for one player, verbatim.
+ *
+ * Every `end` since M4b emits `IncomeCollected` + `UpkeepPaid` for *each*
+ * civilization before `TurnEnded` (INTERFACES.md M4b, "The money loop"), so a test
+ * about the work verbs that pinned the whole `ok:` block has to include them — the
+ * block is exactly what `expectEveryEventRendered` counts, and a money line the
+ * renderer dropped would show up as a wrong length right here.
+ *
+ * Built from the numbers rather than restated, because this helper is used by tests
+ * about *jobs*: the prose is pinned character-for-character where it belongs, in
+ * the `event rendering` suite, which asserts the full six-line block of a turn.
+ * The parameters are the ones that actually vary between these fixtures — the
+ * player, its unit count and its free allowance (`FREE_UNITS_PER_CITY * cities +
+ * FREE_UNITS_BASE`, which is 4 with no cities).
+ */
+const moneyLines = (label: string, units: number, free: number, gold = 0): readonly string[] => [
+  `ok: ${label} collected ${String(gold)} gold, 0 beakers and 0 luxuries from its cities at ` +
+    'its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and ' +
+    'M9 (happiness)',
+  `ok: ${label} paid 0 gold of upkeep (0 building maintenance + 0 unit support for ` +
+    `${String(units)} unit(s), ${String(free)} of them free)`,
+];
+
+/** Both civilizations' money lines, in the pipeline's player-id order. */
+const bothMoneyLines = (): readonly string[] => [
+  ...moneyLines('Player 1 (p0)', 2, 4),
+  ...moneyLines('Player 2 (p1)', 1, 4),
+];
+
+/**
  * The synthetic board plus a goody hut at (1,1) and a chosen RNG state: the unit
  * at (0,0) can step onto the hut, so one `move` reaches the whole hut rule —
  * including which of the three rewards the draw gives, which is `rngSeed`'s job.
@@ -368,6 +431,14 @@ const hutState = (rngSeed: number): GameState => {
         color: '#3f3f46',
         startingTile: tileIndex(WIDTH, 1, 1),
         kind: 'barbarian',
+        // M4b: one shape for every player, barbarians included — `PlayerId` is an
+        // index into `players` and `state.ts` gives them the same money fields a
+        // civilization has, inert. `applyEconomy` skips anything that is not a
+        // civilization, so these are never collected or charged.
+        treasury: 10,
+        rates: { tax: 6, science: 4, luxury: 0 },
+        beakers: 0,
+        luxuries: 0,
       },
     ],
     explored: [...base.explored, new Array<boolean>(WIDTH * HEIGHT).fill(false)],
@@ -379,6 +450,100 @@ const cityOf = (state: GameState, id = 0): City => {
   const city = cityById(state, asCityId(id));
   if (city === undefined) throw new Error(`the session has no city ${String(id)}`);
   return city;
+};
+
+/* ------------------------------------------------------------------ *
+ * M4b fixtures: a board that goes bankrupt, and a ruleset that can bill
+ * ------------------------------------------------------------------ */
+
+/**
+ * A building row that declares a `maintenance`, which the shipped catalog's rows
+ * do not: `BuildingDef` carries a shield `cost` and nothing else, and M4b adds no
+ * effects (that is M4c). `economy.ts` reads the field *structurally* — a row that
+ * carries an integer `maintenance > 0` is billed, one that carries nothing is
+ * billed 0 — so a view like this one is exactly what that read is for, and M4c
+ * filling the field in for real will not change this module's mind.
+ *
+ * Declared on the test's own type rather than cast: `readonly BilledBuildingDef[]`
+ * *is* a `readonly BuildingDef[]`, so no `as` and no eslint escape is involved.
+ */
+interface BilledBuildingDef extends BuildingDef {
+  readonly maintenance: number;
+}
+
+const TOLL_HOUSE: readonly BilledBuildingDef[] = [
+  { id: asBuildingId('toll-house'), name: 'Toll House', cost: 10, maintenance: 4 },
+];
+
+/** The shipped ruleset plus a building that actually bills its owner. */
+const BILLING_RULESET: RulesetView = { ...RULESET, buildings: TOLL_HOUSE };
+
+/**
+ * A board player 0 cannot pay for, built so that **all four money events** happen
+ * in one turn:
+ *
+ * - the city's commerce is split at rates with a science *and* a luxury share, so
+ *   the `IncomeCollected` line has non-zero beakers and luxuries to report (the
+ *   whole point of the inertness warning: they are banked and do nothing);
+ * - a Toll House bills 4 gold, so upkeep exceeds the city's income;
+ * - eight units against an allowance of `FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE`
+ *   = 6 leaves 2 billable, so there is something to disband — and the shortfall
+ *   that survives both removals is `maintenance - income`, which is what makes
+ *   `TreasuryShortfall` reachable at all. With the shipped catalog it is *not*:
+ *   maintenance is 0, income is never negative and the treasury never goes below
+ *   zero, so the unpaid remainder can only be <= 0. That is why this fixture needs
+ *   `BILLING_RULESET`, and it is said here rather than left as a puzzle.
+ *
+ * The city is at population 3 working two grassland tiles: food `2 + 2 + 2 = 6`
+ * against `2 * 3 = 6` eaten, so the turn neither grows nor starves and the
+ * commerce the money loop splits is exactly the assignment below. Everything is
+ * hand-built because no legal sequence of commands produces a broke player with a
+ * paid-up building in one turn, and this is a rendering test.
+ */
+const bankruptState = (): GameState => {
+  const base = syntheticState();
+  const army: readonly Unit[] = Array.from({ length: 7 }, (_, index) => ({
+    id: asUnitId(index + 2),
+    type: asUnitTypeId('warrior'),
+    owner: asPlayerId(0),
+    tile: tileIndex(WIDTH, 3, 3),
+    movementLeft: 1,
+  }));
+
+  return {
+    ...base,
+    nextUnitId: 9,
+    players: base.players.map((player) =>
+      player.id === asPlayerId(0)
+        ? {
+            ...player,
+            // Broke on purpose, and a rates triple that sends something to every
+            // channel: 2/4/4 is a legal split of `RATE_TOTAL` (10).
+            treasury: 0,
+            rates: { tax: 2, science: 4, luxury: 4 },
+            beakers: 0,
+            luxuries: 0,
+          }
+        : player,
+    ),
+    nextCityId: 1,
+    cities: [
+      {
+        id: asCityId(0),
+        owner: asPlayerId(0),
+        name: 'City 1',
+        tile: tileIndex(WIDTH, 0, 0),
+        population: 3,
+        foodBox: 0,
+        shields: 0,
+        queue: [],
+        buildings: [asBuildingId('toll-house')],
+        workedTiles: [tileIndex(WIDTH, 0, 1), tileIndex(WIDTH, 1, 1)],
+      },
+    ],
+    // The settler and settler-plus-army: eight units for player 0, one for player 1.
+    units: [...base.units, ...army],
+  };
 };
 
 /* ------------------------------------------------------------------ *
@@ -400,13 +565,26 @@ const SCRIPT = ['units', 'move 0 1 1', 'move 0 2 2', 'move 0 9 9', 'wibble', 'en
  * under its `units:` line. The view had to grow that line: `describe` draws
  * terrain and goody huts, not cities, so a session that founded one would else
  * show a map with no unit on it and no sign of the city it had just built.
+ *
+ * Regenerated a second time for M4b, and — unlike the M3 and M4a rehashes — the
+ * text really did move. Three things are visible in it, and each is the milestone's
+ * UI half rather than an accident: the banner states the economy before the first
+ * command, every view carries an `economy:` line after its `cities:` line (the money
+ * loop changes something on every turn, so a figure the agent has to ask for is a
+ * figure it notices only too late), and every `end` prints the money loop's two
+ * lines per civilization *before* `TurnEnded` — the pipeline's new step 4. The
+ * inertness sentence travels with both, because a "2 beakers" with no caveat would
+ * imply a research system this build does not have.
  */
 const EXPECTED_TRANSCRIPT = [
   'CivTS play - seed 7, tiny map 4x4, 2 civs',
   'you are Player 1 (p0); every view below is drawn from your fog of war',
-  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | end | units | state | save <path> | help | quit',
+  'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 cities',
+  '  beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness).',
+  '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
+  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | end | units | state | save <path> | help | quit',
   '',
-  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -418,12 +596,14 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> units',
   'units: 2 of 2 visible for Player 1 (p0)',
   'm  id  type        owner        at        move     terrain      job                         legal',
   '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
   '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
-  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -435,10 +615,12 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> move 0 1 1',
   'ok: unit 0 moved to (1,1), cost 1, 1 movement left',
   '  revision 1',
-  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -450,10 +632,12 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> move 0 2 2',
   'error: not-enough-movement - unit 0 (Settler at 1,1, 1/2 per turn movement left) needs 2 movement for the step onto that tile, but only 1 is left. "end" refills movement.',
   '  legal: unit 0 (Settler at 1,1, 1/2 per turn movement left) can move to (0,0) (2,0) (2,1) (0,2) (1,2).',
-  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -465,10 +649,12 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> move 0 9 9',
   'error: malformed command - (9,9) is outside the map (4x4): x must be 0..3 and y must be 0..3.',
   '  the ruler above the map lists the valid columns and rows',
-  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -480,11 +666,13 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> wibble',
   'error: unknown command "wibble" - no such command.',
-  '  commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | end | units | state | save <path> | help | quit',
+  '  commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | end | units | state | save <path> | help | quit',
   '  type "help" for what each one does.',
-  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -496,10 +684,16 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> end',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
-  'CivTS state: seed=7 turn=2 revision=2 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=2 revision=2 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -511,6 +705,8 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> quit',
   'bye - the state lives in memory only unless you ran "save <path>".',
 ].join('\n');
@@ -531,9 +727,12 @@ const WORKER_SCRIPT = [
 const EXPECTED_WORKER_TRANSCRIPT = [
   'CivTS play - seed 7, tiny map 4x4, 2 civs',
   'you are Player 1 (p0); every view below is drawn from your fog of war',
-  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | end | units | state | save <path> | help | quit',
+  'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 cities',
+  '  beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness).',
+  '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
+  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | end | units | state | save <path> | help | quit',
   '',
-  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -545,13 +744,15 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> units',
   'units: 3 of 3 visible for Player 1 (p0)',
   'm  id  type        owner        at        move     terrain      job                         legal',
   '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
   '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
   '*  2   Worker      Player 1     2,2       2/2      Hills        (idle)                      8',
-  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -563,10 +764,12 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> work 2 mine',
   'ok: unit 2 started improvement "Mine" (3 turns) on (2,2): 3 turns left',
   '  revision 1',
-  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -579,14 +782,23 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 mining, 3 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> state',
-  'state: seed=7 turn=1 revision=1 schema=4 map=tiny(4x4) civs=2',
+  'state: seed=7 turn=1 revision=1 schema=5 map=tiny(4x4) civs=2',
+  'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, 0 luxuries',
+  '  beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness) - they only pile up, and nothing in this build spends or reads them.',
+  '  gold is the only channel that acts today: it pays upkeep, and a treasury that cannot pay',
+  '  is paid for by disbanding units (highest id first) rather than by going negative.',
+  'economy: at these rates this state collects 0 gold, 0 beakers and 0 luxuries a turn',
+  '  from 0 cities, and owes 0 gold of upkeep (0 maintenance + 0 unit support for 2 unit(s), 4 free)',
+  '  - a projection from this state, because growth and production run before the bill is drawn.',
   'you: 2 unit(s), explored 16/16 tiles, 16 visible right now',
   'jobs: 2 Worker@2,2 mining, 3 turns left',
   'civs: Player 1 (p0) <- you, Player 2 (p1)',
   'rng: a=-456573687 b=-84222363 c=801465066 d=1648156487',
-  'hash: b7b4f66082f55c25',
-  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'hash: 0511ae245fa10624',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -599,10 +811,16 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 mining, 3 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> end',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
-  'CivTS state: seed=7 turn=2 revision=2 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=2 revision=2 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -615,10 +833,12 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 mining, 2 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement) mining, 2 turns left',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> cancel 2',
   'ok: unit 2 stopped improvement "Mine" (3 turns) on (2,2) (cancelled), 2 turns of work lost',
   '  revision 3',
-  'CivTS state: seed=7 turn=2 revision=3 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=2 revision=3 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -630,10 +850,12 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> work 2 road',
   'ok: unit 2 started improvement "Road" (2 turns) on (2,2): 2 turns left',
   '  revision 4',
-  'CivTS state: seed=7 turn=2 revision=4 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=2 revision=4 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -646,10 +868,16 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 building a road, 2 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) building a road, 2 turns left',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> end',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 3 begins; every unit refilled its movement',
   '  revision 5',
-  'CivTS state: seed=7 turn=3 revision=5 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=3 revision=5 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -662,11 +890,17 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 building a road, 1 turn left',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement) building a road, 1 turn left',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> end',
   'ok: unit 2 finished improvement "Road" (2 turns) on (2,2); the tile is improved',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 4 begins; every unit refilled its movement',
   '  revision 6',
-  'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -678,13 +912,15 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> units',
   'units: 3 of 3 visible for Player 1 (p0)',
   'm  id  type        owner        at        move     terrain      job                         legal',
   '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
   '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
   '*  2   Worker      Player 1     2,2       2/2      Hills        (idle)                      8',
-  'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0',
+  'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
   '  |0123',
@@ -696,6 +932,8 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
   'cities: none',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+  '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> quit',
   'bye - the state lives in memory only unless you ran "save <path>".',
 ].join('\n');
@@ -711,7 +949,15 @@ describe('the REPL transcript', () => {
     // state hash moved. b9166aa11541451a -> d270dc95982b4fdb. The *transcript*
     // did not move: this fixture's two players are both civilizations, so
     // nothing that lists players changed for it.
-    expect(hashValue(syntheticState())).toBe('15920e8782c85ecd');
+    //
+    // Rehashed for M4b (SCHEMA_VERSION 4 -> 5): `PlayerState` gained `treasury`,
+    // `rates`, `beakers` and `luxuries` — four additive fields on every player,
+    // and an additive field moves *every* state hash (the M2 `esc`/M3 `cities`
+    // lesson, stated in `state.ts`). 15920e8782c85ecd -> c3eaac847e1f2b2a. Unlike
+    // M3's rehash, this one *did* move the transcript, and deliberately: the
+    // banner, every view and the `state` output now carry the economy (see the
+    // pinned text below), which is the whole point of the milestone's UI half.
+    expect(hashValue(syntheticState())).toBe('c3eaac847e1f2b2a');
 
     const capture = open();
     runScript(capture.session, SCRIPT.join('\n'), capture.write);
@@ -741,7 +987,17 @@ describe('the REPL transcript', () => {
     // and an additive field moves *every* state hash. 880e2d6fa2c828dd ->
     // 73edef6a26a57a1f. The transcript above is unchanged by this one: `describe`
     // reads the job on a *unit*, and no unit on this board is working.
-    expect(hashValue(capture.session.state)).toBe('73edef6a26a57a1f');
+    //
+    // Rehashed again for M4b (SCHEMA_VERSION 4 -> 5): the four money fields on
+    // `PlayerState` (and this board's `end` now banks a turn of income, so the
+    // treasury in the final state is 12 rather than the starting 10). 73edef6a26a57a1f
+    // -> 849f619e646119bc. The transcript moved with it, for the first time in a
+    // rehash: the money lines are in it (see `EXPECTED_TRANSCRIPT`).
+    expect(hashValue(capture.session.state)).toBe('849f619e646119bc');
+    // The `end` in this script banked a turn of a *cityless* economy: no city, so no
+    // commerce and no income — the treasury is exactly the starting 10. A money loop
+    // that invented income for a player with nothing built would move this.
+    expect(capture.session.state.players[0]?.treasury).toBe(10);
   });
 });
 
@@ -919,9 +1175,13 @@ describe('commands', () => {
 
     expect(capture.session.state).not.toBe(state);
     expect(hashValue(state)).toBe(before);
-    // Rehashed for M4a: the fixture gained `improvements: []` (see the transcript
-    // hash above).
-    expect(hashValue(state)).toBe('15920e8782c85ecd');
+    // Rehashed for M4a (the fixture gained `improvements: []`) and again for M4b
+    // (each player gained the four money fields): 15920e8782c85ecd ->
+    // c3eaac847e1f2b2a. This is the state *it was handed*, not the one the session
+    // ended on — the frozen fixture is never written to, which is the whole
+    // assertion, and a money loop that mutated its input in place would move this
+    // hash and fail right here.
+    expect(hashValue(state)).toBe('c3eaac847e1f2b2a');
 
     // Same input, same result: the session holds no hidden state of its own.
     const fresh = open();
@@ -1272,7 +1532,7 @@ describe('the city verbs', () => {
  * ------------------------------------------------------------------ */
 
 describe('event rendering', () => {
-  it('prints a line for every event a turn emits, completion included', () => {
+  it('prints a line for every event a turn emits, completion and money included', () => {
     const capture = open();
     capture.session.run('found 0');
     capture.session.run('build 0 unit:scout');
@@ -1280,15 +1540,51 @@ describe('event rendering', () => {
 
     const outcome = capture.session.run('end');
     const block = expectEveryEventRendered(outcome, capture.text());
+    // M4b moved this list, deliberately: the turn pipeline is now
+    // `work ++ growth ++ production ++ economy ++ TurnEnded` (INTERFACES.md M4b,
+    // "The money loop"), so an `end` carries the money loop's two lines for *every*
+    // civilization — the zero ones included, which is exactly what the milestone's
+    // ledger evidence asks for. Pinned by identity rather than by count: the order
+    // is the contract.
     expect(appliedEvents(outcome).map((event) => event.type)).toEqual([
       'CityProduced',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
       'TurnEnded',
     ]);
     expect(block[0]).toBe(
       'ok: city 0 "City 1" (Player 1 (p0) at 0,0) finished unit "Scout" (unit 2 at (0,0)); ' +
         '1 shields left',
     );
-    expect(block[1]).toBe('ok: turn 2 begins; every unit refilled its movement');
+    // The money lines, rendered in full. Six lines where there used to be two: the
+    // regression this helper exists for is an *unhandled* `GameEvent` member, and
+    // M4b added four of them, so a renderer that dropped one now shows up as a short
+    // block as well as a blank line (the helper checks both).
+    expect(block[1]).toBe(
+      'ok: Player 1 (p0) collected 2 gold, 0 beakers and 0 luxuries from its cities at its ' +
+        'rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and ' +
+        'M9 (happiness)',
+    );
+    expect(block[2]).toBe(
+      'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for ' +
+        '1 unit(s), 6 of them free)',
+    );
+    expect(block[3]).toBe(
+      'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its ' +
+        'rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and ' +
+        'M9 (happiness)',
+    );
+    expect(block[4]).toBe(
+      'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for ' +
+        '1 unit(s), 4 of them free)',
+    );
+    expect(block[5]).toBe('ok: turn 2 begins; every unit refilled its movement');
+    // And the collection is real, not just printed: 10 to start with plus the 2 the
+    // city's commerce produced. A renderer and a state that disagreed here would be
+    // the worst of both — a plausible line about money that never moved.
+    expect(capture.session.state.players[0]?.treasury).toBe(12);
   });
 
   it('prints a line for a starving city', () => {
@@ -1320,9 +1616,26 @@ describe('event rendering', () => {
     const outcome = capture.session.run('end');
     const block = expectEveryEventRendered(outcome, capture.text());
 
-    expect(appliedEvents(outcome).map((event) => event.type)).toEqual(['CityStarved', 'TurnEnded']);
-    expect(block[0]).toContain('starved down to 1 citizen(s)');
-    expect(block[0]).toContain('food box restarted at 0');
+    expect(appliedEvents(outcome).map((event) => event.type)).toEqual([
+      'CityStarved',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'TurnEnded',
+    ]);
+    expect(block[0]).toBe(
+      'ok: city 0 "City 1" (Player 1 (p0) at 1,0) starved down to 1 citizen(s); food box ' +
+        'restarted at 0',
+    );
+    // A starving city still collects: starvation is food, not money, and a renderer
+    // that let one suppress the other would lose the turn's ledger line entirely.
+    expect(block[1]).toBe(
+      'ok: Player 1 (p0) collected 1 gold, 0 beakers and 0 luxuries from its cities at its ' +
+        'rates - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and ' +
+        'M9 (happiness)',
+    );
+    expect(capture.session.state.players[0]?.treasury).toBe(11);
   });
 
   it('prints a real line for a hut entry, whichever of the three rewards it held', () => {
@@ -1400,6 +1713,126 @@ describe('event rendering', () => {
       }
       expect(capture.text()).not.toMatch(/\n\n {2}revision /);
     }
+  });
+
+  it('never leaves an empty line where a *money* event should be, disbanding included', () => {
+    // M4b's half of the regression above, and the wider net of the two: it walks a
+    // whole session rather than one command, and it *reaches all four money events*
+    // — a collection with non-zero beakers and luxuries, an upkeep, the two
+    // `UnitDisbanded` removals bankruptcy performs, and the `TreasuryShortfall` that
+    // survives them. The M4a sweep above cannot do that: its board is solvent, so
+    // three of the four members would never be emitted and their cases would be
+    // unrendered-and-untested.
+    const capture = open({ state: bankruptState(), ruleset: BILLING_RULESET });
+    const lines = ['state', 'units', 'end', 'units', 'state', 'quit'];
+
+    for (const line of lines) {
+      capture.clear();
+      const outcome = capture.session.run(line);
+      if (outcome.kind === 'applied' && outcome.outcome.events.length > 0) {
+        expectEveryEventRendered(outcome, capture.text());
+      }
+      expect(capture.text()).not.toMatch(/\n\n {2}revision /);
+    }
+  });
+
+  it('renders all four money events, naming the units bankruptcy took and why', () => {
+    const capture = open({ state: bankruptState(), ruleset: BILLING_RULESET });
+    capture.clear();
+
+    const before = capture.session.state;
+    const outcome = capture.session.run('end');
+    const block = expectEveryEventRendered(outcome, capture.text());
+    const events = appliedEvents(outcome);
+
+    // The pipeline, event by event: one collection and one upkeep for each
+    // civilization in player-id order, the two disbandments bankruptcy performs,
+    // the shortfall that survived them, and the turn. Pinned by identity, not by
+    // a count: the order *is* the M4b contract.
+    expect(events.map((event) => event.type)).toEqual([
+      'IncomeCollected',
+      'UpkeepPaid',
+      'UnitDisbanded',
+      'UnitDisbanded',
+      'TreasuryShortfall',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'TurnEnded',
+    ]);
+    expect(block).toHaveLength(events.length);
+
+    // Non-vacuity, stated as a check on the *fixture*: without this the four lines
+    // below could all be about zeroes and the test would prove nothing about the
+    // inert channels or about bankruptcy.
+    const income = events[0];
+    const upkeep = events[1];
+    if (income?.type !== 'IncomeCollected' || upkeep?.type !== 'UpkeepPaid') {
+      throw new Error('the fixture must collect and then pay before it goes broke');
+    }
+    expect(income.beakers).toBeGreaterThan(0);
+    expect(income.luxuries).toBeGreaterThan(0);
+    expect(upkeep.maintenance).toBeGreaterThan(0);
+    expect(upkeep.unitSupport).toBeGreaterThan(0);
+
+    // The two money lines carry the engine's own numbers, and the collection line
+    // says out loud that the two pools it just banked do nothing.
+    expect(block[0]).toBe(
+      `ok: Player 1 (p0) collected ${String(income.gold)} gold, ` +
+        `${String(income.beakers)} ${income.beakers === 1 ? 'beaker' : 'beakers'} and ` +
+        `${String(income.luxuries)} ${income.luxuries === 1 ? 'luxury' : 'luxuries'} from its ` +
+        'cities at its rates - beakers and luxuries DO NOTHING yet: nothing reads them until ' +
+        'M5 (tech) and M9 (happiness)',
+    );
+    expect(block[1]).toBe(
+      `ok: Player 1 (p0) paid ${String(upkeep.gold)} gold of upkeep ` +
+        `(${String(upkeep.maintenance)} building maintenance + ${String(upkeep.unitSupport)} ` +
+        `unit support for ${String(upkeep.units)} unit(s), ${String(upkeep.freeUnits)} of them free)`,
+    );
+
+    // Which units were disbanded, and why. The ids are pinned *and* checked against
+    // the state: the units the lines name are exactly the units that are gone, so a
+    // renderer cannot name one that stayed (or stay silent about one that left). The
+    // order is highest-id-first, the documented rule.
+    const removalOrder = events.flatMap((event) =>
+      event.type === 'UnitDisbanded' ? [event.unitId] : [],
+    );
+    expect(removalOrder).toEqual([asUnitId(8), asUnitId(7)]);
+    const actuallyGone = before.units
+      .filter((unit) => !capture.session.state.units.some((left) => left.id === unit.id))
+      .map((unit) => Number(unit.id))
+      .sort((a, b) => b - a);
+    expect(actuallyGone).toEqual(removalOrder.map(Number));
+    expect(block[2]).toBe(
+      'ok: BANKRUPTCY - Player 1 (p0) disbanded unit 8 (Warrior at (3,3)) to pay 1 gold of ' +
+        "this turn's upkeep: the treasury could not cover it, and the highest-id unit goes first",
+    );
+    expect(block[3]).toBe(
+      'ok: BANKRUPTCY - Player 1 (p0) disbanded unit 7 (Warrior at (3,3)) to pay 1 gold of ' +
+        "this turn's upkeep: the treasury could not cover it, and the highest-id unit goes first",
+    );
+    // …and the second removal saved nothing more than was still owed: the shortfall
+    // line's number is `upkeep - income - treasury` minus what the two saved.
+    const shortfall = events[4];
+    if (shortfall?.type !== 'TreasuryShortfall') throw new Error('expected a shortfall');
+    expect(shortfall.unpaid).toBe(upkeep.gold - income.gold - 2);
+    expect(block[4]).toBe(
+      `ok: BANKRUPTCY - Player 1 (p0) still owes ${String(shortfall.unpaid)} gold of this ` +
+        "turn's upkeep after disbanding every unit it could pay with; the treasury is 0 (it " +
+        'never goes negative) and the unpaid gold is reported here rather than carried as a debt',
+    );
+
+    // The invariant the contract turns on: the treasury NEVER goes negative, and the
+    // pools still took this turn's beakers and luxuries — a broke treasury does not
+    // un-research anything.
+    const after = capture.session.state.players[0];
+    expect(after?.treasury).toBe(0);
+    expect(after?.beakers).toBe(income.beakers);
+    expect(after?.luxuries).toBe(income.luxuries);
+    // Player 2 never went broke and collected nothing (it has no city): its two
+    // lines are still printed, which is the "the stream is the ledger" rule.
+    expect(capture.session.state.players[1]?.treasury).toBe(10);
+    expect(block[5]).toContain('ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries');
+    expect(block[6]).toContain('ok: Player 2 (p1) paid 0 gold of upkeep');
   });
 });
 
@@ -1581,7 +2014,9 @@ describe('the worker verbs', () => {
     capture.clear();
     const first = capture.session.run('end');
     expect(jobOf(capture)?.turnsLeft).toBe(2);
+    // The whole block, in order: the money loop's four lines (M4b) then the turn.
     expect(expectEveryEventRendered(first, capture.text())).toEqual([
+      ...bothMoneyLines(),
       'ok: turn 2 begins; every unit refilled its movement',
     ]);
 
@@ -1593,6 +2028,7 @@ describe('the worker verbs', () => {
     const finished = capture.session.run('end');
     expect(expectEveryEventRendered(finished, capture.text())).toEqual([
       'ok: unit 2 finished improvement "Mine" (3 turns) on (2,2); the tile is improved',
+      ...bothMoneyLines(),
       'ok: turn 4 begins; every unit refilled its movement',
     ]);
 
@@ -1783,7 +2219,11 @@ describe('the worker verbs', () => {
     // exercises the work events: two fresh sessions, one transcript, byte for byte.
     expect(first.text()).toBe(second.text());
     expect(first.text()).toBe(`${EXPECTED_WORKER_TRANSCRIPT}\n`);
-    expect(hashValue(first.session.state)).toBe('9dac80e9663b8231');
+    // Rehashed for M4b along with every other pinned state in this file: the
+    // session ends on a different state because the money loop now banks four
+    // turns of income (and the fixture's players carry the four money fields).
+    // 9dac80e9663b8231 -> 54f6d5c75de7e9d6.
+    expect(hashValue(first.session.state)).toBe('54f6d5c75de7e9d6');
   });
 
   it('documents the worker verbs in help and in the command summary', () => {
@@ -1796,6 +2236,242 @@ describe('the worker verbs', () => {
     expect(capture.text()).toContain('work <cityId> <x> <y> ...');
     expect(COMMAND_SUMMARY).toContain('work <unitId> <improvementId>');
     expect(COMMAND_SUMMARY).toContain('cancel <unitId>');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4b — the money surface: the `rates` verb, and the economy the reader
+ * is shown whether or not it asked.
+ * ------------------------------------------------------------------ */
+
+describe('the rates verb', () => {
+  it('maps onto SetRates rather than editing the player itself', () => {
+    const capture = open();
+    capture.clear();
+
+    const outcome = capture.session.run('rates 7 2 1');
+    expect(outcome).toMatchObject({
+      kind: 'applied',
+      command: { type: 'SetRates', rates: { tax: 7, science: 2, luxury: 1 } },
+    });
+    // No event: the command's payload *is* the record of the change (M3's setters'
+    // precedent), which is why the `ok:` line below has to say what happened itself.
+    expect(appliedEvents(outcome)).toEqual([]);
+
+    // The change is in the engine's state, and it is the *only* thing that moved:
+    // a rate change is a statement about the next collection, never a recomputation
+    // of one that already happened.
+    const before = syntheticState().players[0];
+    const after = capture.session.state.players[0];
+    expect(ratesOf(capture)).toEqual({ tax: 7, science: 2, luxury: 1 });
+    expect(after?.treasury).toBe(before?.treasury);
+    expect(after?.beakers).toBe(before?.beakers);
+    expect(after?.luxuries).toBe(before?.luxuries);
+    expect(capture.session.state.revision).toBe(1);
+
+    // The line says so, in those words.
+    expect(capture.text()).toContain(
+      'ok: rates set to tax 7 / science 2 / luxury 1 (sum 10 of 10); this changes future ' +
+        'collections only - the treasury and the two pools are exactly what they were, and no ' +
+        'turn already collected is recomputed',
+    );
+  });
+
+  it('refuses a triple that does not sum to RATE_TOTAL, with the engine’s own reason', () => {
+    const capture = open();
+    capture.clear();
+
+    const outcome = capture.session.run('rates 7 2 2');
+    const error = refusal(outcome);
+    // The engine's typed reason, and the sum in it — not the REPL's opinion.
+    expect(error.kind).toBe('invalid-argument');
+    if (error.kind === 'invalid-argument') {
+      expect(error.detail).toContain('10');
+      expect(error.detail).toContain('11'); // the sum that was actually asked for
+      expect(error.detail).toContain('rates');
+    }
+    expect(capture.text()).toContain('error: invalid-argument');
+    // The lesson: the rule, and legal triples — each of which the *engine* accepted
+    // before it was printed (the hint is built with `planSetRates`, not asserted).
+    expect(capture.text()).toContain(`must sum to exactly ${String(RATE_TOTAL)}`);
+    expect(capture.text()).toContain(`"rates ${String(RATE_TOTAL)} 0 0"`);
+    expect(capture.text()).toContain(`"rates 0 ${String(RATE_TOTAL)} 0"`);
+    expect(capture.text()).toContain(`"rates 0 0 ${String(RATE_TOTAL)}"`);
+    expect(capture.text()).toContain('"rates 6 4 0"');
+
+    // A refusal is inert: the rates are still what they were.
+    expect(ratesOf(capture)).toEqual({ tax: 6, science: 4, luxury: 0 });
+    expect(capture.session.state.revision).toBe(0);
+
+    // Negative numbers reach the engine too (they parse as integers and are refused
+    // by the rate rule, not by the grammar), so the refusal is always the engine's.
+    capture.clear();
+    const negative = capture.session.run('rates -1 11 0');
+    expect(refusal(negative).kind).toBe('invalid-argument');
+    expect(capture.session.state.revision).toBe(0);
+  });
+
+  it('refuses a non-integer or a wrong arity as malformed, without touching the engine', () => {
+    const capture = open();
+    capture.clear();
+
+    // Wrong arity: the grammar's own refusal, naming the shape it wants.
+    for (const line of ['rates', 'rates 6', 'rates 6 4', 'rates 6 4 0 0']) {
+      capture.clear();
+      expect(capture.session.run(line).kind, line).toBe('malformed');
+      expect(capture.text(), line).toContain('needs 3 arguments: rates <tax> <science> <luxury>');
+      expect(capture.text(), line).toContain(`summing to exactly ${String(RATE_TOTAL)}`);
+      expect(capture.session.state.revision, line).toBe(0);
+    }
+
+    // Right arity, wrong type: also the grammar — a rate is an integer or the command
+    // is not built at all. Note what is *absent* from this list: a negative integer
+    // parses, reaches the engine, and is refused there (the test above), because the
+    // rate *rule* is the engine's and this layer must not hold a second opinion.
+    for (const line of ['rates a b c', 'rates 6 4 1.5', 'rates 6 4 x']) {
+      capture.clear();
+      expect(capture.session.run(line).kind, line).toBe('malformed');
+      expect(capture.text(), line).toContain('tax, science and luxury must be whole numbers');
+      expect(capture.session.state.revision, line).toBe(0);
+    }
+  });
+
+  it('is documented in help and in the command summary', () => {
+    const capture = open();
+    capture.clear();
+    capture.session.run('help');
+
+    expect(capture.text()).toContain('rates <tax> <science> <luxury>');
+    expect(capture.text()).toContain(`sum to exactly ${String(RATE_TOTAL)}`);
+    expect(COMMAND_SUMMARY).toContain('rates <tax> <science> <luxury>');
+  });
+});
+
+describe('the economy the reader is shown', () => {
+  it('states the position in the banner, before the first command', () => {
+    const capture = open();
+    const banner = capture.text();
+
+    expect(banner).toContain(
+      'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 ' +
+        '(sum 10 of 10), 0 cities',
+    );
+    // The inertness sentence, in the banner, in full: nothing here may imply that
+    // research or contentment is modelled.
+    expect(banner).toContain(
+      'beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
+    );
+    expect(banner).toContain('"rates <tax> <science> <luxury>" moves the sliders');
+  });
+
+  it('prints an economy line under every view, so a turn cannot change it unseen', () => {
+    const capture = open();
+    capture.clear();
+    capture.session.run('move 0 1 1');
+
+    // Every view, not just the one the agent asked for: the money loop banks and
+    // charges something on *every* turn, so a figure that has to be asked for is a
+    // figure the player notices only after it has already gone bankrupt.
+    const economyLines = capture
+      .text()
+      .split('\n')
+      .filter((line) => line.startsWith('economy: '));
+    expect(economyLines).toHaveLength(1);
+    expect(economyLines[0]).toBe(
+      'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, ' +
+        '0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) ' +
+        'and M9 (happiness)',
+    );
+    expect(capture.text()).toContain(
+      '1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
+    );
+    // The header of the view carries the gold too, from `textview`.
+    expect(capture.text()).toContain('viewer=0 gold=10');
+  });
+
+  it('prints the full ledger under "state", with the engine’s own projection', () => {
+    const capture = open();
+    capture.clear();
+    capture.session.run('state');
+
+    const text = capture.text();
+    const player = capture.session.state.players[0];
+    if (player === undefined) throw new Error('no player 0');
+    const income = playerIncome(capture.session.state, RULESET, asPlayerId(0));
+    const upkeep = playerUpkeep(capture.session.state, RULESET, asPlayerId(0));
+    const support = unitSupport(capture.session.state, asPlayerId(0));
+
+    expect(text).toContain(
+      'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, ' +
+        '0 luxuries',
+    );
+    expect(text).toContain('- they only pile up, and nothing in this build spends or reads them.');
+    // The per-turn projection, from `playerIncome`/`playerUpkeep` — the same
+    // evaluators the money loop runs — and labelled as a projection, because growth
+    // and production happen before the bill is drawn.
+    expect(text).toContain(
+      `economy: at these rates this state collects ${String(income.gold)} gold, ` +
+        `${String(income.beakers)} beakers and ${String(income.luxuries)} luxuries a turn`,
+    );
+    expect(text).toContain(
+      `from 0 cities, and owes ${String(upkeep.gold)} gold of upkeep ` +
+        `(${String(upkeep.maintenance)} maintenance + ${String(upkeep.unitSupport)} unit ` +
+        `support for ${String(support.units)} unit(s), ${String(support.free)} free)`,
+    );
+    expect(text).toContain('- a projection from this state, because growth and production run');
+  });
+
+  it('lets the rates verb move what that projection says, and nothing else', () => {
+    const capture = open({ state: bankruptState(), ruleset: BILLING_RULESET });
+    capture.clear();
+    capture.session.run('state');
+    const before = capture.text();
+
+    capture.clear();
+    expect(capture.session.run('rates 10 0 0').kind).toBe('applied');
+    expect(capture.text()).toContain(
+      'ok: rates set to tax 10 / science 0 / luxury 0 (sum 10 of 10)',
+    );
+
+    capture.clear();
+    capture.session.run('state');
+    const after = capture.text();
+
+    // All gold: the beaker and luxury channels of the projection go to zero, because
+    // the same city commerce is being split differently.
+    const income = playerIncome(capture.session.state, BILLING_RULESET, asPlayerId(0));
+    expect(income.beakers).toBe(0);
+    expect(income.luxuries).toBe(0);
+    expect(after).toContain('0 beakers, 0 luxuries');
+    expect(after).not.toBe(before);
+    // …and the *pools* are untouched by a rate change: only the next split moves.
+    expect(capture.session.state.players[0]?.beakers).toBe(bankruptState().players[0]?.beakers);
+  });
+
+  it('reads a broken money field as 0 rather than printing a fraction', () => {
+    // The header is the agent's primary view: `gold=2.5` or `rates 1.5/NaN/0` would be
+    // worse than a conservative 0 that says "nothing the engine can count", which is
+    // the same total read `economy.ts` makes of its own fields.
+    //
+    // A *fractional* value rather than `NaN`, deliberately: `NaN` is not
+    // representable in canonical JSON, so `hashValue` refuses such a state outright
+    // (the `canonicalize` guard), and this test is about rendering, not about the
+    // hasher. A fraction is a shape a broken save can really carry.
+    const base = syntheticState();
+    const first = base.players[0];
+    if (first === undefined) throw new Error('the fixture has a player 0');
+    const broken: GameState = {
+      ...base,
+      players: [{ ...first, treasury: 2.5, beakers: -0.5 }, ...base.players.slice(1)],
+    };
+    const capture = open({ state: broken });
+    capture.clear();
+    capture.session.run('state');
+
+    expect(capture.text()).not.toMatch(/2\.5|-0\.5/);
+    expect(capture.text()).toContain('gold=0');
+    expect(capture.text()).toContain('0 gold, rates');
+    expect(capture.text()).toContain('0 beakers');
   });
 });
 
@@ -2037,7 +2713,27 @@ describe('the play command', () => {
       expect(first.stdout).toContain(
         `ok: City 1 founded at (${String(indexToX(state.map, home))},${String(indexToY(state.map, home))})`,
       );
-      expect(first.stdout).toContain('units: none visible'); // the settler was consumed
+      // CORRECTED for M4b. This line used to read `units: none visible` — the
+      // settler is consumed by founding, and on the M4a world it was the only unit
+      // player 0 had. M4b's "Starting units (closes the M4a gap)" gives every
+      // civilization a **worker** as well, so the honest assertion is now that the
+      // settler is gone and the worker is what remains, named in full: the same
+      // claim ("founding consumed the settler") pinned against the world this build
+      // actually starts a game with. The search starts *after* the `found` line
+      // rather than at the top of the transcript, because the opening view — printed
+      // before the city existed — legitimately still names the settler.
+      const startingWorker = state.units.find(
+        (unit) => unit.owner === asPlayerId(0) && Number(unit.id) !== Number(settler.id),
+      );
+      if (startingWorker === undefined) throw new Error('M4b: player 0 starts with a worker too');
+      const afterFounding = first.stdout.slice(first.stdout.indexOf('p0> found'));
+      expect(afterFounding).not.toContain('units: none visible');
+      expect(afterFounding).not.toContain(`*${String(settler.id)} p0 Settler`);
+      expect(afterFounding).toContain(
+        `units: *${String(startingWorker.id)} p0 Worker ` +
+          `@${String(indexToX(state.map, startingWorker.tile))},` +
+          `${String(indexToY(state.map, startingWorker.tile))} (2/2 movement)`,
+      );
       expect(first.stdout).toContain('cities: 1 for Player 1 (p0)');
       expect(first.stdout).toContain('id  name');
       expect(first.stdout).toContain(
@@ -2084,7 +2780,14 @@ describe('the play command', () => {
       // Rehashed for M4a (SCHEMA_VERSION 3 -> 4), deliberately: every state now
       // carries `improvements`, so 3d72c9af7146e389 -> d7caab78d25b1473. The
       // transcript this pin belongs to did not otherwise move.
-      expect(first.stdout).toContain('hash: d7caab78d25b1473');
+      //
+      // Rehashed again for M4b (SCHEMA_VERSION 4 -> 5), for three visible reasons:
+      // every player carries the four money fields, `newGame` starts each
+      // civilization with a **worker** as well as a settler (so the board has two
+      // more units and the city has a second worked tile to grow with), and three
+      // `end`s now bank three turns of income into the treasury.
+      // d7caab78d25b1473 -> 914715d7a9abfab2. The transcript moved with it.
+      expect(first.stdout).toContain('hash: 914715d7a9abfab2');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2156,8 +2859,15 @@ describe('the play command', () => {
       );
       // The job is visible in both of the places a reader looks: the one-line
       // summary under every view, and the `state` view's own `jobs:` line.
+      //
+      // The `units:` line carries *both* of player 0's workers as of M4b (the one
+      // `newGame` now starts the civilization with, and the one the city produced),
+      // so the assertion pins the produced worker's entry inside the line rather
+      // than the whole line: it is now a substring of a longer, non-contiguous set
+      // of entries, and asserting the whole line would pin the *other* worker's
+      // presence too, which is a different claim (the CLI test above makes it).
       expect(first.stdout).toContain(
-        `units: *${workerId} p0 Worker @${at.slice(1, -1)} (0/2 movement) building a road, 2 turns left`,
+        `*${workerId} p0 Worker @${at.slice(1, -1)} (0/2 movement) building a road, 2 turns left`,
       );
       expect(first.stdout).toContain(
         `jobs: ${workerId} Worker@${at.slice(1, -1)} building a road, 2 turns left`,

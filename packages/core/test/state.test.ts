@@ -30,8 +30,12 @@ import {
 } from '../src/map.js';
 import { isErr, type Result } from '../src/result.js';
 import { DEFAULT_SETTINGS, MAP_DIMENSIONS, type Settings } from '../src/settings.js';
+import { ratesProblem } from '../src/economy.js';
 import {
+  DEFAULT_RATES,
+  RATE_TOTAL,
   SCHEMA_VERSION,
+  STARTING_TREASURY,
   civPlayers,
   newGame,
   type GameState,
@@ -433,6 +437,189 @@ describe('starting units', () => {
     for (const unit of state.units) {
       expect(Number.isInteger(unit.movementLeft)).toBe(true);
       expect(unit.movementLeft).toBeGreaterThanOrEqual(1);
+    }
+  });
+});
+
+/**
+ * M4b's starting army: a settler **and a worker** per civilization. Without the
+ * worker the improvement system is unreachable at setup — a player would have to
+ * found a city and produce one before it could build anything — which is why the
+ * milestone closes the M4a gap here rather than in M4c.
+ *
+ * The worker is optional in the *ruleset* sense: a view with no worker row still
+ * starts, with the settler alone (asserted at the end of this block). That is what
+ * keeps the settler-only fixtures elsewhere in the suite meaningful, and it is the
+ * same totality the rest of `newGame` takes: a catalog that does not offer
+ * something cannot be read as an error about it.
+ */
+describe('starting units — M4b adds the worker', () => {
+  const WORKER = makeUnit('worker', 'worker', 1);
+
+  /** The ruleset this milestone's `newGame` is written for: both roles present. */
+  const STAFFED: RulesetView = { ...RULESET, units: [SETTLER, WORKER] };
+
+  it('gives every civilization exactly one settler and one worker, barbarians none', () => {
+    const state = mustGame(42, { ...SETTINGS, civCount: 4 }, STAFFED);
+
+    expect(state.units).toHaveLength(civPlayers(state).length * 2);
+
+    for (const player of civPlayers(state)) {
+      const mine = state.units.filter((unit) => unit.owner === player.id);
+      expect(mine.map((unit) => unit.type)).toEqual([SETTLER.id, WORKER.id]);
+
+      // The settler stands on the start; the worker stands next to it, and no two
+      // units of one civilization share a tile.
+      const settler = mine[0];
+      const worker = mine[1];
+      expect(settler?.tile).toBe(player.startingTile);
+      expect(worker?.tile).not.toBe(player.startingTile);
+      expect(new Set(mine.map((unit) => Number(unit.tile))).size).toBe(2);
+      // A fresh worker can move (movement 1) and therefore *can* start a job on
+      // turn 1: `StartWork` costs the unit's movement, and this is the unit that
+      // spends it.
+      expect(worker?.movementLeft).toBe(WORKER.movement);
+    }
+
+    const barbarian = state.players[state.players.length - 1];
+    expect(barbarian?.kind).toBe('barbarian');
+    expect(state.units.filter((unit) => unit.owner === barbarian?.id)).toEqual([]);
+  });
+
+  it('places the worker on standable land next to its settler, never on water, mountain or a unit', () => {
+    for (const seed of [1, 7, 42, 1337, 90210]) {
+      const state = mustGame(seed, SETTINGS, STAFFED);
+      const map = state.map;
+
+      for (const player of civPlayers(state)) {
+        const mine = state.units.filter((unit) => unit.owner === player.id);
+        const worker = mine.find((unit) => unit.type === WORKER.id);
+        expect(
+          worker,
+          `seed ${String(seed)}: player ${String(Number(player.id))} has a worker`,
+        ).toBeDefined();
+        if (worker === undefined) continue;
+
+        // "Standable" read off the *ruleset's own* impassable flag rather than a
+        // role list: this fixture makes ocean and mountains impassable and coast
+        // passable, and the placement rule is the flag, not the role.
+        const terrain = STAFFED.terrains.find((row) => row.id === map.terrain[Number(worker.tile)]);
+        expect(
+          terrain,
+          `seed ${String(seed)}: the worker stands on described terrain`,
+        ).toBeDefined();
+        expect(terrain?.impassable).toBe(false);
+        // One unit per tile: the worker is a neighbour of the settler, not a stack
+        // on top of it — and adjacency is the contract's "on (or adjacent to) its
+        // starting tile".
+        expect(unitsOnTile(state, worker.tile)).toHaveLength(1);
+        const dx = Math.abs(
+          (Number(worker.tile) % map.width) - (Number(player.startingTile) % map.width),
+        );
+        const dy = Math.abs(
+          Math.floor(Number(worker.tile) / map.width) -
+            Math.floor(Number(player.startingTile) / map.width),
+        );
+        expect(Math.max(dx, dy)).toBe(1);
+        // The fog it stands in is lit: `initialFog` reads the units, and a unit the
+        // player cannot see would be a state its own player cannot explain.
+        expect(state.explored[Number(player.id)]?.[Number(worker.tile)]).toBe(true);
+      }
+    }
+  });
+
+  it('numbers settler-then-worker per civilization, so ids are a function of the civ order', () => {
+    const state = mustGame(7, { ...SETTINGS, civCount: 3 }, STAFFED);
+
+    expect(state.units.map((unit) => Number(unit.owner))).toEqual([0, 0, 1, 1, 2, 2]);
+    expect(state.units.map((unit) => unit.type)).toEqual([
+      SETTLER.id,
+      WORKER.id,
+      SETTLER.id,
+      WORKER.id,
+      SETTLER.id,
+      WORKER.id,
+    ]);
+    expect(state.units.map((unit) => Number(unit.id))).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(state.nextUnitId).toBe(state.units.length);
+    // …and the whole state is still a function of the seed, worker included.
+    expect(mustGame(7, { ...SETTINGS, civCount: 3 }, STAFFED)).toEqual(state);
+  });
+
+  it('never starts a unit on a goody hut', () => {
+    // A hut is consumed by *entering* its tile, so a unit that begins the game
+    // standing on one would leave a hut nothing can ever enter. The start tiles come
+    // from `gen.ts` (which keeps huts off them) and the worker from the free
+    // neighbour this file picks — so this is the assertion that the two agree.
+    for (const seed of [1, 7, 42, 4242, 1337, 90210]) {
+      const state = mustGame(seed, SETTINGS, STAFFED);
+      const huts = new Set(state.map.huts.map(Number));
+      for (const unit of state.units) {
+        expect(
+          huts.has(Number(unit.tile)),
+          `seed ${String(seed)}: unit ${String(Number(unit.id))} stands on a hut`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it('starts a ruleset without a worker row anyway, with the settler alone', () => {
+    // The optional half of the rule. `RULESET` offers a settler and a scout — no
+    // worker — and that is not an error: it is a game with no worker in it, which is
+    // exactly what the M4a and fog fixtures rely on.
+    const state = mustGame(42, SETTINGS, RULESET);
+
+    expect(state.units).toHaveLength(civPlayers(state).length);
+    expect(state.units.every((unit) => unit.type === SETTLER.id)).toBe(true);
+
+    // A missing *settler* is still an error, and it is checked before the worker, so
+    // the message names the role the game genuinely cannot start without.
+    expect(mustErr(newGame(42, SETTINGS, NO_UNITS))).toEqual({
+      kind: 'missing-unit-role',
+      role: 'settler',
+    });
+  });
+});
+
+/**
+ * M4b's money fields at setup. They are part of every state hash
+ * (SCHEMA_VERSION 4 → 5), so their starting values are pinned here rather than
+ * inferred from whichever unit test happens to read a treasury first.
+ */
+describe('starting money', () => {
+  it('gives every civilization STARTING_TREASURY at the default rates, and barbarians nothing', () => {
+    const state = mustGame(42, { ...SETTINGS, civCount: 3 }, RULESET);
+
+    for (const player of civPlayers(state)) {
+      expect(player.treasury).toBe(STARTING_TREASURY);
+      expect(player.rates).toEqual(DEFAULT_RATES);
+      expect(player.beakers).toBe(0);
+      expect(player.luxuries).toBe(0);
+    }
+
+    const barbarian = state.players[state.players.length - 1];
+    expect(barbarian?.kind).toBe('barbarian');
+    // Barbarians have no economy (M4b): no treasury to lose, and nothing that
+    // accumulates. Their rates are the defaults because a player state has one
+    // shape, not because anything reads them.
+    expect(barbarian?.treasury).toBe(0);
+    expect(barbarian?.rates).toEqual(DEFAULT_RATES);
+    expect(barbarian?.beakers).toBe(0);
+    expect(barbarian?.luxuries).toBe(0);
+
+    // The defaults are a legal rate triple, so a game cannot start in a state
+    // `planSetRates` would refuse to re-create.
+    expect(ratesProblem(DEFAULT_RATES)).toBeUndefined();
+    expect(DEFAULT_RATES.tax + DEFAULT_RATES.science + DEFAULT_RATES.luxury).toBe(RATE_TOTAL);
+  });
+
+  it('keeps the money fields whole numbers, and the treasury non-negative', () => {
+    const state = mustGame(3, SETTINGS, RULESET);
+    for (const player of state.players) {
+      for (const value of [player.treasury, player.beakers, player.luxuries]) {
+        expect(Number.isInteger(value)).toBe(true);
+      }
+      expect(player.treasury).toBeGreaterThanOrEqual(0);
     }
   });
 });

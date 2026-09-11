@@ -17,6 +17,7 @@ export * from './state.js';
 export * from './improvements.js';
 export * from './cities.js';
 export * from './growth.js';
+export * from './economy.js';
 export * from './production.js';
 export * from './turn.js';
 export * from './hut.js';

@@ -50,6 +50,24 @@
  *   argument — a coordinate is an integer, an improvement id is a word — and
  *   nothing else in the session is ambiguous. Both readings are documented in
  *   `help`, and a `work` line whose arguments fit neither says so.
+ * - **The economy is shown whether or not the reader asked** (M4b). `rates <tax>
+ *   <science> <luxury>` is the sixth verb: it parses three integers, builds one
+ *   `SetRates`, and hands it to `applyCommand` — the rate rule itself lives in
+ *   `economy.ts`' `ratesProblem`, and the "legal:" line under a refusal is built
+ *   by *asking* `planSetRates`, the same evaluator the applier decides with. Money
+ *   then travels with the reader everywhere it is needed: the banner states the
+ *   starting position, an `economy:` line is printed under **every** view (the
+ *   money loop changes something every single turn, so a figure the agent has to
+ *   ask for is a figure it will notice only after it has already gone bankrupt),
+ *   and `state` prints the full ledger with the engine's own projection of the
+ *   next collection. Every number is read from the state or computed by an engine
+ *   function — `playerIncome`, `playerUpkeep`, `unitSupport` — never re-derived
+ *   here.
+ * - **Beakers and luxuries are labelled inert, in the output, every time.** M4b
+ *   banks them and nothing spends or reads them: research is M5, happiness is M9.
+ *   A transcript that printed "2 beakers" beside a treasury would imply a research
+ *   system that does not exist, so every economy line says out loud that they do
+ *   nothing yet. That is a deliberate wart in the prose, not an oversight.
  * - **The transcript is a pure function of (state, lines, flags).** Numbers are
  *   the only variable content and they come from the state; nothing reads the
  *   clock, and the prompt/echo are written for every line whether the input
@@ -71,6 +89,7 @@ import { createInterface } from 'node:readline';
 import {
   MAP_SIZES,
   MIN_CITY_DISTANCE,
+  RATE_TOTAL,
   applyCommand,
   asBuildingId,
   asCityId,
@@ -97,8 +116,11 @@ import {
   ok,
   planFoundCity,
   planSetProduction,
+  planSetRates,
   planSetWorkedTiles,
   planStartWork,
+  playerIncome,
+  playerUpkeep,
   terrainAtIndex,
   tileIndex,
   unitById,
@@ -106,6 +128,7 @@ import {
   unitDef,
   unitMoveOptions,
   unitsOnTile,
+  unitSupport,
   visibleTiles,
   workSummary,
   type Command,
@@ -121,7 +144,9 @@ import {
   type ImprovementId,
   type MapSize,
   type PlayerId,
+  type PlayerState,
   type ProductionItem,
+  type Rates,
   type Result,
   type RulesetView,
   type SetupError,
@@ -184,6 +209,7 @@ Commands inside a session (also documented by "help"):
   move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
   work <unitId> <improve>    cancel <unitId>
+  rates <tax> <science> <luxury>
   end   units   state   save <path>   help   quit
 `;
 
@@ -262,6 +288,15 @@ export interface ErrorContext {
    * not to this prose-only context.
    */
   readonly cityId: CityId | undefined;
+  /**
+   * The rates a refused `SetRates` asked for, when the refused command was one
+   * (`undefined` otherwise). The only error kind that needs it is
+   * `invalid-argument`, whose detail is the engine's own sentence: with the asked
+   * triple in hand the formatter can add the part a caller actually needs — what
+   * a *legal* triple looks like, checked against `planSetRates` rather than
+   * asserted here.
+   */
+  readonly rates: Rates | undefined;
 }
 
 const coordOf = (map: GameMap, tile: TileIndex): string =>
@@ -621,6 +656,17 @@ const cityIdOf = (command: Command): CityId | undefined =>
     : undefined;
 
 /**
+ * The rates a command asked for, when it asked for any (`rates` does).
+ *
+ * The third and last payload an `ErrorContext` carries, and the only reason it
+ * exists: the lesson under a refused `invalid-argument` depends on *which* command
+ * was refused, and `SetRates` is the one that has a rule to teach (see
+ * `formatGameError`).
+ */
+const ratesOf = (command: Command): Rates | undefined =>
+  command.type === 'SetRates' ? command.rates : undefined;
+
+/**
  * The `ProductionItem` a `build` argument means.
  *
  * `unit:<id>` and `building:<id>` are the explicit spellings, and they are always
@@ -677,6 +723,196 @@ const buildCatalogueHint = (ruleset: RulesetView): string => {
     return 'this ruleset can build nothing: no catalog row carries a usable shield cost';
   }
   return `buildable here: ${[...units, ...buildings].join('; ')}`;
+};
+
+/* ------------------------------------------------------------------ *
+ * M4b - the economy, as the reader sees it.
+ *
+ * The money loop changes something on *every* turn (gold moves, upkeep is
+ * paid, and a treasury that cannot pay disbands units), so its figures are
+ * printed rather than offered: the banner states the starting position, an
+ * `economy:` line rides under every view, and `state` prints the ledger.
+ *
+ * Every number below is either read straight out of the state or computed by
+ * an engine function — `playerIncome`, `playerUpkeep`, `unitSupport`,
+ * `planSetRates`, `RATE_TOTAL` — so the prose cannot develop a second opinion
+ * about what a player earns or owes. Nothing here is a rule; it is all
+ * rendering.
+ *
+ * `beakers` and `luxuries` are printed with the sentence that they DO NOTHING
+ * yet, every single time. That is not padding: M4b banks them and nothing reads
+ * them (research is M5, happiness is M9), and a bare "2 beakers" beside a
+ * treasury would imply a research system the engine does not have.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A whole number read out of the state, or `0`.
+ *
+ * The state is typed, so every field below is a `number` at compile time — the
+ * guard is not a type test, it is a *rendering* rule: this module prints into the
+ * agent's primary view, and `gold=NaN` or `rates 1.5/NaN/0` would be a worse
+ * answer than a 0 that says "nothing the engine can count". `economy.ts` reads the
+ * same fields the same way for the same reason (a hand-built state, a save from
+ * before M4b, a JSON round trip).
+ */
+const wholeNumber = (value: number): number => (Number.isInteger(value) ? value : 0);
+
+/** The acting player's own row, or `undefined` when the state has no such player. */
+const playerStateOf = (state: GameState, id: PlayerId): PlayerState | undefined =>
+  state.players.find((player) => player.id === id);
+
+/**
+ * The sentence that has to travel with the two inert channels, quoted in full
+ * wherever they are printed (M4b, "Be honest about inertness"). One constant so
+ * that "beakers do nothing" cannot be said in one place and quietly dropped in
+ * another.
+ */
+const INERT_CHANNELS =
+  'beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)';
+
+/** `tax 6 / science 4 / luxury 0 (sum 10 of 10)` — the split, spelled out. */
+const ratesLabel = (rates: Rates): string => {
+  const tax = wholeNumber(rates.tax);
+  const science = wholeNumber(rates.science);
+  const luxury = wholeNumber(rates.luxury);
+  return (
+    `tax ${String(tax)} / science ${String(science)} / luxury ${String(luxury)} ` +
+    `(sum ${String(tax + science + luxury)} of ${String(RATE_TOTAL)})`
+  );
+};
+
+/** `6/4/0` — the same three numbers, for a line that already says which is which. */
+const ratesTriple = (rates: Rates): string =>
+  `${String(wholeNumber(rates.tax))}/${String(wholeNumber(rates.science))}/` +
+  String(wholeNumber(rates.luxury));
+
+/** `1 city` / `3 cities`: a count with its noun, so no line reads "1 cit(y|ies)". */
+const plural = (count: number, singular: string, pluralForm?: string): string =>
+  count === 1 ? singular : (pluralForm ?? `${singular}s`);
+
+/** `10 gold, 0 beakers, 0 luxuries` — the three pools, as the state holds them. */
+const poolsOf = (player: PlayerState): string =>
+  `${String(wholeNumber(player.treasury))} gold, ${String(wholeNumber(player.beakers))} ` +
+  `${plural(wholeNumber(player.beakers), 'beaker')}, ` +
+  `${String(wholeNumber(player.luxuries))} ${plural(wholeNumber(player.luxuries), 'luxury', 'luxuries')}`;
+
+/**
+ * The economy in one line, printed under **every** view — the counterpart of the
+ * `units:` and `cities:` lines, and for the reason those exist: without it the
+ * agent would have to ask (`state`) to see a number that changed on the turn it
+ * just ended, and a bankrupt player would find out one command too late.
+ *
+ * A player this state does not have gets a line that says so rather than a
+ * fabricated `0 gold` — the same reading `headerLine`'s gold field takes in
+ * `textview`.
+ */
+const economyLine = (state: GameState, playerId: PlayerId): string => {
+  const player = playerStateOf(state, playerId);
+  if (player === undefined) {
+    return `economy: unknown (this state has no player ${String(playerId)})\n`;
+  }
+  const support = unitSupport(state, playerId);
+  return (
+    `economy: ${String(wholeNumber(player.treasury))} gold, rates ${ratesTriple(player.rates)} ` +
+    `(tax/science/luxury, sum ${String(
+      wholeNumber(player.rates.tax) +
+        wholeNumber(player.rates.science) +
+        wholeNumber(player.rates.luxury),
+    )} of ${String(RATE_TOTAL)}), ${String(wholeNumber(player.beakers))} beakers, ` +
+    `${String(wholeNumber(player.luxuries))} luxuries - ${INERT_CHANNELS}\n` +
+    `  ${String(support.units)} unit(s) against ${String(support.free)} supported free ` +
+    `(${String(support.supported)} billable at ${String(support.gold)} gold); upkeep is what empties a treasury\n`
+  );
+};
+
+/**
+ * The full ledger, for the `state` verb: the three pools, the split that produced
+ * them, and — from the engine's own evaluators — what ending the turn now would
+ * collect and cost.
+ *
+ * The projection is labelled as one, and honestly: it is `playerIncome` and
+ * `playerUpkeep` answering about the *current* state, while the money loop runs
+ * after this turn's growth and production, which can add a city's commerce or a
+ * unit's support before the bill is drawn. Saying "a projection from this state"
+ * is the precise claim; saying "you will collect 4 gold" would not be.
+ *
+ * Beakers and luxuries are shown as accumulated pools *and* as a per-turn flow,
+ * each with the inertness sentence, because those are the two ways a reader could
+ * mistake them for a system: "I have 12 beakers" and "I earn 2 a turn" both sound
+ * like research.
+ */
+const economyDetailLines = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): readonly string[] => {
+  const player = playerStateOf(state, playerId);
+  if (player === undefined) {
+    return [`economy: unknown (this state has no player ${String(playerId)})`];
+  }
+
+  const income = playerIncome(state, ruleset, playerId);
+  const upkeep = playerUpkeep(state, ruleset, playerId);
+  const support = unitSupport(state, playerId);
+  const cities = citiesOf(state, playerId).length;
+
+  return [
+    `economy: ${String(wholeNumber(player.treasury))} gold, rates ${ratesLabel(player.rates)}, ` +
+      `${String(wholeNumber(player.beakers))} beakers, ${String(wholeNumber(player.luxuries))} luxuries`,
+    `  ${INERT_CHANNELS} - they only pile up, and nothing in this build spends or reads them.`,
+    `  gold is the only channel that acts today: it pays upkeep, and a treasury that cannot pay`,
+    `  is paid for by disbanding units (highest id first) rather than by going negative.`,
+    `economy: at these rates this state collects ${String(income.gold)} gold, ` +
+      `${String(income.beakers)} ${plural(income.beakers, 'beaker')} and ` +
+      `${String(income.luxuries)} ${plural(income.luxuries, 'luxury', 'luxuries')} a turn`,
+    `  from ${String(cities)} ${plural(cities, 'city', 'cities')}, and owes ${String(upkeep.gold)} ` +
+      `gold of upkeep (${String(upkeep.maintenance)} maintenance + ${String(upkeep.unitSupport)} ` +
+      `unit support for ${String(support.units)} unit(s), ${String(support.free)} free)`,
+    `  - a projection from this state, because growth and production run before the bill is drawn.`,
+  ];
+};
+
+/**
+ * The banner's economy block: the same facts, once, at the top of a session.
+ *
+ * A session that opens on a 10-gold treasury and never mentions it again is a
+ * session whose player learns about upkeep by being bankrupted by it, so the
+ * numbers are stated before the first command rather than only on demand.
+ */
+const bannerEconomyLines = (state: GameState, playerId: PlayerId): string => {
+  const player = playerStateOf(state, playerId);
+  if (player === undefined) return '';
+  const cities = citiesOf(state, playerId).length;
+  return (
+    `economy: ${poolsOf(player)}, rates ${ratesLabel(player.rates)}, ` +
+    `${String(cities)} ${plural(cities, 'city', 'cities')}\n` +
+    `  ${INERT_CHANNELS}.\n` +
+    `  "rates <tax> <science> <luxury>" moves the sliders (they must sum to ` +
+    `${String(RATE_TOTAL)}); gold pays upkeep, and a treasury that cannot pay disbands units.\n`
+  );
+};
+
+/**
+ * A few legal triples, each one **asked of `planSetRates`** before it is printed —
+ * so the lesson under a refused `rates` cannot advertise a triple the engine would
+ * refuse too. The corners of the space (all gold, all science, all luxury) plus the
+ * shipped default: the four a reader reaching for a slider actually wants.
+ *
+ * Empty when the actor itself is unknown, in which case the lesson is the rule and
+ * nothing else — an example the engine would refuse would be worse than no example.
+ */
+const legalRatesExamples = (context: ErrorContext): readonly string[] => {
+  const candidates: readonly Rates[] = [
+    { tax: RATE_TOTAL, science: 0, luxury: 0 },
+    { tax: 0, science: RATE_TOTAL, luxury: 0 },
+    { tax: 0, science: 0, luxury: RATE_TOTAL },
+    { tax: 6, science: 4, luxury: 0 },
+  ];
+  return candidates
+    .filter((rates) => planSetRates(context.state, context.playerId, rates).ok)
+    .map(
+      (rates) => `"rates ${String(rates.tax)} ${String(rates.science)} ${String(rates.luxury)}"`,
+    );
 };
 
 /**
@@ -857,8 +1093,27 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         ...legalBuildLines(context),
       ].join('\n');
 
-    case 'invalid-argument':
-      return [`error: invalid-argument - ${error.detail}`, ...legalMovesLines(context)].join('\n');
+    case 'invalid-argument': {
+      // `invalid-argument` is one error kind with many causes, so the lesson is
+      // the one that fits the refused command: a refused `SetRates` gets the rate
+      // rule and legal triples (checked against `planSetRates`), everything else
+      // gets the moves that were legal, exactly as before.
+      const lesson =
+        context.rates === undefined
+          ? legalMovesLines(context)
+          : [
+              `  legal: the three rates are integers >= 0 that must sum to exactly ` +
+                `${String(RATE_TOTAL)} (RATE_TOTAL); the split is tenths of a city's commerce,`,
+              '  the remainder of each division going to gold.',
+              ...(legalRatesExamples(context).length === 0
+                ? []
+                : [
+                    `  legal: any such split works, for example ` +
+                      `${legalRatesExamples(context).join(', ')}.`,
+                  ]),
+            ];
+      return [`error: invalid-argument - ${error.detail}`, ...lesson].join('\n');
+    }
 
     /* ---------------- M4a: workers and tile improvements ---------------- */
 
@@ -1159,6 +1414,7 @@ export const COMMAND_SUMMARY =
   'move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | ' +
   'work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | ' +
   'work <unitId> <improvementId> | cancel <unitId> | ' +
+  'rates <tax> <science> <luxury> | ' +
   'end | units | state | save <path> | help | quit';
 
 const HELP = `commands:
@@ -1192,13 +1448,26 @@ const HELP = `commands:
   cancel <unitId>         stop that worker's job. Nothing is refunded: the turns already
                           spent are gone, and the improvement is not built. Moving a
                           working unit cancels its job the same way.
+  rates <tax> <science> <luxury>
+                          move your tax/science/luxury sliders. The three are integers >= 0
+                          that must sum to exactly ${String(RATE_TOTAL)} (RATE_TOTAL, a placeholder
+                          of ours): that many tenths of every city's commerce go to gold,
+                          beakers and luxuries, and the remainder of each division goes to
+                          gold. It changes FUTURE collections only - nothing already banked
+                          is recomputed. BE WARNED: beakers and luxuries DO NOTHING yet.
+                          Research is M5 and happiness is M9, so those two channels only pile
+                          up; gold is the one that acts, because it pays upkeep.
   end                     end the turn: every unit's work advances, every city grows and
-                          produces, every unit refills its movement, turn advances. An
-                          improvement finished this turn counts towards this turn.
+                          produces, every player collects income and pays upkeep (a
+                          treasury that cannot pay disbands units), every unit refills its
+                          movement, turn advances. An improvement finished this turn counts
+                          towards this turn, and a unit produced this turn costs support
+                          from this turn.
   units                   list the units you can see, with position, movement left and
                           what each one is doing.
-  state                   print seed, turn, revision, map size, RNG, what your units are
-                          doing and the state hash.
+  state                   print seed, turn, revision, map size, RNG, your gold, rates,
+                          beakers and luxuries, what your units are doing and the state
+                          hash.
   save <path>             write the state to <path> as canonical JSON (parent
                           directories are created).
   help                    print this text.
@@ -1211,6 +1480,9 @@ notes:
     "units:" line printed under every view ("*" marks a unit of yours), your cities are
     the "cities:" line under it, and a unit in the middle of a job is named on the
     "work:" line under that.
+  - the "economy:" line printed under every view is your own money: gold, the three rates
+    and the two pools that do nothing yet. Your gold is also in the header of every view,
+    as "gold=" beside "viewer=".
   - a refused command prints the typed reason and the choices that were legal, and never
     changes the state.
   - every command goes through the engine's command API; the REPL never edits state.
@@ -1229,6 +1501,10 @@ const bannerText = (state: GameState, playerId: PlayerId, god: boolean): string 
   (god
     ? 'GOD MODE - the whole map is rendered and fog is ignored\n'
     : 'every view below is drawn from your fog of war\n') +
+  // M4b: the economy, before the first command rather than only on demand. A
+  // session that never mentions the treasury is a session whose player finds out
+  // what upkeep costs by being bankrupted by it.
+  bannerEconomyLines(state, playerId) +
   `commands: ${COMMAND_SUMMARY}\n\n`;
 
 /**
@@ -1358,6 +1634,60 @@ const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: Ruleset
           `ok: unit ${String(event.unitId)} finished ${improvementLabel(ruleset, event.kind)} on ` +
           `${eventPlace(outcome, event.tile)}; the tile is improved`
         );
+
+      /* ---------------- M4b: the money loop ---------------- */
+
+      // The four money events, each rendered as a real line. They are the one
+      // place a *zero* is reported: `economy.ts` emits `IncomeCollected` and
+      // `UpkeepPaid` for every civilization on every turn, including a turn whose
+      // amount is zero, because the milestone's evidence bar is that gold is
+      // accounted for — and a ledger with a suppressed line in it can only be
+      // guessed at. So these lines say their zero out loud rather than vanishing.
+      //
+      // `beakers`/`luxuries` carry the inertness sentence here too: this is the
+      // line a reader meets every single turn, and "collected 2 beakers" with no
+      // caveat is exactly the implication M4b's provenance rule forbids.
+      case 'IncomeCollected':
+        return (
+          `ok: ${playerLabel(outcome.state, event.playerId)} collected ${String(event.gold)} gold, ` +
+          `${String(event.beakers)} ${plural(event.beakers, 'beaker')} and ` +
+          `${String(event.luxuries)} ${plural(event.luxuries, 'luxury', 'luxuries')} from its ` +
+          `cities at its rates - ${INERT_CHANNELS}`
+        );
+
+      case 'UpkeepPaid':
+        return (
+          `ok: ${playerLabel(outcome.state, event.playerId)} paid ${String(event.gold)} gold of ` +
+          `upkeep (${String(event.maintenance)} building maintenance + ` +
+          `${String(event.unitSupport)} unit support for ${String(event.units)} unit(s), ` +
+          `${String(event.freeUnits)} of them free)`
+        );
+
+      // Which units, and why. The event names one removal, and the answer to "why
+      // was my unit disbanded?" is three facts: the treasury could not cover the
+      // turn's upkeep, the unit was one the player was *paying* for, and the
+      // highest id goes first (`economy.ts` states the order; this line reports it).
+      case 'UnitDisbanded': {
+        const where = eventPlace(outcome, event.tile);
+        return (
+          `ok: BANKRUPTCY - ${playerLabel(outcome.state, event.playerId)} disbanded unit ` +
+          `${String(event.unitId)} (${typeName(ruleset, event.unitType)} at ${where}) to pay ` +
+          `${String(event.saved)} gold of this turn's upkeep: the treasury could not cover it, ` +
+          'and the highest-id unit goes first'
+        );
+      }
+
+      // The honest failure: nothing left to disband and gold still owed. The
+      // unpaid amount is *reported*, never carried: the frozen state has no debt
+      // field, and inventing one here would put a field in the save file that
+      // nothing else knows about.
+      case 'TreasuryShortfall':
+        return (
+          `ok: BANKRUPTCY - ${playerLabel(outcome.state, event.playerId)} still owes ` +
+          `${String(event.unpaid)} gold of this turn's upkeep after disbanding every unit it ` +
+          'could pay with; the treasury is 0 (it never goes negative) and the unpaid gold is ' +
+          'reported here rather than carried as a debt'
+        );
     }
 
     return assertNever(event);
@@ -1429,6 +1759,19 @@ const appliedCommandText = (
         `${pricedItemLabel(ruleset, command.item)}; ${String(stored)} shields stored`
       );
     }
+
+    // M4b: `SetRates` emits no event either (the command's payload is the record
+    // of the change), so the report is this line — and it has to name the rule a
+    // reader cares about, which is *when* the new split takes effect. It cannot
+    // retroactively recollect: the money loop is the last step of a turn and reads
+    // the rates once, so the next collection uses these numbers and nothing already
+    // banked is recomputed (`planSetRates` states the argument in full).
+    case 'SetRates':
+      return (
+        `ok: rates set to ${ratesLabel(command.rates)}; this changes future collections only - ` +
+        'the treasury and the two pools are exactly what they were, and no turn already' +
+        ' collected is recomputed'
+      );
   }
 
   // Reached only when every member above was handled, which is what makes the tail
@@ -1449,12 +1792,17 @@ export const createSession = (options: SessionOptions): ReplSession => {
   const { ruleset, playerId, god, write } = options;
   let state = options.state;
 
-  const context = (unitId: UnitId | undefined, cityId: CityId | undefined): ErrorContext => ({
+  const context = (
+    unitId: UnitId | undefined,
+    cityId: CityId | undefined,
+    rates?: Rates,
+  ): ErrorContext => ({
     state,
     ruleset,
     playerId,
     unitId,
     cityId,
+    rates,
   });
 
   /**
@@ -1532,6 +1880,13 @@ export const createSession = (options: SessionOptions): ReplSession => {
     write(god ? describe(state, ruleset) : describe(state, ruleset, { viewer: playerId }));
     write(unitsLine());
     write(citiesLine());
+    // M4b: the economy, under every view. The money loop changes something on every
+    // turn — income arrives, upkeep is charged, and a treasury that cannot pay
+    // disbands units — so a figure the agent has to *ask* for is a figure it will
+    // notice only after it has already gone bankrupt. It sits last, after the
+    // things a command was probably about, and it is one line: the detail is a
+    // `state` away.
+    write(economyLine(state, playerId));
   };
 
   const malformed = (detail: string, hint: string): LineOutcome => {
@@ -1630,6 +1985,11 @@ export const createSession = (options: SessionOptions): ReplSession => {
           `revision=${String(state.revision)} schema=${String(state.schemaVersion)} ` +
           `map=${state.settings.mapSize}(${String(state.map.width)}x` +
           `${String(state.map.height)}) civs=${String(civPlayers(state).length)}`,
+        // M4b: the money, in full, before the census lines below it: "can I afford
+        // this?" is the question a player opens the state view with, and it is
+        // answered by the engine's own evaluators rather than by a second reading
+        // of the economy rules here.
+        ...economyDetailLines(state, ruleset, playerId),
         `you: ${String(mine)} unit(s), explored ${String(explored)}/${String(size)} tiles, ` +
           `${String(seeing)} visible right now`,
         `jobs: ${jobs}`,
@@ -1669,7 +2029,12 @@ export const createSession = (options: SessionOptions): ReplSession => {
   const applied = (command: Command): LineOutcome => {
     const result = applyCommand(state, playerId, command, ruleset);
     if (!result.ok) {
-      write(`${formatGameError(result.error, context(unitIdOf(command), cityIdOf(command)))}\n`);
+      write(
+        `${formatGameError(
+          result.error,
+          context(unitIdOf(command), cityIdOf(command), ratesOf(command)),
+        )}\n`,
+      );
       return { kind: 'refused', command, error: result.error };
     }
 
@@ -1918,6 +2283,39 @@ export const createSession = (options: SessionOptions): ReplSession => {
           );
         }
         return saveState(path);
+      }
+
+      /* ---------------- M4b: the economy ---------------- */
+
+      case 'rates': {
+        if (args.length !== 3) {
+          return malformed(
+            `"rates" needs 3 arguments: rates <tax> <science> <luxury> (got ` +
+              `${String(args.length)})`,
+            `example: rates 6 4 0  (the three must be integers >= 0 summing to exactly ` +
+              `${String(RATE_TOTAL)})`,
+          );
+        }
+
+        const tax = intOf(args[0]);
+        const science = intOf(args[1]);
+        const luxury = intOf(args[2]);
+        if (tax === undefined || science === undefined || luxury === undefined) {
+          return malformed(
+            `tax, science and luxury must be whole numbers (got "${args[0] ?? ''}", ` +
+              `"${args[1] ?? ''}" and "${args[2] ?? ''}")`,
+            `example: rates 6 4 0  (the three must be integers >= 0 summing to exactly ` +
+              `${String(RATE_TOTAL)})`,
+          );
+        }
+
+        // The triple is handed to the engine exactly as parsed — including a
+        // negative one or one that does not sum to `RATE_TOTAL`. The rate rule is
+        // `economy.ts`' `ratesProblem`, reached through `planSetRates`, and the
+        // refusal below is the engine's own `invalid-argument` naming the actual
+        // sum. A check here would be this file's second opinion about what a rate
+        // is, which is the one thing the REPL is not allowed to have.
+        return applied({ type: 'SetRates', rates: { tax, science, luxury } });
       }
 
       case 'move': {

@@ -48,7 +48,15 @@ import {
 } from '../src/map.js';
 import { seedRng } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { SCHEMA_VERSION, newGame, type GameState, type PlayerState } from '../src/state.js';
+import {
+  DEFAULT_RATES,
+  RATE_TOTAL,
+  SCHEMA_VERSION,
+  STARTING_TREASURY,
+  newGame,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 import type { UnitDef } from '../src/units.js';
 
 /* ------------------------------------------------------------------ *
@@ -225,6 +233,14 @@ const player = (index: number, tile: number, kind: 'civ' | 'barbarian' = 'civ'):
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind,
+  // M4b: every player carries the money fields, barbarians included (they hold 0
+  // and never move, because they have no economy). A civilization's fixture starts
+  // with the engine's own `STARTING_TREASURY` at `DEFAULT_RATES` so a fixture can
+  // never drift from what `newGame` builds.
+  treasury: kind === 'barbarian' ? 0 : STARTING_TREASURY,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 });
 
 const PLAYERS: readonly PlayerState[] = [
@@ -292,10 +308,13 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
  * ------------------------------------------------------------------ */
 
 describe('GameState.improvements at setup', () => {
-  it('starts empty, as an array, at schema version 4', () => {
-    // A third additive shape change (M1 -> M2 -> M3 -> M4a): the field is empty
-    // here, and the version moved with it, so a save from the previous shape is
-    // recognisable rather than silently misread.
+  it('starts empty, as an array, at schema version 5', () => {
+    // A fourth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b): the field is
+    // empty here, and the version moved with it, so a save from the previous shape
+    // is recognisable rather than silently misread. M4b moved it because
+    // `PlayerState` gained `treasury`/`rates`/`beakers`/`luxuries` and `newGame`
+    // now also places a worker — both of which change every existing hash
+    // (INTERFACES.md M4b, "Migration owners").
     const game = newGame(42, SETTINGS, RULESET);
     expect(game.ok).toBe(true);
     if (!game.ok) return;
@@ -303,7 +322,22 @@ describe('GameState.improvements at setup', () => {
     expect(game.value.improvements).toEqual([]);
     expect(Array.isArray(game.value.improvements)).toBe(true);
     expect(game.value.schemaVersion).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(4);
+    expect(SCHEMA_VERSION).toBe(5);
+
+    // The new keys are readable straight off a fresh game, on *every* player:
+    // civilizations hold the starting treasury, barbarians hold nothing, and every
+    // row carries a well-formed rates triple. A field added to the shape but left
+    // unwritten would be exactly the unhashable-state bug class this project has
+    // hit three times, so it is asserted rather than assumed.
+    expect(game.value.players.length).toBe(SETTINGS.civCount + 1);
+    for (const player of game.value.players) {
+      expect(player.rates).toEqual(DEFAULT_RATES);
+      expect(player.rates.tax + player.rates.science + player.rates.luxury).toBe(RATE_TOTAL);
+      expect(Number.isInteger(player.treasury)).toBe(true);
+      expect(player.treasury).toBe(player.kind === 'barbarian' ? 0 : STARTING_TREASURY);
+      expect(player.beakers).toBe(0);
+      expect(player.luxuries).toBe(0);
+    }
   });
 
   it('is deterministic, and a rebuilt state is deep-equal', () => {

@@ -16,12 +16,18 @@
  *   into `SetupError` values so callers (CLI, UI, goldens) react to a reason
  *   rather than to a stack trace. The unit-role check runs *before* generation
  *   for the same reason.
- * - **A new game is populated, not empty.** Every civilization gets one settler
- *   on its starting tile and an `explored` row covering what that settler can
- *   see, so M2's first legal action is available immediately and the starting
+ * - **A new game is populated, not empty.** Every civilization gets a settler on
+ *   its starting tile and — since M4b — a worker on the first free tile beside it,
+ *   plus an `explored` row covering what those units can see, so M2's first legal
+ *   action and M4a's first job are both available immediately and the starting
  *   position is never "somewhere in the fog". The barbarian player (M3) is
- *   appended to `players` and gets neither: it is a player identity for the
- *   units a hut will later spawn, not a civilization.
+ *   appended to `players` and gets neither: it is a player identity for the units
+ *   a hut will later spawn, not a civilization.
+ * - **Money is state, and every player has the fields.** `treasury`, `rates`,
+ *   `beakers` and `luxuries` (M4b) live on `PlayerState`, so a save file still *is*
+ *   the game and the money loop needs no side table. Barbarians carry them too,
+ *   inert, for the same reason they carry an `explored` row: one shape for every
+ *   player, and `PlayerId` stays an index into `players`.
  */
 
 import { generateWorld, type GeneratedWorld } from './gen.js';
@@ -43,6 +49,8 @@ import { asPlayerId, asTileIndex, asUnitId, type PlayerId, type TileIndex } from
 import {
   TERRAIN_BY_ROLE,
   TERRAIN_ROLES,
+  neighbors8,
+  terrainAtIndex,
   type GameMap,
   type RulesetView,
   type TerrainRole,
@@ -70,11 +78,71 @@ import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js'
  *   harness's documented path (`CIVTS_WRITE_GOLDENS=1`), in the same commit, with
  *   a `rehash:` line in the commit message (INTERFACES.md M4a, "Where
  *   improvements live").
+ * - 5 — M4b: adds `treasury`, `rates`, `beakers` and `luxuries` to `PlayerState`
+ *   (the money loop), and `newGame` now gives every civilization a worker as well
+ *   as its settler — a *behavioural* change that moves the starting `units` array
+ *   and every player's `explored` row, on top of the four new keys. Regenerated
+ *   intentionally, through the harness's documented path, in the same commit, with
+ *   a `rehash:` line in the commit message (INTERFACES.md M4b, "State shape").
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** What a player *is*: a civilization, or the barbarians. */
 export type PlayerKind = 'civ' | 'barbarian';
+
+/**
+ * The three sliders that divide a civilization's commerce: **tax** to gold,
+ * **science** to beakers, **luxury** to luxuries. Each is a number of *tenths* of
+ * the commerce split — see `RATE_TOTAL`.
+ *
+ * The rate rule (integers `>= 0` summing to exactly `RATE_TOTAL`) is stated once,
+ * in `economy.ts`'s `ratesProblem`; the command layer refuses a triple that breaks
+ * it and the split reads whatever the state carries. Nothing here constrains the
+ * numbers: this type is the *shape* of the field, and a state is only as valid as
+ * the command that wrote it.
+ */
+export interface Rates {
+  readonly tax: number;
+  readonly science: number;
+  readonly luxury: number;
+}
+
+/**
+ * The three rates sum to exactly this — the denominator of the split, which is
+ * why the split is exact integer arithmetic.
+ *
+ * 10 is a **placeholder**: it is unsourced, chosen to be playable (ten slider
+ * steps are enough to express a strategy and few enough to see at a glance), and it
+ * is **not** a Civ 3 figure — Civ 3's sliders are percentages of a different
+ * commerce model entirely, and this engine's split is its own. What it buys here is
+ * arithmetic: every rate is a tenth, so each channel's share is
+ * `commerce * tenths / 10`, floored, with the remainder to gold (`splitCommerce`).
+ */
+export const RATE_TOTAL = 10;
+
+/**
+ * The rates every player starts with — see `RATE_TOTAL` for the denominator.
+ *
+ * 6/4/0 is a **placeholder**: it is unsourced and chosen to be playable. Gold is
+ * the only channel M4b *acts* on (it pays upkeep and can go bankrupt), so the
+ * default leans toward it; science banks beakers for M5's research; luxury is 0
+ * because happiness arrives in M9 and luxury commerce spent today would be thrown
+ * away with nothing to show for it. It is not a sourced Civ 3 default — Civ 3's
+ * starting allocation depends on the government and the difficulty.
+ */
+export const DEFAULT_RATES: Rates = { tax: 6, science: 4, luxury: 0 };
+
+/**
+ * Gold a civilization starts with. 10 is a **placeholder**: it is unsourced and
+ * chosen to be playable — with the free unit allowance (`economy.ts`) it is enough
+ * to found a first city from a standing start without ever being forced into
+ * bankruptcy on turn one, and small enough that a player notices upkeep once the
+ * army grows. It is not a sourced Civ 3 figure.
+ *
+ * Barbarians start with 0: they have no economy at all (INTERFACES.md M4b, "The
+ * money loop"), so there is nothing for them to hold.
+ */
+export const STARTING_TREASURY = 10;
 
 export interface PlayerState {
   readonly id: PlayerId;
@@ -88,6 +156,38 @@ export interface PlayerState {
    * `civPlayers`, never `players.length` (INTERFACES.md M3, "State shape").
    */
   readonly kind: PlayerKind;
+  /**
+   * M4b: the player's gold. Income adds, upkeep subtracts, and it **never goes
+   * negative** — a treasury that would go below zero floors at 0 and the shortfall
+   * is paid by disbanding units (`economy.ts`, `applyEconomy`). A debt field was
+   * deliberately not invented: an unpaid shortfall is reported in a
+   * `TreasuryShortfall` event, not carried as state.
+   *
+   * Barbarians hold 0 and never change.
+   */
+  readonly treasury: number;
+  /**
+   * M4b: how this player's commerce divides between gold, beakers and luxuries.
+   * Written by `SetRates` and read once a turn by `applyEconomy`, which is why a
+   * rate change can only affect collections that have not happened yet.
+   *
+   * Every player carries one, barbarians included, so "the rates sum to
+   * `RATE_TOTAL`" is a statement about every row of `players` rather than about
+   * some of them; a barbarian's is inert because barbarians have no commerce.
+   */
+  readonly rates: Rates;
+  /**
+   * M4b: beakers banked so far. **Inert in M4b** — nothing spends them until M5
+   * (research) — so this number accumulates and does nothing. It is in the state
+   * rather than omitted because the split produces it every turn and a channel that
+   * silently discards its output is worse than one that visibly banks it.
+   */
+  readonly beakers: number;
+  /**
+   * M4b: luxuries banked so far. **Inert in M4b** — nothing reads them until M9
+   * (happiness). Same reasoning as `beakers`.
+   */
+  readonly luxuries: number;
 }
 
 export interface GameState {
@@ -220,11 +320,22 @@ const firstMissingRole = (ruleset: RulesetView): TerrainRole | undefined => {
 };
 
 /**
- * The role every player starts with. `newGame` places exactly one of these on
- * each player's starting tile, so a ruleset that cannot supply one cannot start
- * a game — which is a setup failure, not a crash.
+ * The roles every player starts with. `newGame` places one of these per
+ * civilization, in this order, so the **settler** is the role a ruleset must
+ * supply — a civilization with no unit at all has no legal action and no game —
+ * and the **worker** (M4b) is the role that makes the improvement system
+ * reachable from turn one rather than after a city has produced one.
+ *
+ * Why the worker is *optional* and the settler is not: the two absences are not
+ * the same failure. A view with no settler cannot start a playable game, which is
+ * what `missing-unit-role` reports. A view with no worker is a game without
+ * workers — every M2-era structural ruleset in the tree is exactly that, and the
+ * honest reading of "newGame gives each civilization a settler and a worker" is
+ * that it places the worker *the ruleset offers*; inventing one, or refusing to
+ * start a game over a role nothing can build anyway, would both be worse. The
+ * shipped `@civts/rules` catalog defines a worker, so every real game has one.
  */
-const STARTING_UNIT_ROLE: UnitRole = 'settler';
+const STARTING_UNIT_ROLES = ['settler', 'worker'] as const;
 
 /**
  * The first unit of `role` in the ruleset's catalog, or `undefined` when the
@@ -233,6 +344,69 @@ const STARTING_UNIT_ROLE: UnitRole = 'settler';
  */
 const firstUnitOfRole = (ruleset: RulesetView, role: UnitRole): UnitDef | undefined =>
   unitCatalog(ruleset).find((unit) => unit.role === role);
+
+/**
+ * Movement a freshly placed starting unit gets: its own type's movement, or 0 for
+ * a value the engine cannot use.
+ *
+ * The same totality rule `units.ts`' `fullMovement` applies to a spawn, restated
+ * here because `newGame` builds its units by hand (there is no state to spawn into
+ * yet). A fractional or negative budget would otherwise be written straight into
+ * the state, where `canonicalize` would reject it and the game would be unhashable
+ * before the first turn.
+ */
+const startingMovement = (def: UnitDef): number =>
+  Number.isInteger(def.movement) && def.movement > 0 ? def.movement : 0;
+
+/**
+ * Whether a land unit may stand on `tile`: the ruleset describes its terrain and
+ * that terrain is not impassable.
+ *
+ * This is the engine's own rule for *entering* a tile — it is exactly what
+ * `planMove` refuses on — applied to the one place a unit is placed without a
+ * move. Water is excluded because the catalog marks it impassable (a sea unit
+ * would need a different rule; `newGame` places settlers and workers, which are
+ * not sea units), and an undescribed terrain is excluded for the same reason
+ * `production.ts` will not price an item nothing describes.
+ */
+const standable = (map: GameMap, ruleset: RulesetView, tile: TileIndex): boolean => {
+  const terrain = terrainAtIndex(map, Number(tile));
+  if (terrain === undefined) return false;
+  const def = ruleset.terrains.find((candidate) => candidate.id === terrain);
+  return def !== undefined && !def.impassable;
+};
+
+/**
+ * Where a civilization's second starting unit goes: the first tile, in ascending
+ * index order, that is adjacent to its start tile, standable and free.
+ *
+ * Adjacency rather than the start tile itself because the settler is already
+ * standing there, and **occupied is never allowed**: stacking a player's own units
+ * is legal in M2 (and `production.ts` relies on it), but a *starting* placement
+ * that quietly put two units on one tile would make "every civilization starts
+ * with a settler and a worker" true on paper and false on the board. Ascending
+ * index order — not `neighbors8`' row-major box order, which starts at the
+ * top-left — is what makes the choice reproducible and readable.
+ *
+ * `undefined` when there is no such tile: see the caller, which places nothing
+ * rather than inventing an exception.
+ *
+ * The shape — "the tile itself if it is free, else the lowest-index free
+ * neighbour" — is the one `production.ts`'s own `placementTile` uses for a unit
+ * finished in a city. They are two functions rather than one because that one
+ * reads a built `GameState` and asks about *other owners'* units, while this runs
+ * during state assembly against a set of tiles already claimed; both sort the
+ * neighbours ascending, because the chosen tile is part of the state.
+ */
+const freeNeighbourOf = (
+  map: GameMap,
+  ruleset: RulesetView,
+  start: TileIndex,
+  occupied: ReadonlySet<number>,
+): TileIndex | undefined => {
+  const candidates = [...neighbors8(map, Number(start))].sort((a, b) => Number(a) - Number(b));
+  return candidates.find((tile) => !occupied.has(Number(tile)) && standable(map, ruleset, tile));
+};
 
 /**
  * A fresh, entirely unexplored fog layer: one row per player, each of length
@@ -315,13 +489,19 @@ export const newGame = (
   const missingRole = firstMissingRole(ruleset);
   if (missingRole !== undefined) return err({ kind: 'missing-terrain-role', role: missingRole });
 
-  // The unit every player starts with is resolved *before* generation, for the
+  // The units every player starts with are resolved *before* generation, for the
   // same reason the terrain roles are: a ruleset that cannot populate the board
   // should be reported as a typed setup failure, not discovered halfway through
-  // assembling a state.
-  const startingUnit = firstUnitOfRole(ruleset, STARTING_UNIT_ROLE);
-  if (startingUnit === undefined) {
-    return err({ kind: 'missing-unit-role', role: STARTING_UNIT_ROLE });
+  // assembling a state. The settler is mandatory (M2); the worker is placed only
+  // when the ruleset offers one (M4b — see `STARTING_UNIT_ROLES`).
+  const startingDefs: UnitDef[] = [];
+  for (const role of STARTING_UNIT_ROLES) {
+    const def = firstUnitOfRole(ruleset, role);
+    if (def === undefined) {
+      if (role === 'settler') return err({ kind: 'missing-unit-role', role });
+      continue;
+    }
+    startingDefs.push(def);
   }
 
   const dimensions = MAP_DIMENSIONS[settings.mapSize];
@@ -345,12 +525,21 @@ export const newGame = (
   // Player ids are the player's index in `players`, which is also the marker
   // `textview.describe` paints on a start tile; `name` carries the human-facing
   // "Player 1".."Player N" numbering required by INTERFACES.md.
+  //
+  // M4b: every player carries the money fields, civilizations and barbarians
+  // alike. `DEFAULT_RATES` is shared between them on purpose: it is a constant the
+  // engine never mutates (a rate change rebuilds the player's object), and one
+  // shared value cannot drift from itself.
   const civs: readonly PlayerState[] = world.starts.map((startingTile, index) => ({
     id: asPlayerId(index),
     name: `Player ${String(index + 1)}`,
     color: playerColor(index),
     startingTile,
     kind: 'civ',
+    treasury: STARTING_TREASURY,
+    rates: DEFAULT_RATES,
+    beakers: 0,
+    luxuries: 0,
   }));
 
   // M3: barbarians are a player, appended after the civilizations, so that
@@ -372,20 +561,56 @@ export const newGame = (
     color: BARBARIAN_COLOR,
     startingTile: barbarianTile,
     kind: 'barbarian',
+    // No economy at all (M4b): 0 gold, and the pools stay 0 because nothing ever
+    // adds to them. The fields are present rather than absent because `PlayerState`
+    // has one shape for every player — the same reading `explored` takes, where the
+    // barbarian gets a row of nothing rather than a missing row.
+    treasury: 0,
+    rates: DEFAULT_RATES,
+    beakers: 0,
+    luxuries: 0,
   };
   const players: readonly PlayerState[] = [...civs, barbarians];
 
-  // One starting unit per *civilization*, on its own start tile. Ids are handed
-  // out in player order (`0..civCount-1`), so the array is sorted by id by
+  // Every civilization starts with a settler on its own start tile and a worker on
+  // the first free standable tile beside it (M4b, "Starting units"); barbarians
+  // get nothing, because a barbarian settler would be nonsense and a barbarian
+  // worker could only improve land nobody owns.
+  //
+  // Ids are handed out in creation order (`0..`), so the array is sorted by id by
   // construction and `nextUnitId` is simply how many units exist — no counter to
-  // keep in sync and nothing ambient to store.
-  const units: readonly Unit[] = civs.map((player, index) => ({
-    id: asUnitId(index),
-    type: startingUnit.id,
-    owner: player.id,
-    tile: player.startingTile,
-    movementLeft: startingUnit.movement,
-  }));
+  // keep in sync and nothing ambient to store. `occupied` starts with every start
+  // tile, so a worker can never be placed on a settler — its own or another
+  // civilization's.
+  const occupied = new Set<number>(civs.map((player) => Number(player.startingTile)));
+  const units: Unit[] = [];
+  const place = (owner: PlayerId, def: UnitDef, tile: TileIndex): void => {
+    units.push({
+      id: asUnitId(units.length),
+      type: def.id,
+      owner,
+      tile,
+      movementLeft: startingMovement(def),
+    });
+    occupied.add(Number(tile));
+  };
+
+  for (const player of civs) {
+    const settler = startingDefs[0];
+    if (settler === undefined) continue; // unreachable: the settler is mandatory
+    place(player.id, settler, player.startingTile);
+
+    const worker = startingDefs[1];
+    if (worker === undefined) continue;
+    // A start whose neighbours are all water, impassable or occupied leaves the
+    // worker unplaced. That is a defensive branch no generated map reaches (starts
+    // are picked on coherent land), and the alternative — stacking the worker on
+    // the settler — would break the placement rule this file just stated while
+    // claiming to satisfy it.
+    const tile = freeNeighbourOf(world.map, ruleset, player.startingTile, occupied);
+    if (tile === undefined) continue;
+    place(player.id, worker, tile);
+  }
 
   // Fog: one row per player, indexed by `PlayerId`. Each start sees its
   // surroundings; what a unit sees later is derived from its position and folded

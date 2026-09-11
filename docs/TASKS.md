@@ -137,7 +137,34 @@ integration), against the frozen M3 contract.
 - Barbarian `startingTile` is a convention pointing at a hut, not a real start; rendering
   now excludes them, but the field is still required and meaningless for barbarians.
 
-## M4 — Economy & improvements — **NEXT**
+## M4a — Tile improvements & workers — **DONE** (commit `25dd252`)
+
+- [x] sparse `(tile, kind)` improvement list with pure, idempotent helpers
+- [x] improvement catalog (road / mine / irrigation) with mandatory provenance
+- [x] `cityYields` applies improvements for **worked** tiles; centre is never improved
+- [x] workers (`Unit.work`, optional), `StartWork` / `CancelWork`
+- [x] `advanceTurn` runs work **before** growth and production, pinned by a test
+- [x] REPL `work` / `cancel`, and a unit's current job shown in the units line
+- [x] mine-yield, cancellation, illegal-work and work-timing scenarios, with meta-tests
+
+Adversarial finding worth keeping: `improvements.ts` documented the pair ordering as
+"ascending code unit" while the engine sorts by index in `IMPROVEMENT_KINDS`. That
+ordering is hashed, so a reader "correcting" the code to match the comment would have
+moved all three goldens. Comment fixed; ordering pinned by a test.
+
+**Known gap, folded into M4b** (not fixed immediately, to avoid two rehashes back to
+back): civilizations start with a **settler only**, so a worker must be produced in a
+city before any improvement can be built. Real Civ 3 starts with settler + worker, and
+it makes the improvement system immediately exercisable.
+
+## M4b — The economy — **NEXT**
+
+- [ ] tax / science / luxury sliders; commerce split into gold, beakers, luxuries
+- [ ] a treasury per player: income, maintenance, and **unit support**
+- [ ] buildings & wonders v1 (effects, not just costs)
+- [ ] road-connected luxury and strategic resources
+- [ ] starting worker per civilization (see the M4a gap above) — bundles the rehash
+- [ ] a **bankruptcy** scenario, and a treasury/conservation scenario
 
 ## Later milestones
 

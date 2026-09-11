@@ -23,6 +23,8 @@
  *   ruleset, and the honest fix is for the turn to apply. `actions.test.ts`
  *   asserts both directions on every board it builds, that state included, and
  *   M4a's work commands extend the sweep to five generators rather than three.
+ *   M4b's `planSetRates` is the sixth: the rate space is a query, not an
+ *   enumeration, for the reasons in the `SetRates` note below.
  * - **`StartWork` is enumerated over the catalog, and that is complete.** The
  *   command names an improvement kind, so "every way this worker may start work"
  *   is exactly "every kind this ruleset can build here" — a finite list read from
@@ -49,6 +51,39 @@
  *   enumeration is the whole space, not a sample of it. `CancelWork` is a single
  *   question about the unit's own state, and it is legal exactly when the unit is
  *   working.
+ * - **`SetRates` (M4b) is a query too, and the sixth generator is its evaluator.**
+ *   `planSetRates` is the applier's own decision — "this actor exists, and this
+ *   triple is three integers `>= 0` summing to `RATE_TOTAL`" — and `applyCommand`
+ *   refuses with it, so the two cannot disagree. What this module does **not** do is
+ *   enumerate the rate space, and that is a stated decision rather than an
+ *   oversight:
+ *   - the space is *not* small. Every triple of non-negative integers summing to
+ *     `RATE_TOTAL` is legal, which at `RATE_TOTAL = 10` is 66 commands, per player,
+ *     per call. `legalActions` is the AI's and the UI's hot path (PLAN.md §5.2), and
+ *     a 66-entry block of slider moves beside a settler's five steps is a bad
+ *     answer to "what can I do now?" — the argument M3 already made for
+ *     `SetWorkedTiles` and `SetProduction`, whose spaces are larger but of the same
+ *     kind;
+ *   - and every one of those 66 commands is **invisible in the event stream**:
+ *     `SetRates` writes a setting and emits nothing (M3's setter precedent — the
+ *     payload is the record of the change). The committed adversarial sweeps treat
+ *     "an advertised action applied without emitting an event" as a failure
+ *     (`packages/testing/test/m2-adversarial.test.ts`,
+ *     `packages/testing/test/m4a-adversarial.test.ts`), and they are right to: an
+ *     advertised action with no observable effect is exactly the shape of a
+ *     generator that has drifted from the applier. Enumerating rates would either
+ *     fail those sweeps or require a new `GameEvent` member, which the frozen M4b
+ *     event list does not name (`IncomeCollected`, `UpkeepPaid`, `UnitDisbanded`,
+ *     `TreasuryShortfall` are the money loop's four).
+ *
+ *   So this module yields **no** `SetRates`, the way it yields no `SetWorkedTiles`
+ *   or `SetProduction`: legality is stated once, in `planSetRates`, and
+ *   `actions.test.ts` sweeps a candidate universe of legal *and* illegal triples
+ *   through that evaluator against `applyCommand` in **both** directions — the
+ *   keystone property, held for the sixth generator without pretending a slider is
+ *   a move. (`RATE_TOTAL`'s shape makes this cheap: a caller that wants a rate
+ *   choice asks `planSetRates` about the triple it has in mind, which is what a
+ *   slider UI does anyway.)
  * - **Deterministic order.** Units are visited in `state.units` order (sorted by
  *   id, INTERFACES.md M2); each unit yields `FoundCity` (when it can found), then
  *   one `StartWork` per accepted catalog kind, then `CancelWork` (when it is
@@ -192,6 +227,10 @@ export const unitActions = (
  *
  * `EndTurn` is always legal for a real player: M2 has no turn-order state to
  * violate, and the command layer refuses only what the rules forbid.
+ *
+ * M4b's `SetRates` is deliberately **not** among these yields, for both
+ * barbarians and civilizations: it is a setting over a 66-triple space with no
+ * event of its own, and `planSetRates` is its evaluator — see the module note.
  */
 export function* legalActions(
   state: GameState,

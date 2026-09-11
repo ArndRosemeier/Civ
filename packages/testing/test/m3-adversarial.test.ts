@@ -80,6 +80,30 @@
  * were re-pinned to the M4a values for the deliberate `SCHEMA_VERSION` 4 rehash.
  * Every other assertion here still holds unchanged, which is itself evidence that
  * M4a added a field without disturbing M3's rules.
+ *
+ * Migrated for M4b (docs/INTERFACES.md M4b), again by the F6 rule — this file's
+ * author had finished before the milestone's contract landed. Three things needed
+ * it, and again a typecheck failure named the first:
+ *
+ * 1. `cmdKey` gained `SetRates`, keyed by the triple (the same "carry the payload"
+ *    rule the M4a keys follow).
+ * 2. `checkTurn`'s pipeline composition gained the **economy** step, and the change
+ *    is the interesting one: the old three-term claim failed on *every turn of every
+ *    seed* (660 recorded problems), which is exactly what a pipeline test is for. The
+ *    step is composed from `applyEconomy` itself — the money rule is the money
+ *    module's to state — and what this file checks instead is what a pipeline test
+ *    can: the four event groups appear in that order, `after`'s players are exactly
+ *    what the economy step computed (so nothing downstream re-clamps a treasury or
+ *    re-opens a settled debt), and no player ends a turn with a negative or
+ *    fractional treasury, beaker count or luxury count.
+ * 3. The three pinned golden hashes were re-pinned to the M4b values
+ *    (`SCHEMA_VERSION` 4 -> 5: every player gains the four money fields, and
+ *    `newGame` places a starting worker per civilization), regenerated through the
+ *    harness's own opt-in path and recorded in the milestone's `rehash:` note.
+ *
+ * Nothing was relaxed to reach green: the conservation sweeps kept every claim they
+ * had and gained the two above, and the golden pin still compares the digits this
+ * file writes down against both the file on disk and this build's hashes.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -95,6 +119,7 @@ import {
   DEFAULT_SETTINGS,
   HUT_REWARD_KINDS,
   applyCommand,
+  applyEconomy,
   applyGrowth,
   applyProduction,
   asBuildingId,
@@ -239,6 +264,12 @@ const cmdKey = (cmd: Command): string => {
       return `StartWork ${String(cmd.unitId)} ${String(cmd.kind)}`;
     case 'CancelWork':
       return `CancelWork ${String(cmd.unitId)}`;
+    // M4b. Keyed by the *triple*, for the M4a reason: two `SetRates` naming
+    // different splits are different commands, and a key that dropped the numbers
+    // would call them equal — the exact false equivalence this comparator exists to
+    // prevent.
+    case 'SetRates':
+      return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
   }
 };
 
@@ -1426,7 +1457,19 @@ interface RunTotals {
  * a bug in growth's own arithmetic would have to fool the transcription above
  * *and* survive the shape invariants. The pipeline itself is checked by
  * composition: the events of `EndTurn` must be exactly
- * `applyGrowth(before).events ++ applyProduction(grown).events ++ TurnEnded`.
+ * `applyGrowth(before).events ++ applyProduction(grown).events ++
+ * applyEconomy(produced).events ++ TurnEnded`.
+ *
+ * **Migrated to the M4b pipeline** (docs/INTERFACES.md M4b, "Money loop"). M4b
+ * inserts an **economy** step between production and the movement refill, so the
+ * composition above gained a fourth term and the old three-term version failed on
+ * every turn of every seed — which is exactly what a pipeline test is for. The
+ * step is composed from `applyEconomy` itself rather than from a transcription of
+ * its arithmetic, deliberately: the money rule is the money module's to state, and
+ * this file's job is the *order* of the pipeline and the invariants either side of
+ * it. What is checked here instead is what a pipeline test can check — the events
+ * appear in exactly that order, and `after` carries the money the economy step
+ * computed, un-clamped by anything downstream.
  */
 const checkTurn = (
   rec: Recorder,
@@ -1447,19 +1490,47 @@ const checkTurn = (
 
   const grown = applyGrowth(before, RULESET);
   const produced = applyProduction(grown.state, RULESET);
+  const paid = applyEconomy(produced.state, RULESET);
   const last = events[events.length - 1];
   rec.check(
     sameJson(events, [
       ...grown.events,
       ...produced.events,
+      ...paid.events,
       {
         type: 'TurnEnded',
         playerId: last?.type === 'TurnEnded' ? last.playerId : -1,
         turn: after.turn,
       },
     ]),
-    `${label}: EndTurn is not growth ++ production ++ TurnEnded, in that order`,
+    `${label}: EndTurn is not growth ++ production ++ economy ++ TurnEnded, in that order`,
   );
+
+  // The money the turn reports is the money the turn *kept*: the refill and the
+  // turn counter that follow the economy step touch units and `turn`, never a
+  // player — so nothing downstream may re-clamp a treasury, drop a beaker or
+  // re-open a debt the money loop already settled. `players` is compared whole,
+  // which also pins the four money fields as the only ones that could move.
+  rec.check(
+    sameJson(after.players, paid.state.players),
+    `${label}: the money fields after the turn are not what the economy step computed`,
+  );
+  // A treasury is never negative at any point after a turn, for any player,
+  // barbarians included (who are skipped, and therefore untouched).
+  for (const player of after.players) {
+    rec.check(
+      Number.isInteger(player.treasury) && player.treasury >= 0,
+      `${label}: player ${String(player.id)} ended the turn with treasury ${String(player.treasury)}`,
+    );
+    rec.check(
+      Number.isInteger(player.beakers) && player.beakers >= 0,
+      `${label}: player ${String(player.id)} ended the turn with ${String(player.beakers)} beakers`,
+    );
+    rec.check(
+      Number.isInteger(player.luxuries) && player.luxuries >= 0,
+      `${label}: player ${String(player.id)} ended the turn with ${String(player.luxuries)} luxuries`,
+    );
+  }
 
   // --- refill, and no unit is moved by a turn ---------------------------
   const beforeById = new Map(before.units.map((unit) => [Number(unit.id), unit]));
@@ -2272,19 +2343,23 @@ const runGoldenHarness = (corrupt: boolean): GoldenHarnessRun => {
  *
  * They moved once per persisted-shape change, never for any other reason: M3's
  * foundation commit took `SCHEMA_VERSION` 2 -> 3 (`nextCityId`, `cities`,
- * `PlayerState.kind`, the barbarian player, `GameMap.huts`) and M4a's took it
- * 3 -> 4 (`GameState.improvements`). Both were deliberate, contract-mandated
- * rehashes regenerated through the harness's own opt-in path; the M4a values below
- * are the ones `packages/testing/goldens/state.json` now stores.
+ * `PlayerState.kind`, the barbarian player, `GameMap.huts`), M4a's took it
+ * 3 -> 4 (`GameState.improvements`), and M4b's takes it 4 -> 5 — every player
+ * gains the four money fields (`treasury`, `rates`, `beakers`, `luxuries`) and
+ * `newGame` starts each civilization with a worker as well as a settler, which is
+ * a persisted-shape change *and* a board change, so every hash moves for two
+ * independent reasons. All three were deliberate, contract-mandated rehashes
+ * regenerated through the harness's own opt-in path; the M4b values below are the
+ * ones `packages/testing/goldens/state.json` now stores.
  *
  * A hash that moves *without* a shape change is a semantic bug and must not be
  * re-pinned — that is the whole point of writing the digits down rather than
  * comparing the file against itself.
  */
 const PINNED_GOLDENS: readonly { readonly name: string; readonly hash: string }[] = [
-  { name: 'tiny-civs2-seed1', hash: '831e0e3c07bf668f' },
-  { name: 'tiny-civs2-seed42', hash: '206e27796f4f7aa9' },
-  { name: 'tiny-civs2-seed1337', hash: 'd814838fe71c6a3a' },
+  { name: 'tiny-civs2-seed1', hash: '6f2e1f2a9adb3a2a' },
+  { name: 'tiny-civs2-seed42', hash: '93a436cc99000580' },
+  { name: 'tiny-civs2-seed1337', hash: 'ed23a69cd84d5ab4' },
 ];
 
 describe('goldens — still a gate, still refusing to auto-write', () => {
@@ -2298,9 +2373,10 @@ describe('goldens — still a gate, still refusing to auto-write', () => {
     console.log('m3 golden hashes:', computed.join(' '));
 
     // M3 changed the persisted shape once, at its foundation commit, and M4a
-    // changed it once more (`improvements`, SCHEMA_VERSION 4). Both moved every
-    // hash deliberately, through the harness's opt-in path, and both are recorded
-    // in the milestone's `rehash:` note. Nothing else may move them.
+    // changed it once more (`improvements`, SCHEMA_VERSION 4); M4b changes it again
+    // (the four money fields plus M4b's starting worker, SCHEMA_VERSION 5). All
+    // three moved every hash deliberately, through the harness's opt-in path, and
+    // each is recorded in its milestone's `rehash:` note. Nothing else may move them.
     expect(computed).toEqual(PINNED_GOLDENS.map((entry) => entry.hash));
     // Named as well as positional: a pin is only meaningful if the hash is the one
     // the scenario the name describes produces.

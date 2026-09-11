@@ -39,6 +39,19 @@
  *   is said about a feature that is not on the board), and through a `viewer` only
  *   for jobs on explored tiles, because a worker nobody can see is not knowledge
  *   that player has.
+ * - **The viewer's gold is a header field, not a line** (M4b). A treasury is
+ *   money, and money is a fact about a *player*, not about a tile, a unit or a
+ *   city — so there is no glyph for it and no natural place in the grid. It joins
+ *   the header beside `viewer=`, the one other field that already names the player
+ *   the picture is drawn for, and it is read *totally*: a player the state does
+ *   not carry has no gold, so nothing is printed for it rather than a `gold=0`
+ *   that would be a claim about a player who does not exist. God mode (no
+ *   `viewer`) prints no gold at all: there is no player whose money it would be,
+ *   and the no-`viewer` output stays exactly what it was before this field
+ *   existed. `beakers` and `luxuries` are deliberately **not** printed here: they
+ *   do nothing until M5 and M9 (INTERFACES.md M4b, "Be honest about inertness"),
+ *   and a number in a header is a claim that it means something — the REPL, which
+ *   can afford the sentence, is where the inertness is spelled out.
  */
 
 import type { PlayerId, TerrainId, UnitTypeId } from './ids.js';
@@ -166,7 +179,24 @@ const headerLine = (state: GameState, viewer: PlayerId | undefined): string =>
   `civs=${String(civPlayers(state).length)}` +
   // God mode has no viewer, so it says nothing extra: the no-`viewer` header is
   // byte-for-byte what it was before this option existed.
-  (viewer === undefined ? '' : ` viewer=${String(viewer)}`);
+  (viewer === undefined ? '' : ` viewer=${String(viewer)}${goldField(state, viewer)}`);
+
+/**
+ * The viewer's gold as a header field (` gold=10`), or `''` when the state has no
+ * player with that id — see `headerLine`.
+ *
+ * Read **totally**, the way `economy.ts` reads a treasury: a hand-built state, an
+ * older save loaded through JSON or a foreign object can carry a missing,
+ * fractional or `NaN` money field, and printing `gold=NaN` in the agent's primary
+ * view would be worse than printing a 0 that says "this player holds nothing the
+ * engine can count". A whole number is printed verbatim; anything else reads as 0.
+ */
+const goldField = (state: GameState, viewer: PlayerId): string => {
+  const player = state.players.find((candidate) => candidate.id === viewer);
+  if (player === undefined) return '';
+  const treasury = player.treasury;
+  return ` gold=${String(Number.isInteger(treasury) ? treasury : 0)}`;
+};
 
 const viewLine = (view: Window, map: GameMap): string => {
   if (view.width === 0 || view.height === 0) {
@@ -403,10 +433,16 @@ const workLine = (
  *
  * With `options.viewer`, the same geometry is drawn from that player's explored
  * row: unexplored tiles become `?` (including their start markers and their
- * huts), the legend gains `? unexplored`, and the header names the viewer.
+ * huts), the legend gains `? unexplored`, the header names the viewer and — since
+ * M4b — that viewer's gold:
+ *
+ * ```
+ * CivTS state: seed=7 turn=1 revision=0 map=duel(4x4) civs=2 viewer=0 gold=10
+ * ```
+ *
  * Nothing else changes, and with no `viewer` the output is exactly what it was
  * before the option existed (PLAN.md 8.1: the agent's primary eyes, in both
- * modes).
+ * modes) — god mode has no player, so it has no gold to print.
  */
 export const describe = (
   state: GameState,

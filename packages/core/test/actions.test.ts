@@ -40,10 +40,24 @@
  * new evaluators' agreement directly, including that an accepted work command
  * *is* advertised, which the setters' half deliberately does not claim.
  *
+ * M4b's `SetRates` is the **sixth generator**, and it goes on the queried side with
+ * the setters: `planSetRates` is the evaluator `applyCommand` consults, and the rate
+ * space — 66 triples at `RATE_TOTAL = 10` — is a slider's choice, not an action a
+ * generator should pretend to enumerate (`actions.ts` states the decision, including
+ * the two reasons: a 66-entry block in the hot path, and a command whose only effect
+ * is a setting, which the adversarial sweeps' "an advertised action emits an event"
+ * rule would reject). `assertRatesAgreement` below walks all 2197 integer triples in
+ * `[-1, RATE_TOTAL + 1]³` plus fractional and non-finite shapes, requires the
+ * applier's verdict *and* its typed refusal to be the plan's, requires every accepted
+ * one to be exactly the setting it claims and to touch nothing else in the state, and
+ * requires that none of them is advertised.
+ *
  * The walk covers eight states — a hand-built board, one with cities, a starved
  * one, a rich one, the unknown-type one, real `newGame` boards, and the M4a worker
  * boards (idle, working, and on an already-improved tile) — and applies every
- * candidate to the state it came from.
+ * candidate to the state it came from. The rate sweep runs on those boards too,
+ * including a generated one, because a rate's legality is about the *actor* and not
+ * about the board.
  *
  * The hand-built board is the one from `commands.test.ts`: width 4, tile index
  * `y * 4 + x`, every `explored` row `false` so that legality is visibly not a fog
@@ -57,6 +71,7 @@ import {
   applyCommand,
   planCancelWork,
   planSetProduction,
+  planSetRates,
   planSetWorkedTiles,
   planStartWork,
   type Command,
@@ -87,7 +102,16 @@ import {
 } from '../src/map.js';
 import type { Result } from '../src/result.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { SCHEMA_VERSION, newGame, type GameState, type PlayerState } from '../src/state.js';
+import {
+  DEFAULT_RATES,
+  RATE_TOTAL,
+  SCHEMA_VERSION,
+  STARTING_TREASURY,
+  newGame,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
+import { advanceTurn } from '../src/turn.js';
 import { withWork, type Unit, type UnitDef, type UnitRole, type UnitWork } from '../src/units.js';
 
 const TERRAIN_ROWS: readonly (readonly [TerrainRole, number, boolean])[] = [
@@ -207,6 +231,14 @@ const player = (index: number, startingTile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(startingTile),
   kind: 'civ',
+  // M4b: the money fields, spelled out like every other field of a fixture. The
+  // rates every player starts with (`RATE_TOTAL` split six/four/nothing), and a
+  // treasury the *turns* below move — these boards assert command behaviour, not
+  // upkeep, so the amounts are only ever read by the pipeline's money step.
+  treasury: STARTING_TREASURY,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 });
 
 /** A city with M3's shape and playable defaults; every field is spelled out. */
@@ -300,6 +332,11 @@ const startWork = (unitId: number, kind: string): Command => ({
 });
 
 const cancelWork = (unitId: number): Command => ({ type: 'CancelWork', unitId: asUnitId(unitId) });
+
+const setRates = (tax: number, science: number, luxury: number): Command => ({
+  type: 'SetRates',
+  rates: { tax, science, luxury },
+});
 
 /** An improvement kind no row in this file's catalog describes. */
 const UNKNOWN_KIND = 'space-elevator';
@@ -486,6 +523,8 @@ const commandKey = (cmd: Command): string => {
       return `StartWork:${String(Number(cmd.unitId))}:${cmd.kind}`;
     case 'CancelWork':
       return `CancelWork:${String(Number(cmd.unitId))}`;
+    case 'SetRates':
+      return `SetRates:${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
   }
 };
 
@@ -726,6 +765,104 @@ const assertWorkAgreement = (
   }
 
   return { checked, accepted, refused: checked - accepted };
+};
+
+/**
+ * The rate candidate universe (M4b): every integer triple in
+ * `[-1, RATE_TOTAL + 1]³` — 2197 of them, so both directions are swept rather than
+ * sampled — plus shapes no integer grid can express: a fractional rate, a `NaN`,
+ * an infinity, and a negative zero.
+ *
+ * It is deliberately wider than anything the applier accepts, and it is *not*
+ * derived from `planSetRates`: the whole point is that the two must agree on
+ * inputs neither of them chose.
+ */
+const ratesCommands = (): readonly Command[] => {
+  const commands: Command[] = [];
+  for (let tax = -1; tax <= RATE_TOTAL + 1; tax += 1) {
+    for (let science = -1; science <= RATE_TOTAL + 1; science += 1) {
+      for (let luxury = -1; luxury <= RATE_TOTAL + 1; luxury += 1) {
+        commands.push(setRates(tax, science, luxury));
+      }
+    }
+  }
+  for (const rates of [
+    [1.5, 4, 4.5],
+    [Number.NaN, 5, 5],
+    [Number.POSITIVE_INFINITY, 0, 0],
+    [0, 0, -0],
+  ] as readonly (readonly number[])[]) {
+    commands.push({
+      type: 'SetRates',
+      rates: { tax: rates[0] ?? 0, science: rates[1] ?? 0, luxury: rates[2] ?? 0 },
+    });
+  }
+  return commands;
+};
+
+/** What one rate sweep measured, so a caller can prove it was not vacuous. */
+interface RatesTotals {
+  readonly checked: number;
+  readonly accepted: number;
+  readonly refused: number;
+  readonly yielded: number;
+}
+
+/**
+ * M4b's half of the keystone property — the sixth generator, `planSetRates`.
+ *
+ * For every candidate rate triple:
+ *
+ * - the applier's verdict must be the plan evaluator's, with the *same* typed
+ *   refusal (so a triple refused as `unknown-player` by one and `invalid-argument`
+ *   by the other fails here);
+ * - an accepted one must write exactly that triple onto the actor, and must leave
+ *   everything else in the state alone — reference-identical `units`, `cities`,
+ *   `map`, `rng` and `turn` — because a rate is a setting, not a transaction; and
+ * - an accepted one must **not** be advertised, which is the opposite of what the
+ *   work sweep claims and the whole content of the "rates are a query" decision.
+ *   The last assertion is also made on the generator directly: no `legalActions`
+ *   output for any player may be a `SetRates` at all.
+ */
+const assertRatesAgreement = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): RatesTotals => {
+  const yielded = [...legalActions(state, ruleset, playerId)];
+  expect(yielded.some((cmd) => cmd.type === 'SetRates')).toBe(false);
+  const keys = new Set(yielded.map(commandKey));
+
+  let checked = 0;
+  let accepted = 0;
+
+  for (const cmd of ratesCommands()) {
+    checked += 1;
+    if (cmd.type !== 'SetRates') throw new Error(`not a rate command: ${cmd.type}`);
+    const applied = applyCommand(state, playerId, cmd, ruleset);
+    const planned = planSetRates(state, playerId, cmd.rates);
+
+    expect(applied.ok).toBe(planned.ok);
+    if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+
+    if (applied.ok) {
+      accepted += 1;
+      const after = applied.value.state;
+      const actor = after.players.find((each) => each.id === playerId);
+      expect(actor?.rates).toEqual(cmd.rates);
+      // Nothing else moved: same arrays, same map, same turn, one more revision.
+      expect(after.units).toBe(state.units);
+      expect(after.cities).toBe(state.cities);
+      expect(after.map).toBe(state.map);
+      expect(after.rng).toBe(state.rng);
+      expect(after.turn).toBe(state.turn);
+      expect(after.revision).toBe(state.revision + 1);
+      expect(applied.value.events).toEqual([]);
+      expect(keys.has(commandKey(cmd))).toBe(false);
+    }
+  }
+
+  return { checked, accepted, refused: checked - accepted, yielded: keys.size };
 };
 
 /**
@@ -1189,6 +1326,92 @@ describe('keystone — the generator and the applier agree, in both directions',
       checked: 5,
       accepted: 0,
       refused: 5,
+    });
+  });
+
+  it('agrees for the rate evaluator — the sixth generator, over every integer triple', () => {
+    // `planSetRates` is the applier's own evaluator, so the sweep is the setter
+    // sweep's shape one milestone on: 2197 integer triples plus four shapes no grid
+    // holds, of which exactly the 66 triples of non-negative rates summing to
+    // RATE_TOTAL are accepted, and none of them is advertised. The counts are
+    // asserted, so the walk cannot pass by checking nothing.
+    const universe = ratesCommands().length;
+    const legal = ((RATE_TOTAL + 1) * (RATE_TOTAL + 2)) / 2; // 66
+    expect(universe).toBe((RATE_TOTAL + 3) ** 3 + 4);
+    expect(legal).toBe(66);
+
+    for (const board of [STATE, CITY_STATE, SHARED_STATE, WORKER_STATE]) {
+      expect(assertRatesAgreement(board, RULESET, P0)).toEqual({
+        checked: universe,
+        accepted: legal,
+        refused: universe - legal,
+        // The generator's own output size on that board, unchanged by the sweep:
+        // rates add nothing to it.
+        yielded: [...legalActions(board, RULESET, P0)].length,
+      });
+    }
+  });
+
+  it('agrees for the rate evaluator on a generated board, and on an actor that is not there', () => {
+    // The rate space has no state in it at all beyond the actor, which is exactly
+    // why it is swept on a real `newGame` board as well as the hand-built ones: a
+    // ruleset, a map or a set of cities must not be able to change a rate's
+    // legality. (The generator's output size differs on a generated board, so it is
+    // not asserted here — that count belongs to the movement and work sweeps.)
+    const board = generatedBoard(4);
+    const legal = ((RATE_TOTAL + 1) * (RATE_TOTAL + 2)) / 2;
+    const universe = ratesCommands().length;
+
+    const totals = assertRatesAgreement(board, RULESET, P0);
+    expect(totals.checked).toBe(universe);
+    expect(totals.accepted).toBe(legal);
+    expect(totals.refused).toBe(universe - legal);
+
+    // An actor the state does not have: every candidate is refused, by both, with
+    // the same `unknown-player` — so the accepted count is zero and the walk is
+    // still checking a real verdict.
+    expect(assertRatesAgreement(board, RULESET, asPlayerId(99))).toEqual({
+      checked: universe,
+      accepted: 0,
+      refused: universe,
+      yielded: 0,
+    });
+  });
+
+  it('applies a legal rate change the generator does not advertise, and reads it next turn', () => {
+    // The stated scope, one concrete command deep: `SetRates` is legal, it is not in
+    // any generator's output, and the money loop — not the command — is what turns
+    // it into gold. That is the same division the two city setters have.
+    const command = setRates(0, 10, 0);
+    expect([...legalActions(CITY_STATE, RULESET, P0)].map(commandKey)).not.toContain(
+      commandKey(command),
+    );
+
+    const changed = applyCommand(CITY_STATE, P0, command, RULESET);
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error('the applier refused a legal rate change');
+
+    // Nothing about the board changed except the rates, and the city's next
+    // collection — its centre's 1 commerce, all of it science — is what the change
+    // bought. Under the default 6/4/0 rates the same commerce would have been 1
+    // gold, which is asserted alongside it so the two are one statement.
+    expect(changed.value.state.cities).toBe(CITY_STATE.cities);
+    const incomeOf = (board: GameState): unknown =>
+      advanceTurn(board, RULESET).events.find((event) => event.type === 'IncomeCollected');
+
+    expect(incomeOf(changed.value.state)).toEqual({
+      type: 'IncomeCollected',
+      playerId: P0,
+      gold: 0,
+      beakers: 1,
+      luxuries: 0,
+    });
+    expect(incomeOf(CITY_STATE)).toEqual({
+      type: 'IncomeCollected',
+      playerId: P0,
+      gold: 1,
+      beakers: 0,
+      luxuries: 0,
     });
   });
 

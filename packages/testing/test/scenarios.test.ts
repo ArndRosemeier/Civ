@@ -23,11 +23,17 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_RATES,
+  FREE_UNITS_BASE,
+  FREE_UNITS_PER_CITY,
   HUT_REWARD_KINDS,
   HUT_REWARD_PROVENANCE,
   MAP_DIMENSIONS,
+  RATE_TOTAL,
   SCHEMA_VERSION,
+  STARTING_TREASURY,
   TERRAIN_BY_ROLE,
+  UNIT_SUPPORT_COST,
   VISIBILITY_RADIUS,
   applyCommand,
   asBuildingId,
@@ -48,23 +54,32 @@ import {
   improvementsAt,
   isExplored,
   isPlaceholder,
+  loadSettings,
+  neighbors8,
+  newGame,
   nextBelow,
+  playerIncome,
+  ratesProblem,
   seedRng,
+  splitCommerce,
   tileIndex,
   tileYields,
   unitById,
   unitDef,
+  unitSupport,
   unitsOnTile,
   visibleTiles,
   type City,
   type Command,
   type CommandOutcome,
   type GameError,
+  type GameEvent,
   type GameState,
   type HutRewardKind,
   type ImprovementId,
   type PlayerId,
   type ProductionItem,
+  type Rates,
   type Result,
   type RulesetView,
   type TileIndex,
@@ -940,6 +955,48 @@ const endTurnsFrom = (
 /** The position of the hut in the hut scenarios: one step east of the mover. */
 const HUT_TILE = at(6, 5);
 
+/**
+ * M4b: the two ledger lines the money loop emits for **every** civilization on
+ * **every** turn, and the `TurnEnded` the command layer appends after them.
+ *
+ * They are here, next to the M3 command spellings, because they changed what an
+ * `EndTurn` puts in the event list: the M3 and M4a expectations below now name the
+ * ledger lines explicitly rather than filtering them out. A helper that *hid* them
+ * (by filtering the event list down to the types a test cares about) would let a
+ * wrong amount, a missing player or a wrong order pass unnoticed, which is exactly
+ * what those assertions exist to catch — so every list below still spells out the
+ * amounts, one line per channel, per player, in player-id order.
+ */
+const incomeEvent = (
+  playerId: PlayerId,
+  gold: number,
+  beakers: number,
+  luxuries: number,
+): GameEvent => ({ type: 'IncomeCollected', playerId, gold, beakers, luxuries });
+
+const upkeepEvent = (
+  playerId: PlayerId,
+  gold: number,
+  maintenance: number,
+  unitSupport: number,
+  units: number,
+  freeUnits: number,
+): GameEvent => ({
+  type: 'UpkeepPaid',
+  playerId,
+  gold,
+  maintenance,
+  unitSupport,
+  units,
+  freeUnits,
+});
+
+/** `EndTurn` by Rome, as every M3/M4a scenario runs it. */
+const turnEnded = (turn: number): GameEvent => ({ type: 'TurnEnded', playerId: ROME, turn });
+
+/** `SetRates`, spelled as the REPL spells it (M4b's one new command). */
+const setRates = (rates: Rates): Command => ({ type: 'SetRates', rates });
+
 /* ------------------------------------------------------------------ *
  * 4. Growth timing and carry-over
  * ------------------------------------------------------------------ */
@@ -1562,14 +1619,43 @@ describe('M3 scenario: growth timing and carry-over', () => {
     expect(after.turn).toBe(5);
     expect(cityById(after, asCityId(0))?.population).toBe(1);
     expect(cityById(after, asCityId(0))?.foodBox).toBe(8);
-    // `FoundCity` is the run's first command, so its own event leads the list.
+    // `FoundCity` is the run's first command, so its own event leads the list. Each
+    // of the four turns then adds the M4b ledger lines of both civilizations —
+    // Carthage's are zeroes (it owns no city), but a complete stream is what makes
+    // "income minus upkeep equals the delta" checkable from events alone.
     expect(result.events.map((event) => event.type)).toEqual([
       'CityFounded',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
       'TurnEnded',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
       'TurnEnded',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
       'TurnEnded',
+      'IncomeCollected',
+      'UpkeepPaid',
+      'IncomeCollected',
+      'UpkeepPaid',
       'TurnEnded',
     ]);
+    // Rome's one city makes 2 commerce (grassland centre 1 + the one worked
+    // grassland 1) at the default 6/4/0: floor(2*6/10) = 1 gold, floor(2*4/10) = 0
+    // beakers, 0 luxuries, and the leftover 1 is gold — 2 gold a turn, and nothing
+    // to support (the settler became the city, so Rome owns no unit).
+    const romeLine: readonly GameEvent[] = [
+      incomeEvent(ROME, 2, 0, 0),
+      upkeepEvent(ROME, 0, 0, 0, 0, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+    ];
     expect(result.events).toEqual([
       {
         type: 'CityFounded',
@@ -1578,10 +1664,14 @@ describe('M3 scenario: growth timing and carry-over', () => {
         name: 'City 1',
         tile: at(5, 5),
       },
-      { type: 'TurnEnded', playerId: ROME, turn: 2 },
-      { type: 'TurnEnded', playerId: ROME, turn: 3 },
-      { type: 'TurnEnded', playerId: ROME, turn: 4 },
-      { type: 'TurnEnded', playerId: ROME, turn: 5 },
+      ...romeLine,
+      turnEnded(2),
+      ...romeLine,
+      turnEnded(3),
+      ...romeLine,
+      turnEnded(4),
+      ...romeLine,
+      turnEnded(5),
     ]);
   });
 
@@ -1644,7 +1734,16 @@ describe('M3 scenario: starvation', () => {
     expect(starved.state.turn).toBe(12);
     expect(starved.events).toEqual([
       { type: 'CityStarved', cityId: asCityId(0), owner: ROME, population: 1, foodBox: 0 },
-      { type: 'TurnEnded', playerId: ROME, turn: 12 },
+      // M4b: a starving city that works nothing still has its centre's commerce —
+      // the plains centre is 1/2/1, so 1 commerce at 6/4/0 floors to 0 gold and 0
+      // beakers and the leftover 1 becomes gold. Rome owns no unit (its settler
+      // became the city) and Carthage's single warrior is inside its free
+      // allowance of `FREE_UNITS_PER_CITY * 0 + FREE_UNITS_BASE = 4`.
+      incomeEvent(ROME, 1, 0, 0),
+      upkeepEvent(ROME, 0, 0, 0, 0, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(12),
     ]);
     expect(cityById(starved.state, asCityId(0))).toMatchObject({
       population: 1,
@@ -1677,9 +1776,16 @@ describe('M3 scenario: production', () => {
 
     expect(after.turn).toBe(3);
     // Only the second turn produced anything, and the pipeline's own order shows:
-    // the world's events first, then the command layer's `TurnEnded`.
+    // the world's events first (production, then M4b's money step), then the
+    // command layer's `TurnEnded`. The settler is added to `units` *before* the
+    // money step, so the turn it appears is the turn its owner starts counting it
+    // — Rome's `units` count is 2 on that turn, not 1.
     expect(result.events).toEqual([
-      { type: 'TurnEnded', playerId: ROME, turn: 2 },
+      incomeEvent(ROME, 2, 0, 0),
+      upkeepEvent(ROME, 0, 0, 0, 1, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(2),
       {
         type: 'CityProduced',
         cityId: asCityId(0),
@@ -1689,7 +1795,11 @@ describe('M3 scenario: production', () => {
         unitId: asUnitId(2),
         tile: PRODUCTION_CITY,
       },
-      { type: 'TurnEnded', playerId: ROME, turn: 3 },
+      incomeEvent(ROME, 2, 0, 0),
+      upkeepEvent(ROME, 0, 0, 0, 2, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(3),
     ]);
 
     // The queue promotion and the carried-over shield, on the state itself.
@@ -3014,12 +3124,22 @@ describe('M4a scenario: mine yield', () => {
     expect(workOf(after, 0)).toEqual({ kind: MINE, tile: MINE_TILE, turnsLeft: 1 });
 
     // Progress is state, not an event: the run emitted the `WorkStarted` and the
-    // two `TurnEnded`s and nothing else — no per-turn progress event, and no
-    // completion before the last turn is paid.
+    // two turns' worth of events and nothing else — no per-turn progress event, and
+    // no completion before the last turn is paid. The hill the single citizen works
+    // has no commerce, so Rome's one city earns its centre's 1 commerce at 6/4/0:
+    // floor(0.6) = 0 gold + floor(0.4) = 0 beakers, and the leftover 1 is gold.
+    const mineLedger: readonly GameEvent[] = [
+      incomeEvent(ROME, 1, 0, 0),
+      upkeepEvent(ROME, 0, 0, 0, 1, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+    ];
     expect(result.events).toEqual([
       { type: 'WorkStarted', unitId: asUnitId(0), kind: MINE, tile: MINE_TILE, turnsLeft: 3 },
-      { type: 'TurnEnded', playerId: ROME, turn: 2 },
-      { type: 'TurnEnded', playerId: ROME, turn: 3 },
+      ...mineLedger,
+      turnEnded(2),
+      ...mineLedger,
+      turnEnded(3),
     ]);
   });
 
@@ -3091,7 +3211,10 @@ describe('M4a scenario: work cancelled by movement', () => {
 
     // The engine's own account, in the order it happened: the move, then the
     // cancellation it caused (reason `moved`, and the two turns still owed are
-    // reported rather than refunded).
+    // reported rather than refunded). M4b's ledger lines sit between them because
+    // the one `EndTurn` in the run came first in the command list: this world has
+    // no city at all, so both civilizations earn nothing and owe nothing — Rome's
+    // two workers are still inside the 4 free units a cityless player gets.
     expect(result.events).toEqual([
       { type: 'WorkStarted', unitId: asUnitId(0), kind: MINE, tile: CANCEL_HILL, turnsLeft: 3 },
       {
@@ -3101,7 +3224,11 @@ describe('M4a scenario: work cancelled by movement', () => {
         tile: CANCEL_FLAT,
         turnsLeft: 2,
       },
-      { type: 'TurnEnded', playerId: ROME, turn: 2 },
+      incomeEvent(ROME, 0, 0, 0),
+      upkeepEvent(ROME, 0, 0, 0, 2, 4),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(2),
       {
         type: 'UnitMoved',
         unitId: asUnitId(0),
@@ -3622,5 +3749,1497 @@ describe('the M4a scenario assertions discriminate (they are not decoration)', (
     const text = failures(result.assertions).join('\n');
     expect(text).toMatch(/the run only STARTED the two jobs, on turn 1/);
     expect(text).toMatch(/each turn pays exactly one turn of each job and no more/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4b acceptance evidence — the money loop
+ * ------------------------------------------------------------------ */
+
+/**
+ * EVERY number in this section is a **placeholder** and is asserted as one. The
+ * tuning constants it leans on — `FREE_UNITS_PER_CITY` (2), `FREE_UNITS_BASE` (4),
+ * `UNIT_SUPPORT_COST` (1), `RATE_TOTAL` (10), `DEFAULT_RATES` (6/4/0) and
+ * `STARTING_TREASURY` (10) — are M4b's own tuned values (docs/INTERFACES.md M4b,
+ * "Rates and the commerce split" / "The money loop"), chosen to be playable and
+ * explicitly **not** sourced from Civ 3: no row below claims that any of them is
+ * Civ 3's figure, and the scenarios assert them as the engine's placeholders
+ * (as the M4a mine scenario asserts `mineDef.turns === 3`) so that changing one is
+ * a decision someone has to make on purpose.
+ *
+ * The two event shapes the money loop adds are read through these aliases, so a
+ * test that wants "the gold this player collected" says so in its own words rather
+ * than narrowing a union by hand at every call site.
+ */
+type IncomeCollectedEvent = Extract<GameEvent, { readonly type: 'IncomeCollected' }>;
+type UpkeepPaidEvent = Extract<GameEvent, { readonly type: 'UpkeepPaid' }>;
+type UnitDisbandedEvent = Extract<GameEvent, { readonly type: 'UnitDisbanded' }>;
+type TreasuryShortfallEvent = Extract<GameEvent, { readonly type: 'TreasuryShortfall' }>;
+
+/** The money fields of a player, in one value a test can compare outright. */
+interface Money {
+  readonly treasury: number;
+  readonly beakers: number;
+  readonly luxuries: number;
+}
+
+const moneyOf = (state: GameState, playerId: PlayerId): Money => {
+  const player = state.players.find((candidate) => candidate.id === playerId);
+  if (player === undefined) throw new Error(`player ${String(playerId)} is not in the state`);
+  return {
+    treasury: player.treasury,
+    beakers: player.beakers,
+    luxuries: player.luxuries,
+  };
+};
+
+const incomeLines = (
+  events: readonly GameEvent[],
+  playerId: PlayerId,
+): readonly IncomeCollectedEvent[] =>
+  events.filter(
+    (event): event is IncomeCollectedEvent =>
+      event.type === 'IncomeCollected' && event.playerId === playerId,
+  );
+
+const upkeepLines = (
+  events: readonly GameEvent[],
+  playerId: PlayerId,
+): readonly UpkeepPaidEvent[] =>
+  events.filter(
+    (event): event is UpkeepPaidEvent => event.type === 'UpkeepPaid' && event.playerId === playerId,
+  );
+
+const disbandLines = (
+  events: readonly GameEvent[],
+  playerId: PlayerId,
+): readonly UnitDisbandedEvent[] =>
+  events.filter(
+    (event): event is UnitDisbandedEvent =>
+      event.type === 'UnitDisbanded' && event.playerId === playerId,
+  );
+
+const shortfallLines = (
+  events: readonly GameEvent[],
+  playerId: PlayerId,
+): readonly TreasuryShortfallEvent[] =>
+  events.filter(
+    (event): event is TreasuryShortfallEvent =>
+      event.type === 'TreasuryShortfall' && event.playerId === playerId,
+  );
+
+/** One player's ledger line for one turn, read off the event stream alone. */
+interface Ledger {
+  readonly income: number;
+  readonly beakers: number;
+  readonly luxuries: number;
+  readonly upkeep: number;
+  /** What the disbands of this turn paid for: the sum of `UnitDisbanded.saved`. */
+  readonly covered: number;
+  /** What nobody paid: the sum of `TreasuryShortfall.unpaid`. */
+  readonly unpaid: number;
+  readonly disbanded: readonly number[];
+}
+
+/**
+ * One turn's ledger for `playerId`, reconstructed from the events and from nothing
+ * else — which is the point: the acceptance criterion is that gold is *accounted
+ * for*, and an account kept from the state would assume what it is checking.
+ */
+const ledgerOf = (events: readonly GameEvent[], playerId: PlayerId): Ledger => {
+  const income = incomeLines(events, playerId);
+  const upkeep = upkeepLines(events, playerId);
+  const disbands = disbandLines(events, playerId);
+  const shortfalls = shortfallLines(events, playerId);
+  return {
+    income: income.reduce((total, line) => total + line.gold, 0),
+    beakers: income.reduce((total, line) => total + line.beakers, 0),
+    luxuries: income.reduce((total, line) => total + line.luxuries, 0),
+    upkeep: upkeep.reduce((total, line) => total + line.gold, 0),
+    covered: disbands.reduce((total, line) => total + line.saved, 0),
+    unpaid: shortfalls.reduce((total, line) => total + line.unpaid, 0),
+    disbanded: disbands.map((line) => Number(line.unitId)),
+  };
+};
+
+/** The commerce `playerId`'s cities produce in `state` — the sum the split divides. */
+const commerceOf = (state: GameState, ruleset: RulesetView, playerId: PlayerId): number =>
+  state.cities
+    .filter((city) => city.owner === playerId)
+    .reduce((total, city) => total + cityYields(state, ruleset, city.id).commerce, 0);
+
+/** One command as an arbitrary player, thrown away on refusal — for hand-walked turns. */
+const applyFor = (
+  state: GameState,
+  playerId: PlayerId,
+  command: Command,
+  ruleset: RulesetView,
+): CommandOutcome => {
+  const result = applyCommand(state, playerId, command, ruleset);
+  if (!result.ok) {
+    throw new Error(
+      `${command.type} as player ${String(playerId)} was refused: ${result.error.kind}`,
+    );
+  }
+  return result.value;
+};
+
+/* ------------------------------------------------------------------ *
+ * 11. Bankruptcy
+ * ------------------------------------------------------------------ */
+
+/** Where Rome's twelve workers stand: unit `n` on `(10 + n, 10)`, ids 0..11. */
+const BANKRUPTCY_ARMY: readonly (readonly [number, number])[] = [
+  [10, 10],
+  [11, 10],
+  [12, 10],
+  [13, 10],
+  [14, 10],
+  [15, 10],
+  [16, 10],
+  [17, 10],
+  [18, 10],
+  [19, 10],
+  [20, 10],
+  [21, 10],
+];
+
+const BANKRUPTCY_FARM = at(4, 3);
+const BANKRUPTCY_START = 5;
+
+/**
+ * The bankruptcy world, shared by the scenario and by the falsification tests
+ * below, so that a variant differs from the real thing in exactly one stated way.
+ *
+ * Rome: one city on grassland whose single citizen works another grassland tile
+ * (commerce 2 -> 2 gold a turn at 6/4/0), a treasury of 5, and **twelve** workers.
+ * Carthage: one warrior, far away, with no city and nothing to pay.
+ */
+const bankruptcySetup = (b: ScenarioBuilder): ScenarioBuilder => {
+  let builder = b
+    .addPlayer('Rome')
+    .addPlayer('Carthage')
+    .fillTerrain('grassland')
+    .setTreasury(0, BANKRUPTCY_START);
+  for (const [x, y] of BANKRUPTCY_ARMY) {
+    builder = builder.addUnit(0, WORKER, [x, y]);
+  }
+  return builder
+    .addUnit(1, WARRIOR, [20, 20])
+    .addCity(0, [5, 5], { population: 1, workedTiles: [BANKRUPTCY_FARM] });
+};
+
+/**
+ * BANKRUPTCY. Rome owns more units than it can support, from a treasury that
+ * cannot cover the bill, and the money loop's answer is exact.
+ *
+ * The arithmetic, on the frozen placeholder constants:
+ *
+ * - Rome's allowance is `FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE` = 2 + 4 = **6**,
+ *   so of its twelve workers **6** cost `UNIT_SUPPORT_COST` = 1 gold each: an
+ *   upkeep of **6** a turn. Carthage has no city, so its allowance is 4 and its
+ *   single warrior is free.
+ * - Rome's income is its one city's commerce 2 (grassland centre 1 + the worked
+ *   grassland 1) at 6/4/0: `floor(2*6/10)` = 1 gold, `floor(2*4/10)` = 0 beakers,
+ *   0 luxuries, and the leftover 1 goes to gold — **2 gold** a turn.
+ * - So a turn with the whole army is `+2 income - 6 upkeep` = **-4**, from a
+ *   treasury of 5.
+ *
+ * The timeline, exactly:
+ *
+ * 1. **turn 2** — 5 + 2 - 6 = **1** gold. Solvent, and no unit is touched.
+ * 2. **turn 3** — 1 + 2 - 6 = -3. The treasury floors at **0** and the shortfall
+ *    of 3 is paid by disbanding the player's **highest-id** units one at a time:
+ *    worker **11** (tile 421), then **10** (420), then **9** (419), each `saved: 1`,
+ *    which covers the 3 owed exactly. Nine workers remain, so the bill falls to 3.
+ * 3. **turn 4** — 0 + 2 - 3 = -1. Worker **8** (418) goes, and the bill falls to
+ *    2 = income: the treasury is **0** and stays there, because the disband stops
+ *    the moment the bill fits. The fixed point of the money loop is "broke but
+ *    breaking even".
+ * 4. **turn 5** — 0 + 2 - 2 = 0: nobody is taken, no `TreasuryShortfall`, and the
+ *    treasury is still exactly **0**.
+ * 5. **turn 6** — the city's food box fills and it grows to two citizens, so its
+ *    commerce is 3 and the collection is 2 gold plus its first beaker; the bill is
+ *    still 2, so the treasury is still exactly **0**.
+ *
+ * `run` is steps 1-3 (the state it returns is at turn 4, treasury 0, army ids 0..7,
+ * with three of the four disbands in its event list) and the assertions probe
+ * steps 4 and 5.
+ *
+ * Nothing here is a rounding-away of a negative number: the treasury is never
+ * negative at any point in the sequence, and the disbands are what make that true
+ * while still paying the bill.
+ */
+const bankruptcyScenario = defineScenario({
+  name: 'bankruptcy-disbands-the-highest-id-unit-until-the-shortfall-is-covered',
+  settings: DUEL_SETTINGS,
+  setup: bankruptcySetup,
+  run: [endTurn(), endTurn(), endTurn()],
+  assert: (after, ruleset) => {
+    const army = after.units.filter((unit) => unit.owner === ROME);
+    const support = unitSupport(after, ROME);
+    const income = playerIncome(after, ruleset, ROME);
+
+    // The two turns after the run stops: the first takes nobody, the second grows
+    // the city.
+    const next = romeApply(after, ruleset, endTurn());
+    const later = next === undefined ? undefined : romeApply(next.state, ruleset, endTurn());
+    const afterNext = next?.state;
+    const afterLater = later?.state;
+    const nextLedger = next === undefined ? undefined : ledgerOf(next.events, ROME);
+    const grew = later?.events.some((event) => event.type === 'CityGrew') === true;
+    const laterIncome = later === undefined ? undefined : incomeLines(later.events, ROME)[0];
+
+    // Every treasury the scenario can see, in the order the turns produced them.
+    const observed = [
+      { where: 'the state the run stopped at', gold: moneyOf(after, ROME).treasury },
+      {
+        where: 'after the next turn',
+        gold: afterNext === undefined ? -1 : moneyOf(afterNext, ROME).treasury,
+      },
+      {
+        where: 'after the turn after that',
+        gold: afterLater === undefined ? -1 : moneyOf(afterLater, ROME).treasury,
+      },
+    ];
+
+    return [
+      check(
+        support.free === FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE &&
+          support.gold === UNIT_SUPPORT_COST * support.supported,
+        `the allowance is the engine's own formula — FREE_UNITS_PER_CITY per city plus FREE_UNITS_BASE, and UNIT_SUPPORT_COST for each unit beyond it: ${String(FREE_UNITS_PER_CITY)}*1 + ${String(FREE_UNITS_BASE)} = ${String(support.free)} free, ${String(UNIT_SUPPORT_COST)} * ${String(support.supported)} = ${String(support.gold)} owed (the PLACEHOLDER 2/4/1)`,
+      ),
+      check(
+        support.free === 6 &&
+          BANKRUPTCY_ARMY.length === 12 &&
+          support.units === 8 &&
+          support.supported === 2 &&
+          support.gold === 2,
+        `Rome's allowance is 2*1 + 4 = 6, and the twelve workers it started with are down to eight, so the bill is 2 (the world's army ${String(BANKRUPTCY_ARMY.length)}, in the final state units ${String(support.units)}, free ${String(support.free)}, supported ${String(support.supported)}, gold ${String(support.gold)})`,
+      ),
+      check(
+        income.gold === 2 && income.beakers === 0 && income.luxuries === 0,
+        `Rome's one city makes 2 commerce, which is 2 gold (floor(1.2) = 1 plus the leftover 1) and no beakers at 6/4/0 (got ${JSON.stringify(income)})`,
+      ),
+      check(
+        after.turn === 4 && after.revision === 3,
+        `the run applied exactly three EndTurns: the state is at turn 4 with revision 3 (got turn ${String(after.turn)}, revision ${String(after.revision)})`,
+      ),
+      check(
+        moneyOf(after, ROME).treasury === 0 &&
+          army.map((unit) => Number(unit.id)).join(',') === '0,1,2,3,4,5,6,7',
+        `the two bankruptcy turns left the treasury at exactly 0 and took workers 11, 10, 9 and 8, so the army is ids 0..7 (gold ${String(moneyOf(after, ROME).treasury)}, units ${army.map((unit) => String(unit.id)).join(',')})`,
+      ),
+      check(
+        next !== undefined &&
+          nextLedger !== undefined &&
+          disbandLines(next.events, ROME).length === 0 &&
+          shortfallLines(next.events, ROME).length === 0 &&
+          afterNext !== undefined &&
+          moneyOf(afterNext, ROME).treasury === 0,
+        `the next turn takes nobody: with the bill down to 2 = income the treasury sits at exactly 0, and no TreasuryShortfall is emitted because nothing was left unpaid (gold ${String(afterNext === undefined ? 'no state' : moneyOf(afterNext, ROME).treasury)})`,
+      ),
+      check(
+        nextLedger !== undefined &&
+          afterNext !== undefined &&
+          nextLedger.income - nextLedger.upkeep + nextLedger.covered + nextLedger.unpaid ===
+            moneyOf(afterNext, ROME).treasury - moneyOf(after, ROME).treasury,
+        `and that turn's ledger balances to the gold: ${String(nextLedger?.income)} income - ${String(nextLedger?.upkeep)} upkeep + ${String(nextLedger?.covered)} covered = the treasury's own delta (${nextLedger === undefined || afterNext === undefined ? 'no turn' : String(moneyOf(afterNext, ROME).treasury - moneyOf(after, ROME).treasury)})`,
+      ),
+      check(
+        grew &&
+          laterIncome !== undefined &&
+          laterIncome.gold === 2 &&
+          laterIncome.beakers === 1 &&
+          afterLater !== undefined &&
+          moneyOf(afterLater, ROME).treasury === 0,
+        `the turn after that grows the city (commerce 2 -> 3, so the collection is 2 gold and its first beaker) and the treasury is still exactly 0 (event ${JSON.stringify(laterIncome)})`,
+      ),
+      check(
+        observed.every((step) => step.gold >= 0),
+        `treasury >= 0 at every point this scenario can observe it (${observed.map((step) => `${step.where}: ${String(step.gold)}`).join(', ')})`,
+      ),
+      check(
+        afterLater !== undefined &&
+          unitSupport(afterLater, ROME).gold === playerIncome(afterLater, ruleset, ROME).gold,
+        "and the state it settles in is the money loop's fixed point: the bill equals the income",
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 12. The commerce split at the player's rates
+ * ------------------------------------------------------------------ */
+
+const RATES_TILE_A = at(4, 3);
+const RATES_TILE_B = at(5, 3);
+
+/** The triple this scenario switches to: 3/3/4 tenths, which does not divide evenly. */
+const SPLIT_RATES: Rates = { tax: 3, science: 3, luxury: 4 };
+
+/**
+ * RATES SPLIT. One city whose commerce is **exactly 5** — a grassland centre (1
+ * commerce) plus two grassland tiles carrying a road (1 + the road's +1 each) —
+ * with two citizens working them, at the default 6/4/0 and then at 3/3/4.
+ *
+ * The split, channel by channel, on the frozen `RATE_TOTAL = 10`:
+ *
+ * - at **6/4/0**: gold `floor(5*6/10)` = 3, beakers `floor(5*4/10)` = 2, luxuries
+ *   `floor(5*0/10)` = 0 — the three floors already sum to the whole commerce, so
+ *   nothing is left over. Treasury 3, beakers 2, luxuries 0.
+ * - at **3/3/4**: gold `floor(15/10)` = 1, beakers `floor(15/10)` = 1, luxuries
+ *   `floor(20/10)` = 2 — the floors sum to **4 of the 5**, and the **remainder goes
+ *   to gold**, so gold is 2, not 1. That is the rule this scenario exists to pin:
+ *   round-half-up would give 2/2/2 = 6 (more than the city made), dropping the
+ *   remainder would give 1/1/2 = 4 (a gold piece vanished), and "whatever floating
+ *   point did" is not a rule at all. The three channels always sum to the commerce
+ *   that was split.
+ *
+ * The **timing** rule is pinned by the same run: `SetRates` is applied *after* the
+ * first collection, and it changes nothing about it — the treasury, beakers and
+ * luxuries are exactly what they were the moment before the command applied, and
+ * only the *next* collection divides differently. The contract's reading
+ * (docs/INTERFACES.md M4b, "Commands") is that a collection that has not run yet
+ * reads the new rates, because the money step is the last one in a turn and there
+ * is no moment for a player to act after this turn's collection.
+ */
+const ratesSplitScenario = defineScenario({
+  name: 'commerce-splits-at-the-players-rates-with-the-remainder-to-gold',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTreasury(0, 0)
+      .addImprovement(4, 3, ROAD)
+      .addImprovement(5, 3, ROAD)
+      .addUnit(0, WARRIOR, [30, 30])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], { population: 2, workedTiles: [RATES_TILE_A, RATES_TILE_B] }),
+  run: [endTurn()],
+  assert: (after, ruleset) => {
+    const yields = cityYields(after, ruleset, asCityId(0));
+    const splitAtDefault = splitCommerce(yields.commerce, DEFAULT_RATES);
+    const splitAtNew = splitCommerce(yields.commerce, SPLIT_RATES);
+
+    // The run collected once at 6/4/0. The state says the same thing the split does.
+    const collected = moneyOf(after, ROME);
+
+    // The rate change: applied, and provably incapable of touching this turn.
+    const changed = romeApply(after, ruleset, setRates(SPLIT_RATES));
+    const afterChange = changed?.state;
+    const ratesAfter = afterChange?.players.find((player) => player.id === ROME)?.rates;
+
+    // The turn after it.
+    const next = afterChange === undefined ? undefined : romeApply(afterChange, ruleset, endTurn());
+    const afterNext = next?.state;
+    const nextIncome = next === undefined ? undefined : incomeLines(next.events, ROME)[0];
+
+    // The refusals, through the applier and through the rule the applier uses.
+    const badSum = errorOf(
+      applyCommand(after, ROME, setRates({ tax: 6, science: 4, luxury: 1 }), ruleset),
+    );
+    const badNegative = errorOf(
+      applyCommand(after, ROME, setRates({ tax: 6, science: -1, luxury: 5 }), ruleset),
+    );
+    const badFraction = errorOf(
+      applyCommand(after, ROME, setRates({ tax: 6.5, science: 3.5, luxury: 0 }), ruleset),
+    );
+
+    /**
+     * The whole state a `SetRates` is allowed to produce, rebuilt from `after`: the
+     * actor's `rates` and the `revision` bump, and **nothing else**.
+     *
+     * Comparing the applier's state against this, field for field, is what makes
+     * "a rate change affects future turns only" a claim about the *whole* state
+     * rather than about the three fields this test happens to name — a change that
+     * quietly recollected, refunded, re-sorted a player or touched a city would
+     * fail here.
+     */
+    const expectedAfterChange: GameState = {
+      ...after,
+      revision: after.revision + 1,
+      players: after.players.map((player) =>
+        player.id === ROME ? { ...player, rates: SPLIT_RATES } : player,
+      ),
+    };
+
+    return [
+      check(
+        ratesProblem(DEFAULT_RATES) === undefined &&
+          ratesProblem({ tax: RATE_TOTAL - 1, science: 1, luxury: 0 }) === undefined &&
+          ratesProblem({ tax: RATE_TOTAL - 1, science: 1, luxury: 1 }) !== undefined,
+        `the default triple is a legal split and RATE_TOTAL = ${String(RATE_TOTAL)} is the total it is legal against: taking a tenth off is still legal and adding one is not (the PLACEHOLDER ${String(RATE_TOTAL)} and ${JSON.stringify(DEFAULT_RATES)})`,
+      ),
+      check(
+        yields.commerce === 5,
+        `the city's commerce is exactly 5: grassland centre 1 + two roaded grassland tiles at 1 + 1 (got ${String(yields.commerce)})`,
+      ),
+      check(
+        splitAtDefault.gold === 3 && splitAtDefault.beakers === 2 && splitAtDefault.luxuries === 0,
+        `at 6/4/0 the 5 commerce is 3 gold / 2 beakers / 0 luxuries — the floors floor(3.0), floor(2.0), floor(0.0) leave nothing over (got ${JSON.stringify(splitAtDefault)})`,
+      ),
+      check(
+        collected.treasury === 3 && collected.beakers === 2 && collected.luxuries === 0,
+        `the run's one turn collected exactly that: treasury 3, beakers 2, luxuries 0 (got ${JSON.stringify(collected)})`,
+      ),
+      check(
+        after.turn === 2 && after.revision === 1 && after.units.length === 2,
+        `the run advanced exactly one turn and applied exactly one command: turn 2, revision 1, two units (turn ${String(after.turn)}, revision ${String(after.revision)}, units ${String(after.units.length)})`,
+      ),
+      check(
+        changed !== undefined &&
+          ratesAfter !== undefined &&
+          ratesAfter.tax === 3 &&
+          ratesAfter.science === 3 &&
+          ratesAfter.luxury === 4,
+        `SetRates wrote the new triple (rates ${JSON.stringify(ratesAfter)})`,
+      ),
+      check(
+        afterChange !== undefined &&
+          afterChange.revision === after.revision + 1 &&
+          afterChange.turn === after.turn &&
+          moneyOf(afterChange, ROME).treasury === collected.treasury &&
+          moneyOf(afterChange, ROME).beakers === collected.beakers &&
+          moneyOf(afterChange, ROME).luxuries === collected.luxuries,
+        `and the rate change affected NOTHING that already happened: revision +1, the turn unchanged, and the treasury/beakers/luxuries are still ${JSON.stringify(collected)} (got ${afterChange === undefined ? 'no state' : JSON.stringify(moneyOf(afterChange, ROME))})`,
+      ),
+      check(
+        splitAtNew.gold === 2 && splitAtNew.beakers === 1 && splitAtNew.luxuries === 2,
+        `at 3/3/4 the same 5 commerce is 2 gold / 1 beaker / 2 luxuries: floor(5*3/10) = 1 and floor(5*4/10) = 2 leave 4 of the 5 paid out, so the REMAINDER 1 goes to gold — 2, not 1 (got ${JSON.stringify(splitAtNew)})`,
+      ),
+      check(
+        nextIncome !== undefined &&
+          nextIncome.gold === 2 &&
+          nextIncome.beakers === 1 &&
+          nextIncome.luxuries === 2 &&
+          nextIncome.gold + nextIncome.beakers + nextIncome.luxuries === yields.commerce,
+        `the NEXT turn's collection is that split, and the three channels still add up to the 5 commerce that was divided (event ${JSON.stringify(nextIncome)})`,
+      ),
+      check(
+        afterNext !== undefined &&
+          moneyOf(afterNext, ROME).treasury === 5 &&
+          moneyOf(afterNext, ROME).beakers === 3 &&
+          moneyOf(afterNext, ROME).luxuries === 2,
+        `so the pools move by exactly that: 3 + 2 = 5 gold, 2 + 1 = 3 beakers, 0 + 2 = 2 luxuries (got ${afterNext === undefined ? 'no state' : JSON.stringify(moneyOf(afterNext, ROME))})`,
+      ),
+      check(
+        afterChange !== undefined &&
+          JSON.stringify(afterChange) === JSON.stringify(expectedAfterChange),
+        `and the state after the rate change differs from the state before it in exactly two places — the actor's \`rates\` and the \`revision\` bump — so nothing was recollected, refunded or re-ordered (after ${afterChange === undefined ? 'no state' : JSON.stringify(moneyOf(afterChange, ROME))})`,
+      ),
+      check(
+        badSum !== undefined &&
+          badSum.kind === 'invalid-argument' &&
+          badSum.detail.includes('= 11') &&
+          ratesProblem({ tax: 6, science: 4, luxury: 1 })?.includes('= 11') === true,
+        `a triple summing to 11 is refused with invalid-argument naming the actual sum, and the shared rule says the same thing (error ${JSON.stringify(badSum)})`,
+      ),
+      check(
+        badNegative !== undefined &&
+          badNegative.kind === 'invalid-argument' &&
+          badNegative.detail.includes('science'),
+        `a negative rate is refused as an invalid argument and names the offending channel (error ${JSON.stringify(badNegative)})`,
+      ),
+      check(
+        badFraction !== undefined &&
+          badFraction.kind === 'invalid-argument' &&
+          badFraction.detail.includes('integer'),
+        `a fractional rate is refused as an invalid argument — the state carries whole tenths or nothing (error ${JSON.stringify(badFraction)})`,
+      ),
+    ];
+  },
+});
+
+/** `UnitDisbanded` for Rome's workers, which is every disband in these scenarios. */
+const unitDisbanded = (unitId: number, tile: TileIndex, saved: number): GameEvent => ({
+  type: 'UnitDisbanded',
+  playerId: ROME,
+  unitId: asUnitId(unitId),
+  unitType: WORKER,
+  tile,
+  saved,
+});
+
+/**
+ * Split a `ScenarioRunResult`'s merged event list into one list per turn, at each
+ * `TurnEnded`. The command layer appends exactly one `TurnEnded` per `EndTurn` and
+ * the pipeline puts everything a turn did before it, so a run's events can be read
+ * turn by turn — which is what makes a per-turn ledger checkable without stepping
+ * the world by hand.
+ */
+const turnLedgers = (events: readonly GameEvent[]): readonly (readonly GameEvent[])[] => {
+  const turns: GameEvent[][] = [];
+  let current: GameEvent[] = [];
+  for (const event of events) {
+    current.push(event);
+    if (event.type === 'TurnEnded') {
+      turns.push(current);
+      current = [];
+    }
+  }
+  if (current.length > 0) turns.push(current);
+  return turns;
+};
+
+/* ------------------------------------------------------------------ *
+ * 13. Treasury conservation over 120 turns
+ * ------------------------------------------------------------------ */
+
+/** Rome's ten workers: unit `n` on `(10 + n, 10)`, ids 0..9. */
+const CONSERVATION_ARMY: readonly (readonly [number, number])[] = [
+  [10, 10],
+  [11, 10],
+  [12, 10],
+  [13, 10],
+  [14, 10],
+  [15, 10],
+  [16, 10],
+  [17, 10],
+  [18, 10],
+  [19, 10],
+];
+
+/** The length of the conservation run: "100+" turns, and a round number of them. */
+const CONSERVATION_TURNS = 120;
+
+/**
+ * The conservation world, shared by the scenario and by the hand-walked test below.
+ *
+ * **Rome is the failing economy.** Its one city stands on plains, has two citizens
+ * and works **no** tile: 1 food from the centre against the 4 two citizens eat is a
+ * deficit of 3, so the city starves down to one citizen on the first turn and keeps
+ * starving (a deficit of 1, the box reset to 0, `CityStarved` every single turn).
+ * Its commerce is the centre's 1, which at 6/4/0 is floor(0.6) = 0 gold and
+ * floor(0.4) = 0 beakers with the leftover 1 to gold — **1 gold a turn**. Against
+ * that it keeps ten workers, of which `10 - (2*1 + 4)` = 4 are billable: **4 gold**
+ * a turn, from a treasury of **2**.
+ *
+ * **Carthage is the solvent one.** Its city works a roaded grassland tile (commerce
+ * 1 + 1 + 1 = 3) at rates 0/5/5, so floor(3*5/10) = 1 beaker and 1 luxury, and the
+ * leftover 1 is gold: a gold piece a turn, and two pools that grow in step. It owns
+ * one unit, which its allowance of 4 covers, so it pays nothing.
+ */
+const conservationSetup = (b: ScenarioBuilder): ScenarioBuilder => {
+  let builder = b
+    .addPlayer('Rome')
+    .addPlayer('Carthage')
+    .fillTerrain('grassland')
+    .setTile(5, 5, 'plains') // Rome's starving centre: 1 food, 2 shields, 1 commerce
+    .setTreasury(0, 2);
+  for (const [x, y] of CONSERVATION_ARMY) {
+    builder = builder.addUnit(0, WORKER, [x, y]);
+  }
+  return builder
+    .addUnit(1, WORKER, [34, 31])
+    .setRates(1, { tax: 0, science: 5, luxury: 5 })
+    .setTreasury(1, 0)
+    .addImprovement(34, 30, ROAD)
+    .addCity(0, [5, 5], { population: 2, workedTiles: [] })
+    .addCity(1, [35, 30], { population: 1, workedTiles: [at(34, 30)] });
+};
+
+/**
+ * TREASURY CONSERVATION over 120 turns: **income minus upkeep minus what the
+ * disbands paid equals the observed gold delta, every turn, for every
+ * civilization, and no treasury ever goes below zero** — including a starving city
+ * and two bankruptcies.
+ *
+ * Rome's first two turns, exactly:
+ *
+ * 1. **turn 1** — 2 + 1 - 4 = -1. The treasury floors at 0 and the shortfall of 1
+ *    is paid with worker **9**; the bill falls to 3.
+ * 2. **turn 2** — 0 + 1 - 3 = -2. Workers **8** and then **7** go, each saving 1,
+ *    which covers the 2; the bill falls to 1 = income.
+ * 3. **turn 3 and the 117 after it** — 0 + 1 - 1 = 0: the treasury sits at exactly
+ *    0 for the rest of the run, and the ledger identity is `0 = 1 - 1 + 0 + 0`
+ *    every one of those turns.
+ *
+ * Over the whole run: income 120, upkeep 125, disbands 3, unpaid 0, and
+ * 2 + 120 - 125 + 3 = **0**, which is the treasury the scenario asserts. Carthage
+ * ends at 60 gold, 438 beakers and 438 luxuries — and the two pools are equal
+ * because its rates are 0/5/5, so the same floor is applied to the same commerce
+ * on both sides. Those three numbers are the accumulation of the per-turn ledger
+ * the test checks line by line; they are pinned here because a change to the split,
+ * to growth or to upkeep has to move them, and a reader who disagrees with them
+ * should be able to see exactly which turn they came from.
+ *
+ * The assertions here are the ones the *final state* can carry. The per-turn
+ * identity — the substance of "gold is accounted for" — is checked in the
+ * hand-walked test below and again, over the runner's merged event stream, in the
+ * test that runs this scenario.
+ */
+const conservationScenario = defineScenario({
+  name: 'treasury-conservation-over-120-turns-of-starvation-and-bankruptcy',
+  settings: DUEL_SETTINGS,
+  setup: conservationSetup,
+  run: endTurns(CONSERVATION_TURNS),
+  assert: (after, ruleset) => {
+    const rome = moneyOf(after, ROME);
+    const carthage = moneyOf(after, CARTHAGE);
+    const army = after.units.filter((unit) => unit.owner === ROME);
+    const city = cityById(after, asCityId(0));
+
+    return [
+      check(
+        after.turn === CONSERVATION_TURNS + 1 && after.revision === CONSERVATION_TURNS,
+        `the run is ${String(CONSERVATION_TURNS)} turns long: the state is at turn ${String(CONSERVATION_TURNS + 1)} with ${String(CONSERVATION_TURNS)} revisions (got turn ${String(after.turn)}, revision ${String(after.revision)})`,
+      ),
+      check(
+        rome.treasury === 0 && rome.beakers === 0 && rome.luxuries === 0,
+        `Rome ends with exactly 0 gold: 2 + 120 income - 125 upkeep + 3 covered by disbands = 0, and at 6/4/0 its 1 commerce a turn never fills the beaker or luxury pool (got ${JSON.stringify(rome)})`,
+      ),
+      check(
+        carthage.treasury === 60 && carthage.beakers === 438 && carthage.luxuries === 438,
+        `Carthage ends with exactly 60 gold, 438 beakers and 438 luxuries — the accumulation of its 0/5/5 split over 120 turns, with the two pools equal because their rates are (got ${JSON.stringify(carthage)})`,
+      ),
+      check(
+        army.map((unit) => Number(unit.id)).join(',') === '0,1,2,3,4,5,6',
+        `Rome's army lost exactly the three highest-id workers, 9, 8 and 7, so seven remain (units ${army.map((unit) => String(unit.id)).join(',')})`,
+      ),
+      check(
+        city !== undefined &&
+          city.population === 1 &&
+          city.foodBox === 0 &&
+          city.workedTiles.length === 0,
+        `and Rome's city starved to one citizen and stayed there, working nothing (city ${JSON.stringify(city?.population)} citizens, box ${String(city?.foodBox)}, worked ${JSON.stringify(city?.workedTiles)})`,
+      ),
+      check(
+        rome.treasury >= 0 && carthage.treasury >= 0,
+        `neither treasury is negative after 120 turns (Rome ${String(rome.treasury)}, Carthage ${String(carthage.treasury)})`,
+      ),
+      check(
+        unitSupport(after, ROME).supported === 1 &&
+          playerIncome(after, ruleset, ROME).gold === 1 &&
+          unitSupport(after, ROME).gold === playerIncome(after, ruleset, ROME).gold,
+        'and the world it ends in is the fixed point: one billable worker, 1 gold of income, and nothing left over',
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 14. Starting units
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every way the starting position of `state` breaks M4b's rule, as a list of
+ * reasons — empty when it holds.
+ *
+ * The rule (docs/INTERFACES.md M4b, "Starting units"): **every civilization starts
+ * with exactly one settler and one worker**, the settler on (or beside) its
+ * starting tile and the worker on a tile beside it, and **barbarians get
+ * nothing**. It is written as a report rather than as a chain of `expect`s so the
+ * falsification tests at the bottom of this file can run the *same* rules against
+ * worlds that should break them — an assertion that cannot fail is not evidence.
+ *
+ * This checks the *roles*, not the type ids: "a settler and a worker" is a claim
+ * about what the units can do (`UnitDef.role` is what `FoundCity` and `StartWork`
+ * read), so a catalog that ships its settler under another name still passes, and
+ * a catalog that ships two units of role `worker` and no settler still fails.
+ */
+const startingUnitsReport = (state: GameState, ruleset: RulesetView): readonly string[] => {
+  const problems: string[] = [];
+  const civs = civPlayers(state);
+
+  if (civs.length !== state.settings.civCount) {
+    problems.push(
+      `the state has ${String(civs.length)} civilizations but its settings say ${String(state.settings.civCount)}`,
+    );
+  }
+
+  for (const player of civs) {
+    const owned = state.units.filter((unit) => unit.owner === player.id);
+    const settlers = owned.filter((unit) => unitDef(ruleset, unit.type)?.role === 'settler');
+    const workers = owned.filter((unit) => unitDef(ruleset, unit.type)?.role === 'worker');
+
+    if (settlers.length !== 1) {
+      problems.push(`${player.name} owns ${String(settlers.length)} settler(s), not exactly 1`);
+    }
+    if (workers.length !== 1) {
+      problems.push(`${player.name} owns ${String(workers.length)} worker(s), not exactly 1`);
+    }
+
+    const settler = settlers[0];
+    const worker = workers[0];
+    if (settler !== undefined && settler.tile !== player.startingTile) {
+      problems.push(
+        `${player.name}'s settler stands on tile ${String(settler.tile)}, not on its starting tile ${String(player.startingTile)}`,
+      );
+    }
+    if (worker !== undefined && settler !== undefined) {
+      if (worker.tile === settler.tile) {
+        problems.push(`${player.name}'s worker shares the settler's tile ${String(worker.tile)}`);
+      } else if (!neighbors8(state.map, settler.tile).includes(worker.tile)) {
+        problems.push(
+          `${player.name}'s worker on tile ${String(worker.tile)} is not beside the settler on ${String(settler.tile)}`,
+        );
+      }
+    }
+  }
+
+  const barbarians = state.players.filter((player) => player.kind === 'barbarian');
+  if (barbarians.length !== 1) {
+    problems.push(`the state has ${String(barbarians.length)} barbarian player(s), not exactly 1`);
+  }
+  for (const barbarian of barbarians) {
+    const owned = state.units.filter((unit) => unit.owner === barbarian.id);
+    if (owned.length !== 0) {
+      problems.push(`the barbarians own ${String(owned.length)} unit(s), not 0`);
+    }
+    if (barbarian.treasury !== 0) {
+      problems.push(
+        `the barbarians hold ${String(barbarian.treasury)} gold, and they have no economy`,
+      );
+    }
+  }
+
+  // The id sequence every state the engine assembles satisfies: dense from 0, and
+  // `nextUnitId` exactly how many units exist.
+  const ids = state.units.map((unit) => Number(unit.id));
+  const dense = ids.every((id, index) => id === index);
+  if (!dense) problems.push(`unit ids are not dense from 0 (${ids.join(',')})`);
+  if (state.nextUnitId !== state.units.length) {
+    problems.push(
+      `nextUnitId is ${String(state.nextUnitId)} with ${String(state.units.length)} unit(s) in the state`,
+    );
+  }
+
+  return problems;
+};
+
+/** The `Settings` a starting-units case asks for, or a thrown authoring error. */
+const settingsFor = (patch: { readonly mapSize: 'duel' | 'tiny'; readonly civCount: number }) => {
+  const loaded = loadSettings(patch);
+  if (!loaded.ok) throw new Error(`invalid settings in a starting-units case: ${patch.mapSize}`);
+  return loaded.value;
+};
+
+/* ------------------------------------------------------------------ *
+ * The M4b scenarios, as tests
+ * ------------------------------------------------------------------ */
+
+describe('M4b scenario: bankruptcy', () => {
+  it('disbands the highest-id units in order until the shortfall is covered, and never goes negative', () => {
+    const result = runScenario(bankruptcyScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The PLACEHOLDER constants this scenario's arithmetic is built on, pinned by
+    // value: the engine's support rule (2 free units a city, 4 free with no city,
+    // 1 gold a unit beyond that) and the starting treasury the DSL defaults a
+    // civilization to. None of them is a Civ 3 figure; all of them are asserted in
+    // the scenario's own words above as `2*1 + 4 = 6` and `1 * 6 = 6`.
+    expect([FREE_UNITS_PER_CITY, FREE_UNITS_BASE, UNIT_SUPPORT_COST]).toEqual([2, 4, 1]);
+    expect(STARTING_TREASURY).toBe(10);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the bankruptcy scenario must build a state');
+
+    // The whole ledger of the three scripted turns, in pipeline order: production
+    // was empty, so the money step's lines come first for Rome, then Carthage's,
+    // and the command layer's `TurnEnded` closes each turn. The disbands sit after
+    // the owner's own `UpkeepPaid` — the bill is what they pay — and before the
+    // next player's lines.
+    expect(result.events).toEqual([
+      incomeEvent(ROME, 2, 0, 0),
+      upkeepEvent(ROME, 6, 0, 6, 12, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(2),
+      incomeEvent(ROME, 2, 0, 0),
+      upkeepEvent(ROME, 6, 0, 6, 12, 6),
+      unitDisbanded(11, at(21, 10), 1),
+      unitDisbanded(10, at(20, 10), 1),
+      unitDisbanded(9, at(19, 10), 1),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(3),
+      incomeEvent(ROME, 2, 0, 0),
+      upkeepEvent(ROME, 3, 0, 3, 9, 6),
+      unitDisbanded(8, at(18, 10), 1),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(4),
+    ]);
+
+    // The treasury's whole trajectory, reconstructed from the events alone: 5 is
+    // where the scenario started it, and every step of it stays at or above zero.
+    const turns = turnLedgers(result.events);
+    expect(turns).toHaveLength(3);
+    let gold = BANKRUPTCY_START;
+    const trajectory: number[] = [];
+    for (const events of turns) {
+      const ledger = ledgerOf(events, ROME);
+      gold = gold + ledger.income - ledger.upkeep + ledger.covered + ledger.unpaid;
+      expect(gold).toBeGreaterThanOrEqual(0);
+      trajectory.push(gold);
+    }
+    expect(trajectory).toEqual([1, 0, 0]);
+    expect(moneyOf(after, ROME).treasury).toBe(0);
+
+    // Nothing was left unpaid anywhere in the run, so no `TreasuryShortfall` — the
+    // disbands covered every shortfall to the gold.
+    expect(result.events.filter((event) => event.type === 'TreasuryShortfall')).toEqual([]);
+
+    // The final world: eight workers, ids 0..7 — the four highest ids are gone, in
+    // descending order — and Carthage untouched.
+    expect(
+      after.units.filter((unit) => unit.owner === ROME).map((unit) => Number(unit.id)),
+    ).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(
+      after.units.filter((unit) => unit.owner === CARTHAGE).map((unit) => Number(unit.id)),
+    ).toEqual([12]);
+    // Carthage never spent or collected anything: its treasury is exactly the
+    // PLACEHOLDER starting balance the DSL wrote when the player was added, which
+    // is what makes the zeroes in its ledger lines above a *statement* — it really
+    // did collect and pay nothing.
+    expect(moneyOf(after, CARTHAGE).treasury).toBe(STARTING_TREASURY);
+  });
+});
+
+describe('M4b scenario: treasury conservation over 120 turns', () => {
+  it('agrees with the scenario assertions and pins the two economies end to end', () => {
+    const result = runScenario(conservationScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the conservation scenario must build a state');
+
+    expect(after.turn).toBe(CONSERVATION_TURNS + 1);
+    expect(moneyOf(after, ROME)).toEqual({ treasury: 0, beakers: 0, luxuries: 0 });
+    expect(moneyOf(after, CARTHAGE)).toEqual({ treasury: 60, beakers: 438, luxuries: 438 });
+  });
+
+  it('accounts for every gold piece of every turn, from the run’s own event stream', () => {
+    const result = runScenario(conservationScenario);
+    const turns = turnLedgers(result.events);
+    expect(turns).toHaveLength(CONSERVATION_TURNS);
+
+    // The two treasuries the world started with: Rome 2, Carthage 0. The identity
+    // below is the *only* thing that moves them.
+    const gold = new Map<number, number>([
+      [Number(ROME), 2],
+      [Number(CARTHAGE), 0],
+    ]);
+    const pools = new Map<number, readonly [number, number]>([
+      [Number(ROME), [0, 0]],
+      [Number(CARTHAGE), [0, 0]],
+    ]);
+    const disbandedOn: { readonly turn: number; readonly ids: readonly number[] }[] = [];
+    const romeUpkeep: number[] = [];
+    const carthageGold: number[] = [];
+
+    for (const [index, events] of turns.entries()) {
+      const turn = index + 1;
+
+      // The stream is complete: one line of each kind per civilization, every turn,
+      // even when the amount is zero. Without that, a suppressed line would be
+      // indistinguishable from a payment that never happened.
+      for (const playerId of [ROME, CARTHAGE]) {
+        expect(incomeLines(events, playerId)).toHaveLength(1);
+        expect(upkeepLines(events, playerId)).toHaveLength(1);
+      }
+
+      for (const playerId of [ROME, CARTHAGE]) {
+        const key = Number(playerId);
+        const ledger = ledgerOf(events, playerId);
+        const [beforeBeakers, beforeLuxuries] = pools.get(key) ?? [0, 0];
+        const before = gold.get(key) ?? -1;
+
+        // The identity the contract states, in the engine's own terms: income
+        // minus upkeep, **plus what the disbands paid** and what nobody paid, is
+        // exactly the change in the treasury. `covered` is a term and not an
+        // omission because a disband pays with a unit instead of with gold.
+        gold.set(key, before + ledger.income - ledger.upkeep + ledger.covered + ledger.unpaid);
+        expect(gold.get(key)).toBeGreaterThanOrEqual(0);
+
+        // The two inert pools take exactly their own channel of the split.
+        pools.set(key, [beforeBeakers + ledger.beakers, beforeLuxuries + ledger.luxuries]);
+        expect(ledger.beakers).toBeGreaterThanOrEqual(0);
+        expect(ledger.luxuries).toBeGreaterThanOrEqual(0);
+      }
+
+      const romeLedger = ledgerOf(events, ROME);
+      romeUpkeep.push(romeLedger.upkeep);
+      if (romeLedger.disbanded.length > 0) {
+        disbandedOn.push({ turn, ids: romeLedger.disbanded });
+      }
+      carthageGold.push(ledgerOf(events, CARTHAGE).income);
+      // Carthage's rates are 0/5/5, so the same floor is applied to the same
+      // commerce on both sides: its two pools must grow by the same amount every
+      // turn, and a rate mix-up cannot hide behind a total.
+      expect(ledgerOf(events, CARTHAGE).beakers).toBe(ledgerOf(events, CARTHAGE).luxuries);
+    }
+
+    // Rome is broke from its second turn on and stays exactly there; Carthage's
+    // 60 gold are the gold channel of 120 turns of its 0/5/5 split, and its two
+    // pools are equal at the end for the same reason they were equal every turn.
+    expect(gold.get(Number(ROME))).toBe(0);
+    expect(gold.get(Number(CARTHAGE))).toBe(60);
+    expect(pools.get(Number(ROME))).toEqual([0, 0]);
+    expect(pools.get(Number(CARTHAGE))).toEqual([438, 438]);
+
+    // The exact shape of Rome's decline: the bill starts at 4, the disbands bring
+    // it down to 1 over the first three turns, and it never moves again.
+    expect(romeUpkeep.slice(0, 4)).toEqual([4, 3, 1, 1]);
+    expect(romeUpkeep.slice(4).every((bill) => bill === 1)).toBe(true);
+    expect(disbandedOn).toEqual([
+      { turn: 1, ids: [9] },
+      { turn: 2, ids: [8, 7] },
+    ]);
+
+    // Carthage's gold is 1 a turn while its commerce divides with a remainder left
+    // over; the first four turns are before its first growth changes the number.
+    expect(carthageGold.slice(0, 4)).toEqual([1, 1, 1, 1]);
+    expect(carthageGold.reduce((total, piece) => total + piece, 0)).toBe(60);
+  });
+
+  it('walks all 120 turns by hand and checks the split against the commerce that was there', () => {
+    // The same world, stepped one `EndTurn` at a time, so that each turn's *state*
+    // is available as well as its events: that is what lets the split be compared
+    // with the commerce the cities actually produced — "the three channels add up
+    // to what was divided" — instead of only with itself.
+    const built = conservationSetup(createScenarioBuilder(RULESET, DUEL_SETTINGS)).build();
+    if (!built.ok)
+      throw new Error(`the conservation fixture must build: ${JSON.stringify(built.error)}`);
+
+    let state = built.value;
+    const trajectory: number[] = [];
+    const carthage: {
+      readonly gold: number;
+      readonly beakers: number;
+      readonly luxuries: number;
+    }[] = [];
+
+    for (let turn = 1; turn <= CONSERVATION_TURNS; turn += 1) {
+      const before = {
+        rome: moneyOf(state, ROME),
+        carthage: moneyOf(state, CARTHAGE),
+      };
+      const outcome = applyFor(state, ROME, endTurn(), RULESET);
+      state = outcome.state;
+
+      for (const playerId of [ROME, CARTHAGE]) {
+        const key = playerId === ROME ? 'rome' : 'carthage';
+        const ledger = ledgerOf(outcome.events, playerId);
+        const starting = before[key];
+        const ending = moneyOf(state, playerId);
+
+        // (1) gold: income minus upkeep plus the disbands' savings equals the delta.
+        expect(ending.treasury - starting.treasury).toBe(
+          ledger.income - ledger.upkeep + ledger.covered + ledger.unpaid,
+        );
+        // (2) the pools take their own channel, and nothing else.
+        expect(ending.beakers - starting.beakers).toBe(ledger.beakers);
+        expect(ending.luxuries - starting.luxuries).toBe(ledger.luxuries);
+        // (3) never negative, in any state of any turn.
+        expect(ending.treasury).toBeGreaterThanOrEqual(0);
+        // (4) the split divides the commerce that was really there: the three
+        // channels sum to the player's cities' commerce, which the money step read
+        // after growth and production and nothing after it changed.
+        expect(ledger.income + ledger.beakers + ledger.luxuries).toBe(
+          commerceOf(state, RULESET, playerId),
+        );
+      }
+
+      trajectory.push(moneyOf(state, ROME).treasury);
+      const carthageLedger = ledgerOf(outcome.events, CARTHAGE);
+      carthage.push({
+        gold: carthageLedger.income,
+        beakers: carthageLedger.beakers,
+        luxuries: carthageLedger.luxuries,
+      });
+    }
+
+    // Rome: broke on the first turn and exactly zero for the remaining 119; the
+    // disband turns are the only turns where the delta is not `income - upkeep`.
+    expect(state.turn).toBe(CONSERVATION_TURNS + 1);
+    expect(trajectory[0]).toBe(0);
+    expect(trajectory.slice(1).every((piece) => piece === 0)).toBe(true);
+    expect(trajectory).toHaveLength(CONSERVATION_TURNS);
+
+    // Carthage: gold accumulates by exactly the split's gold channel, and its two
+    // pools move in lockstep because its rates are.
+    expect(carthage.reduce((total, row) => total + row.gold, 0)).toBe(60);
+    expect(carthage.reduce((total, row) => total + row.beakers, 0)).toBe(438);
+    expect(carthage.reduce((total, row) => total + row.luxuries, 0)).toBe(438);
+    expect(carthage.every((row) => row.beakers === row.luxuries)).toBe(true);
+    expect(carthage[0]).toEqual({ gold: 1, beakers: 1, luxuries: 1 });
+  });
+});
+
+describe('M4b scenario: the commerce split at the player’s rates', () => {
+  it('splits a known commerce exactly, sends the remainder to gold, and applies a rate change to the next turn only', () => {
+    const result = runScenario(ratesSplitScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The PLACEHOLDER rate constants, pinned by value: the split is in tenths of
+    // `RATE_TOTAL`, and a new player starts at 6/4/0.
+    expect([RATE_TOTAL, DEFAULT_RATES.tax, DEFAULT_RATES.science, DEFAULT_RATES.luxury]).toEqual([
+      10, 6, 4, 0,
+    ]);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the rates-split scenario must build a state');
+
+    // One collection, at the default rates: 5 commerce -> floor(3.0) gold,
+    // floor(2.0) beakers, floor(0.0) luxuries, and nothing left over.
+    expect(result.events).toEqual([
+      incomeEvent(ROME, 3, 2, 0),
+      upkeepEvent(ROME, 0, 0, 0, 1, 6),
+      incomeEvent(CARTHAGE, 0, 0, 0),
+      upkeepEvent(CARTHAGE, 0, 0, 0, 1, 4),
+      turnEnded(2),
+    ]);
+    expect(moneyOf(after, ROME)).toEqual({ treasury: 3, beakers: 2, luxuries: 0 });
+
+    // The city's commerce is the sum of its parts, stated as parts: the centre's 1
+    // and two roaded grassland tiles at 1 + the road's 1.
+    expect(cityYields(after, RULESET, asCityId(0)).commerce).toBe(5);
+    expect(tileYields(after, RULESET, RATES_TILE_A)).toEqual({ food: 2, shields: 1, commerce: 2 });
+    expect(tileYields(after, RULESET, RATES_TILE_B)).toEqual({ food: 2, shields: 1, commerce: 2 });
+
+    // The rate change, and the next turn under it: 1 + 1 + 2 from the floors, and
+    // the 1 that was left over goes to gold, so gold is 2 rather than 1.
+    const changed = applyFor(after, ROME, setRates(SPLIT_RATES), RULESET);
+    expect(moneyOf(changed.state, ROME)).toEqual({ treasury: 3, beakers: 2, luxuries: 0 });
+
+    const next = applyFor(changed.state, ROME, endTurn(), RULESET);
+    expect(incomeLines(next.events, ROME)).toEqual([
+      { type: 'IncomeCollected', playerId: ROME, gold: 2, beakers: 1, luxuries: 2 },
+    ]);
+    expect(moneyOf(next.state, ROME)).toEqual({ treasury: 5, beakers: 3, luxuries: 2 });
+
+    // The floors, spelled out: 5 commerce is not divisible by 10 tenths into three
+    // whole channels, and the contract says which one gets what is left.
+    expect(Math.floor((5 * SPLIT_RATES.tax) / RATE_TOTAL)).toBe(1);
+    expect(Math.floor((5 * SPLIT_RATES.science) / RATE_TOTAL)).toBe(1);
+    expect(Math.floor((5 * SPLIT_RATES.luxury) / RATE_TOTAL)).toBe(2);
+    expect(5 - 1 - 1 - 2).toBe(1); // the remainder, which is gold: 1 + 1 = 2 above
+  });
+});
+
+describe('M4b scenario: starting units', () => {
+  const cases: readonly {
+    readonly mapSize: 'duel' | 'tiny';
+    readonly civCount: number;
+    readonly seeds: readonly number[];
+  }[] = [
+    { mapSize: 'duel', civCount: 2, seeds: [1, 2, 3, 7, 11] },
+    { mapSize: 'tiny', civCount: 4, seeds: [1, 4] },
+  ];
+
+  for (const testCase of cases) {
+    for (const seed of testCase.seeds) {
+      it(`gives every civilization exactly one settler and one worker (seed ${String(seed)}, ${testCase.mapSize}/${String(testCase.civCount)} civs)`, () => {
+        // `newGame` is what "starting units" means: the DSL's builder places
+        // exactly the units a scenario names, so a scenario about the *starting
+        // position* has to read the position the engine assembles (see
+        // `startingUnitsReport`).
+        const game = newGame(
+          seed,
+          // Only the two settings keys: a patch layer with an unknown key is
+          // rejected by the settings schema, which is why the case's `seeds` is not
+          // handed over with it.
+          settingsFor({ mapSize: testCase.mapSize, civCount: testCase.civCount }),
+          RULESET,
+        );
+        if (!game.ok) {
+          throw new Error(`newGame must host seed ${String(seed)}: ${JSON.stringify(game.error)}`);
+        }
+
+        expect(startingUnitsReport(game.value, RULESET)).toEqual([]);
+
+        // The rule, counted directly as well: two units for each of the
+        // civilizations and none for the barbarian, ids 0..2n-1.
+        const civs = civPlayers(game.value);
+        expect(game.value.units).toHaveLength(civs.length * 2);
+        expect(game.value.units.map((unit) => Number(unit.id))).toEqual(
+          Array.from({ length: civs.length * 2 }, (_, index) => index),
+        );
+        expect(game.value.units.map((unit) => unitDef(RULESET, unit.type)?.role)).toEqual(
+          civs.flatMap(() => ['settler', 'worker']),
+        );
+        expect(
+          game.value.units.every((unit) => civs.some((player) => player.id === unit.owner)),
+        ).toBe(true);
+
+        // M4b's money fields come with them: every civilization starts at
+        // `STARTING_TREASURY` with the default rates and two empty pools, and the
+        // barbarian's are inert zeroes.
+        for (const player of civs) {
+          expect(player.treasury).toBe(STARTING_TREASURY);
+          expect(player.rates).toEqual(DEFAULT_RATES);
+          expect(player.beakers).toBe(0);
+          expect(player.luxuries).toBe(0);
+        }
+        const barbarians = game.value.players.filter((player) => player.kind === 'barbarian');
+        expect(barbarians).toHaveLength(1);
+        expect(barbarians[0]?.treasury).toBe(0);
+      });
+    }
+  }
+
+  it('refuses to start a game with no settler role in the ruleset, and says which role', () => {
+    // The settler is mandatory (a civilization that cannot found a city cannot
+    // play), and the contract makes that a typed setup failure rather than a state
+    // with no units at all.
+    const noSettlers: RulesetView = {
+      ...RULESET,
+      units: RULESET.units.filter((unit) => unit.role !== 'settler'),
+    };
+
+    const game = newGame(1, settingsFor({ mapSize: 'duel', civCount: 2 }), noSettlers);
+    expect(game.ok).toBe(false);
+    if (game.ok) throw new Error('a ruleset with no settler must not start a game');
+    expect(game.error).toEqual({ kind: 'missing-unit-role', role: 'settler' });
+  });
+
+  it('places settlers and no workers when the ruleset ships no worker role, which the report must notice', () => {
+    // The worker is optional in the catalog, so this is a legal game — a
+    // civilization with a settler and nothing to improve land with. It is here
+    // because it is the falsification of the *report*: the same world the passing
+    // cases accept must be rejected when the worker is missing, which shows the
+    // assertions are about what the engine placed and not about a list this file
+    // wrote down.
+    const noWorkers: RulesetView = {
+      ...RULESET,
+      units: RULESET.units.filter((unit) => unit.role !== 'worker'),
+    };
+
+    const game = newGame(1, settingsFor({ mapSize: 'duel', civCount: 2 }), noWorkers);
+    if (!game.ok)
+      throw new Error(
+        `newGame must still host a world without workers: ${JSON.stringify(game.error)}`,
+      );
+
+    const roles = game.value.units.map((unit) => unitDef(noWorkers, unit.type)?.role);
+    expect(roles).toEqual(['settler', 'settler']);
+    expect(startingUnitsReport(game.value, noWorkers).join('\n')).toMatch(
+      /owns 0 worker\(s\), not exactly 1/,
+    );
+  });
+});
+
+describe('M4b: the money loop’s unpaid branch', () => {
+  it('reports a shortfall it cannot disband away, rather than inventing a debt or a negative treasury', () => {
+    // The shipped catalog declares **no** `maintenance` on any building — M4b sums
+    // whatever a row declares and M4c owns effects — so the only way a shortfall
+    // survives every disband is a catalog that does declare one. That is exactly
+    // what this test states: a ruleset view whose granary bills 3 gold a turn, in a
+    // city with 1 commerce of income (1 gold at 6/4/0) and a treasury of 0.
+    //
+    // Rome's one unit is *free* (1 unit against an allowance of 6), so there is
+    // nothing to disband and the loop ends with the bill unpaid: the treasury is
+    // left at exactly 0 and the unpaid 2 is reported in a `TreasuryShortfall`
+    // event, which is the contract's answer to "no debt field, no invented number".
+    const granaryRow = CATALOG.buildings.find((row) => row.id === GRANARY);
+    if (granaryRow === undefined) throw new Error('the shipped catalog must describe a granary');
+    const taxedGranary = { ...granaryRow, maintenance: 3 };
+    const withMaintenance: RulesetView = {
+      ...RULESET,
+      buildings: [taxedGranary, ...(RULESET.buildings ?? []).filter((row) => row.id !== GRANARY)],
+    };
+
+    const built = createScenarioBuilder(withMaintenance, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTreasury(0, 0)
+      .addUnit(0, WARRIOR, [30, 30])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], { population: 1, workedTiles: [], buildings: [GRANARY] })
+      .build();
+    if (!built.ok)
+      throw new Error(`the maintenance fixture must build: ${JSON.stringify(built.error)}`);
+
+    const outcome = applyFor(built.value, ROME, endTurn(), withMaintenance);
+
+    expect(upkeepLines(outcome.events, ROME)).toEqual([
+      {
+        type: 'UpkeepPaid',
+        playerId: ROME,
+        gold: 3,
+        maintenance: 3,
+        unitSupport: 0,
+        units: 1,
+        freeUnits: 6,
+      },
+    ]);
+    expect(disbandLines(outcome.events, ROME)).toEqual([]);
+    expect(shortfallLines(outcome.events, ROME)).toEqual([
+      { type: 'TreasuryShortfall', playerId: ROME, unpaid: 2 },
+    ]);
+    expect(moneyOf(outcome.state, ROME).treasury).toBe(0);
+    expect(outcome.state.units.filter((unit) => unit.owner === ROME)).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Falsification: the M4b scenarios' assertions must be able to fail
+ * ------------------------------------------------------------------ */
+
+describe('the M4b scenario assertions discriminate (they are not decoration)', () => {
+  it('the bankruptcy assertions fail when the treasury outlasts the deficit', () => {
+    // The same twelve workers and the same bill, but 10 gold instead of 5: the
+    // treasury covers three turns of the deficit, so the first disband happens a
+    // turn later than the scenario says and only two units are ever taken — the
+    // army that survives is ids 0..9 rather than 0..7, and the bill that is left
+    // is 4 a turn rather than 2.
+    const variant: Scenario = {
+      name: 'bankruptcy-with-a-deeper-treasury',
+      settings: DUEL_SETTINGS,
+      setup: (b) => bankruptcySetup(b).setTreasury(0, 10),
+      run: [endTurn(), endTurn(), endTurn()],
+      assert: assertOf(bankruptcyScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/took workers 11, 10, 9 and 8, so the army is ids 0\.\.7/);
+    expect(text).toMatch(/twelve workers it started with are down to eight/);
+
+    // The world itself is the one the variant described — twelve workers, one city,
+    // three turns — so those failures are about the money and not about a fixture
+    // that never ran.
+    const finalState = result.finalState;
+    if (finalState === undefined) throw new Error('the variant must still build a world');
+    expect(finalState.turn).toBe(4);
+    expect(finalState.units.filter((unit) => unit.owner === ROME)).toHaveLength(10);
+    expect(moneyOf(finalState, ROME).treasury).toBe(0);
+  });
+
+  it('the bankruptcy assertions fail when the army is affordable after all', () => {
+    // Eight workers instead of twelve: the allowance of 6 leaves only 2 billable,
+    // which the 2 gold of income covers, so nothing ever goes bankrupt and the
+    // treasury is still the 5 it started with.
+    const variant: Scenario = {
+      name: 'bankruptcy-that-never-comes',
+      settings: DUEL_SETTINGS,
+      setup: (b) => {
+        let builder = b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTreasury(0, BANKRUPTCY_START);
+        for (const [x, y] of BANKRUPTCY_ARMY.slice(0, 8)) {
+          builder = builder.addUnit(0, WORKER, [x, y]);
+        }
+        return builder
+          .addUnit(1, WARRIOR, [20, 20])
+          .addCity(0, [5, 5], { population: 1, workedTiles: [BANKRUPTCY_FARM] });
+      },
+      run: [endTurn(), endTurn(), endTurn()],
+      assert: assertOf(bankruptcyScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/took workers 11, 10, 9 and 8, so the army is ids 0\.\.7/);
+    expect(text).toMatch(/with the bill down to 2 = income the treasury sits at exactly 0/);
+
+    const finalState = result.finalState;
+    if (finalState === undefined) throw new Error('the variant must still build a world');
+    expect(moneyOf(finalState, ROME).treasury).toBe(BANKRUPTCY_START);
+    expect(finalState.units.filter((unit) => unit.owner === ROME)).toHaveLength(8);
+  });
+
+  it('the rates-split assertions fail when the city’s commerce is not the one the scenario names', () => {
+    // One road missing: commerce 4 rather than 5, which changes both collections —
+    // 4 at 6/4/0 is floor(2.4) + remainder 1 = 3 gold and floor(1.6) = 1 beaker, so
+    // the "5 commerce / 3 gold / 2 beakers" expectations must both break.
+    const variant: Scenario = {
+      name: 'rates-split-with-one-road-missing',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTreasury(0, 0)
+          .addImprovement(4, 3, ROAD) // the second road is gone
+          .addUnit(0, WARRIOR, [30, 30])
+          .addUnit(1, WARRIOR, [20, 20])
+          .addCity(0, [5, 5], { population: 2, workedTiles: [RATES_TILE_A, RATES_TILE_B] }),
+      run: [endTurn()],
+      assert: assertOf(ratesSplitScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/the city's commerce is exactly 5/);
+    expect(text).toMatch(/at 6\/4\/0 the 5 commerce is 3 gold \/ 2 beakers \/ 0 luxuries/);
+  });
+
+  it('the conservation assertions fail when the solvent civilization pays the default rates', () => {
+    // Carthage at 6/4/0 rather than 0/5/5: it still earns, but the gold channel is
+    // different and nothing reaches the two pools in step, so the exact end state
+    // the scenario pins has to disagree.
+    const variant: Scenario = {
+      name: 'conservation-with-default-rates',
+      settings: DUEL_SETTINGS,
+      setup: (b) => conservationSetup(b).setRates(1, DEFAULT_RATES),
+      run: endTurns(CONSERVATION_TURNS),
+      assert: assertOf(conservationScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/Carthage ends with exactly 60 gold, 438 beakers and 438 luxuries/);
+
+    // Rome's half of the scenario still holds, which is what makes the failure
+    // above about Carthage's rates and not about a world that did not run.
+    const finalState = result.finalState;
+    if (finalState === undefined) throw new Error('the variant must still build a world');
+    expect(moneyOf(finalState, ROME)).toEqual({ treasury: 0, beakers: 0, luxuries: 0 });
+    expect(finalState.turn).toBe(CONSERVATION_TURNS + 1);
+  });
+
+  it('the starting-units rules reject a world that lost a worker or gained a barbarian', () => {
+    // The rules are the engine's answer, so they have to react to a world that is
+    // wrong in each of the two ways the rule names — otherwise "every civilization
+    // has one worker" is a sentence with nothing behind it.
+    const game = newGame(1, settingsFor({ mapSize: 'duel', civCount: 2 }), RULESET);
+    if (!game.ok) throw new Error('newGame must host seed 1');
+
+    expect(startingUnitsReport(game.value, RULESET)).toEqual([]);
+
+    const withoutWorker: GameState = {
+      ...game.value,
+      units: game.value.units.filter(
+        (unit) => !(unit.owner === ROME && unitDef(RULESET, unit.type)?.role === 'worker'),
+      ),
+    };
+    expect(startingUnitsReport(withoutWorker, RULESET).join('\n')).toMatch(
+      /Player 1 owns 0 worker\(s\), not exactly 1/,
+    );
+
+    const barbarian = game.value.players.find((player) => player.kind === 'barbarian');
+    if (barbarian === undefined) throw new Error('a new game must have a barbarian player');
+    const withBand: GameState = {
+      ...game.value,
+      units: [
+        ...game.value.units,
+        {
+          id: asUnitId(game.value.units.length),
+          type: WARRIOR,
+          owner: barbarian.id,
+          tile: asTileIndex(0),
+          movementLeft: 1,
+        },
+      ],
+    };
+    expect(startingUnitsReport(withBand, RULESET).join('\n')).toMatch(
+      /the barbarians own 1 unit\(s\), not 0/,
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The DSL's M4b additions — additive, and loud when they are wrong
+ * ------------------------------------------------------------------ */
+
+describe('the scenario builder states M4b money', () => {
+  /** A one-civilization world with a single unit, which is all these cases need. */
+  const withRome = (b: ScenarioBuilder): ScenarioBuilder =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, SETTLER, [5, 5])
+      .addUnit(1, WARRIOR, [20, 20]);
+
+  const build = (setup: (builder: ScenarioBuilder) => ScenarioBuilder) =>
+    setup(createScenarioBuilder(RULESET, DUEL_SETTINGS)).build();
+
+  it('gives every civilization the starting treasury, the default rates and two empty pools', () => {
+    // The defaults `newGame` writes, so a scenario that says nothing about money
+    // still describes a state the engine could have produced — and so every
+    // existing M2/M3/M4a scenario kept building the same world it always did (the
+    // hashes move, because the fields are part of the state, which is M4b's own
+    // SCHEMA_VERSION bump).
+    const built = build(withRome);
+    if (!built.ok) throw new Error(`the fixture must build: ${JSON.stringify(built.error)}`);
+
+    expect(built.value.players.map((player) => player.treasury)).toEqual([
+      STARTING_TREASURY,
+      STARTING_TREASURY,
+    ]);
+    expect(built.value.players.map((player) => player.rates)).toEqual([
+      DEFAULT_RATES,
+      DEFAULT_RATES,
+    ]);
+    expect(built.value.players.map((player) => player.beakers)).toEqual([0, 0]);
+    expect(built.value.players.map((player) => player.luxuries)).toEqual([0, 0]);
+
+    // The four fields are plain JSON: they survive a round trip and the state still
+    // hashes, which is the whole reason they are written rather than left off (a
+    // key holding `undefined` cannot survive either, and `canonicalize` rejects
+    // it).
+    expect(JSON.parse(JSON.stringify(built.value))).toEqual(built.value);
+    expect(hashValue(built.value)).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('states a treasury, rates and pools — and keeps an omitted pool field', () => {
+    const built = build((b) =>
+      withRome(b)
+        .setTreasury(0, 7)
+        .setRates(0, { tax: 2, science: 3, luxury: 5 })
+        .setPools(0, { beakers: 3 })
+        .setPools(0, { luxuries: 9 }),
+    );
+    if (!built.ok) throw new Error(`the fixture must build: ${JSON.stringify(built.error)}`);
+
+    const rome = built.value.players[0];
+    const carthage = built.value.players[1];
+    expect(rome?.treasury).toBe(7);
+    expect(rome?.rates).toEqual({ tax: 2, science: 3, luxury: 5 });
+    expect(rome?.beakers).toBe(3);
+    expect(rome?.luxuries).toBe(9);
+    // The second player was not mentioned, so it keeps the defaults.
+    expect(carthage?.treasury).toBe(STARTING_TREASURY);
+    expect(carthage?.rates).toEqual(DEFAULT_RATES);
+  });
+
+  it('refuses a treasury the engine can never hold, a rate triple that breaks the rule, and a barbarian with money', () => {
+    expect(() => build((b) => withRome(b).setTreasury(0, -1))).toThrow(
+      /never lets a treasury go below zero/,
+    );
+    expect(() => build((b) => withRome(b).setTreasury(0, 1.5))).toThrow(/integer gold >= 0/);
+    expect(() => build((b) => withRome(b).setRates(0, { tax: 6, science: 4, luxury: 1 }))).toThrow(
+      /= 11/,
+    );
+    expect(() =>
+      build((b) => withRome(b).setRates(0, { tax: 6.5, science: 3.5, luxury: 0 })),
+    ).toThrow(/tax must be an integer >= 0/);
+    expect(() => build((b) => withRome(b).setPools(0, { beakers: -1 }))).toThrow(
+      /integer beakers >= 0/,
+    );
+    // The index has to name a player that was added...
+    expect(() => build((b) => withRome(b).setTreasury(2, 5))).toThrow(/needs a player index/);
+    // ...and it has to be a civilization: `applyEconomy` skips barbarians outright,
+    // so a barbarian treasury is a number nothing reads.
+    expect(() => build((b) => withRome(b).addBarbarianPlayer().setTreasury(2, 5))).toThrow(
+      /the barbarian player .* has no economy/,
+    );
+    expect(() =>
+      build((b) => withRome(b).addBarbarianPlayer().setRates(2, { tax: 1, science: 1, luxury: 8 })),
+    ).toThrow(/the barbarian player .* has no economy/);
   });
 });

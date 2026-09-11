@@ -43,7 +43,13 @@ import { indexToX, indexToY, tileIndex, type RulesetView, type TerrainDef } from
 import { asImprovementId, type TileImprovement } from '../src/improvements.js';
 import { seedRng } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
-import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
+import {
+  DEFAULT_RATES,
+  SCHEMA_VERSION,
+  STARTING_TREASURY,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 
 /* ------------------------------------------------------------------ *
  * The synthetic board
@@ -153,6 +159,14 @@ const player = (index: number, tile: number, kind: 'civ' | 'barbarian' = 'civ'):
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind,
+  // M4b: every player carries the money fields, barbarians included (they hold 0
+  // and never move, because they have no economy). A civilization's fixture starts
+  // with the engine's own `STARTING_TREASURY` at `DEFAULT_RATES` so a fixture can
+  // never drift from what `newGame` builds.
+  treasury: kind === 'barbarian' ? 0 : STARTING_TREASURY,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 });
 
 const at = (x: number, y: number): number => tileIndex(WIDTH, x, y);

@@ -89,6 +89,47 @@
  * `BARBARIAN_BAND_SIZE` and `HUT_REWARD_PROVENANCE` are reachable from
  * `@civts/core` rather than only from the module path.
  *
+ * **Migrated to the M4b contract** (docs/INTERFACES.md M4b). Six claims in this
+ * file moved, and each moved for a reason a reader can see in the state rather
+ * than because the engine was wrong:
+ *
+ * 1. `SetRates` is a new `Command` member, so `cmdKey` gained a case keyed by the
+ *    triple — and a new test walks the *whole* rate space (`0..RATE_TOTAL + 1`
+ *    cubed, illegal triples included) asserting that `planSetRates` and
+ *    `applyCommand` give the same verdict per triple, that a legal change is one
+ *    revision, no event and nothing but the rates, and that `legalActions` either
+ *    models the space exactly or not at all. The M4b acceptance text ("the keystone
+ *    sweep stays green with `SetRates` among the generators") is ambiguous about
+ *    whether the generator must *yield* it; today's `actions.ts` deliberately does
+ *    not, and that open question is reported rather than resolved here.
+ * 2. `EndTurn` is now five events rather than one: the economy step emits an income
+ *    and an upkeep per civilization, in player-id order, before `TurnEnded`. The
+ *    totality test pins the whole list (and that the barbarians appear in none of
+ *    it) instead of just the turn event.
+ * 3. `unitActions` yields `StartWork`/`CancelWork` as soon as a civilization has a
+ *    worker — which M4b's starting units give it on turn one — so the keystone
+ *    sweep's `accepted` count enumerated both families too. Before this, the
+ *    completeness equality was short by exactly the jobs.
+ * 4. Starting units are a settler **and a worker** per civilization, so unit ids
+ *    come in pairs and "unit 1 is the other player's settler" is no longer true: the
+ *    purity test's "not your unit" refusal now finds a foreign unit *by owner*, and
+ *    asserts the refusal's kind, rather than naming an id that silently became legal.
+ * 5. The purity test's "the map is deep-equal to the input" became false for a
+ *    correct reason — a legal move onto a goody hut spends it — so the map claim is
+ *    now split: terrain and dimensions never move, and `huts` differs by exactly the
+ *    tile a `HutEntered` event names.
+ * 6. The fog-honesty test used to move `units[0]` and require the move to reveal new
+ *    tiles. M4b's starting worker folds its own sight into the player's fog row at
+ *    setup, so that first move can now reveal nothing and the claim was about the
+ *    wrong move. It now sweeps **every** legal move of **every** unit this player
+ *    owns: memory never shrinks, the render never claims more than the row holds,
+ *    the revealed cells are exactly the tiles the row gained, and at least one move
+ *    really does reveal something (so the sweep cannot pass on zeroes).
+ *
+ * No claim was dropped or weakened by that migration: every changed assertion either
+ * kept its strength exactly (the rehashed goldens, the moved event list) or was
+ * replaced by a strictly wider one (the fog sweep, the map split, the rate space).
+ *
  * Findings that could NOT be turned into a test are reported in prose with the
  * review (cast/`any`/non-null audit, the `rehash:` commit note, the golden
  * harness's refusal to auto-write, CLI transcript hashes).
@@ -108,6 +149,7 @@ import {
   DEFAULT_SETTINGS,
   HUT_REWARD_KINDS,
   HUT_REWARD_PROVENANCE,
+  RATE_TOTAL,
   applyCommand,
   asPlayerId,
   asTileIndex,
@@ -124,6 +166,7 @@ import {
   legalActions,
   neighbors8,
   newGame,
+  planSetRates,
   resolveHutEntry,
   terrainAtIndex,
   unitActions,
@@ -136,6 +179,7 @@ import {
   type GameError,
   type GameState,
   type PlayerId,
+  type Rates,
   type RulesetView,
   type Settings,
   type TileIndex,
@@ -246,8 +290,18 @@ const cmdKey = (cmd: Command): string => {
       return `StartWork ${String(cmd.unitId)} ${String(cmd.kind)}`;
     case 'CancelWork':
       return `CancelWork ${String(cmd.unitId)}`;
+    // M4b. Keyed by the *triple*, for the M4a reason: two `SetRates` naming
+    // different splits are different commands, and a key that dropped the numbers
+    // would call them equal — the exact false equivalence this comparator exists to
+    // prevent.
+    case 'SetRates':
+      return `SetRates ${String(cmd.rates.tax)}/${String(cmd.rates.science)}/${String(cmd.rates.luxury)}`;
   }
 };
+
+/** `7/2/1` — a rates triple on its own, the way `cmdKey` keys a `SetRates`. */
+const rateKey = (rates: Rates): string =>
+  `${String(rates.tax)}/${String(rates.science)}/${String(rates.luxury)}`;
 
 const errorText = (error: GameError): string => JSON.stringify(error);
 
@@ -431,6 +485,52 @@ const sweepGames = (
             founded.ok === mine.has(cmdKey(foundCity)),
             `seed ${String(seed)} step ${String(step)}: FoundCity accepted=${String(founded.ok)} ` +
               `but unitActions yielded=${String(mine.has(cmdKey(foundCity)))}`,
+          );
+
+          // M4b: `unitActions` yields a third family — `StartWork` and `CancelWork` —
+          // as soon as a civilization *has* a worker, and M4b's starting units give
+          // every civilization one on turn one. It is enumerated here for the M3
+          // reason above: a job is named by its kind and a kind is a finite list
+          // (`improvementCatalog`), so the candidates are "this unit, every
+          // improvement the ruleset defines" — exactly what the applier is asked
+          // about, one command per pair — and `CancelWork` carries no payload at
+          // all, so there is exactly one candidate, enumerated unconditionally like
+          // `FoundCity`. Without this block `accepted` falls short of `unitActions`
+          // by exactly the jobs and the completeness count reads as a generator bug.
+          for (const improvement of RULESET.improvements) {
+            const cmd: Command = { type: 'StartWork', unitId: unit.id, kind: improvement.id };
+            enumerated += 1;
+
+            const outcome = applyCommand(state, player.id, cmd, RULESET);
+            if (!outcome.ok) continue;
+            accepted += 1;
+            check(
+              mine.has(cmdKey(cmd)),
+              `seed ${String(seed)}: engine ACCEPTED ${cmdKey(cmd)} but unitActions never ` +
+                'yields it (generator incomplete)',
+            );
+            check(
+              legal.has(cmdKey(cmd)),
+              `seed ${String(seed)}: engine ACCEPTED ${cmdKey(cmd)} but legalActions never ` +
+                'yields it (generator incomplete)',
+            );
+          }
+
+          const cancel: Command = { type: 'CancelWork', unitId: unit.id };
+          enumerated += 1;
+          const cancelled = applyCommand(state, player.id, cancel, RULESET);
+          if (cancelled.ok) {
+            accepted += 1;
+            check(
+              mine.has(cmdKey(cancel)),
+              `seed ${String(seed)}: engine ACCEPTED ${cmdKey(cancel)} but unitActions never ` +
+                'yields it (generator incomplete)',
+            );
+          }
+          check(
+            cancelled.ok === mine.has(cmdKey(cancel)),
+            `seed ${String(seed)} step ${String(step)}: CancelWork accepted=${String(cancelled.ok)} ` +
+              `but unitActions yielded=${String(mine.has(cmdKey(cancel)))}`,
           );
         }
       }
@@ -658,9 +758,49 @@ describe('keystone — the engine and the generator agree, in both directions', 
     const after = ended.value.state;
     expect(after.revision).toBe(foreign.revision + 1);
     expect(after.turn).toBe(foreign.turn + 1);
+    // MIGRATED (docs/INTERFACES.md M4b, "Money loop"): `EndTurn` is now five events
+    // rather than one. The turn-advance pipeline gained an **economy** step between
+    // production and the movement refill, and that step emits one income and one
+    // upkeep per *civilization*, in player-id order, **before** `TurnEnded`. The
+    // whole list is pinned, not the turn event alone: "the event stream is the
+    // ledger" is the contract, so a turn that collected for nobody would be as wrong
+    // as a turn that refused.
+    //
+    // The numbers are 0 because neither civilization owns a city yet, and the unit
+    // counts are 2 each because M4b's starting units give every civilization a
+    // settler *and* a worker (`STARTING_UNIT_ROLES`) — both free, since the
+    // allowance with no city is `FREE_UNITS_BASE` = 4. The barbarian player is
+    // named nowhere: barbarians are skipped by the money loop, which is why the
+    // list below is built from `civPlayers` and the assertion under it checks that
+    // exactly those ids were billed.
     expect(ended.value.events).toEqual([
+      { type: 'IncomeCollected', playerId: asPlayerId(0), gold: 0, beakers: 0, luxuries: 0 },
+      {
+        type: 'UpkeepPaid',
+        playerId: asPlayerId(0),
+        gold: 0,
+        maintenance: 0,
+        unitSupport: 0,
+        units: 2,
+        freeUnits: 4,
+      },
+      { type: 'IncomeCollected', playerId: asPlayerId(1), gold: 0, beakers: 0, luxuries: 0 },
+      {
+        type: 'UpkeepPaid',
+        playerId: asPlayerId(1),
+        gold: 0,
+        maintenance: 0,
+        unitSupport: 0,
+        units: 2,
+        freeUnits: 4,
+      },
       { type: 'TurnEnded', playerId: player.id, turn: foreign.turn + 1 },
     ]);
+    expect(
+      ended.value.events
+        .filter((event) => event.type === 'IncomeCollected')
+        .map((event) => Number(event.playerId)),
+    ).toEqual(civPlayers(foreign).map((candidate) => Number(candidate.id)));
     expect(after.units.length).toBe(foreign.units.length);
 
     // The unit whose type no catalog can resolve is left exactly as it was: no
@@ -694,6 +834,104 @@ describe('keystone — the engine and the generator agree, in both directions', 
     expect(unitMoveOptions(orphan, RULESET, first.id)).toEqual([]);
     expect(unitActions(orphan, RULESET, first.id)).toEqual([]);
     expect([...legalActions(orphan, RULESET, asPlayerId(7))]).toEqual([]);
+  });
+
+  it('keys a `SetRates` by its triple, and agrees with `planSetRates` over the space', () => {
+    // M4b's `SetRates` is the one command family with a *numeric* space rather than a
+    // finite list of tiles or kinds, so the keystone property is stated here as
+    // planner-versus-applier equality over an exhaustive enumeration of the space
+    // including its illegal part: every triple in `0..RATE_TOTAL + 1` cubed, which
+    // covers the boundary (`0 0 10`, `10 0 0`) and the neighbours that must be
+    // refused (sum 9, sum 11, a negative share) — the neighbours are why the bound is
+    // `RATE_TOTAL + 1` rather than `RATE_TOTAL`.
+    //
+    // Scope, stated so the coverage is not oversold: the *legality* half overlaps
+    // with `packages/core/test/actions.test.ts`'s `assertRatesAgreement`, which owns
+    // the candidate-universe sweep and asserts strictly more about it (identical
+    // error objects, reference-identical `units`/`cities`/`map`/`rng`). What this
+    // test adds is (a) a claim about *this file's* comparator — `cmdKey`'s new case
+    // must carry the payload, so two triples cannot key alike — and (b) the sixth
+    // generator's two directions stated in the describe that owns the keystone, on
+    // this file's own fixture, so a reader does not have to know to go looking in
+    // `core` for it. Where the two overlap, both are cheap; where they do not, this
+    // one is the only statement.
+    //
+    // What this does NOT assert is that `legalActions` *yields* `SetRates`, and that
+    // is not an oversight: `actions.ts` states the decision in full (the rate space
+    // is a query, not an enumeration, exactly as `SetWorkedTiles`/`SetProduction`
+    // are, and `actions.test.ts` pins that no `legalActions` output is ever a
+    // `SetRates`), while docs/INTERFACES.md M4b's acceptance line — "the keystone
+    // sweep stays green with `SetRates` among the generators" — reads two ways.
+    // Rather than pin one reading of an ambiguous line, the claim below holds in
+    // **both** worlds: if the generator ever offers rates, it must offer exactly the
+    // legal triples and no others. The open question is reported rather than
+    // silently resolved here.
+    const state = generated(7);
+    const player = state.players[0];
+    if (player === undefined) throw new Error('no players');
+
+    // (a) The comparator. A key that dropped the numbers would call two different
+    // rate changes equal — the exact false equivalence `cmdKey` exists to prevent.
+    expect(cmdKey({ type: 'SetRates', rates: { tax: 6, science: 4, luxury: 0 } })).not.toBe(
+      cmdKey({ type: 'SetRates', rates: { tax: 4, science: 6, luxury: 0 } }),
+    );
+    expect(cmdKey({ type: 'SetRates', rates: { tax: 1, science: 2, luxury: 3 } })).toBe(
+      `SetRates ${rateKey({ tax: 1, science: 2, luxury: 3 })}`,
+    );
+
+    const triples: Rates[] = [];
+    for (let tax = 0; tax <= RATE_TOTAL + 1; tax += 1) {
+      for (let science = 0; science <= RATE_TOTAL + 1; science += 1) {
+        for (let luxury = 0; luxury <= RATE_TOTAL + 1; luxury += 1) {
+          triples.push({ tax, science, luxury });
+        }
+      }
+    }
+
+    const legal: Rates[] = [];
+    for (const rates of triples) {
+      const planned = planSetRates(state, player.id, rates);
+      const applied = applyCommand(state, player.id, { type: 'SetRates', rates }, RULESET);
+      // The two directions, per triple: the planner's verdict *is* the applier's.
+      expect(applied.ok, rateKey(rates)).toBe(planned.ok);
+      if (!planned.ok) {
+        expect(planned.error.kind, rateKey(rates)).toBe('invalid-argument');
+        continue;
+      }
+      legal.push(rates);
+      if (!applied.ok) continue;
+
+      // A legal change is exactly that and nothing else: one revision, no events,
+      // the same state but for the player's `rates`, and the rates are the triple
+      // that was asked for.
+      const after = applied.value.state;
+      expect(applied.value.events, rateKey(rates)).toEqual([]);
+      expect(after.revision).toBe(state.revision + 1);
+      expect(after.players[Number(player.id)]?.rates).toEqual(rates);
+      expect(hashValue({ ...after, revision: state.revision })).toBe(
+        hashValue({
+          ...state,
+          players: state.players.map((candidate) =>
+            candidate.id === player.id ? { ...candidate, rates } : candidate,
+          ),
+        }),
+      );
+    }
+
+    // Non-vacuity in both directions: the space really does contain refused triples
+    // and accepted ones, so neither half of the equality above is empty.
+    expect(legal.length).toBeGreaterThan(0);
+    expect(legal.length).toBeLessThan(triples.length);
+    expect(legal).toContainEqual({ tax: RATE_TOTAL, science: 0, luxury: 0 });
+    expect(legal).toContainEqual({ tax: 0, science: 0, luxury: RATE_TOTAL });
+
+    // (b) …and the conditional generator claim (see the comment above).
+    const yielded = [...legalActions(state, RULESET, player.id)].flatMap((cmd) =>
+      cmd.type === 'SetRates' ? [rateKey(cmd.rates)] : [],
+    );
+    if (yielded.length > 0) {
+      expect(yielded).toEqual(legal.map(rateKey));
+    }
   });
 });
 
@@ -735,7 +973,25 @@ describe('purity — a command never writes to what it was given', () => {
       applied += 1;
       expect(outcome.value.state, cmdKey(cmd)).not.toBe(state);
       expect(outcome.value.state.units, cmdKey(cmd)).not.toBe(unitsRef);
-      expect(outcome.value.state.map).toEqual(mapRef);
+      // The map is shared *except* for the one change the hut rule allows: entering a
+      // goody hut spends it, so a `MoveUnit` onto a hut legitimately returns a map
+      // with that hut gone. MIGRATED (M4b): this fixture is `newGame`, which now
+      // starts every civilization with a worker as well as a settler, so the
+      // `legalActions` walk below reaches a worker's move into a hut and the old
+      // "deep-equal to the input map" claim became false for a *correct* outcome.
+      // Rather than weaken it to "the map may differ", the two halves are pinned
+      // separately and tightly: the terrain and dimensions never move, and `huts`
+      // differs by exactly the tile the `HutEntered` event names (nothing when there
+      // is no such event, which is the original assertion).
+      const entered = outcome.value.events.flatMap((event) =>
+        event.type === 'HutEntered' ? [Number(event.tile)] : [],
+      );
+      expect(outcome.value.state.map.terrain, cmdKey(cmd)).toEqual(mapRef.terrain);
+      expect(outcome.value.state.map.width, cmdKey(cmd)).toBe(mapRef.width);
+      expect(outcome.value.state.map.height, cmdKey(cmd)).toBe(mapRef.height);
+      expect(outcome.value.state.map.huts, cmdKey(cmd)).toEqual(
+        mapRef.huts.filter((hut) => !entered.includes(Number(hut))),
+      );
       expect(outcome.value.state.revision).toBe(state.revision + 1);
       expect(outcome.value.state.turn).toBe(cmd.type === 'EndTurn' ? state.turn + 1 : state.turn);
 
@@ -758,16 +1014,31 @@ describe('purity — a command never writes to what it was given', () => {
     if (player === undefined) throw new Error('no players');
 
     const before = hashValue(state);
+    // MIGRATED (M4b): the "not your unit" case has to *name* another player's unit
+    // rather than assume one sits at id 1. M4b's starting units are a settler and a
+    // worker **per civilization**, so ids come in pairs and `asUnitId(1)` is this
+    // player's own worker, not player 2's settler — the refusal below silently became
+    // an accepted move when the starting units changed. The id is looked up by owner
+    // so the claim cannot drift again.
+    const foreign = state.units.find((unit) => unit.owner !== player.id);
+    if (foreign === undefined) throw new Error('seed 42 needs a unit of another player');
     const refusals: readonly Command[] = [
       { type: 'MoveUnit', unitId: asUnitId(0), to: asTileIndex(0) },
       { type: 'MoveUnit', unitId: asUnitId(99), to: asTileIndex(1) },
-      { type: 'MoveUnit', unitId: asUnitId(1), to: asTileIndex(Number(state.units[0]?.tile ?? 0)) },
+      { type: 'MoveUnit', unitId: foreign.id, to: asTileIndex(Number(state.units[0]?.tile ?? 0)) },
     ];
 
     for (const cmd of refusals) {
       const outcome = applyCommand(state, player.id, cmd, RULESET);
       expect(outcome.ok, cmdKey(cmd)).toBe(false);
     }
+    // …and the third one is refused for the reason it is there for, rather than for
+    // an accident of the map: the unit belongs to somebody else.
+    const trespassCommand = refusals[2];
+    if (trespassCommand === undefined) throw new Error('the refusal list lost its third entry');
+    const trespass = applyCommand(state, player.id, trespassCommand, RULESET);
+    expect(trespass.ok).toBe(false);
+    if (!trespass.ok) expect(trespass.error.kind).toBe('not-your-unit');
 
     expect(state.revision).toBe(0);
     expect(state.turn).toBe(1);
@@ -1533,25 +1804,49 @@ describe('fog honesty — memory only grows and never lies', () => {
 
     // A legal move grows memory by exactly the newly explored tiles, and the
     // viewer render reveals exactly that many more cells.
-    const move = unitMoveOptions(state, RULESET, state.units[0]?.id ?? asUnitId(0))[0];
-    const unit = state.units[0];
-    if (move === undefined || unit === undefined) throw new Error('seed 42 has no legal move');
-
-    const outcome = applyCommand(
-      state,
-      unit.owner,
-      { type: 'MoveUnit', unitId: unit.id, to: move },
-      RULESET,
-    );
-    expect(outcome.ok).toBe(true);
-    if (!outcome.ok) return;
-
-    const afterCells = gridCells(renderState(outcome.value.state, RULESET, { viewer: player.id }));
+    //
+    // MIGRATED (M4b): *every* legal move of every unit this player owns, rather than
+    // the first option of `units[0]`. M4b's starting units put a worker on a
+    // neighbour of the settler's start and fold **its** sight into the player's fog
+    // row at setup, so the settler's first legal move can now reveal nothing new —
+    // the old shape of the test ("that one move must grow memory") became false for
+    // a correct engine, and the honest reading was always about all of them. The
+    // property is asserted per move — memory never shrinks, the render never claims
+    // more than the row holds, and the cells it reveals are exactly the tiles the row
+    // gained — with the non-vacuity check moved to the end, so the sweep cannot pass
+    // by comparing nothing but zeroes.
     const before = unexploredCount(state, player.id);
-    const after = unexploredCount(outcome.value.state, player.id);
-    expect(after).toBeLessThan(before);
-    expect(countGlyph(afterCells, '?')).toBe(after);
-    expect(before - after).toBe(countGlyph(viewerCells, '?') - countGlyph(afterCells, '?'));
+    const beforeUnknown = countGlyph(viewerCells, '?');
+    let grew = 0;
+    let moves = 0;
+
+    for (const candidate of state.units.filter((unit) => unit.owner === player.id)) {
+      for (const to of unitMoveOptions(state, RULESET, candidate.id)) {
+        const outcome = applyCommand(
+          state,
+          player.id,
+          { type: 'MoveUnit', unitId: candidate.id, to },
+          RULESET,
+        );
+        expect(outcome.ok, `unit ${String(candidate.id)} -> ${String(to)}`).toBe(true);
+        if (!outcome.ok) continue;
+        moves += 1;
+
+        const afterCells = gridCells(
+          renderState(outcome.value.state, RULESET, { viewer: player.id }),
+        );
+        const after = unexploredCount(outcome.value.state, player.id);
+        // Memory only grows: exploration is a fold, never a reset.
+        expect(after, `unit ${String(candidate.id)} -> ${String(to)}`).toBeLessThanOrEqual(before);
+        // …and the render reveals exactly the explored set, no more and no less.
+        expect(countGlyph(afterCells, '?')).toBe(after);
+        expect(before - after).toBe(beforeUnknown - countGlyph(afterCells, '?'));
+        if (after < before) grew += 1;
+      }
+    }
+
+    expect(moves).toBeGreaterThan(0);
+    expect(grew).toBeGreaterThan(0);
   });
 
   it('documents the asymmetry: a scenario-built world starts with no fog memory', () => {

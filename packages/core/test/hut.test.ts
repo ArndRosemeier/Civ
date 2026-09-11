@@ -50,7 +50,14 @@ import type { RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { isPlaceholder } from '../src/provenance.js';
 import { nextBelow, seedRng, type RngState } from '../src/rng.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
-import { SCHEMA_VERSION, civPlayers, type GameState, type PlayerState } from '../src/state.js';
+import {
+  DEFAULT_RATES,
+  SCHEMA_VERSION,
+  STARTING_TREASURY,
+  civPlayers,
+  type GameState,
+  type PlayerState,
+} from '../src/state.js';
 import { unitDef, type Unit, type UnitDef, type UnitRole } from '../src/units.js';
 
 const WIDTH = 4;
@@ -152,6 +159,12 @@ const civ = (id: number, tile: number): PlayerState => ({
   color: '#123456',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M4b: every player carries the money fields, so a hand-built player literal
+  // must too. The engine's own constants are used rather than copied literals.
+  treasury: STARTING_TREASURY,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 });
 
 /** The player a hut's band belongs to: a player identity with no homeland. */
@@ -162,6 +175,13 @@ const BARBARIANS: PlayerState = {
   // M3's convention: the map's first hut, not a real start.
   startingTile: asTileIndex(HUT_TILE),
   kind: 'barbarian',
+  // M4b: barbarians have no economy at all — 0 gold, and pools nothing ever
+  // adds to — but the fields are present because `PlayerState` has one shape for
+  // every player (the same reading `explored` takes).
+  treasury: 0,
+  rates: DEFAULT_RATES,
+  beakers: 0,
+  luxuries: 0,
 };
 
 const unit = (id: number, type: UnitTypeId, owner: number, tile: number): Unit => ({

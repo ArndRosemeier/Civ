@@ -58,7 +58,8 @@ const USAGE = `civts — headless tooling
 Usage: civts <command> [options]
 
 Commands:
-  provenance   print every rules-data row's provenance (terrains, units, buildings)
+  provenance   print every rules-data row's provenance (terrains, units, buildings,
+               improvements)
   map          generate a world, render it as ASCII, print its state hash
   play         interactive text REPL: play the game from a terminal or a script
   run          headless AI-vs-AI game                     (arrives in M7)
@@ -82,7 +83,12 @@ play options:
 play commands (inside a session; "help" prints the same list with detail):
   move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
+  work <unitId> <improve>    cancel <unitId>
+  rates <tax> <science> <luxury>
   end   units   state   save <path>   help   quit
+
+  gold, the three rates and the (currently inert) beakers and luxuries are shown in
+  the banner, under every view, and in "state".
 
 Examples:
   pnpm map --seed 42

@@ -9,8 +9,9 @@
  * 1. work progress for every unit (unit-id order), then
  * 2. growth for every city (city-id order), then
  * 3. production for every city (city-id order), then
- * 4. every unit's movement refilled, then
- * 5. `turn += 1`.
+ * 4. the money loop for every civilization (player-id order) — M4b, then
+ * 5. every unit's movement refilled, then
+ * 6. `turn += 1`.
  *
  * Why it is a module rather than a branch of `EndTurn`: the ordering is the kind
  * of rule that quietly gets re-derived. The CLI, a scenario harness, a "skip
@@ -51,6 +52,14 @@
  *   make an unresolvable type also freeze work in place, which is the sort of
  *   silent half-failure the refill's totality exists to avoid. The catalog decides
  *   what an improvement *does* (in `cityYields`), never whether the work happened.
+ * - **The money loop runs between production and the refill (M4b), and that is
+ *   observable in both directions.** Production has already added a finished unit
+ *   to `state.units`, so the turn a unit appears is the turn its owner starts paying
+ *   support for it; and the refill runs after bankruptcy, so a unit disbanded this
+ *   turn is gone before anything gives it movement back. The full argument is on
+ *   `advanceTurn` below, where the order is written; nothing else in the pipeline
+ *   reads a treasury or a rate, and `turn.ts` still knows nothing about how money is
+ *   counted (`economy.ts` owns that).
  * - **`revision` is not touched here.** It counts *applied commands* (M2
  *   invariant 2), and advancing a turn is one step of one command: `applyCommand`
  *   bumps it exactly once. This keeps the pipeline usable by a caller that is not
@@ -70,6 +79,9 @@
  */
 
 import type { GameEvent } from './commands.js';
+// M4b's step of the pipeline. `economy.ts` imports `GameEvent` from `commands.ts`
+// type-only, so this is the only runtime edge in the pair and there is no cycle.
+import { applyEconomy } from './economy.js';
 import { applyGrowth } from './growth.js';
 import { withImprovement } from './improvements.js';
 import type { RulesetView } from './map.js';
@@ -115,7 +127,7 @@ export interface TurnOutcome {
  *   state, and it never silently drops the job the way a cancellation would.
  * - **The unit is idle afterwards**, by `withoutWork` — the key is removed, never
  *   written as `undefined`. That also releases the worker to start another job on
- *   the same turn it finishes one (movement is refilled at step 4, and `StartWork`
+ *   the same turn it finishes one (movement is refilled at step 5, and `StartWork`
  *   requires movement), which is a **placeholder** reading of "a worker does one
  *   thing at a time": it is chosen to be playable and is not sourced from Civ 3.
  */
@@ -182,9 +194,34 @@ const refillMovement = (state: GameState, ruleset: RulesetView): GameState => {
 
 /**
  * Advance the world by exactly one turn: work progress for every unit, then
- * growth for every city, then production for every city, then refill movement,
- * then `turn += 1` — in that order, for the reasons in the module note (the first
- * step is first because an improvement finished this turn pays out this turn).
+ * growth for every city, then production for every city, then **the money loop**,
+ * then refill movement, then `turn += 1` — in that order, for the reasons in the
+ * module note (the first step is first because an improvement finished this turn
+ * pays out this turn).
+ *
+ * M4b's step is *after production and before the refill*, and both halves of that
+ * placement are observable:
+ *
+ * - **After production**, so a unit produced this turn costs support **from the
+ *   turn it appears**. Production has just added it to `state.units`, and the money
+ *   loop counts every unit its owner has — so the turn a city finishes a unit is
+ *   also the turn its owner starts paying for it. Running the money loop first
+ *   would hand out a free turn of support to every unit ever built, which is both a
+ *   different game and a number the acceptance evidence would pin. (The same
+ *   argument the work step makes for running first: the step that *creates* the
+ *   thing must come before the step that charges for it.)
+ * - **Before the refill**, because the refill is the last thing a turn does to the
+ *   world before `turn += 1`, and bankruptcy must not be able to bring a unit back
+ *   that a *later* step has already touched. A disbanded unit is gone for good —
+ *   there is nothing left to refill, and the refill simply does not see it. (The
+ *   refill is also total over the units it does see, so the two orders cannot
+ *   disagree about a unit's movement; the difference is only whether a unit
+ *   disbanded this turn still exists when the refill runs, and "gone" is the
+ *   honest answer.)
+ *
+ * The money loop's events come after production's and before nothing else: the
+ * event list is in pipeline order, so a consumer reads what was built and then what
+ * it cost.
  *
  * Pure: the returned state is a fresh object built from `state`, which is never
  * modified, and the same `(state, ruleset)` always yields an equal result.
@@ -193,10 +230,12 @@ export const advanceTurn = (state: GameState, ruleset: RulesetView): TurnOutcome
   const worked = advanceWork(state);
   const grown = applyGrowth(worked.state, ruleset);
   const produced = applyProduction(grown.state, ruleset);
-  const refilled = refillMovement(produced.state, ruleset);
+  // M4b, step 4: income, upkeep and bankruptcy for every civilization.
+  const paid = applyEconomy(produced.state, ruleset);
+  const refilled = refillMovement(paid.state, ruleset);
 
   return {
     state: { ...refilled, turn: refilled.turn + 1 },
-    events: [...worked.events, ...grown.events, ...produced.events],
+    events: [...worked.events, ...grown.events, ...produced.events, ...paid.events],
   };
 };

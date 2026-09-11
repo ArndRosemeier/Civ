@@ -54,6 +54,16 @@
  * "every player", it says so and is asserted against the M3 invariant
  * (`civPlayers(state).length === civCount` plus exactly one barbarian), so
  * "civ count" can never silently drift back to "the length of `players`".
+ *
+ * **Migrated to M4b's starting units** (docs/INTERFACES.md M4b). `newGame` now
+ * places a **settler and a worker per civilization** (`STARTING_UNIT_ROLES`), so the
+ * setup-boundary test's control reads 8 units for 4 civilizations rather than 4, and
+ * the claim is now per-civilization and per-role: one of each, the settler on the
+ * start, the worker on a free *neighbour* of it (never stacked), no two starting
+ * units on one tile. The same test gained the asymmetry from the other side — a
+ * catalog with a settler but **no worker** still starts a game, because the two
+ * absences are not the same failure and every pre-M4b structural view in the tree is
+ * exactly that — which is a claim about M4b's contract rather than about this file.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -95,6 +105,8 @@ import {
   type TerrainId,
   type TerrainRole,
   type Unit,
+  type UnitRole,
+  type UnitTypeId,
 } from '@civts/core';
 import { CATALOG, type TerrainSpec } from '@civts/rules';
 import { canonicalize, fnv1a64, hashValue } from '../src/index.js';
@@ -1211,6 +1223,19 @@ describe('adversarial: settings boundary', () => {
     // reported as a terrain problem.
     const settings = settingsFor('tiny', 4, 5);
 
+    // The two roles `newGame` places (M4b), read out of the catalog by role so the
+    // assertions below are about *roles* and not about the shipped ids happening to
+    // be spelled "settler" and "worker". A missing row throws rather than silently
+    // comparing against a placeholder id: the fixture, not the assertion, would be
+    // the thing that is wrong.
+    const roleId = (role: UnitRole): UnitTypeId => {
+      const row = RULESET.units.find((unit) => unit.role === role);
+      if (row === undefined) throw new Error(`the shipped catalog has no ${role} row`);
+      return row.id;
+    };
+    const settlerId = roleId('settler');
+    const workerId = roleId('worker');
+
     const noUnits: RulesetView = {
       terrains: RULESET.terrains,
       units: [],
@@ -1239,14 +1264,63 @@ describe('adversarial: settings boundary', () => {
         expect(result.error, label).toEqual({ kind: 'missing-unit-role', role: 'settler' });
     }
 
-    // Control: the untouched view starts a game and places one settler per
-    // player, so the failure above is about the catalog and not about `settings`.
+    // Control: the untouched view starts a game and places the starting units the
+    // catalog offers, so the failure above is about the catalog and not about
+    // `settings`. M4b makes that **a settler and a worker per civilization**
+    // (`STARTING_UNIT_ROLES`), which is why this reads 8 and not 4: the count is
+    // pinned rather than derived, so a milestone that quietly added or dropped a
+    // starting unit would fail here as well as in the golden hashes.
     const control = newGame(5, settings, RULESET);
     expect(control.ok).toBe(true);
     if (control.ok) {
-      expect(control.value.units).toHaveLength(4);
-      expect(control.value.nextUnitId).toBe(4);
+      expect(control.value.units).toHaveLength(8);
+      expect(control.value.nextUnitId).toBe(8);
       expect(control.value.units.every((unit) => unit.movementLeft > 0)).toBe(true);
+      const settlers = control.value.units.filter((unit) => unit.type === settlerId);
+      const workers = control.value.units.filter((unit) => unit.type === workerId);
+      expect(settlers).toHaveLength(4);
+      expect(workers).toHaveLength(4);
+      // One of each per civilization: "a settler and a worker" is per civ, not four
+      // of one role and four of the other scattered by luck. The settler stands on
+      // the start; the worker stands on a free *neighbour* of it, because stacking
+      // two units on one tile would break the placement rule `newGame` states.
+      for (const player of civPlayers(control.value)) {
+        const mine = control.value.units.filter((unit) => unit.owner === player.id);
+        expect(mine.map((unit) => unit.type).sort()).toEqual([settlerId, workerId].sort());
+        const settler = mine.find((unit) => unit.type === settlerId);
+        const worker = mine.find((unit) => unit.type === workerId);
+        expect(settler?.tile).toBe(player.startingTile);
+        expect(worker?.tile).not.toBe(player.startingTile);
+        if (worker !== undefined) {
+          expect(distance8(control.value.map, player.startingTile, worker.tile)).toBe(1);
+        }
+      }
+      // No two starting units share a tile — the rule the loop above relies on, said
+      // once for the whole board rather than per civ.
+      const tiles = control.value.units.map((unit) => unit.tile);
+      expect(new Set(tiles).size).toBe(tiles.length);
+    }
+
+    // …and the asymmetry M4b documents, from the other side: a catalog with a
+    // settler but **no worker** still starts a game. The two absences are not the
+    // same failure — a view with no settler cannot be played, whereas a game without
+    // workers is a game, and every M2-era structural view in the tree is exactly
+    // that. FAILS IF: the worker becomes required, which would refuse to start every
+    // pre-M4b ruleset in the repository (and this file's own `noUnits` view, which
+    // is checked before generation for precisely that reason).
+    const noWorker: RulesetView = {
+      ...noSettler,
+      units: RULESET.units.filter((unit) => unit.role !== 'worker'),
+    };
+    expect(noWorker.units.some((unit) => unit.role === 'settler')).toBe(true);
+    expect(noWorker.units.some((unit) => unit.role === 'worker')).toBe(false);
+    const workerless = newGame(5, settings, noWorker);
+    expect(workerless.ok).toBe(true);
+    if (workerless.ok) {
+      expect(workerless.value.units).toHaveLength(4);
+      expect(workerless.value.units.every((unit) => unit.type === settlerId)).toBe(true);
+      expect(workerless.value.nextUnitId).toBe(4);
+      expect(workerless.value.units.some((unit) => unit.type === workerId)).toBe(false);
     }
   });
 

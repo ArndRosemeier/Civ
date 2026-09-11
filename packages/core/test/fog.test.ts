@@ -113,13 +113,33 @@ const MAP: GameMap = {
   huts: [],
 };
 
-/** A civilization. M3 added `kind`; these hand-built players are all civs. */
+/**
+ * A civilization. M3 added `kind`; these hand-built players are all civs, and M4b
+ * added the four money fields (`treasury`, `rates`, `beakers`, `luxuries`) that
+ * every `PlayerState` now carries.
+ *
+ * The money values are **identical for every player this factory builds**, and
+ * deliberately so: several tests below compare two rendered views byte for byte
+ * while swapping *which player* sits where, and a treasury that varied with the
+ * index would make those comparisons fail for a reason that has nothing to do with
+ * fog. The one gold reading this file does assert on is the `viewer=0` header
+ * field, which `GOLD` pins.
+ */
+const GOLD = 7;
+
 const player = (index: number, tile: number): PlayerState => ({
   id: asPlayerId(index),
   name: `Player ${String(index + 1)}`,
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M4b: `RATE_TOTAL` is 10, so 7/3/0 is a legal split (the command layer refuses
+  // any other sum) and an arbitrary one — nothing in this file reads the rates, and
+  // no rate value here is presented as sourced from Civ 3.
+  treasury: GOLD,
+  rates: { tax: 7, science: 3, luxury: 0 },
+  beakers: 0,
+  luxuries: 0,
 });
 
 const unit = (id: number, owner: number, tile: number): Unit => ({
@@ -522,7 +542,7 @@ describe('describe with a viewer and fog', () => {
     const seen = describeState(FOGGED, RULESET, { viewer: asPlayerId(0) });
 
     expect(god).toContain('legend: ~ ocean');
-    expect(seen).toContain('viewer=0');
+    expect(seen).toContain(`viewer=0 gold=${String(GOLD)}`);
     expect(fogCount(seen)).toBe(SIZE - 4);
     expect(fogCount(god)).toBe(0);
     // God mode is not merely different: it is the map the viewer cannot see.

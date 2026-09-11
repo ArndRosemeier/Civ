@@ -125,6 +125,14 @@
  *   writes only `work`; the pair lands in `state.improvements` when the last
  *   turn is paid (in `turn.ts`), which is what makes the job cancellable without
  *   unpicking anything.
+ * - **`SetRates` (M4b) is a setting, not a transition.** It writes the actor's own
+ *   `rates` and nothing else — no treasury arithmetic, no event, no recomputation
+ *   of a turn already collected. Its legality is `planSetRates`, which is the
+ *   sixth generator in the keystone sweep: `unitMoveOptions`, `unitActions` and
+ *   `legalActions` enumerate, and `planStartWork`, `planCancelWork` and
+ *   `planSetRates` decide, each shared with `applyCommand` so a generator cannot
+ *   advertise what the applier refuses. `actions.ts` yields **no** `SetRates` and
+ *   says why (a 66-triple choice space is a query, like M3's two setters).
  */
 
 import {
@@ -135,6 +143,11 @@ import {
   type City,
   type ProductionItem,
 } from './cities.js';
+// Runtime import of the rate *rule*, not of the money loop: `SetRates` must refuse
+// a triple the split cannot use with the same reason a slider UI would show, and
+// `economy.ts` is where that rule is written down once. `economy.ts` imports this
+// module's `GameEvent` **type-only**, so the edge is one-way at runtime.
+import { ratesProblem } from './economy.js';
 import { visibleTiles, withExplored } from './fog.js';
 import { resolveHutEntry, type HutRewardKind } from './hut.js';
 // Runtime imports, not type-only: `StartWork` asks the catalog what a job *is*
@@ -153,6 +166,7 @@ import {
   type PlayerId,
   type TileIndex,
   type UnitId,
+  type UnitTypeId,
 } from './ids.js';
 import {
   distance8,
@@ -166,7 +180,7 @@ import {
 } from './map.js';
 import { itemCostOf } from './production.js';
 import { err, ok, type Result } from './result.js';
-import type { GameState, PlayerState } from './state.js';
+import type { GameState, PlayerState, Rates } from './state.js';
 import { advanceTurn } from './turn.js';
 import {
   unitById,
@@ -200,7 +214,21 @@ export type Command =
    */
   | { readonly type: 'StartWork'; readonly unitId: UnitId; readonly kind: ImprovementId }
   /** Abandon the unit's job. Nothing is refunded: the turns already paid are spent. */
-  | { readonly type: 'CancelWork'; readonly unitId: UnitId };
+  | { readonly type: 'CancelWork'; readonly unitId: UnitId }
+  /**
+   * Set the acting player's tax/science/luxury rates (M4b). No `playerId`: a player
+   * sets its own rates and nothing else, which removes the only way a caller could
+   * ask to move somebody else's sliders.
+   *
+   * The triple must be three integers `>= 0` summing to exactly `RATE_TOTAL`, else
+   * the command is refused with `invalid-argument` naming the actual sum
+   * (`economy.ts`' `ratesProblem` states the rule). It changes **only** `rates`:
+   * the treasury and the two pools are never recomputed, so a rate change cannot
+   * rewrite a collection that has already happened — the next `advanceTurn`
+   * collects at the new rates, and that is the whole of "affects future turns
+   * only, never the current one".
+   */
+  | { readonly type: 'SetRates'; readonly rates: Rates };
 
 /**
  * Every way a command can be refused, as a *reason* rather than a message
@@ -336,6 +364,16 @@ export type GameError =
  * is deliberately no `WorkProgressed` event: a job losing a turn is visible in
  * the state's `turnsLeft`, and a per-turn event for every worker would be a log
  * line that says nothing new. Completion is the event; progress is state.
+ *
+ * M4b adds the money loop's four: `IncomeCollected`, `UpkeepPaid`, `UnitDisbanded`
+ * and `TreasuryShortfall`, all emitted by `economy.ts` through the turn pipeline.
+ * They are the one place this file's "no event that says nothing new" rule is
+ * deliberately bent: `IncomeCollected`/`UpkeepPaid` are emitted per civilization
+ * per turn even at zero, because they are the *ledger* the milestone's evidence is
+ * checked against, and a suppressed zero line can only be guessed at. `SetRates`
+ * emits **nothing**, on the M3 setters' precedent — the command's payload is the
+ * record of the change, and a consumer that wants the rates reads them from the
+ * state.
  */
 export type GameEvent =
   | {
@@ -468,6 +506,73 @@ export type GameEvent =
       readonly unitId: UnitId;
       readonly kind: ImprovementId;
       readonly tile: TileIndex;
+    }
+  /**
+   * M4b: `playerId` collected `gold` this turn, with the other two channels of the
+   * same split — `beakers` and `luxuries` — beside it. Emitted for every
+   * civilization on every turn, **including a turn whose amounts are zero**: the
+   * money loop's evidence bar is that gold is accounted for (income minus upkeep
+   * minus spending equals the delta), and that identity is checkable from the event
+   * stream alone only if the stream has a line for every player (`economy.ts`
+   * states the reasoning in full).
+   *
+   * Barbarians never collect, so no such event ever names them.
+   */
+  | {
+      readonly type: 'IncomeCollected';
+      readonly playerId: PlayerId;
+      readonly gold: number;
+      readonly beakers: number;
+      readonly luxuries: number;
+    }
+  /**
+   * M4b: `playerId`'s upkeep for this turn — `maintenance` plus `unitSupport`, and
+   * their sum in `gold`. Like `IncomeCollected`, emitted even when the amount is
+   * zero.
+   *
+   * `units` and `freeUnits` travel with it so a reader can check the placeholder
+   * support formula (`FREE_UNITS_PER_CITY * cities + FREE_UNITS_BASE`) straight off
+   * the event instead of re-deriving the allowance from the state.
+   */
+  | {
+      readonly type: 'UpkeepPaid';
+      readonly playerId: PlayerId;
+      readonly gold: number;
+      readonly maintenance: number;
+      readonly unitSupport: number;
+      readonly units: number;
+      readonly freeUnits: number;
+    }
+  /**
+   * M4b: bankruptcy disbanded `unitId` (a `unitType` unit of `playerId`, last seen
+   * on `tile`), and its removal saved `saved` gold of this turn's upkeep.
+   *
+   * Emitted once per removal, in removal order (highest id first), and only for a
+   * unit that was actually *supported*: disbanding a free unit would destroy it and
+   * buy nothing. `saved` is capped at what was still owed, so the sum of every
+   * `saved` plus the `TreasuryShortfall` remainder is exactly the shortfall that was
+   * covered — the ledger identity the money loop documents.
+   *
+   * The field is `unitType`, not `type`: the event's own discriminant has that name.
+   */
+  | {
+      readonly type: 'UnitDisbanded';
+      readonly playerId: PlayerId;
+      readonly unitId: UnitId;
+      readonly unitType: UnitTypeId;
+      readonly tile: TileIndex;
+      readonly saved: number;
+    }
+  /**
+   * M4b: `playerId`'s treasury could not cover its upkeep even after every unit it
+   * could disband was gone, so `unpaid` gold was never paid. The treasury floors at
+   * **0** — it never goes negative — and the shortfall is reported here rather than
+   * invented as a debt field on the state (INTERFACES.md M4b, "The money loop").
+   */
+  | {
+      readonly type: 'TreasuryShortfall';
+      readonly playerId: PlayerId;
+      readonly unpaid: number;
     };
 
 /**
@@ -1182,6 +1287,71 @@ export const planCancelWork = (
   return ok({ unit, work });
 };
 
+/** What `planSetRates` decided: the player whose sliders move, and the new triple. */
+export interface SetRatesPlan {
+  readonly player: PlayerState;
+  /**
+   * The rates as they will be written: a fresh object with exactly the three
+   * fields of `Rates`.
+   *
+   * Not the caller's object, deliberately. A foreign command payload can carry
+   * extra keys (a JSON round trip of a newer client, a hand-built object), and
+   * copying them into the state would put keys nothing declared into the hashed
+   * JSON — the same trap `withWork` avoids for a unit's job.
+   */
+  readonly rates: Rates;
+}
+
+/**
+ * Decide whether `playerId` may set its rates to `rates` — the one place
+ * `SetRates`' legality is stated, called by `applyCommand` to refuse and by a UI
+ * that wants to disable the confirm button before submitting.
+ *
+ * Two checks, and they are the whole rule:
+ *
+ * 1. the actor exists (`unknown-player`) — the same opening every command has, and
+ *    the reason a mistyped id is a typed refusal rather than a silent no-op;
+ * 2. the triple is three integers `>= 0` summing to exactly `RATE_TOTAL`
+ *    (`invalid-argument`, with the actual sum in the message) — the rule itself
+ *    lives in `economy.ts`' `ratesProblem`, so the command layer cannot develop a
+ *    second opinion about what a rate is.
+ *
+ * `playerId`'s own rates are the only ones in reach: the command has no player
+ * field, so "only for its own rates" is not a check but the shape of the command —
+ * there is nothing to check.
+ *
+ * **Nothing about the current turn is re-derived here.** The treasury, the beakers
+ * and the luxuries are untouched by the plan and by the applier; the money loop
+ * reads `rates` once, inside `advanceTurn`. That is what makes a rate change unable
+ * to rewrite a collection that has already happened — the contract's "affects
+ * **future** turns only, never the current one", read precisely:
+ *
+ * - A rate change never recollects, refunds or recomputes anything: it is a
+ *   setting, and every pool is exactly what it was the moment before it applied.
+ * - A collection that has not run yet reads the new rates, because the money loop is
+ *   the *last* step of a turn and there is no moment "after this turn's collection"
+ *   for a player to act in. Deferring the change by one turn would need a
+ *   pending-rates field, and the frozen state shape has none (M4b's `PlayerState`
+ *   gains exactly `treasury`/`rates`/`beakers`/`luxuries`) — so the reading above is
+ *   the only one the state can express, and it is stated here rather than implied.
+ */
+export const planSetRates = (
+  state: GameState,
+  playerId: PlayerId,
+  rates: Rates,
+): Result<SetRatesPlan, GameError> => {
+  const player = playerById(state, playerId);
+  if (player === undefined) return err({ kind: 'unknown-player', playerId });
+
+  const problem = ratesProblem(rates);
+  if (problem !== undefined) return err({ kind: 'invalid-argument', detail: problem });
+
+  return ok({
+    player,
+    rates: { tax: rates.tax, science: rates.science, luxury: rates.luxury },
+  });
+};
+
 /**
  * The `WorkCancelled` event for a unit that is giving up `work`, or `[]` when
  * there was no job to give up.
@@ -1437,6 +1607,26 @@ export const applyCommand = (
         state: { ...withUnit(state, idle), revision: state.revision + 1 },
         events: workCancelledEvent(plan.value.unit, 'cancelled'),
       });
+    }
+
+    case 'SetRates': {
+      const plan = planSetRates(state, playerId, cmd.rates);
+      if (!plan.ok) return err(plan.error);
+
+      // M4b. Only `rates` moves. The player's `treasury`, `beakers` and `luxuries`
+      // are carried over untouched — a rate change is a statement about how the
+      // *next* collection divides, never a recomputation of one that already
+      // happened, and there is no cached income here to invalidate. The other
+      // players and every other field are shared with the input, which is never
+      // modified.
+      //
+      // No event, on the M3 setters' precedent: the command's payload *is* the
+      // record of the change (see the `GameEvent` note above).
+      const players = state.players.map((player) =>
+        player.id === plan.value.player.id ? { ...player, rates: plan.value.rates } : player,
+      );
+
+      return ok({ state: { ...state, revision: state.revision + 1, players }, events: [] });
     }
   }
 };

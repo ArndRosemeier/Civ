@@ -424,6 +424,94 @@ describe('an optional field, absent versus undefined', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * M4b: the money fields are inside the hashed input
+ *
+ * The M4b shape change adds four fields to every player — `treasury`, `rates`,
+ * `beakers`, `luxuries` — and the point of hashing the state is that *nothing* that
+ * can differ between two games may be invisible to the hash. A money field the
+ * canonical form skipped would make `SetRates` a no-op to the gate, and two saves
+ * that bank different gold would collide. The fields are also the newest instance of
+ * the trap above: `rates` is a *nested object*, so a hand-built player is one typo
+ * away from a key that holds `undefined`, which `canonicalize` refuses.
+ *
+ * Like the M4a section, this one stays shape-free on purpose: it uses plain records
+ * with the money fields' names rather than a hand-built `GameState`, so it keeps
+ * testing the hasher and not the engine's state layout.
+ * ------------------------------------------------------------------ */
+
+describe('the M4b money fields are part of the hashed input', () => {
+  /** One player-shaped record: everything the money loop writes, and nothing else. */
+  const player = (money: {
+    readonly treasury: number;
+    readonly rates: { readonly tax: number; readonly science: number; readonly luxury: number };
+    readonly beakers: number;
+    readonly luxuries: number;
+  }): Record<string, unknown> => ({
+    id: 0,
+    name: 'Player 1',
+    kind: 'civ',
+    treasury: money.treasury,
+    rates: money.rates,
+    beakers: money.beakers,
+    luxuries: money.luxuries,
+  });
+
+  const BASE = {
+    treasury: 10,
+    rates: { tax: 6, science: 4, luxury: 0 },
+    beakers: 0,
+    luxuries: 0,
+  } as const;
+
+  it('hashes each money field independently — none of the four is invisible', () => {
+    const digests = new Set<string>([
+      hashValue(player(BASE)),
+      hashValue(player({ ...BASE, treasury: 11 })),
+      hashValue(player({ ...BASE, beakers: 1 })),
+      hashValue(player({ ...BASE, luxuries: 1 })),
+      hashValue(player({ ...BASE, rates: { tax: 7, science: 3, luxury: 0 } })),
+      hashValue(player({ ...BASE, rates: { tax: 7, science: 2, luxury: 1 } })),
+      // A rate triple that is *illegal* under `RATE_TOTAL` still has to hash
+      // differently from a legal one: the hash describes the state, and refusing
+      // illegal rates is the command layer's job, not the canonical form's.
+      hashValue(player({ ...BASE, rates: { tax: 11, science: 0, luxury: 0 } })),
+    ]);
+    expect(digests.size).toBe(7);
+    for (const digest of digests) expect(digest).toMatch(HEX64);
+  });
+
+  it('is insertion-order independent for the nested rates object', () => {
+    // `withMoney` rebuilds a player's object; the canonical form is what makes the
+    // *order* those keys happen to be written in irrelevant to the hash.
+    const one = { rates: { tax: 6, science: 4, luxury: 0 }, treasury: 10 };
+    const other = { treasury: 10, rates: { luxury: 0, tax: 6, science: 4 } };
+    expect(canonicalize(one)).toBe(canonicalize(other));
+    expect(hashValue(one)).toBe(hashValue(other));
+  });
+
+  it('refuses a money field present but undefined, and survives the JSON round trip when absent', () => {
+    // The mistake, as plain data: this is what an editing slip or an `unknown` value
+    // arriving from a save looks like, and it is the M2 `Settings.ruleset` / M3
+    // `City.production` bug class one milestone later.
+    const broken: Record<string, unknown> = { ...player(BASE), rates: undefined };
+    expect(() => canonicalize(broken)).toThrow(/undefined is not representable/);
+    expect(() => hashValue(broken)).toThrow(/canonicalize/);
+    // …and JSON hands back the value *without* the key, so the value that would have
+    // been reloaded is not the value that was refused: dropping the rejection would
+    // not make the two agree, it would only hide the difference.
+    const reloaded: unknown = JSON.parse(JSON.stringify(broken));
+    expect(reloaded).not.toHaveProperty('rates');
+
+    // The honest spelling round-trips: the same value the engine wrote hashes the
+    // same after a save and a reload.
+    const intact = player(BASE);
+    const parsed: unknown = JSON.parse(JSON.stringify(intact));
+    expect(parsed).toEqual(intact);
+    expect(hashValue(parsed)).toBe(hashValue(intact));
+  });
+});
+
 describe('index re-exports', () => {
   it('keeps the invariant machinery alongside the hashing helpers', () => {
     const invariant: Invariant<{ n: number }> = (state) =>

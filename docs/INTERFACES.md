@@ -851,3 +851,130 @@ agents launch: `packages/testing/src/scenario.ts` (builds units/states by hand),
 `packages/testing/test/{adversarial,m2-adversarial,scenarios,hash}.test.ts` and
 `packages/headless/test/repl.test.ts`. Last time I listed only the *test* files and
 missed the two *source* ones; both broke.
+
+---
+
+# M4b contracts — FROZEN (the money loop)
+
+The rest of M4 is split because it is genuinely large: **M4b** is the economy
+(rates, treasury, upkeep, bankruptcy), and **M4c** is buildings & wonders v1 plus
+resources. Provenance rule unchanged: every new row is `placeholder` and no number
+is presented as Civ 3's.
+
+## Rates and the commerce split
+
+```ts
+export interface Rates {
+  readonly tax: number;       // integers, each >= 0
+  readonly science: number;
+  readonly luxury: number;
+}
+export const RATE_TOTAL = 10;   // placeholder: the three must sum to exactly this
+```
+
+`PlayerState` gains:
+
+```ts
+readonly treasury: number;    // gold, never negative
+readonly rates: Rates;
+readonly beakers: number;     // accumulates; MEANINGLESS until M5
+readonly luxuries: number;    // accumulates; MEANINGLESS until M9
+```
+
+Each city's commerce is split by the rates. `RATE_TOTAL = 10` is a placeholder
+chosen so the split is exact integer arithmetic with no rounding: `tax` tenths to
+gold, `science` tenths to beakers, `luxury` tenths to luxuries, and the remainder
+from integer division goes to **gold** (deterministic and stated, not "whatever
+floating point did").
+
+**Be honest about inertness.** `beakers` and `luxuries` accumulate but do nothing
+until M5 (tech) and M9 (happiness). Say so in the doc comments and in the REPL,
+rather than implying research or contentment is modelled.
+
+## The money loop
+
+Per turn, per player, in **player-id order**:
+
+1. **income**: sum of every city's gold share, plus any building/improvement gold
+   effects.
+2. **upkeep**: building maintenance (M4c adds effects; M4b sums whatever
+   `maintenance` the catalog already declares) plus **unit support**.
+3. Unit support rule (placeholder): the first `FREE_UNITS_PER_CITY * cityCount + FREE_UNITS_BASE`
+   units are free; each unit beyond that costs `UNIT_SUPPORT_COST` gold. Count only
+   civilizations' units — barbarians have no economy.
+4. `treasury += income - upkeep`.
+5. **Bankruptcy**: if `treasury` would go below zero, it floors at 0 and the
+   shortfall is paid by **disbanding units**, deterministically: repeatedly remove
+   the highest-id unit of that player (barbarians excluded) until the shortfall is
+   covered or no units remain, emitting `UnitDisbanded` for each. The treasury
+   NEVER goes negative — assert that as an invariant, because a negative treasury
+   silently breaks every later subtraction.
+6. If nothing can be disbanded and the shortfall remains, emit
+   `TreasuryShortfall` and record the unpaid amount in the event, rather than
+   inventing a debt field.
+
+This runs inside `advanceTurn`, after production and before the movement refill,
+so a unit produced this turn costs support from the turn it appears. State that
+ordering in the code.
+
+`GameEvent` gains `IncomeCollected`, `UpkeepPaid`, `UnitDisbanded`,
+`TreasuryShortfall`.
+
+## Commands
+
+```ts
+| { readonly type: 'SetRates'; readonly rates: Rates }
+```
+
+Legal only for the actor, only for its own rates; rates must be integers `>= 0`
+summing to exactly `RATE_TOTAL`, else `invalid-argument` with the actual sum in the
+message. Changing rates affects **future** turns only, never the current one.
+
+## Starting units (closes the M4a gap)
+
+`newGame` gives each civilization a **settler and a worker** on (or adjacent to)
+its starting tile; barbarians still get nothing. This is what real Civ 3 does and
+it is what makes the improvement system reachable at all — without it a player
+must found a city and produce a worker before it can build anything.
+
+## Acceptance evidence for M4b
+
+- A **bankruptcy scenario**: a player with more units than it can support loses
+  treasury deterministically, disbands in the exact documented order, and never
+  goes negative — asserting the exact unit ids removed and the exact final gold.
+- A conservation scenario over 100+ turns: gold is accounted for (income minus
+  upkeep minus spending equals the delta), and `treasury >= 0` throughout.
+- A rates-split scenario: a city with known commerce yields exactly the expected
+  gold/beakers/luxuries for a given rate, including the remainder-to-gold rule.
+- A starting-units scenario: every civilization has exactly one settler and one
+  worker, barbarians have none.
+- The keystone sweep stays green **with `SetRates` covered as a queried
+  generator**, not as a `legalActions` yield.
+
+> **Amendment (mine, correcting this document).** The M4b draft said
+> "`actions.ts` yields `SetRates` exactly where the applier accepts it", and the
+> implementing agent declined, for two reasons that check out: (1) the committed
+> adversarial sweeps require every command `legalActions` advertises to emit at
+> least one event, and `SetRates` emits none; (2) enumerating the legal triples
+> adds 66 options per player per call to a hot path used by the sweep and later by
+> AI search.
+>
+> I verified the deciding fact myself rather than accepting the argument: the
+> module yields **no** `SetWorkedTiles` and **no** `SetProduction` either. The
+> setters have been planner-only since M3 — legality is stated once in `plan*`,
+> and `actions.test.ts` sweeps the planner/applier agreement in both directions.
+> So this was never a new inconsistency; it is the established pattern, and the
+> draft line contradicted it. `SetRates` follows `planSetRates` and the same
+> sweep.
+>
+> The property I actually cared about — generator/applier agreement — is still
+> verified exhaustively over the whole rate space, just through the planner. The
+> reworded acceptance line above is the binding one.
+
+## Migration owners (F6 rule)
+
+Named up front: `packages/testing/src/scenario.ts`, `packages/headless/src/repl.ts`,
+`packages/core/src/textview.ts`, and the hand-built literals in
+`packages/core/test/*.test.ts`, `packages/testing/test/*.test.ts` and
+`packages/headless/test/repl.test.ts` — all gain `treasury`/`rates`/`beakers`/`luxuries`
+on `PlayerState`, which changes every state hash again (SCHEMA_VERSION 4 → 5).
