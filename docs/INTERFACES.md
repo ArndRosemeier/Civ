@@ -695,3 +695,159 @@ with the exact `file:line` and the fix recipe — do not edit it.
 - A hut scenario covering each reward branch on a fixed seed.
 - The REPL can found a city and show it, and a scripted session is still a
   hash-pinned regression fixture.
+
+---
+
+# M4a contracts — FROZEN (workers and tile improvements)
+
+M4 is the largest milestone, so it runs in two waves. **M4a** is workers, tile
+improvements, and the yield changes they cause. **M4b** (later) is the economy:
+tax/science/luxury sliders, gold, unit support, buildings & wonders v1,
+road-connected resources, and the bankruptcy scenario.
+
+Provenance rule from M3 still applies, verbatim: every new row is `placeholder`,
+its detail says the value is unsourced and chosen to be playable, and no number is
+presented as Civ 3's. Worker turn counts, improvement yields and terrain
+restrictions are all guesses.
+
+## Where improvements live
+
+**Improvements go on `GameState`, not on `GameMap`.** `GameMap` stays what
+generation produced (terrain + huts); improvements are gameplay state, exactly
+like units and cities. Keeping that boundary means a regenerated map and a played
+map are never confused.
+
+```ts
+// improvements.ts
+export interface TileImprovement {
+  readonly tile: TileIndex;
+  readonly kind: ImprovementId;
+}
+
+// GameState gains:
+readonly improvements: readonly TileImprovement[];   // sorted by (tile, kind), unique pairs
+```
+
+A tile may hold **several** improvements (a road *and* a mine), which is why this
+is a list of pairs rather than one value per tile. It is a **sparse** list, not a
+dense per-tile array: improvements start empty, most tiles never get one, and a
+dense array of the largest map would be 32 400 entries of almost entirely nothing.
+Do not use a sentinel "none" id — an absent pair *is* "nothing here".
+
+```ts
+export function improvementsAt(state: GameState, tile: TileIndex): readonly ImprovementId[];
+export function hasImprovement(state: GameState, tile: TileIndex, kind: ImprovementId): boolean;
+export function withImprovement(state: GameState, tile: TileIndex, kind: ImprovementId): GameState;
+export function withoutImprovement(state: GameState, tile: TileIndex, kind: ImprovementId): GameState;
+```
+
+`withImprovement` is idempotent (adding an existing pair returns an equal state)
+and every helper is pure. Ordering is part of the contract because it is hashed.
+
+## Rules — improvement catalog
+
+```ts
+export interface ImprovementSpec {
+  readonly id: ImprovementId;
+  readonly kind: ImprovementKind;            // 'road' | 'mine' | 'irrigation'
+  readonly name: string;
+  readonly turns: number;                    // worker turns to complete, >= 1
+  readonly yields: TerrainYields;            // delta applied to the tile it sits on
+  readonly allowedRoles: readonly TerrainRole[];   // where it may be built
+  readonly provenance: Provenance;
+}
+export const IMPROVEMENT_KINDS: readonly ImprovementKind[];
+```
+
+`validateRuleset` must reject: duplicate ids, `turns < 1`, a non-integer or
+negative yield delta, an unknown kind, and an empty `allowedRoles`. `cited-only`
+rejects placeholder improvements like everything else. The provenance report must
+count them (the existing single-function-sections-and-totals rule).
+
+## Yields with improvements
+
+`cityYields` must apply improvements for a **worked** tile: base terrain yields
+plus every improvement's delta, clamped at zero per component (an improvement may
+never make a tile yield a negative amount). The city centre is unaffected by
+improvements — it is not a worked tile. `yieldDelta` sums are integer addition.
+
+## Workers
+
+A worker is a unit whose role is `worker`. It improves one tile at a time, over
+several turns:
+
+```ts
+export interface Unit {
+  readonly id: UnitId;
+  readonly type: UnitTypeId;
+  readonly owner: PlayerId;
+  readonly tile: TileIndex;
+  readonly movementLeft: number;
+  readonly work?: UnitWork;      // ABSENT when idle — never `undefined`
+}
+export interface UnitWork {
+  readonly kind: ImprovementId;
+  readonly tile: TileIndex;
+  readonly turnsLeft: number;    // > 0 while in progress
+}
+```
+
+Optional, not `| undefined`, for the reason M3 established the hard way: a key
+holding `undefined` cannot survive a JSON round trip and makes the state
+unhashable. `exactOptionalPropertyTypes` makes the mistake unrepresentable.
+
+## Commands (added to the frozen union)
+
+```ts
+| { readonly type: 'StartWork'; readonly unitId: UnitId; readonly kind: ImprovementId }
+| { readonly type: 'CancelWork'; readonly unitId: UnitId }
+```
+
+- `StartWork` requires: the unit is a worker, owned by the actor, idle, standing
+  **on** the target tile (which is therefore the unit's own tile — do not add a
+  target parameter, it would only invite a mismatch), the improvement is allowed
+  on that terrain role, the tile is not already improved with that kind, and the
+  unit has movement left. It costs the unit's remaining movement for the turn.
+- `CancelWork` clears `work` and is legal only when the unit is working; it does
+  **not** refund anything.
+- Moving a working unit, or any other action that would relocate it, **cancels**
+  its work. Say so in the event stream rather than silently dropping it.
+- New `GameEvent` members: `WorkStarted`, `WorkCancelled`, `WorkCompleted`.
+- `legalActions`/`unitActions` must yield `StartWork` exactly where the applier
+  accepts it and nowhere else — the keystone invariant is BOTH directions and now
+  spans five generators.
+
+`advanceTurn` order gains a step, and the order is part of the contract:
+
+1. work progress for every unit in **unit-id order** (decrementing `turnsLeft`,
+   completing at zero and adding the improvement), then
+2. growth for every city (city-id order), then
+3. production for every city (city-id order), then
+4. refill every unit's movement, then
+5. `turn += 1`.
+
+Work completes **before** growth and production deliberately: an improvement
+finished this turn contributes to this turn's yields. State that reasoning in the
+code, because it is observable and someone will otherwise "fix" the order.
+
+## Acceptance evidence for M4a
+
+- A **mine-yield scenario**: a hand-built city working a hill, asserting the exact
+  shields per turn before and after a mine completes, and the exact turn it
+  completes.
+- A scenario asserting work is cancelled by movement, with the typed event.
+- A scenario asserting an illegal `StartWork` (wrong terrain, already improved) is
+  refused with the right error and leaves the state hash unchanged.
+- The REPL gains worker verbs (`work`/`cancel`) and shows a unit's current job.
+- Keystone sweep green with the fifth generator included.
+
+## Migration owners (the F6 rule — do not repeat M3's omission)
+
+Source files that consume the shapes above and MUST have a named owner before
+agents launch: `packages/testing/src/scenario.ts` (builds units/states by hand),
+`packages/headless/src/repl.ts` (unit rendering and verbs),
+`packages/core/src/textview.ts` (unit/terrain rendering), and the hand-built
+`GameState`/`Unit` literals in `packages/core/test/{state,units,commands,actions,textview,fog}.test.ts`,
+`packages/testing/test/{adversarial,m2-adversarial,scenarios,hash}.test.ts` and
+`packages/headless/test/repl.test.ts`. Last time I listed only the *test* files and
+missed the two *source* ones; both broke.

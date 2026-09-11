@@ -1,3 +1,13 @@
+import {
+  asImprovementId,
+  asPlayerId,
+  asTileIndex,
+  asUnitId,
+  asUnitTypeId,
+  withWork,
+  withoutWork,
+  type Unit,
+} from '@civts/core';
 import { describe, expect, it } from 'vitest';
 import {
   assertInvariants,
@@ -335,6 +345,82 @@ describe('hashValue', () => {
   it('propagates rejections from canonicalize', () => {
     expect(() => hashValue({ bad: Number.NaN })).toThrow(/canonicalize/);
     expect(() => hashValue(undefined)).toThrow(/canonicalize/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4a: an ABSENT optional field versus one present holding `undefined`
+ *
+ * This file has no hand-built `GameState` (nothing here reads the shape), so the
+ * M4a migration left its assertions alone. What it *can* pin is the trap the shape
+ * change walks past, in the one place where it is observable: the hash. `Unit.work`
+ * is optional and must be **absent** when a unit is idle, because a key holding
+ * `undefined` is dropped by `JSON.stringify` — the round-tripped state would hash
+ * differently, so `canonicalize` refuses it outright rather than letting an
+ * unhashable save exist. That bug class cost M2's `Settings.ruleset` and M3's
+ * `City.production` a hunt each; this is the loud version of it.
+ * ------------------------------------------------------------------ */
+
+describe('an optional field, absent versus undefined', () => {
+  /** An idle worker: `newGame`/`spawnUnit` build this with no `work` key at all. */
+  const idleWorker = (): Unit => ({
+    id: asUnitId(0),
+    type: asUnitTypeId('worker'),
+    owner: asPlayerId(0),
+    tile: asTileIndex(5),
+    movementLeft: 1,
+  });
+
+  it('hashes a unit with a job and a unit without one, both JSON-stable', () => {
+    const idle = idleWorker();
+    const working = withWork(idle, {
+      kind: asImprovementId('mine'),
+      tile: asTileIndex(5),
+      turnsLeft: 2,
+    });
+
+    // `withWork`/`withoutWork` are the only two writers of the field, and they
+    // rebuild the unit explicitly: the key appears and disappears, and never holds
+    // `undefined` in between.
+    expect(Object.hasOwn(idle, 'work')).toBe(false);
+    expect(Object.hasOwn(working, 'work')).toBe(true);
+    expect(Object.hasOwn(withoutWork(working), 'work')).toBe(false);
+    expect(withoutWork(working)).toEqual(idle);
+
+    // A save is JSON, so the hash of a state and of its round trip must agree —
+    // for both shapes, which is exactly what an `undefined` valued key would break.
+    for (const unit of [idle, working]) {
+      const parsed: unknown = JSON.parse(JSON.stringify(unit));
+      expect(parsed).toEqual(unit);
+      expect(hashValue(parsed)).toBe(hashValue(unit));
+    }
+  });
+
+  it('refuses a record whose optional key is present but undefined', () => {
+    // The shape of the mistake, built as plain data (a `Unit` literal with this key
+    // is a *type* error under `exactOptionalPropertyTypes`, which is half the
+    // defence; this is the other half, for a value that arrived as `unknown`).
+    const broken: Record<string, unknown> = {
+      id: 0,
+      type: 'worker',
+      owner: 0,
+      tile: 5,
+      movementLeft: 1,
+      work: undefined,
+    };
+
+    expect(() => canonicalize(broken)).toThrow(/undefined is not representable/);
+    expect(() => hashValue(broken)).toThrow(/canonicalize/);
+
+    // …and the value JSON would have handed back is not the value that was hashed:
+    // the key is simply gone. Two different states, which is why the rejection
+    // above is the honest behaviour rather than a lost key.
+    const survived: unknown = JSON.parse(JSON.stringify(broken));
+    expect(survived).not.toHaveProperty('work');
+    // The key that was hashed is not the key that comes back, so the two states
+    // could never have hashed the same — which is the whole reason for refusing it.
+    expect(Object.keys(broken)).toContain('work');
+    expect(Object.keys(survived ?? {})).not.toContain('work');
   });
 });
 

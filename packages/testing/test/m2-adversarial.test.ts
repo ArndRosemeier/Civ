@@ -218,11 +218,17 @@ const deepFrozenCopy = <T>(value: T): T => {
 /**
  * A stable key for a command, so two generators can be compared as sets.
  *
- * Migrated twice: M2's pair (`MoveUnit`/`EndTurn`), and M3, which added the two
- * city commands and `FoundCity` to the frozen `Command` union. The switch is
- * exhaustive on purpose — a `Command` variant that is not keyed here is a
- * *typecheck* failure, not a silently equal pair of different commands, which is
- * what a comparator used as evidence for the keystone property has to guarantee.
+ * Migrated three times: M2's pair (`MoveUnit`/`EndTurn`), M3, which added the two
+ * city commands and `FoundCity` to the frozen `Command` union, and M4a, which added
+ * the two worker commands. The switch is exhaustive on purpose — a `Command`
+ * variant that is not keyed here is a *typecheck* failure, not a silently equal
+ * pair of different commands, which is what a comparator used as evidence for the
+ * keystone property has to guarantee.
+ *
+ * The M4a keys carry the offending *payload*, not just the command name: two
+ * `StartWork`s naming different improvements are different commands, and a key that
+ * dropped the kind would call them equal — the exact false equivalence this
+ * comparator exists to prevent.
  */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
@@ -236,6 +242,10 @@ const cmdKey = (cmd: Command): string => {
       return `SetWorkedTiles ${String(cmd.cityId)} [${cmd.tiles.map(String).join(',')}]`;
     case 'SetProduction':
       return `SetProduction ${String(cmd.cityId)} ${cmd.item.kind}:${String(cmd.item.id)}`;
+    case 'StartWork':
+      return `StartWork ${String(cmd.unitId)} ${String(cmd.kind)}`;
+    case 'CancelWork':
+      return `CancelWork ${String(cmd.unitId)}`;
   }
 };
 

@@ -40,6 +40,7 @@ import {
   asUnitTypeId,
 } from '../src/ids.js';
 import { indexToX, indexToY, tileIndex, type RulesetView, type TerrainDef } from '../src/map.js';
+import { asImprovementId, type TileImprovement } from '../src/improvements.js';
 import { seedRng } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
@@ -110,8 +111,21 @@ const TERRAINS: readonly TerrainDef[] = Object.entries(YIELDS_BY_ROLE).map(([rol
   impassable: role === 'mountains',
 }));
 
-/** A ruleset with no building catalog at all — the "no buildings" view. */
-const NO_BUILDINGS: RulesetView = { terrains: TERRAINS, units: [], fidelity: 'tuned' };
+/**
+ * A ruleset with no building catalog at all — the "no buildings" view.
+ *
+ * `improvements: []` is spelled out because M4a made the improvement catalog a
+ * required part of a `RulesetView`: `cityYields` reads it for every worked tile,
+ * so a view without it is not a view the engine can compute city output from.
+ * An empty catalog is a catalog — it means "nothing is buildable", which is a
+ * different claim from a missing field.
+ */
+const NO_BUILDINGS: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  improvements: [],
+  fidelity: 'tuned',
+};
 
 /** The same view with a building catalog, as `@civts/rules` would supply. */
 const WITH_BUILDINGS: RulesetView = {
@@ -121,6 +135,7 @@ const WITH_BUILDINGS: RulesetView = {
     { id: asBuildingId('granary'), name: 'Granary', cost: 10 },
     { id: asBuildingId('library'), name: 'Library', cost: 20 },
   ],
+  improvements: [],
   fidelity: 'tuned',
 };
 
@@ -168,7 +183,46 @@ const PLAYERS: readonly PlayerState[] = [
   player(2, at(2, 2), 'barbarian'),
 ];
 
-const state = (cities: readonly City[]): GameState => ({
+/**
+ * The same view with two improvement rows, so this file can assert that
+ * `cityYields` consults them. A single component each (+1 food, +1 shields) keeps
+ * the arithmetic in the test above readable: the delta *is* the difference. The
+ * shipped catalog's placeholder values are pinned in `@civts/rules`' test.
+ */
+const IMPROVEMENT_RULESET: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  improvements: [
+    {
+      id: asImprovementId('irrigation'),
+      kind: 'irrigation',
+      name: 'Irrigation',
+      turns: 2,
+      yields: { food: 1, shields: 0, commerce: 0 },
+      allowedRoles: ['grassland', 'plains'],
+    },
+    {
+      id: asImprovementId('mine'),
+      kind: 'mine',
+      name: 'Mine',
+      turns: 3,
+      yields: { food: 0, shields: 1, commerce: 0 },
+      allowedRoles: ['hills', 'mountains'],
+    },
+  ],
+  fidelity: 'tuned',
+};
+
+/**
+ * A hand-built board. `improvements` defaults to nothing built and can be given
+ * pairs outright, so an improvement test reads as one line rather than as a
+ * builder call — the M4a yield rules are asserted in `improvements.test.ts`, and
+ * what this file pins is that `cityYields` *consults* them for a worked tile.
+ */
+const state = (
+  cities: readonly City[],
+  improvements: readonly TileImprovement[] = [],
+): GameState => ({
   schemaVersion: SCHEMA_VERSION,
   revision: 0,
   turn: 1,
@@ -182,6 +236,7 @@ const state = (cities: readonly City[]): GameState => ({
   explored: PLAYERS.map(() => new Array<boolean>(WIDTH * HEIGHT).fill(false)),
   nextCityId: cities.length,
   cities,
+  improvements,
 });
 
 /** A city on the middle tile (2,2) — mountains, so the centre floor is visible. */
@@ -399,6 +454,53 @@ describe('cityYields', () => {
 
     expect(yields.food).toBe(1);
     expect(yields.foodSurplus).toBe(1 - FOOD_PER_CITIZEN * 3);
+  });
+
+  /**
+   * M4a's half of this file. The improvement *rules* — the catalog, the pair
+   * order, the idempotence of `withImprovement`, the clamp — are asserted in
+   * `improvements.test.ts`; these two tests pin the one thing this module owns:
+   * `cityYields` adds an improvement's delta for a **worked** tile and for no
+   * other tile, including the centre.
+   */
+  it('adds a worked tile’s improvements to the city’s output', () => {
+    const tile = at(3, 2);
+    const worked = city(1, 0, CENTRE, { population: 2, workedTiles: [asTileIndex(tile)] });
+    const plain = state([worked]);
+    // An irrigation, whose only delta in this file's ruleset is +1 food.
+    const irrigated = state(
+      [worked],
+      [{ tile: asTileIndex(tile), kind: asImprovementId('irrigation') }],
+    );
+
+    const before = cityYields(plain, IMPROVEMENT_RULESET, asCityId(1));
+    const after = cityYields(irrigated, IMPROVEMENT_RULESET, asCityId(1));
+
+    expect(after.food - before.food).toBe(1);
+    expect(after.shields).toBe(before.shields);
+    expect(after.commerce).toBe(before.commerce);
+    expect(after.foodSurplus).toBe(before.foodSurplus + 1);
+  });
+
+  it('ignores an improvement on a tile no citizen works, and on the centre', () => {
+    const tile = at(3, 2);
+    const other = at(1, 2); // inside the radius, but unassigned
+    const worked = city(1, 0, CENTRE, { population: 2, workedTiles: [asTileIndex(tile)] });
+
+    const plain = state([worked]);
+    const improvedElsewhere = state(
+      [worked],
+      [
+        { tile: asTileIndex(other), kind: asImprovementId('irrigation') },
+        // The centre is not a worked tile, so an improvement on it does nothing —
+        // not even lifting its 1/1/1 floor, which is read from the terrain alone.
+        { tile: asTileIndex(CENTRE), kind: asImprovementId('mine') },
+      ],
+    );
+
+    expect(cityYields(improvedElsewhere, IMPROVEMENT_RULESET, asCityId(1))).toEqual(
+      cityYields(plain, IMPROVEMENT_RULESET, asCityId(1)),
+    );
   });
 });
 

@@ -29,10 +29,19 @@
  *   movement" rule live here once rather than in each caller. It is *not* a
  *   command: it does not touch `revision`, `turn` or the RNG — the caller that
  *   owns the transition does that (see `commands.ts` and the turn pipeline).
+ * - **A unit's job is `work`, and it is `undefined` by being *absent*.**
+ *   `Unit.work` is an optional field (M4a): an idle unit has no `work` key at
+ *   all, never one holding `undefined`. That is not a style preference — a
+ *   present-but-`undefined` key cannot survive a JSON round trip, so
+ *   `canonicalize` rejects it and the state becomes unhashable. The same trap
+ *   cost the project three bug hunts (M2's `Settings.ruleset`, M3's
+ *   `City.production`, and the state hashes that moved for it), which is why
+ *   `withWork`/`withoutWork` below — the only two writers of the field — rebuild
+ *   the unit explicitly instead of spreading a key that might be `undefined`.
  *
  * Nothing here reads ambient state: no RNG, no clock, no I/O. Every function is
- * a pure read of the state or the ruleset it is handed; `spawnUnit` is a pure
- * rebuild of one.
+ * a pure read of the state or the ruleset it is handed; `spawnUnit`, `withWork`
+ * and `withoutWork` are pure rebuilds of one.
  */
 
 import {
@@ -43,6 +52,10 @@ import {
   type UnitId,
   type UnitTypeId,
 } from './ids.js';
+// Type-only, and therefore erased: `UnitWork.kind` *is* an `ImprovementId`, but
+// nothing here ever calls into `improvements.ts`, so this module gains no runtime
+// edge (and no cycle: `improvements.ts` imports `GameState` type-only in turn).
+import type { ImprovementId } from './improvements.js';
 import type { RulesetView } from './map.js';
 import type { GameState } from './state.js';
 
@@ -81,6 +94,33 @@ export interface UnitDef {
 }
 
 /**
+ * A job a unit is doing on the tile it stands on: which improvement, where, and
+ * how many turns are still owed (M4a, "Workers").
+ *
+ * - **`tile` is stored even though it is always the unit's own tile while the
+ *   job runs.** `StartWork` takes no target parameter for exactly that reason
+ *   (INTERFACES.md M4a: "do not add a target parameter, it would only invite a
+ *   mismatch"), and a job is *cancelled* rather than followed when the unit
+ *   relocates — so the two stay in step by construction. It is stored anyway
+ *   because completion happens in the turn pipeline, which reads the job off the
+ *   unit: recording the tile in the job is what lets completion add the
+ *   improvement to the tile the work was *started* on without a second lookup
+ *   that could disagree.
+ * - **`turnsLeft` is a positive whole number while the job is in progress.** It
+ *   is decremented once per turn (step 1 of `advanceTurn`, in unit-id order) and
+ *   the improvement is added when it reaches zero. It is part of every state
+ *   hash, so a job whose count is not a whole number is never written: the
+ *   command that starts one refuses a catalog row whose `turns` is not a usable
+ *   count (see `planStartWork` in `commands.ts`).
+ */
+export interface UnitWork {
+  readonly kind: ImprovementId;
+  readonly tile: TileIndex;
+  /** Turns still owed; `> 0` while the job is in progress. */
+  readonly turnsLeft: number;
+}
+
+/**
  * A unit as it exists in the world.
  *
  * This is plain data inside `GameState`, so it is part of every state hash:
@@ -96,7 +136,51 @@ export interface Unit {
   readonly tile: TileIndex;
   /** Movement points left this turn; spent by movement, refilled by `EndTurn`. */
   readonly movementLeft: number;
+  /**
+   * The job this unit is doing, **absent** when it is idle — never a key holding
+   * `undefined` (see the module note, and `withWork`/`withoutWork` below, which
+   * are the only writers of this field).
+   */
+  readonly work?: UnitWork;
 }
+
+/**
+ * `unit` busy with `work` — the only way a job is ever attached.
+ *
+ * The unit is rebuilt field by field rather than spread, so the result carries
+ * exactly the six fields `Unit` declares and `work` is written as a real value.
+ * A spread (`{ ...unit, work }`) would also copy any field a *foreign* unit
+ * object happened to carry, which is the sort of undeclared key that reaches a
+ * state hash and surprises everyone; and, more importantly, the explicit rebuild
+ * makes it impossible for this module to write `work: undefined` by accident.
+ */
+export const withWork = (unit: Unit, work: UnitWork): Unit => ({
+  id: unit.id,
+  type: unit.type,
+  owner: unit.owner,
+  tile: unit.tile,
+  movementLeft: unit.movementLeft,
+  work,
+});
+
+/**
+ * `unit` idle — the `work` key is **removed**, not set to `undefined`.
+ *
+ * Used by `CancelWork`, by the relocation path that cancels a job when a unit
+ * moves (M4a: "Moving a working unit … cancels its work"), and by `advanceTurn`
+ * when a job completes. In every one of those the job is gone, and "gone" in
+ * this state is an absent key: writing `undefined` there would make the state
+ * unhashable, which is the failure mode this helper exists to make impossible.
+ * Pure: the unit handed in is not modified, and a unit that was already idle
+ * comes back equal to the input.
+ */
+export const withoutWork = (unit: Unit): Unit => ({
+  id: unit.id,
+  type: unit.type,
+  owner: unit.owner,
+  tile: unit.tile,
+  movementLeft: unit.movementLeft,
+});
 
 /**
  * The unit catalog of a ruleset, in catalog order. Data order, never RNG order,

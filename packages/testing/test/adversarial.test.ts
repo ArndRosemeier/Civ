@@ -135,6 +135,11 @@ const toTerrainDef = (spec: TerrainSpec): TerrainDef => {
 const RULESET: RulesetView = {
   terrains: CATALOG.terrains.map(toTerrainDef),
   units: CATALOG.units,
+  // M4a: the improvement catalog is a required field of a view. This file's sweeps
+  // are about movement, fog, cities and the hash, and no state here has an
+  // improvement on a tile, so the shipped rows change nothing they assert — but a
+  // view that omitted the field would not typecheck at all.
+  improvements: CATALOG.improvements,
   fidelity: 'tuned',
 };
 const ROLE_BY_ID: ReadonlyMap<TerrainId, TerrainRole> = new Map(
@@ -453,6 +458,7 @@ describe('adversarial: determinism', () => {
       nextUnitId: state.nextUnitId,
       cities: state.cities,
       nextCityId: state.nextCityId,
+      improvements: state.improvements,
       players: state.players,
       map: state.map,
       rng: state.rng,
@@ -1143,10 +1149,16 @@ describe('adversarial: settings boundary', () => {
     // the ruleset is audited for terrain before generation runs, and for a unit
     // role before the state is assembled, so the first thing genuinely missing is
     // what a caller is told.
-    const missingAll: RulesetView = { terrains: [], units: [], fidelity: 'tuned' };
+    const missingAll: RulesetView = {
+      terrains: [],
+      units: [],
+      improvements: [],
+      fidelity: 'tuned',
+    };
     const missingMountains: RulesetView = {
       terrains: RULESET.terrains.filter((terrain) => terrain.role !== 'mountains'),
       units: RULESET.units,
+      improvements: RULESET.improvements,
       fidelity: 'tuned',
     };
     const landImpassable: RulesetView = {
@@ -1154,6 +1166,7 @@ describe('adversarial: settings boundary', () => {
         WATER_ROLES.has(terrain.role) ? terrain : { ...terrain, impassable: true },
       ),
       units: RULESET.units,
+      improvements: RULESET.improvements,
       fidelity: 'tuned',
     };
     const seaPassable: RulesetView = {
@@ -1162,6 +1175,7 @@ describe('adversarial: settings boundary', () => {
         impassable: !WATER_ROLES.has(terrain.role),
       })),
       units: RULESET.units,
+      improvements: RULESET.improvements,
       fidelity: 'tuned',
     };
 
@@ -1197,12 +1211,18 @@ describe('adversarial: settings boundary', () => {
     // reported as a terrain problem.
     const settings = settingsFor('tiny', 4, 5);
 
-    const noUnits: RulesetView = { terrains: RULESET.terrains, units: [], fidelity: 'tuned' };
+    const noUnits: RulesetView = {
+      terrains: RULESET.terrains,
+      units: [],
+      improvements: RULESET.improvements,
+      fidelity: 'tuned',
+    };
     const noSettler: RulesetView = {
       terrains: RULESET.terrains,
       // Every role *except* the one `newGame` places: a non-empty catalog that is
       // still the wrong catalog, which is the case a length check would miss.
       units: RULESET.units.filter((unit) => unit.role !== 'settler'),
+      improvements: RULESET.improvements,
       fidelity: 'tuned',
     };
     expect(noSettler.units.length).toBeGreaterThan(0);
@@ -1344,6 +1364,7 @@ describe('adversarial: text renderer', () => {
     const rebuiltRuleset: RulesetView = {
       terrains: CATALOG.terrains.map(toTerrainDef),
       units: CATALOG.units,
+      improvements: CATALOG.improvements,
       fidelity: 'tuned',
     };
     const third = describeState(state, rebuiltRuleset);

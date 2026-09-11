@@ -28,9 +28,21 @@
  *   a `viewer`, the picture is what *that player* has explored: unexplored tiles
  *   render `?`, and nothing about them leaks — not the terrain, not a start
  *   marker, not a start coordinate. See `viewer` in `DescribeOptions`.
+ * - **Work in progress is drawn as a line, not as a glyph** (M4a). A worker's job
+ *   is a fact about a *unit*, and the map has no per-unit marking of any kind —
+ *   inventing a glyph for "a worker is here" would have to answer what happens
+ *   when a worker stands on a hut, on a start tile or in fog. So a job is named on
+ *   its own `work:` line, exactly as `starts:` names tiles that the grid can only
+ *   mark with an ambiguous digit, and the reader gets the unit id, where the job
+ *   is, what it is doing and how many turns are left. It is drawn *only when
+ *   something is being worked*, the rule the `% hut` legend entry follows (nothing
+ *   is said about a feature that is not on the board), and through a `viewer` only
+ *   for jobs on explored tiles, because a worker nobody can see is not knowledge
+ *   that player has.
  */
 
-import type { PlayerId, TerrainId } from './ids.js';
+import type { PlayerId, TerrainId, UnitTypeId } from './ids.js';
+import { improvementDef, type ImprovementId } from './improvements.js';
 import {
   indexToX,
   indexToY,
@@ -40,6 +52,7 @@ import {
   type TerrainRole,
 } from './map.js';
 import { civPlayers, type GameState } from './state.js';
+import { unitDef, type UnitWork } from './units.js';
 
 export interface Viewport {
   readonly x: number;
@@ -261,6 +274,99 @@ const startsLine = (
 };
 
 /**
+ * What a job is doing, as a reader needs it: `mining, 2 turns left`.
+ *
+ * The *verb* comes from the improvement's **kind**, which is the engine's own
+ * vocabulary (`IMPROVEMENT_KINDS`), so a ruleset that renames a row or spells its
+ * ids differently still renders a job the engine understands. The catalog row is
+ * looked up only to learn that kind, and a job naming an improvement this ruleset
+ * cannot describe falls back to the raw id — the same "read what is there" the
+ * renderer applies to an unknown terrain id. The fact that the work is happening
+ * belongs to the *state*, and it has to be visible even when the catalog cannot
+ * name it: a reader who saw nothing at all would think the worker idle.
+ *
+ * The turn count is the state's `turnsLeft`, verbatim — this function states no
+ * rule about how long a job takes (the catalog's `turns` and the turn pipeline
+ * own that), it only says what is left.
+ *
+ * Exported because the REPL prints the same fact in its `units` line, its `units`
+ * table and its `state` view: one mapping from a job to prose, not three that can
+ * drift apart.
+ */
+export const workSummary = (ruleset: RulesetView, work: UnitWork): string =>
+  `${workActivity(ruleset, work.kind)}, ${String(work.turnsLeft)} turn${
+    work.turnsLeft === 1 ? '' : 's'
+  } left`;
+
+/** The activity word behind `workSummary`: `road` → `building a road`, and so on. */
+const workActivity = (ruleset: RulesetView, kind: ImprovementId): string => {
+  const def = improvementDef(ruleset, kind);
+  // No row, no kind: the id is all that is known about the job, and printing it
+  // is truer than printing a verb invented for it.
+  if (def === undefined) return kind;
+  switch (def.kind) {
+    case 'road':
+      return 'building a road';
+    case 'mine':
+      return 'mining';
+    case 'irrigation':
+      return 'irrigating';
+    default:
+      // A foreign catalog can carry a kind this build does not know; its own name
+      // is then the only honest description of the job.
+      return def.name.toLowerCase();
+  }
+};
+
+/** The type name of a unit, or its raw type id when the ruleset cannot name it. */
+const unitTypeName = (ruleset: RulesetView, type: UnitTypeId): string =>
+  unitDef(ruleset, type)?.name ?? type;
+
+/**
+ * One line naming every unit that is **working**, or `undefined` when none is.
+ *
+ * `tile` is the job's own tile, which is where the improvement will land — the
+ * unit's position while a job runs (M4a: the job is on the tile the worker stands
+ * on), so the coordinate answers "where is my worker" and "what is being built"
+ * with one number. The unit's *id* is on the line because the id is what a command
+ * names.
+ *
+ * Through a `viewer`, a job on a tile that player has not explored is omitted and
+ * counted, exactly as an unexplored start is: a job is knowledge, and a line that
+ * recited an opponent's worker would leak through the fog the grid is hiding. The
+ * count keeps the line honest about what it left out, and with nothing being
+ * worked at all the line is absent entirely — the same rule the `% hut` legend
+ * entry follows.
+ */
+const workLine = (
+  state: GameState,
+  ruleset: RulesetView,
+  explored: readonly boolean[] | undefined,
+): string | undefined => {
+  const parts: string[] = [];
+  let hidden = 0;
+
+  for (const unit of state.units) {
+    const work = unit.work;
+    if (work === undefined) continue;
+
+    if (explored !== undefined && explored[work.tile] !== true) {
+      hidden += 1;
+      continue;
+    }
+
+    parts.push(
+      `${String(unit.id)} p${String(unit.owner)} ${unitTypeName(ruleset, unit.type)}` +
+        `@${String(indexToX(state.map, work.tile))},${String(indexToY(state.map, work.tile))} ` +
+        workSummary(ruleset, work),
+    );
+  }
+
+  if (hidden > 0) parts.push(`(+${String(hidden)} unexplored)`);
+  return parts.length === 0 ? undefined : `work: ${parts.join('  ')}`;
+};
+
+/**
  * Render `state` as deterministic ASCII.
  *
  * Layout (a real 20x10 crop of a duel map, so the alignment below is exact):
@@ -282,6 +388,13 @@ const startsLine = (
  *
  * ```
  * legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains  % hut
+ * ```
+ *
+ * A unit in the middle of a job adds one `work:` line under `starts:` (M4a), and
+ * only when something is being worked:
+ *
+ * ```
+ * work: 3 p0 Worker@2,2 mining, 2 turns left
  * ```
  *
  * The gutter is sized to the widest row number, the tens ruler writes a digit
@@ -394,6 +507,14 @@ export const describe = (
   if (showStarts && civs.length > 0) {
     lines.push(startsLine(state, map, view, viewerRow));
   }
+
+  // Work in progress, last — it is the most transient fact on the board (a job
+  // ends, a worker moves, a new one starts) and it is the only line whose content
+  // changes between two turns of the same game. `showStarts` deliberately does not
+  // gate it: a job is not a start marker, and switching the starts legend off must
+  // not hide what the army of workers is doing.
+  const work = workLine(state, ruleset, viewerRow);
+  if (work !== undefined) lines.push(work);
 
   return `${lines.join('\n')}\n`;
 };

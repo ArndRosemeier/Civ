@@ -88,7 +88,15 @@ const SETTLER: UnitDef = {
   domain: 'land',
 };
 
-const RULESET: RulesetView = { terrains: TERRAINS, units: [SETTLER], fidelity: 'tuned' };
+const RULESET: RulesetView = {
+  terrains: TERRAINS,
+  units: [SETTLER],
+  // M4a: the improvement catalog is required on a view. These tests read nothing
+  // from it — fog is a property of the state — and an empty catalog is how a view
+  // says "nothing can be built".
+  improvements: [],
+  fidelity: 'tuned',
+};
 
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
@@ -176,6 +184,10 @@ const STATE: GameState = {
   // M3: a hand-built world has no cities; `FoundCity` is the only creator.
   nextCityId: 0,
   cities: [],
+  // M4a: nor any tile improvements — a worker is the only writer, and no unit here
+  // is working. The key is an empty array, never `undefined`: it is part of every
+  // state hash and `canonicalize` refuses `undefined`.
+  improvements: [],
 };
 
 /** A tile player 0 has never been near: (5,5) = 35, four tiles from its unit. */
@@ -552,7 +564,12 @@ describe('describe with a viewer and fog', () => {
     // can have. An *empty* catalog is how a view says it has no units, and it
     // preserves the claim being made here exactly: fog and `describe` read the
     // state, never the catalog.
-    const terrainOnly: RulesetView = { terrains: TERRAINS, units: [], fidelity: 'tuned' };
+    const terrainOnly: RulesetView = {
+      terrains: TERRAINS,
+      units: [],
+      improvements: [],
+      fidelity: 'tuned',
+    };
     // `describe` never needs a unit catalog: fog comes from the state.
     expect(describeState(STATE, terrainOnly, { viewer: asPlayerId(0) })).toBe(
       describeState(STATE, RULESET, { viewer: asPlayerId(0) }),

@@ -3,20 +3,24 @@ import {
   TERRAIN_ROLES,
   UNIT_ROLES,
   asBuildingId,
+  asImprovementId,
   asTerrainId,
   asUnitTypeId,
   isPlaceholder,
+  type ImprovementKind,
   type Provenance,
   type UnitRole,
 } from '@civts/core';
 import {
   CATALOG,
   CITED_EXAMPLE,
+  IMPROVEMENT_KINDS,
   provenanceSections,
   summarizeProvenance,
   validateRuleset,
   type BuildingSpec,
   type Catalog,
+  type ImprovementSpec,
   type ProvenanceSection,
   type UnitSpec,
 } from '../src/index.js';
@@ -26,6 +30,8 @@ const UNITS = CATALOG.units;
 const LAND_UNITS = UNITS.filter((u) => u.domain === 'land');
 /** The catalog's building rows. M3 production spends shields on these. */
 const BUILDINGS = CATALOG.buildings;
+/** The catalog's improvement rows. M4a's workers build these. */
+const IMPROVEMENTS = CATALOG.improvements;
 
 /**
  * The catalog with one unit row replaced. Written as a function rather than a
@@ -45,6 +51,19 @@ const withUnit = (id: string, patch: Partial<UnitSpec>): Catalog => ({
 const withBuilding = (id: string, patch: Partial<BuildingSpec>): Catalog => ({
   ...CATALOG,
   buildings: BUILDINGS.map((b) => (b.id === id ? { ...b, ...patch } : b)),
+});
+
+/**
+ * The catalog with one improvement row replaced — the improvement counterpart of
+ * `withUnit`/`withBuilding`.
+ *
+ * `patch` is `Partial<ImprovementSpec>`, which allows **any** `kind` string, so
+ * the unknown-kind case below reaches validation the way a JSON catalog would
+ * rather than through a cast.
+ */
+const withImprovementRow = (id: string, patch: Partial<ImprovementSpec>): Catalog => ({
+  ...CATALOG,
+  improvements: IMPROVEMENTS.map((i) => (i.id === id ? { ...i, ...patch } : i)),
 });
 
 /** The field names of `invalid-value` errors, or the kind for every other error. */
@@ -83,7 +102,10 @@ describe('ruleset validation', () => {
   });
 
   it('reports an empty catalog', () => {
-    const r = validateRuleset({ terrains: [], units: [], buildings: [] }, 'tuned');
+    const r = validateRuleset(
+      { terrains: [], units: [], buildings: [], improvements: [] },
+      'tuned',
+    );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error[0]?.kind).toBe('empty-catalog');
   });
@@ -345,6 +367,217 @@ describe('building catalog', () => {
   });
 });
 
+describe('improvement catalog', () => {
+  it('provides at least one row per engine kind', () => {
+    // The shipped catalog is the content the CLI and the golden harness run on,
+    // so every kind the engine understands must be exercised by a real row rather
+    // than only by a test's stand-in.
+    for (const kind of IMPROVEMENT_KINDS) {
+      expect(IMPROVEMENTS.some((i) => i.kind === kind)).toBe(true);
+    }
+    expect(IMPROVEMENTS.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('has the three rows the milestone asks for, with unique ids', () => {
+    const ids = IMPROVEMENTS.map((i) => i.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ['road', 'mine', 'irrigation']) {
+      expect(ids).toContain(asImprovementId(id));
+    }
+  });
+
+  it('restricts each row to terrains that exist in the catalog', () => {
+    // `allowedRoles` is checked for emptiness by validation; that every role it
+    // names is a role this catalog actually ships is a content property, asserted
+    // here — a mine on a role no terrain fills would be unbuildable in every game.
+    const roles: readonly string[] = TERRAIN_ROLES;
+    for (const i of IMPROVEMENTS) {
+      expect(i.allowedRoles.length).toBeGreaterThan(0);
+      for (const role of i.allowedRoles) {
+        expect(roles).toContain(role);
+        expect(CATALOG.terrains.some((t) => t.role === role)).toBe(true);
+      }
+      expect(new Set(i.allowedRoles).size).toBe(i.allowedRoles.length);
+    }
+  });
+
+  it('never lets a shipped row subtract: every delta is a non-negative integer', () => {
+    // The engine clamps at zero per component for *foreign* data; a shipped row
+    // that relied on that clamp would be a row whose author meant something else.
+    for (const i of IMPROVEMENTS) {
+      expect(Number.isInteger(i.turns)).toBe(true);
+      expect(i.turns).toBeGreaterThanOrEqual(1);
+      expect(i.name).not.toBe('');
+      for (const value of [i.yields.food, i.yields.shields, i.yields.commerce]) {
+        expect(Number.isInteger(value)).toBe(true);
+        expect(value).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it('is honest about provenance: every row is a placeholder that says so', () => {
+    // The provenance warning at the top of INTERFACES.md M3 applies verbatim to
+    // M4a: worker turn counts, improvement yields and terrain restrictions are all
+    // guesses, and each note has to *say* the value is unsourced and ours rather
+    // than Civ 3's. "Looks right" is not provenance.
+    for (const i of IMPROVEMENTS) {
+      expect(i.provenance.kind).toBe('placeholder');
+      if (i.provenance.kind === 'placeholder') {
+        const note = i.provenance.note.toLowerCase();
+        expect(note).toContain('unsourced');
+        expect(note).toContain('ours');
+      }
+    }
+  });
+
+  it('requires provenance by type — a spec without one does not compile', () => {
+    expectTypeOf<ImprovementSpec['provenance']>().toEqualTypeOf<Provenance>();
+    expectTypeOf<ImprovementSpec['kind']>().toEqualTypeOf<ImprovementKind>();
+    expectTypeOf<ImprovementSpec['turns']>().toEqualTypeOf<number>();
+  });
+
+  it('rejects a duplicate improvement id', () => {
+    const r = validateRuleset(
+      { ...CATALOG, improvements: [...IMPROVEMENTS, ...IMPROVEMENTS] },
+      'tuned',
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const dupes = r.error.filter((e) => e.kind === 'duplicate-id');
+      expect(dupes).toHaveLength(IMPROVEMENTS.length);
+      expect(dupes.map((d) => d.catalog)).toEqual(IMPROVEMENTS.map(() => 'improvements'));
+    }
+  });
+
+  it('rejects a turn count below 1, and a non-integer turn count', () => {
+    const zero = validateRuleset(withImprovementRow('mine', { turns: 0 }), 'tuned');
+    expect(zero.ok).toBe(false);
+    if (!zero.ok) {
+      expect(zero.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'improvements',
+        id: asImprovementId('mine'),
+        field: 'turns',
+        detail: 'must be >= 1',
+      });
+    }
+
+    const fractional = validateRuleset(withImprovementRow('mine', { turns: 1.5 }), 'tuned');
+    expect(fractional.ok).toBe(false);
+    if (!fractional.ok) {
+      expect(fractional.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'improvements',
+        id: asImprovementId('mine'),
+        field: 'turns',
+        detail: 'must be an integer',
+      });
+    }
+  });
+
+  it('rejects a negative and a fractional yield delta', () => {
+    const bad = validateRuleset(
+      withImprovementRow('mine', { yields: { food: -1, shields: 0.5, commerce: 0 } }),
+      'tuned',
+    );
+
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) {
+      expect(bad.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'improvements',
+        id: asImprovementId('mine'),
+        field: 'yields.food',
+        detail: 'must not be negative',
+      });
+      expect(bad.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'improvements',
+        id: asImprovementId('mine'),
+        field: 'yields.shields',
+        detail: 'must be an integer',
+      });
+      // The commerce component is fine, so it is not complained about: one error
+      // per broken field, not one per row.
+      expect(fieldsOf(bad.error)).not.toContain('yields.commerce');
+    }
+  });
+
+  it('rejects an unknown kind', () => {
+    // `ImprovementKind` makes this a compile error in content code, so the route
+    // in is data — a JSON catalog or, as here, a patch. The engine's ordering is
+    // defined in terms of the known kinds, so an unknown one is refused by name.
+    const r = validateRuleset(
+      withImprovementRow('mine', { kind: 'farm' as ImprovementKind }),
+      'tuned',
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const error = r.error.find(
+        (e) => e.kind === 'invalid-value' && e.catalog === 'improvements' && e.field === 'kind',
+      );
+      expect(error).toBeDefined();
+      if (error?.kind === 'invalid-value') {
+        expect(error.detail).toContain('road, mine, irrigation');
+        expect(error.detail).toContain('farm');
+      }
+    }
+  });
+
+  it('rejects an improvement allowed on no terrain', () => {
+    // An empty `allowedRoles` is not "anywhere", it is "nowhere": `StartWork`
+    // checks membership, so the row would be silently unbuildable.
+    const r = validateRuleset(withImprovementRow('road', { allowedRoles: [] }), 'tuned');
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'improvements',
+        id: asImprovementId('road'),
+        field: 'allowedRoles',
+        detail: 'must list at least one terrain role',
+      });
+    }
+  });
+
+  it('reports an empty improvements catalog the way it reports any empty catalog', () => {
+    const r = validateRuleset({ ...CATALOG, improvements: [] }, 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({ kind: 'empty-catalog', catalog: 'improvements' });
+      // Nothing else is wrong with this catalog, so the one complaint is the hole.
+      expect(r.error).toEqual([{ kind: 'empty-catalog', catalog: 'improvements' }]);
+    }
+  });
+
+  it('refuses placeholder improvements in cited-only mode', () => {
+    const r = validateRuleset(CATALOG, 'cited-only');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const improvementsInCitedOnly = r.error.filter(
+        (e) => e.kind === 'placeholder-in-cited-only' && e.catalog === 'improvements',
+      );
+      expect(improvementsInCitedOnly).toHaveLength(IMPROVEMENTS.length);
+    }
+  });
+
+  it('is carried through validation, so the engine can read a row', () => {
+    const r = validateRuleset(CATALOG, 'tuned');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.improvements).toEqual([...IMPROVEMENTS]);
+      // A validated ruleset carries improvements, so it satisfies the engine's
+      // `RulesetView` — which is what lets `cityYields` read a delta at all.
+      for (const i of r.value.improvements) {
+        expect(Number.isInteger(i.turns)).toBe(true);
+        expect(Number.isInteger(i.yields.food)).toBe(true);
+      }
+    }
+  });
+});
+
 describe('terrain role coverage', () => {
   it('accepts the full catalog: every engine role is provided', () => {
     const r = validateRuleset(CATALOG, 'tuned');
@@ -412,16 +645,25 @@ describe('terrain role coverage', () => {
 });
 
 describe('provenance summary', () => {
-  it('counts every row exactly once, terrain, unit and building alike', () => {
+  it('counts every row exactly once, terrain, unit, building and improvement alike', () => {
     const s = summarizeProvenance(CATALOG);
-    expect(s.total).toBe(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
+    expect(s.total).toBe(
+      CATALOG.terrains.length + UNITS.length + BUILDINGS.length + IMPROVEMENTS.length,
+    );
     expect(s.cited + s.placeholder).toBe(s.total);
+    // The improvement rows are counted, not merely present: the report's sections
+    // and its total come from one function precisely because they once disagreed
+    // (M2 F4), so a catalog added to `Catalog` without a section would show up
+    // here as a total that is too small.
+    expect(s.total).toBeGreaterThan(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
   });
 
   it('is honest about the current state: nothing is cited yet', () => {
     const s = summarizeProvenance(CATALOG);
     expect(s.cited).toBe(0);
-    expect(s.placeholder).toBe(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
+    expect(s.placeholder).toBe(
+      CATALOG.terrains.length + UNITS.length + BUILDINGS.length + IMPROVEMENTS.length,
+    );
   });
 
   /**
@@ -442,6 +684,7 @@ describe('provenance summary', () => {
         ...CATALOG.terrains.map((t) => t.id),
         ...UNITS.map((u) => u.id),
         ...BUILDINGS.map((b) => b.id),
+        ...IMPROVEMENTS.map((i) => i.id),
       ]);
     });
 
@@ -452,7 +695,12 @@ describe('provenance summary', () => {
       const total = sections.reduce((n, s) => n + s.summary.total, 0);
       const placeholder = sections.reduce((n, s) => n + s.summary.placeholder, 0);
 
-      expect(sections.map((s) => s.name)).toEqual(['terrains', 'units', 'buildings']);
+      expect(sections.map((s) => s.name)).toEqual([
+        'terrains',
+        'units',
+        'buildings',
+        'improvements',
+      ]);
       expect(total).toBe(summary.total);
       expect(placeholder).toBe(summary.placeholder);
       expect(summary.cited).toBe(summary.total - summary.placeholder);
@@ -469,6 +717,7 @@ describe('provenance summary', () => {
       expect(sectionOf(CATALOG, 'terrains')?.summary.total).toBe(CATALOG.terrains.length);
       expect(sectionOf(CATALOG, 'units')?.summary.total).toBe(UNITS.length);
       expect(sectionOf(CATALOG, 'buildings')?.summary.total).toBe(BUILDINGS.length);
+      expect(sectionOf(CATALOG, 'improvements')?.summary.total).toBe(IMPROVEMENTS.length);
     });
 
     it('counts a cited unit row as cited, not as a missing row', () => {
@@ -481,7 +730,9 @@ describe('provenance summary', () => {
       };
 
       const summary = summarizeProvenance(cited);
-      expect(summary.total).toBe(CATALOG.terrains.length + UNITS.length + BUILDINGS.length);
+      expect(summary.total).toBe(
+        CATALOG.terrains.length + UNITS.length + BUILDINGS.length + IMPROVEMENTS.length,
+      );
       expect(summary.cited).toBe(1);
       expect(summary.placeholder).toBe(summary.total - 1);
 
@@ -491,6 +742,7 @@ describe('provenance summary', () => {
       expect(sectionOf(cited, 'units')?.summary.cited).toBe(1);
       expect(sectionOf(cited, 'units')?.summary.placeholder).toBe(UNITS.length - 1);
       expect(sectionOf(cited, 'buildings')?.summary.cited).toBe(0);
+      expect(sectionOf(cited, 'improvements')?.summary.cited).toBe(0);
     });
   });
 });

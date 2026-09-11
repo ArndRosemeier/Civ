@@ -15,6 +15,12 @@
  *   through the real CLI with stdin closed, so `play` can never hang a pipeline.
  * - **The REPL never mutates state.** Commands run against a frozen state, and a
  *   second run from the same input reaches the same final hash.
+ * - **M4a: the worker surface is a third copy of the same arrangement.** `work
+ *   <unitId> <improvementId>` and `cancel <unitId>` build exactly one `Command`
+ *   each and hand it to the engine, every refusal is the engine's typed reason, and
+ *   what a unit is *doing* shows up wherever a unit shows up — the `units:` line,
+ *   the `units` table and the `state` view. `work` keeps M3's city reading (the
+ *   second argument tells the two apart) and both readings are pinned.
  *
  * The synthetic 4x4 map is deliberate: small enough that the expected transcript
  * stays readable, and it puts every interesting case next to the unit —
@@ -33,6 +39,7 @@ import {
   SCHEMA_VERSION,
   asBuildingId,
   asCityId,
+  asImprovementId,
   asPlayerId,
   asTerrainId,
   asUnitId,
@@ -144,7 +151,44 @@ const syntheticState = (): GameState => ({
   ],
   nextCityId: 0,
   cities: [],
+  // M4a: nothing is built yet, and the key is an *empty array* rather than absent —
+  // `improvements` is part of every state hash, and `canonicalize` refuses
+  // `undefined` (the trap that cost M2's `Settings.ruleset` and M3's
+  // `City.production` a bug hunt each). `workerState` below is where a job appears.
+  improvements: [],
 });
+
+/**
+ * The synthetic board plus one worker of player 0's, standing on the hills at
+ * (2,2) with a full allowance of movement and no job yet.
+ *
+ * The worker exists for the M4a surface: `work <unitId> <improvementId>` and
+ * `cancel <unitId>`, and the job that then shows up in the `units:` line, the
+ * `units` table and the `state` view. (2,2) is deliberately the *hills* tile: it is
+ * the one tile on this board where a mine is allowed but irrigation is not, so a
+ * refusal about terrain has somewhere to happen.
+ *
+ * An idle unit carries **no** `work` key: `withWork` is the only writer of that
+ * field and it is never handed `undefined`, because a present-but-`undefined` key
+ * cannot survive a JSON round trip and would make the state unhashable.
+ */
+const workerState = (): GameState => {
+  const base = syntheticState();
+  return {
+    ...base,
+    nextUnitId: 3,
+    units: [
+      ...base.units,
+      {
+        id: asUnitId(2),
+        type: asUnitTypeId('worker'),
+        owner: asPlayerId(0),
+        tile: tileIndex(WIDTH, 2, 2),
+        movementLeft: 2,
+      },
+    ],
+  };
+};
 
 /** A state whose explored rows are all `false`: the viewer sees nothing. */
 const blindState = (): GameState => ({
@@ -260,6 +304,46 @@ const expectEveryEventRendered = (outcome: LineOutcome, text: string): readonly 
 };
 
 /**
+ * The same regression without the events list: **no `ok:` block may contain a
+ * blank line**.
+ *
+ * `expectEveryEventRendered` above proves it for one command whose events the test
+ * already knows. This walks a whole transcript instead, which is how the M4a work
+ * events are covered end to end — `WorkStarted`, `WorkCancelled` and
+ * `WorkCompleted` each have to print a real line, and an unhandled member shows up
+ * here as an empty line *inside* a block (or as a block that runs into the revision
+ * line with nothing in it).
+ */
+const expectNoBlankEventLines = (text: string): void => {
+  const lines = text.split('\n');
+  let blocks = 0;
+
+  // Anchored on the revision line rather than on the block's first `ok: ` line: an
+  // event that renders as `''` produces no `ok: ` line at all, so a scan that looks
+  // for one simply *skips* the very block it was meant to catch. Everything before a
+  // revision line, back to the echoed command, is that command's events.
+  for (const [index, line] of lines.entries()) {
+    if (!/^ {2}revision /.test(line)) continue;
+
+    let previous = index - 1;
+    while (previous >= 0 && (lines[previous] ?? '').startsWith('ok: ')) {
+      expect((lines[previous] ?? '').length).toBeGreaterThan('ok: '.length);
+      previous -= 1;
+    }
+
+    // At least one event, and the line before the block is the command that was
+    // echoed — never a blank line, which is exactly what a missing `case` leaves.
+    expect(index - 1 - previous).toBeGreaterThan(0);
+    expect(lines[previous] ?? '').not.toBe('');
+    blocks += 1;
+  }
+
+  expect(blocks).toBeGreaterThan(0);
+  expect(text).not.toMatch(/\nok: ?\n/);
+  expect(text).not.toMatch(/\n\n {2}revision /);
+};
+
+/**
  * The synthetic board plus a goody hut at (1,1) and a chosen RNG state: the unit
  * at (0,0) can step onto the hut, so one `move` reaches the whole hut rule —
  * including which of the three rewards the draw gives, which is `rngSeed`'s job.
@@ -320,7 +404,7 @@ const SCRIPT = ['units', 'move 0 1 1', 'move 0 2 2', 'move 0 9 9', 'wibble', 'en
 const EXPECTED_TRANSCRIPT = [
   'CivTS play - seed 7, tiny map 4x4, 2 civs',
   'you are Player 1 (p0); every view below is drawn from your fog of war',
-  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | end | units | state | save <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -336,9 +420,9 @@ const EXPECTED_TRANSCRIPT = [
   'cities: none',
   'p0> units',
   'units: 2 of 2 visible for Player 1 (p0)',
-  'm  id  type        owner        at        move     terrain      legal',
-  '*  0   Settler     Player 1     0,0       2/2      Grassland    1',
-  '   1   Settler     Player 2     0,1       2/2      Grassland    3',
+  'm  id  type        owner        at        move     terrain      job                         legal',
+  '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
+  '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -398,7 +482,7 @@ const EXPECTED_TRANSCRIPT = [
   'cities: none',
   'p0> wibble',
   'error: unknown command "wibble" - no such command.',
-  '  commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | end | units | state | save <path> | help | quit',
+  '  commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | end | units | state | save <path> | help | quit',
   '  type "help" for what each one does.',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -431,6 +515,191 @@ const EXPECTED_TRANSCRIPT = [
   'bye - the state lives in memory only unless you ran "save <path>".',
 ].join('\n');
 
+const WORKER_SCRIPT = [
+  'units',
+  'work 2 mine',
+  'state',
+  'end',
+  'cancel 2',
+  'work 2 road',
+  'end',
+  'end',
+  'units',
+  'quit',
+];
+
+const EXPECTED_WORKER_TRANSCRIPT = [
+  'CivTS play - seed 7, tiny map 4x4, 2 civs',
+  'you are Player 1 (p0); every view below is drawn from your fog of war',
+  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | end | units | state | save <path> | help | quit',
+  '',
+  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'cities: none',
+  'p0> units',
+  'units: 3 of 3 visible for Player 1 (p0)',
+  'm  id  type        owner        at        move     terrain      job                         legal',
+  '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
+  '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
+  '*  2   Worker      Player 1     2,2       2/2      Hills        (idle)                      8',
+  'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'cities: none',
+  'p0> work 2 mine',
+  'ok: unit 2 started improvement "Mine" (3 turns) on (2,2): 3 turns left',
+  '  revision 1',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'work: 2 p0 Worker@2,2 mining, 3 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
+  'cities: none',
+  'p0> state',
+  'state: seed=7 turn=1 revision=1 schema=4 map=tiny(4x4) civs=2',
+  'you: 2 unit(s), explored 16/16 tiles, 16 visible right now',
+  'jobs: 2 Worker@2,2 mining, 3 turns left',
+  'civs: Player 1 (p0) <- you, Player 2 (p1)',
+  'rng: a=-456573687 b=-84222363 c=801465066 d=1648156487',
+  'hash: b7b4f66082f55c25',
+  'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'work: 2 p0 Worker@2,2 mining, 3 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
+  'cities: none',
+  'p0> end',
+  'ok: turn 2 begins; every unit refilled its movement',
+  '  revision 2',
+  'CivTS state: seed=7 turn=2 revision=2 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'work: 2 p0 Worker@2,2 mining, 2 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement) mining, 2 turns left',
+  'cities: none',
+  'p0> cancel 2',
+  'ok: unit 2 stopped improvement "Mine" (3 turns) on (2,2) (cancelled), 2 turns of work lost',
+  '  revision 3',
+  'CivTS state: seed=7 turn=2 revision=3 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'cities: none',
+  'p0> work 2 road',
+  'ok: unit 2 started improvement "Road" (2 turns) on (2,2): 2 turns left',
+  '  revision 4',
+  'CivTS state: seed=7 turn=2 revision=4 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'work: 2 p0 Worker@2,2 building a road, 2 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) building a road, 2 turns left',
+  'cities: none',
+  'p0> end',
+  'ok: turn 3 begins; every unit refilled its movement',
+  '  revision 5',
+  'CivTS state: seed=7 turn=3 revision=5 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'work: 2 p0 Worker@2,2 building a road, 1 turn left',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement) building a road, 1 turn left',
+  'cities: none',
+  'p0> end',
+  'ok: unit 2 finished improvement "Road" (2 turns) on (2,2); the tile is improved',
+  'ok: turn 4 begins; every unit refilled its movement',
+  '  revision 6',
+  'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'cities: none',
+  'p0> units',
+  'units: 3 of 3 visible for Player 1 (p0)',
+  'm  id  type        owner        at        move     terrain      job                         legal',
+  '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
+  '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
+  '*  2   Worker      Player 1     2,2       2/2      Hills        (idle)                      8',
+  'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0',
+  'view: x 0..3, y 0..3 (4x4 of 4x4)',
+  '  |0',
+  '  |0123',
+  '0 |0^,,',
+  '1 |1,,,',
+  '2 |,,h,',
+  '3 |,,,,',
+  'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
+  'starts: 0=Player 1@0,0  1=Player 2@0,1',
+  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'cities: none',
+  'p0> quit',
+  'bye - the state lives in memory only unless you ran "save <path>".',
+].join('\n');
+
 describe('the REPL transcript', () => {
   it('is exactly this, for a fixed state and script', () => {
     // The fixture is pinned as well as its rendering: if the shape of
@@ -442,7 +711,7 @@ describe('the REPL transcript', () => {
     // state hash moved. b9166aa11541451a -> d270dc95982b4fdb. The *transcript*
     // did not move: this fixture's two players are both civilizations, so
     // nothing that lists players changed for it.
-    expect(hashValue(syntheticState())).toBe('d270dc95982b4fdb');
+    expect(hashValue(syntheticState())).toBe('15920e8782c85ecd');
 
     const capture = open();
     runScript(capture.session, SCRIPT.join('\n'), capture.write);
@@ -468,9 +737,11 @@ describe('the REPL transcript', () => {
     // refused or malformed, so the final revision is exactly 2.
     expect(capture.session.state.revision).toBe(2);
     expect(capture.session.state.turn).toBe(2);
-    // Rehashed for M3: 416a43bd669192b4 -> 880e2d6fa2c828dd (see the fixture hash
-    // above for why the state shape, not the transcript, moved).
-    expect(hashValue(capture.session.state)).toBe('880e2d6fa2c828dd');
+    // Rehashed for M4a (SCHEMA_VERSION 3 -> 4): the state gained `improvements`,
+    // and an additive field moves *every* state hash. 880e2d6fa2c828dd ->
+    // 73edef6a26a57a1f. The transcript above is unchanged by this one: `describe`
+    // reads the job on a *unit*, and no unit on this board is working.
+    expect(hashValue(capture.session.state)).toBe('73edef6a26a57a1f');
   });
 });
 
@@ -522,6 +793,18 @@ describe('a command that does not apply', () => {
       'build 0 tile:scout', // not a kind of thing to build
       'build 0 unit:wibble', // no such item, and no city either
       'build 9 unit:scout', // no such city
+      // The M4a worker verbs, same rule: a bad argument, a missing unit, a unit that
+      // is not a worker, a job that cannot start and a `cancel` on an idle unit are
+      // all refusals or malformed lines, and none of them touches the state.
+      'work 2 mine', // no such unit on this board
+      'work 0 mine', // a settler is not a worker
+      'work 0', // the city reading: no such city
+      'work 0 mine extra', // the worker reading takes one improvement id
+      'cancel', // needs a unit id
+      'cancel 0 extra', // and only one
+      'cancel x', // not a number
+      'cancel 0', // not working: a refusal, never a silent no-op
+      'cancel 9', // no such unit
     ];
 
     for (const line of lines) {
@@ -636,7 +919,9 @@ describe('commands', () => {
 
     expect(capture.session.state).not.toBe(state);
     expect(hashValue(state)).toBe(before);
-    expect(hashValue(state)).toBe('d270dc95982b4fdb');
+    // Rehashed for M4a: the fixture gained `improvements: []` (see the transcript
+    // hash above).
+    expect(hashValue(state)).toBe('15920e8782c85ecd');
 
     // Same input, same result: the session holds no hidden state of its own.
     const fresh = open();
@@ -1236,6 +1521,285 @@ const stateOf = (envelope: unknown): unknown => {
 };
 
 /* ------------------------------------------------------------------ *
+ * M4a: the worker surface — `work <unitId> <improvementId>`, `cancel <unitId>`
+ *
+ * The verbs are thin (`applyCommand` decides everything), so what is worth
+ * pinning is the arrangement: one command built per line, every refusal the
+ * engine's own typed reason, the job visible wherever a unit is visible, and an
+ * `ok:` line for each of the three work events. The pinned `workerState`
+ * transcript above is the whole-session fixture; these are the pieces.
+ * ------------------------------------------------------------------ */
+
+/** A session on the board with a worker, the way every test below wants it. */
+const openWorker = (): Capture => open({ state: workerState() });
+
+/** The worker's job, read out of the state — `undefined` when it has none. */
+const jobOf = (capture: Capture, id = 2) =>
+  capture.session.state.units.find((unit) => Number(unit.id) === id)?.work;
+
+describe('the worker verbs', () => {
+  it('builds the engine command rather than editing the state', () => {
+    const capture = openWorker();
+
+    const started = capture.session.run('work 2 mine');
+    expect(started.kind).toBe('applied');
+    expect(started.kind === 'applied' ? started.command : undefined).toEqual({
+      type: 'StartWork',
+      unitId: asUnitId(2),
+      kind: asImprovementId('mine'),
+    });
+
+    // The engine wrote the job, not the REPL: the tile, the count and the unit are
+    // the applier's, and `revision` moved exactly once.
+    expect(jobOf(capture)).toEqual({
+      kind: asImprovementId('mine'),
+      tile: tileIndex(WIDTH, 2, 2),
+      turnsLeft: 3,
+    });
+    expect(capture.session.state.revision).toBe(1);
+
+    const cancelled = capture.session.run('cancel 2');
+    expect(cancelled.kind).toBe('applied');
+    expect(cancelled.kind === 'applied' ? cancelled.command : undefined).toEqual({
+      type: 'CancelWork',
+      unitId: asUnitId(2),
+    });
+    // An idle unit carries no `work` key at all — never one holding `undefined`,
+    // which cannot survive a JSON round trip and would make the state unhashable.
+    expect(jobOf(capture)).toBeUndefined();
+    expect(Object.hasOwn(capture.session.state.units[2] ?? {}, 'work')).toBe(false);
+    expect(capture.session.state.revision).toBe(2);
+  });
+
+  it('advances a job a turn at a time and finishes it on the turn it is owed', () => {
+    const capture = openWorker();
+    expect(capture.session.run('work 2 mine').kind).toBe('applied');
+
+    // A mine takes three turns: two `end`s leave work in progress, the third
+    // completes it — and completion is a `WorkCompleted` *event*, which is how a
+    // consumer learns about it (there is no "job vanished" diff to read).
+    capture.clear();
+    const first = capture.session.run('end');
+    expect(jobOf(capture)?.turnsLeft).toBe(2);
+    expect(expectEveryEventRendered(first, capture.text())).toEqual([
+      'ok: turn 2 begins; every unit refilled its movement',
+    ]);
+
+    capture.clear();
+    capture.session.run('end');
+    expect(jobOf(capture)?.turnsLeft).toBe(1);
+
+    capture.clear();
+    const finished = capture.session.run('end');
+    expect(expectEveryEventRendered(finished, capture.text())).toEqual([
+      'ok: unit 2 finished improvement "Mine" (3 turns) on (2,2); the tile is improved',
+      'ok: turn 4 begins; every unit refilled its movement',
+    ]);
+
+    // The job is gone and the tile really is improved — the engine's own record,
+    // not a REPL bookkeeping field.
+    expect(jobOf(capture)).toBeUndefined();
+    expect(capture.session.state.improvements).toEqual([
+      { tile: tileIndex(WIDTH, 2, 2), kind: asImprovementId('mine') },
+    ]);
+  });
+
+  it('cancels a job when the worker walks away from the tile', () => {
+    const capture = openWorker();
+    capture.session.run('work 2 mine');
+    capture.session.run('end'); // refills movement, leaves two turns of work
+    capture.clear();
+
+    const moved = capture.session.run('move 2 1 1');
+
+    // A step invalidates the job (M4a: work happens on a tile by a unit standing
+    // there), and the *event* is how a reader learns it — not the absence of a job.
+    expect(expectEveryEventRendered(moved, capture.text())).toEqual([
+      'ok: unit 2 moved to (1,1), cost 1, 1 movement left',
+      'ok: unit 2 stopped improvement "Mine" (3 turns) on (2,2) (the unit moved), 2 turns of work lost',
+    ]);
+    expect(jobOf(capture)).toBeUndefined();
+    expect(capture.session.state.improvements).toEqual([]);
+  });
+
+  it('reports the engine’s typed reason for every way a job is refused', () => {
+    const capture = openWorker();
+
+    // A settler is not a worker, whatever it is standing on.
+    expect(refusal(capture.session.run('work 0 mine')).kind).toBe('not-a-worker');
+    // No such unit, and not yours.
+    expect(refusal(capture.session.run('work 9 mine')).kind).toBe('unknown-unit');
+    expect(refusal(capture.session.run('work 1 road')).kind).toBe('not-your-unit');
+    // …and an improvement no catalog row defines.
+    expect(refusal(capture.session.run('work 2 wibble')).kind).toBe('unknown-improvement');
+    expect(capture.session.run('work 2 mine').kind).toBe('applied');
+    expect(refusal(capture.session.run('work 2 road')).kind).toBe('already-working');
+    expect(capture.session.run('end').kind).toBe('applied');
+    expect(refusal(capture.session.run('work 2 road')).kind).toBe('already-working');
+    expect(capture.session.run('end').kind).toBe('applied');
+    expect(capture.session.run('end').kind).toBe('applied'); // the mine completes
+    // Now it is idle again, and the tile carries a mine: building one twice is
+    // refused rather than quietly ignored.
+    expect(refusal(capture.session.run('work 2 mine')).kind).toBe('already-improved');
+    // Nothing to cancel on an idle unit — a command aimed at a state that does not
+    // exist, which the typed refusal is what tells a client about.
+    expect(refusal(capture.session.run('cancel 2')).kind).toBe('not-working');
+    expect(refusal(capture.session.run('cancel 0')).kind).toBe('not-working');
+    expect(refusal(capture.session.run('cancel 9')).kind).toBe('unknown-unit');
+    expect(refusal(capture.session.run('cancel 1')).kind).toBe('not-your-unit');
+
+    // A worker with no movement left cannot start at all: the job spends whatever
+    // the unit had, so the smallest amount that would have made it legal is 1.
+    const tired: GameState = {
+      ...workerState(),
+      units: workerState().units.map((unit) =>
+        Number(unit.id) === 2 ? { ...unit, movementLeft: 0 } : unit,
+      ),
+    };
+    const idle = open({ state: tired });
+    expect(refusal(idle.session.run('work 2 mine')).kind).toBe('not-enough-movement');
+  });
+
+  it('refuses an improvement the terrain does not allow, and says what would', () => {
+    // Step the worker onto grassland at (1,1): a mine is not allowed there, and the
+    // lesson under the refusal has to come from the catalog, not from a second
+    // statement of the rule in this file.
+    const worker = openWorker();
+    expect(worker.session.run('move 2 1 1').kind).toBe('applied');
+    worker.clear();
+
+    const line = worker.session.run('work 2 mine');
+    expect(refusal(line).kind).toBe('improvement-not-allowed');
+    expect(worker.text()).toContain('cannot be built at (1,1)');
+    expect(worker.text()).toContain('this terrain role allows: road, irrigation');
+    // …and the same tile really does take an irrigation job, so the refusal was
+    // about the improvement and not about the worker.
+    expect(worker.session.run('work 2 irrigation').kind).toBe('applied');
+  });
+
+  it('tells `work <unitId> <improvementId>` apart from `work <cityId> <x> <y>`', () => {
+    // A word after the id is an improvement id; numbers are coordinates. This is
+    // the one ambiguous reading in the grammar, so both halves are pinned.
+    const worded = openWorker();
+    const start = worded.session.run('work 2 mine');
+    expect(start.kind === 'applied' ? start.command.type : undefined).toBe('StartWork');
+
+    const numbers = open();
+    numbers.session.run('found 0');
+    const assignment = numbers.session.run('work 0 1 1');
+    expect(assignment.kind === 'applied' ? assignment.command.type : undefined).toBe(
+      'SetWorkedTiles',
+    );
+    // …and a lone coordinate is still the *city* form's half-pair error, not a
+    // silently accepted improvement id.
+    const half = open();
+    half.session.run('found 0');
+    expect(half.session.run('work 0 1').kind).toBe('malformed');
+    expect(half.text()).toContain('usage: work 0 <improvementId>');
+  });
+
+  it('shows the job in the units line, the units table and the state view', () => {
+    const capture = openWorker();
+    capture.clear();
+    capture.session.run('work 2 mine');
+
+    const text = capture.text();
+    // The line under every view: position, movement *and* the job, so "what is my
+    // worker doing?" needs no second command. Pinned whole, because the job has to
+    // sit *after* the movement it spent rather than replacing it.
+    const unitsLine = text.split('\n').find((line) => line.startsWith('units: ')) ?? '';
+    expect(unitsLine).toBe(
+      'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  ' +
+        '*2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
+    );
+    // `describe`'s own line (see textview.test.ts): the agent's eyes on the map.
+    expect(text).toContain('work: 2 p0 Worker@2,2 mining, 3 turns left');
+
+    capture.clear();
+    capture.session.run('units');
+    expect(capture.text()).toContain('job');
+    expect(capture.text()).toContain('mining, 3 turns left');
+    expect(capture.text()).toContain(
+      'Settler     Player 2     0,1       2/2      Grassland    (idle)',
+    );
+
+    capture.clear();
+    capture.session.run('state');
+    expect(capture.text()).toContain('jobs: 2 Worker@2,2 mining, 3 turns left');
+
+    // An idle board says so, in the same place and in the same words.
+    const idle = openWorker();
+    idle.clear();
+    idle.session.run('state');
+    expect(idle.text()).toContain('jobs: none of your units is working');
+  });
+
+  it('names a working unit in the prose of a refusal about it', () => {
+    const capture = openWorker();
+    capture.session.run('work 2 mine');
+    capture.clear();
+
+    capture.session.run('work 2 road');
+
+    // The label carries the job, because "why can this worker not start a job?" is
+    // answered by the job it already has — and so does the per-unit units line.
+    expect(capture.text()).toContain('mining, 3 turns left');
+    capture.clear();
+    capture.session.run('move 9 1 1');
+    expect(capture.text()).toContain('2 Worker at 2,2 (0 movement left, mining, 3 turns left)');
+  });
+
+  it('renders every work event as a real line, never a blank one', () => {
+    // The regression this file exists to keep, at the level of the whole session:
+    // an event member with no `case` joins into the `ok:` block as an *empty* line,
+    // which reads like a formatting choice rather than a missing renderer. Every
+    // block in the M4a transcript must be `ok: ` lines and nothing else.
+    const capture = openWorker();
+    runScript(capture.session, WORKER_SCRIPT.join('\n'), capture.write);
+
+    expectNoBlankEventLines(capture.text());
+    // …and the three M4a members are in there, each on its own line.
+    expect(capture.text()).toContain('ok: unit 2 started improvement "Mine" (3 turns)');
+    expect(capture.text()).toContain('ok: unit 2 stopped improvement "Mine" (3 turns)');
+    expect(capture.text()).toContain('ok: unit 2 finished improvement "Road" (2 turns)');
+
+    // The same sweep over the sessions that reach the *other* event members: a
+    // blank line is a property of a block, and this is the widest net for it.
+    const plain = open();
+    runScript(plain.session, SCRIPT.join('\n'), plain.write);
+    expectNoBlankEventLines(plain.text());
+    const hut = open({ state: hutState(3) });
+    runScript(hut.session, ['move 0 1 1', 'units', 'end', 'quit'].join('\n'), hut.write);
+    expectNoBlankEventLines(hut.text());
+  });
+
+  it('is byte-identical across two runs of the same worker script', () => {
+    const first = openWorker();
+    runScript(first.session, WORKER_SCRIPT.join('\n'), first.write);
+    const second = openWorker();
+    runScript(second.session, WORKER_SCRIPT.join('\n'), second.write);
+
+    // The same guarantee the main transcript makes, for the session that actually
+    // exercises the work events: two fresh sessions, one transcript, byte for byte.
+    expect(first.text()).toBe(second.text());
+    expect(first.text()).toBe(`${EXPECTED_WORKER_TRANSCRIPT}\n`);
+    expect(hashValue(first.session.state)).toBe('9dac80e9663b8231');
+  });
+
+  it('documents the worker verbs in help and in the command summary', () => {
+    const capture = open();
+    capture.clear();
+    capture.session.run('help');
+
+    expect(capture.text()).toContain('work <unitId> <improvementId>');
+    expect(capture.text()).toContain('cancel <unitId>');
+    expect(capture.text()).toContain('work <cityId> <x> <y> ...');
+    expect(COMMAND_SUMMARY).toContain('work <unitId> <improvementId>');
+    expect(COMMAND_SUMMARY).toContain('cancel <unitId>');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * Flags
  * ------------------------------------------------------------------ */
 
@@ -1516,7 +2080,96 @@ describe('the play command', () => {
       // rules, the turn pipeline or the generator moves it, and moving it has to be
       // deliberate — `hashValue(session.state)` alone would only prove the CLI and
       // this process agreed, not that either still plays the same game.
-      expect(first.stdout).toContain('hash: 3d72c9af7146e389');
+      //
+      // Rehashed for M4a (SCHEMA_VERSION 3 -> 4), deliberately: every state now
+      // carries `improvements`, so 3d72c9af7146e389 -> d7caab78d25b1473. The
+      // transcript this pin belongs to did not otherwise move.
+      expect(first.stdout).toContain('hash: d7caab78d25b1473');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('puts a worker on a job, shows it and cancels it, through the real CLI', () => {
+    // The M4a surface end to end, on a generated world: the city produces a worker,
+    // the worker starts a road, the `units:` line and the `state` view both say what
+    // it is doing, and `cancel` gives the job up. The script is derived from the
+    // engine's own state (the produced unit's id, the city's tile), never from
+    // numbers typed in by hand, so it stays a session on *this* world.
+    const setup = newGame(
+      42,
+      { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2, seed: 42 },
+      RULESET,
+    );
+    if (!setup.ok) throw new Error(`newGame failed: ${setup.error.kind}`);
+
+    const state = setup.value;
+    const settler = state.units.find((unit) => unit.owner === asPlayerId(0));
+    if (settler === undefined) throw new Error('player 0 has no settler');
+
+    // Ids are dense and monotonic (M2): the worker the city produces takes the id
+    // `newGame` left in `nextUnitId`, and nothing else is created on this board.
+    const workerId = String(state.nextUnitId);
+    const at = `(${String(indexToX(state.map, settler.tile))},${String(indexToY(state.map, settler.tile))})`;
+
+    const lines = [
+      `found ${String(settler.id)}`,
+      'build 0 unit:worker',
+      'end',
+      'end',
+      'end',
+      'units',
+      `work ${workerId} road`,
+      'state',
+      'end',
+      `cancel ${workerId}`,
+      'units',
+      'quit',
+    ];
+
+    const dir = mkdtempSync(join(tmpdir(), 'civts-repl-worker-'));
+    try {
+      const script = join(dir, 'session.txt');
+      writeFileSync(script, `${lines.join('\n')}\n`, 'utf8');
+      const args = [
+        'play',
+        '--seed',
+        '42',
+        '--map-size',
+        'duel',
+        '--civs',
+        '2',
+        '--script',
+        script,
+      ];
+
+      const first = runCli(args, '');
+      const second = runCli(args, '');
+
+      expect(first.status).toBe(0);
+      expect(first.stderr).not.toContain('fatal');
+      expect(first.stdout).toBe(second.stdout); // two fresh processes, one transcript
+
+      expect(first.stdout).toContain('ok: city 0 "City 1"');
+      expect(first.stdout).toContain(
+        `ok: unit ${workerId} started improvement "Road" (2 turns) on ${at}`,
+      );
+      // The job is visible in both of the places a reader looks: the one-line
+      // summary under every view, and the `state` view's own `jobs:` line.
+      expect(first.stdout).toContain(
+        `units: *${workerId} p0 Worker @${at.slice(1, -1)} (0/2 movement) building a road, 2 turns left`,
+      );
+      expect(first.stdout).toContain(
+        `jobs: ${workerId} Worker@${at.slice(1, -1)} building a road, 2 turns left`,
+      );
+      expect(first.stdout).toContain(
+        `ok: unit ${workerId} stopped improvement "Road" (2 turns) on ${at}`,
+      );
+      expect(first.stdout).toContain('building a road, 1 turn left'); // after one `end`
+
+      // The whole-transcript form of the blank-line regression, over a real CLI run.
+      expectNoBlankEventLines(first.stdout);
+      expect(first.stdout).not.toMatch(/undefined|NaN/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1617,7 +2270,7 @@ const printedRows = (printed: PrintedProvenance): readonly PrintedRow[] =>
   printed.sections.flatMap((section) => section.rows);
 
 describe('the provenance command', () => {
-  it('lists every row its totals count — terrain, unit and building alike', () => {
+  it('lists every row its totals count — terrain, unit, building and improvement alike', () => {
     const run = runCli(['provenance'], '');
 
     expect(run.status).toBe(0);
@@ -1635,11 +2288,15 @@ describe('the provenance command', () => {
     // M3 added a third catalog (buildings), which the same claim now covers: the
     // report is the honesty surface for the M3 numbers, so a section it forgot
     // would be exactly the kind of unstated guess the rule exists to prevent.
+    // M4a added the fourth catalog (improvements), and the claim covers it the same
+    // way: every row the totals count is a row this test read out of the catalog
+    // itself, so a section the report forgot — or invented — fails here.
     const rows = printedRows(printed);
     expect(rows.map((row) => row.id)).toEqual([
       ...CATALOG.terrains.map((t) => t.id),
       ...CATALOG.units.map((u) => u.id),
       ...CATALOG.buildings.map((b) => b.id),
+      ...CATALOG.improvements.map((i) => i.id),
     ]);
 
     // …which is what makes the table and the totals agree.
@@ -1656,6 +2313,7 @@ describe('the provenance command', () => {
       'terrains',
       'units',
       'buildings',
+      'improvements',
     ]);
 
     for (const section of printed.sections) {
@@ -1694,6 +2352,19 @@ describe('the provenance command', () => {
       expect(spec.provenance.kind).toBe('placeholder');
       if (spec.provenance.kind === 'placeholder') {
         expect(buildings?.rows[index]?.detail).toBe(spec.provenance.note);
+      }
+    }
+
+    // …and for M4a's improvement rows, which is where "unsourced, chosen to be
+    // playable" has to be readable for the mine/road/irrigation numbers: no row of
+    // this catalog claims Civ 3 accuracy, and the report is where that is said.
+    const improvements = printed.sections.find((section) => section.name === 'improvements');
+    expect(improvements?.rows.map((row) => row.id)).toEqual(CATALOG.improvements.map((i) => i.id));
+    for (const [index, spec] of CATALOG.improvements.entries()) {
+      expect(spec.provenance.kind).toBe('placeholder');
+      if (spec.provenance.kind === 'placeholder') {
+        expect(improvements?.rows[index]?.detail).toBe(spec.provenance.note);
+        expect(spec.provenance.note).toContain('unsourced');
       }
     }
   }, 120_000);

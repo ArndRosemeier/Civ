@@ -34,6 +34,11 @@ import type { City } from './cities.js';
 // the single writer of the explored layer. There is no runtime cycle — `fog.ts`
 // imports `GameState` from here with `import type`, which erases.
 import { visibleTiles, withExplored } from './fog.js';
+// Type-only: `GameState` gains `improvements` in M4a, and this module never calls
+// into `improvements.ts` at runtime (the improvement *helpers* are the callers'
+// business). The import is erased, so the type-only edge cannot become a runtime
+// cycle — `improvements.ts` imports `GameState` from here the same way.
+import type { TileImprovement } from './improvements.js';
 import { asPlayerId, asTileIndex, asUnitId, type PlayerId, type TileIndex } from './ids.js';
 import {
   TERRAIN_BY_ROLE,
@@ -59,8 +64,14 @@ import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js'
  *   again, and every hash moves again for the same reason; the goldens were
  *   regenerated intentionally, through the harness's documented path, in the
  *   same commit (INTERFACES.md M3, "State shape").
+ * - 4 — M4a: adds `improvements` to the state. Additive a third time — the field
+ *   is empty at `newGame`, and an empty array in the hashed JSON is still a new
+ *   key, so every existing hash moves. Regenerated intentionally, through the
+ *   harness's documented path (`CIVTS_WRITE_GOLDENS=1`), in the same commit, with
+ *   a `rehash:` line in the commit message (INTERFACES.md M4a, "Where
+ *   improvements live").
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** What a player *is*: a civilization, or the barbarians. */
 export type PlayerKind = 'civ' | 'barbarian';
@@ -115,6 +126,21 @@ export interface GameState {
    * `newGame`: cities are founded by `FoundCity`, not by setup.
    */
   readonly cities: readonly City[];
+  /**
+   * Every improvement built on a tile, as a **sparse** list of `(tile, kind)`
+   * pairs sorted by `(tile, kind)` with no duplicates (see `improvements.ts`).
+   *
+   * Empty at `newGame`: nothing is built by setup, and a worker (M4a) is the only
+   * thing that will write here. It lives on the *state* rather than on `GameMap`
+   * so that regenerating a map cannot silently keep or drop what a civilization
+   * built on it — the map is what the world is, this is what was done to it
+   * (INTERFACES.md M4a, "Where improvements live").
+   *
+   * Sparse by design: most tiles never carry an improvement, and a dense array
+   * over the largest map would be 32 400 entries of almost entirely nothing.
+   * Absence of a pair *is* "nothing here" — there is no sentinel "none" id.
+   */
+  readonly improvements: readonly TileImprovement[];
 }
 
 export type SetupError =
@@ -384,6 +410,11 @@ export const newGame = (
     // city 0.
     nextCityId: 0,
     cities: [],
+    // M4a: nothing is built at setup. Improvements are what a worker does to the
+    // world after the game starts (`StartWork`), so the honest starting value is
+    // an empty list — and it is an *empty array*, never `undefined`, because the
+    // key is part of every state hash and `canonicalize` refuses `undefined`.
+    improvements: [],
   };
 
   return ok(initialFog(seeded));

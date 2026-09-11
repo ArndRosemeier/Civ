@@ -78,10 +78,20 @@ const UNITS: readonly UnitDef[] = [SETTLER, makeUnit('scout', 'scout', 3)];
  * catalog, so "no units" is always visibly `units: []` rather than a field left
  * off.
  */
-const RULESET: RulesetView = { terrains: TERRAINS, units: UNITS, fidelity: 'tuned' };
+const RULESET: RulesetView = {
+  terrains: TERRAINS,
+  units: UNITS,
+  improvements: [],
+  fidelity: 'tuned',
+};
 
 /** The same terrains with an empty unit catalog. */
-const NO_UNITS: RulesetView = { terrains: TERRAINS, units: [], fidelity: 'tuned' };
+const NO_UNITS: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  improvements: [],
+  fidelity: 'tuned',
+};
 
 /** A duel map (40x40) with two civilizations: small, fast, and enough land. */
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
@@ -208,6 +218,19 @@ describe('newGame', () => {
     expect(state.nextCityId).toBe(0);
   });
 
+  it('starts with nothing built: improvements are empty at setup', () => {
+    // M4a: an improvement is something a *worker* does after the game starts, so
+    // setup has none. The field is a required, empty array — never `undefined` —
+    // because it is part of every state hash, and a key holding `undefined` could
+    // not survive a JSON round trip (the bug class M3's `City.production`
+    // documents). Improvements live on the *state* rather than on `GameMap`, so a
+    // generated map and a played world cannot be confused for one another.
+    const game = mustGame(42, SETTINGS, RULESET);
+
+    expect(game.improvements).toEqual([]);
+    expect(JSON.parse(JSON.stringify(game))).toEqual(game);
+  });
+
   it('places every civilization on a passable land tile inside the map', () => {
     const state = mustGame(99, SETTINGS, RULESET);
 
@@ -227,6 +250,7 @@ describe('newGame', () => {
       const ruleset: RulesetView = {
         terrains: TERRAINS.filter((t) => t.role !== missing),
         units: UNITS,
+        improvements: [],
         fidelity: 'tuned',
       };
       expect(TERRAIN_BY_ROLE(ruleset, missing)).toBeUndefined();
@@ -238,7 +262,12 @@ describe('newGame', () => {
   });
 
   it('reports missing-terrain-role for an entirely empty ruleset', () => {
-    const result = newGame(42, SETTINGS, { terrains: [], units: [], fidelity: 'tuned' });
+    const result = newGame(42, SETTINGS, {
+      terrains: [],
+      units: [],
+      improvements: [],
+      fidelity: 'tuned',
+    });
     expect(mustErr(result)).toEqual({ kind: 'missing-terrain-role', role: 'ocean' });
   });
 
@@ -248,6 +277,7 @@ describe('newGame', () => {
     const withoutSettler: RulesetView = {
       terrains: TERRAINS,
       units: UNITS.filter((u) => u.role !== 'settler'),
+      improvements: [],
       fidelity: 'tuned',
     };
 
@@ -267,7 +297,7 @@ describe('newGame', () => {
   it('reports the missing terrain role before the missing unit role', () => {
     // Both are wrong here; generation is the earlier boundary, so its error is
     // the one reported and the unit check never masks it.
-    const empty: RulesetView = { terrains: [], units: [], fidelity: 'tuned' };
+    const empty: RulesetView = { terrains: [], units: [], improvements: [], fidelity: 'tuned' };
     const result = newGame(42, SETTINGS, empty);
     expect(mustErr(result)).toEqual({ kind: 'missing-terrain-role', role: 'ocean' });
   });
@@ -276,6 +306,7 @@ describe('newGame', () => {
     const impassableRuleset: RulesetView = {
       terrains: TERRAINS.map((t) => ({ ...t, impassable: true })),
       units: UNITS,
+      improvements: [],
       fidelity: 'tuned',
     };
 
@@ -299,11 +330,16 @@ describe('newGame', () => {
 
   it('never throws for a hostile setup: failures are values, not exceptions', () => {
     const setups: readonly (readonly [number, Settings, RulesetView])[] = [
-      [42, SETTINGS, { terrains: [], units: [], fidelity: 'tuned' }],
+      [42, SETTINGS, { terrains: [], units: [], improvements: [], fidelity: 'tuned' }],
       [
         42,
         SETTINGS,
-        { terrains: TERRAINS.filter((t) => t.role !== 'hills'), units: UNITS, fidelity: 'tuned' },
+        {
+          terrains: TERRAINS.filter((t) => t.role !== 'hills'),
+          units: UNITS,
+          improvements: [],
+          fidelity: 'tuned',
+        },
       ],
       [
         42,
@@ -311,6 +347,7 @@ describe('newGame', () => {
         {
           terrains: TERRAINS.map((t) => ({ ...t, impassable: true })),
           units: UNITS,
+          improvements: [],
           fidelity: 'tuned',
         },
       ],

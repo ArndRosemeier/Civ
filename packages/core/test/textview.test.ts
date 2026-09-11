@@ -23,10 +23,16 @@
  * something false (see the ruling test at the bottom). And a goody hut is drawn
  * as `%` with a legend entry, under the same fog rule as everything else: a hut
  * on a tile the viewer has not explored is not revealed, not even in the legend.
+ *
+ * **M4a.** A unit in the middle of a job is named on a `work:` line of its own —
+ * what it is doing and how many turns are left — because the picture has no way to
+ * draw a *unit*, let alone its job. The line follows the same fog rule (`describe`
+ * with a `viewer`), and it is absent when nothing is being worked.
  */
 
 import { describe, expect, it } from 'vitest';
 import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
+import { asImprovementId, type ImprovementDef } from '../src/improvements.js';
 import type { RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import {
@@ -36,8 +42,8 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
-import { describe as describeState } from '../src/textview.js';
-import { type Unit, type UnitDef } from '../src/units.js';
+import { describe as describeState, workSummary } from '../src/textview.js';
+import { withWork, type Unit, type UnitDef, type UnitWork } from '../src/units.js';
 
 const ROLES: readonly TerrainRole[] = [
   'ocean',
@@ -75,10 +81,52 @@ const SETTLER: UnitDef = {
   domain: 'land',
 };
 
+/**
+ * A worker (M4a). `describe` reads it only to *name* the unit on the `work:` line,
+ * so its stats are arbitrary — but it has to be in the catalog for the line to say
+ * `Worker` rather than the raw type id.
+ */
+const WORKER: UnitDef = {
+  id: asUnitTypeId('worker'),
+  role: 'worker',
+  name: 'Worker',
+  attack: 0,
+  defense: 0,
+  movement: 1,
+  cost: 2,
+  domain: 'land',
+};
+
+/**
+ * The improvement rows the `work:` line's activity word comes from (M4a): the
+ * *kind* is the engine's vocabulary, so the row is what tells the renderer that a
+ * job on `mine` is "mining". All placeholder content, as every rules row is —
+ * these numbers are never read by `describe`.
+ */
+const IMPROVEMENTS: readonly ImprovementDef[] = [
+  {
+    id: asImprovementId('mine'),
+    kind: 'mine',
+    name: 'Mine',
+    turns: 3,
+    yields: { food: 0, shields: 1, commerce: 0 },
+    allowedRoles: ['hills', 'mountains'],
+  },
+  {
+    id: asImprovementId('road'),
+    kind: 'road',
+    name: 'Road',
+    turns: 2,
+    yields: { food: 0, shields: 0, commerce: 1 },
+    allowedRoles: ['grassland', 'plains', 'hills', 'mountains'],
+  },
+];
+
 /** The ruleset as the engine sees it in M2: terrain *and* a unit catalog. */
 const RULESET: RulesetView = {
   terrains: TERRAINS,
-  units: [SETTLER],
+  units: [SETTLER, WORKER],
+  improvements: IMPROVEMENTS,
   fidelity: 'tuned',
 };
 
@@ -88,7 +136,12 @@ const RULESET: RulesetView = {
  * field — and `describe` still draws the same picture, because it reads terrain
  * from the view and fog from the state.
  */
-const NO_UNITS: RulesetView = { terrains: TERRAINS, units: [], fidelity: 'tuned' };
+const NO_UNITS: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  improvements: [],
+  fidelity: 'tuned',
+};
 
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
@@ -167,6 +220,11 @@ const syntheticState = (
   explored: explored ?? players.map(() => fogRow([])),
   nextCityId: 0,
   cities: [],
+  // M4a: nothing is built at setup, and the key is an *empty array* rather than
+  // absent — it is part of every state hash, and `canonicalize` refuses
+  // `undefined`. None of `describe`'s picture reads it; the work *line* reads the
+  // jobs on the units instead, which is where the state says what is being built.
+  improvements: [],
 });
 
 const STATE_4x4: GameState = syntheticState([player(0, 5), player(1, 10)]);
@@ -221,6 +279,7 @@ const namedStarts = (view: string): readonly string[] =>
 const withTerrains = (terrains: readonly TerrainDef[]): RulesetView => ({
   terrains,
   units: [],
+  improvements: [],
   fidelity: 'tuned',
 });
 
@@ -493,6 +552,186 @@ describe('describe', () => {
 
     expect(glyphRows(view)).toEqual(['????', '?0??', '??1?', '????']);
     expect(view).toContain('? unknown');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4a — work in progress
+ *
+ * A worker's job is the one thing on the board that the *grid* cannot draw: the
+ * picture marks terrain, huts and start tiles, and has no per-unit marking at
+ * all. So the job is named on a line of its own, and these tests pin what that
+ * line says, when it is there, and what a viewer may see of it.
+ * ------------------------------------------------------------------ */
+
+/** The hills tile at (2,3): a mine may be built there, and it is off both starts. */
+const WORKER_TILE = 14;
+
+/** A job on the worker's own tile, as `StartWork` writes it. */
+const job = (kind: string, turnsLeft: number, tile = WORKER_TILE): UnitWork => ({
+  kind: asImprovementId(kind),
+  tile: asTileIndex(tile),
+  turnsLeft,
+});
+
+/**
+ * A unit of `type` (a worker unless a test says otherwise) owned by player 0,
+ * standing on `tile`, doing `work` when one is given. `work` is attached through
+ * `withWork`, the only writer of the field — an idle unit carries no `work` key at
+ * all, never a key holding `undefined`.
+ */
+const withWorkOn = (
+  work: UnitWork | undefined,
+  options?: { type?: string; tile?: number },
+): GameState => {
+  const base: Unit = {
+    id: asUnitId(2),
+    type: asUnitTypeId(options?.type ?? 'worker'),
+    owner: asPlayerId(0),
+    tile: asTileIndex(options?.tile ?? WORKER_TILE),
+    movementLeft: 0,
+  };
+  return {
+    ...STATE_4x4,
+    nextUnitId: 3,
+    units: [...STATE_4x4.units, work === undefined ? base : withWork(base, work)],
+  };
+};
+
+/** A working worker with an explicit id, owner and tile — for the two-worker cases. */
+const workerOn = (id: number, owner: number, tile: number, work: UnitWork): Unit =>
+  withWork(
+    {
+      id: asUnitId(id),
+      type: asUnitTypeId('worker'),
+      owner: asPlayerId(owner),
+      tile: asTileIndex(tile),
+      movementLeft: 0,
+    },
+    work,
+  );
+
+/** The same board with only the fog rows replaced — the viewer cases below. */
+const foggedAs = (state: GameState, seen: readonly number[]): GameState => ({
+  ...state,
+  explored: [fogRow(seen), fogRow([])],
+});
+
+describe('describe and work in progress', () => {
+  it('names the job of every working unit, and says nothing when none is', () => {
+    // Nothing is being worked: no line, exactly like a `% hut` legend entry that
+    // would claim a glyph that is not on the map.
+    const idle = describeState(withWorkOn(undefined), RULESET);
+    expect(idle).not.toContain('work:');
+    expect(idle).not.toContain('mining');
+
+    // A job in progress is a line of its own, under `starts:`, naming the unit by
+    // id, its owner, its type, the tile the job is on and how long it has left.
+    const working = describeState(withWorkOn(job('mine', 2)), RULESET);
+    const lines = working.split('\n').filter((line) => line !== '');
+    expect(lines[lines.length - 1]).toBe('work: 2 p0 Worker@2,3 mining, 2 turns left');
+    // …and the rest of the picture is untouched: the grid, the legend and the
+    // starts line are byte-for-byte what the same board renders with no job.
+    expect(working.replace('work: 2 p0 Worker@2,3 mining, 2 turns left\n', '')).toBe(idle);
+  });
+
+  it('says one turn when one turn is left, and names every job on one line', () => {
+    expect(describeState(withWorkOn(job('mine', 1)), RULESET)).toContain(
+      'work: 2 p0 Worker@2,3 mining, 1 turn left',
+    );
+
+    // Two workers on two tiles: both jobs, two spaces apart, in `units` order.
+    const pair: GameState = {
+      ...STATE_4x4,
+      nextUnitId: 4,
+      units: [
+        ...STATE_4x4.units,
+        workerOn(2, 0, 9, job('road', 2, 9)),
+        workerOn(3, 1, 13, job('mine', 3, 13)),
+      ],
+    };
+    expect(describeState(pair, RULESET)).toContain(
+      'work: 2 p0 Worker@1,2 building a road, 2 turns left  3 p1 Worker@1,3 mining, 3 turns left',
+    );
+  });
+
+  it('shows a job even when the start legend is switched off', () => {
+    // `showStarts` hides the markers and their legend; a job is not a start, and
+    // switching one off must not hide what the workers are doing.
+    const view = describeState(withWorkOn(job('mine', 2)), RULESET, { showStarts: false });
+
+    expect(view).not.toContain('starts:');
+    expect(view).toContain('work: 2 p0 Worker@2,3 mining, 2 turns left');
+  });
+
+  it('falls back to the raw ids for a job the ruleset cannot describe', () => {
+    // An improvement no catalog row defines: the work still *happened* — the state
+    // says so — and the renderer must not pretend the worker is idle. The id is
+    // all that is known, so the id is what is printed.
+    expect(describeState(withWorkOn(job('quarry', 2)), RULESET)).toContain(
+      'work: 2 p0 Worker@2,3 quarry, 2 turns left',
+    );
+
+    // …and a unit type the ruleset cannot name is printed as its raw id, the same
+    // rule the rest of this file applies to an unknown terrain id.
+    expect(describeState(withWorkOn(job('mine', 2), { type: 'ghost' }), RULESET)).toContain(
+      'work: 2 p0 ghost@2,3 mining, 2 turns left',
+    );
+    // A ruleset with no catalogs at all is the same case twice over: no crash, and
+    // both the type and the job are named by their ids.
+    expect(describeState(withWorkOn(job('mine', 2)), NO_UNITS)).toContain(
+      'work: 2 p0 worker@2,3 mine, 2 turns left',
+    );
+  });
+
+  it('hides a job on an unexplored tile from a viewer, and counts it', () => {
+    // Player 0 has explored tiles 4, 5, 6 and 9 (the same blob the fog block below
+    // uses); the hills at 14 are not among them, so the job there is not knowledge
+    // this player has.
+    const seen = describeState(foggedAs(withWorkOn(job('mine', 2)), [4, 5, 6, 9]), RULESET, {
+      viewer: asPlayerId(0),
+    });
+
+    // The *existence* of unseen work is counted, exactly as an unexplored start is
+    // (`starts: … (+1 unexplored)`): the count is a number, and it is the only
+    // thing about the hidden job that reaches the screen.
+    expect(seen).toContain('work: (+1 unexplored)');
+    expect(seen).not.toContain('Worker@');
+    expect(seen).not.toContain('mining');
+    expect(seen).not.toContain('2,3');
+
+    // The strongest form of "does not leak the content": two *different* hidden
+    // jobs, on two different unexplored tiles, render the same bytes — so nothing
+    // about a job the viewer cannot see can influence the output at all.
+    const other = foggedAs(withWorkOn(job('road', 7, 13), { tile: 13 }), [4, 5, 6, 9]);
+    expect(describeState(other, RULESET, { viewer: asPlayerId(0) })).toBe(seen);
+
+    // …and the same job, on a tile the viewer *has* explored, is shown in full.
+    const inSight = foggedAs(withWorkOn(job('mine', 2, 9), { tile: 9 }), [4, 5, 6, 9]);
+    expect(describeState(inSight, RULESET, { viewer: asPlayerId(0) })).toContain(
+      'work: 2 p0 Worker@1,2 mining, 2 turns left',
+    );
+  });
+
+  it('renders the job of a unit in the state, never the state of the world', () => {
+    // A job's line is a pure function of the state: the same state renders the same
+    // line, and adding a job changes exactly one line of the picture.
+    const first = describeState(withWorkOn(job('mine', 2)), RULESET);
+
+    expect(describeState(withWorkOn(job('mine', 2)), RULESET)).toBe(first);
+    expect(first).not.toBe(describeState(withWorkOn(job('mine', 1)), RULESET));
+    expect(first).not.toBe(describeState(withWorkOn(job('road', 2)), RULESET));
+  });
+
+  it('describes one job as prose, from the catalog and the state alone', () => {
+    // The exported helper the REPL prints too, pinned phrase by phrase: the verb
+    // comes from the improvement's kind, and the count is the state's.
+    expect(workSummary(RULESET, job('mine', 2))).toBe('mining, 2 turns left');
+    expect(workSummary(RULESET, job('mine', 1))).toBe('mining, 1 turn left');
+    expect(workSummary(RULESET, job('road', 3))).toBe('building a road, 3 turns left');
+    // Nothing in the catalog describes `quarry`, so the id stands in for the verb.
+    expect(workSummary(RULESET, job('quarry', 2))).toBe('quarry, 2 turns left');
+    expect(workSummary(NO_UNITS, job('mine', 2))).toBe('mine, 2 turns left');
   });
 });
 

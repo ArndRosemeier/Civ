@@ -1,20 +1,30 @@
 /**
- * Unit lookups (INTERFACES.md M2, "Core — units, movement, fog").
+ * Unit lookups (INTERFACES.md M2, "Core — units, movement, fog") and the M4a
+ * `withWork` / `withoutWork` rebuilds that attach and detach a worker's job
+ * (INTERFACES.md M4a, "Workers").
  *
- * These tests are about the *lookups*, so they run against a small hand-built
- * `GameState` instead of a generated one: a 4x4 map with three units, two of them
- * stacked on the same tile. That makes every assertion readable as "on this
- * board, asking this question gives that answer", and it keeps the file
- * independent of generation, which `state.test.ts` covers.
+ * These tests are about the *lookups* and the two pure unit rebuilds, so they run
+ * against a small hand-built `GameState` instead of a generated one: a 4x4 map
+ * with three units, two of them stacked on the same tile. That makes every
+ * assertion readable as "on this board, asking this question gives that answer",
+ * and it keeps the file independent of generation, which `state.test.ts` covers.
  *
  * The state literal is deliberately a full `GameState` (including the M2
- * `nextUnitId` / `units` / `explored` fields): a partial object would typecheck
- * only through a cast, and a cast here would hide exactly the drift these tests
- * exist to catch.
+ * `nextUnitId` / `units` / `explored` fields and M3's cities and M4a's
+ * improvements): a partial object would typecheck only through a cast, and a cast
+ * here would hide exactly the drift these tests exist to catch.
+ *
+ * The work field is the one place this file reaches for the hasher: M4a's hardest
+ * rule is that an idle unit has **no** `work` key rather than a key holding
+ * `undefined` (three earlier milestones lost a bug hunt to that spelling), and
+ * `canonicalize` throwing on `undefined` is the only assertion that actually
+ * proves it.
  */
 
 import { describe, expect, it } from 'vitest';
+import { canonicalize, hashValue } from '@civts/testing';
 import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
+import { asImprovementId } from '../src/improvements.js';
 import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
@@ -24,9 +34,12 @@ import {
   unitCatalog,
   unitDef,
   unitsOnTile,
+  withWork,
+  withoutWork,
   type Unit,
   type UnitDef,
   type UnitRole,
+  type UnitWork,
 } from '../src/units.js';
 
 const ROLES: readonly TerrainRole[] = [
@@ -69,6 +82,12 @@ const DEFS: readonly UnitDef[] = [SETTLER, SCOUT, WARRIOR];
 const RULESET: RulesetView = {
   terrains: TERRAINS,
   units: DEFS,
+  // M4a: the catalog is a required field of a view. These tests are about unit
+  // *lookups*, and every helper they exercise (`withWork`/`withoutWork` included)
+  // reads a kind off a job rather than resolving it through a catalog, so "no
+  // improvements ship in this stand-in" is the honest value — and it is stated as
+  // an empty catalog rather than omitted, which the type would reject anyway.
+  improvements: [],
   fidelity: 'tuned',
 };
 
@@ -79,7 +98,12 @@ const RULESET: RulesetView = {
  * ships no units states `units: []`. This is the shape to test against: every
  * unit lookup must miss cleanly rather than reading a missing field.
  */
-const NO_UNITS_RULESET: RulesetView = { terrains: TERRAINS, units: [], fidelity: 'tuned' };
+const NO_UNITS_RULESET: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  improvements: [],
+  fidelity: 'tuned',
+};
 
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
@@ -107,6 +131,17 @@ const unit = (id: number, owner: number, tile: number, movementLeft: number): Un
   movementLeft,
 });
 
+/**
+ * The job the fixture worker is doing, in M4a's shape. `turnsLeft: 3` is a
+ * constructor argument of the test, not a claim about Civ 3: the engine carries
+ * whatever the catalog's `turns` said, and nothing in this file resolves it.
+ */
+const WORK: UnitWork = {
+  kind: asImprovementId('mine'),
+  tile: asTileIndex(5),
+  turnsLeft: 3,
+};
+
 /** Three units: 0 and 1 share tile 5 (player 0's start), 2 sits alone on tile 10. */
 const UNITS: readonly Unit[] = [unit(0, 0, 5, 2), unit(1, 0, 5, 3), unit(2, 1, 10, 3)];
 
@@ -128,6 +163,7 @@ const STATE: GameState = {
   explored: [exploredRow([0, 1, 4, 5]), exploredRow([10, 11, 14, 15])],
   nextCityId: 0,
   cities: [],
+  improvements: [],
 };
 
 describe('unitById', () => {
@@ -206,5 +242,89 @@ describe('unitCatalog', () => {
     for (const def of unitCatalog(RULESET)) {
       expect(UNIT_ROLES).toContain(def.role);
     }
+  });
+});
+
+describe('withWork / withoutWork — a unit’s job, in M4a’s shape', () => {
+  it('is idle by absence: a unit that has never worked carries no `work` key at all', () => {
+    // The rule the whole optional field exists for. `'work' in unit` is the honest
+    // question — `unit.work === undefined` is also true for a key that is present
+    // and holds `undefined`, which is precisely the spelling that cannot survive a
+    // JSON round trip and made three earlier states unhashable.
+    for (const looked of UNITS) {
+      expect('work' in looked).toBe(false);
+    }
+
+    // …and the hasher agrees: `canonicalize` throws on any `undefined` it finds.
+    expect(() => canonicalize(STATE)).not.toThrow();
+    expect(() => hashValue(STATE)).not.toThrow();
+  });
+
+  it('attaches a job with exactly the unit’s own fields plus `work`', () => {
+    const idle = UNITS[0];
+    if (idle === undefined) throw new Error('the fixture has no unit 0');
+    const busy = withWork(idle, WORK);
+
+    expect(busy).toStrictEqual({ ...idle, work: WORK });
+    expect(Object.keys(busy).sort()).toEqual([
+      'id',
+      'movementLeft',
+      'owner',
+      'tile',
+      'type',
+      'work',
+    ]);
+    expect(busy.work).toStrictEqual({
+      kind: asImprovementId('mine'),
+      tile: asTileIndex(5),
+      turnsLeft: 3,
+    });
+  });
+
+  it('detaches a job by removing the key — never by writing `undefined`', () => {
+    const idle = UNITS[1];
+    if (idle === undefined) throw new Error('the fixture has no unit 1');
+
+    const busy = withWork(idle, WORK);
+    const released = withoutWork(busy);
+
+    expect('work' in released).toBe(false);
+    expect(Object.keys(released).sort()).toEqual(['id', 'movementLeft', 'owner', 'tile', 'type']);
+    // Every other field survives untouched, including the movement the job did not
+    // refund: releasing a unit is not a state the caller has to repair.
+    expect(released).toStrictEqual(idle);
+  });
+
+  it('is idempotent in both directions and never mutates the unit handed in', () => {
+    const idle = UNITS[2];
+    if (idle === undefined) throw new Error('the fixture has no unit 2');
+
+    const frozen = Object.freeze({ ...idle });
+    const busy = withWork(frozen, WORK);
+
+    expect(withWork(busy, WORK)).toStrictEqual(busy); // attaching the same job again
+    expect(withoutWork(withoutWork(busy))).toStrictEqual(idle); // releasing twice
+    expect(frozen).toStrictEqual(idle); // the input is untouched
+    expect('work' in frozen).toBe(false);
+  });
+
+  it('stays hashable with a job attached, and the job is part of the hash', () => {
+    const board: GameState = {
+      ...STATE,
+      units: UNITS.map((u) => (u.id === asUnitId(0) ? withWork(u, WORK) : u)),
+    };
+
+    expect(() => canonicalize(board)).not.toThrow();
+    // A job is persisted state, so it must move the hash — a unit's work that did
+    // not change the hash would make replays and goldens blind to it.
+    expect(hashValue(board)).not.toBe(hashValue(STATE));
+    // A different count is a different state, for the same reason.
+    const advanced: GameState = {
+      ...board,
+      units: board.units.map((u) =>
+        u.id === asUnitId(0) ? withWork(u, { ...WORK, turnsLeft: 2 }) : u,
+      ),
+    };
+    expect(hashValue(advanced)).not.toBe(hashValue(board));
   });
 });

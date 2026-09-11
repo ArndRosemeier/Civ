@@ -268,8 +268,18 @@ describe('golden scenarios', () => {
     // `missing-unit-role` (`newGame` now places a starting settler per player),
     // so this pins that the harness names it — and that it names it as a *unit*
     // problem, not a terrain one.
-    const withoutUnits: RulesetView = { terrains: RULESET.terrains, units: [], fidelity: 'tuned' };
-    const withoutTerrain: RulesetView = { terrains: [], units: RULESET.units, fidelity: 'tuned' };
+    const withoutUnits: RulesetView = {
+      terrains: RULESET.terrains,
+      units: [],
+      improvements: RULESET.improvements,
+      fidelity: 'tuned',
+    };
+    const withoutTerrain: RulesetView = {
+      terrains: [],
+      units: RULESET.units,
+      improvements: RULESET.improvements,
+      fidelity: 'tuned',
+    };
 
     const noUnits = newGame(GOLDEN_SEEDS[0], settingsFor(GOLDEN_SEEDS[0]), withoutUnits);
     expect(noUnits.ok).toBe(false);

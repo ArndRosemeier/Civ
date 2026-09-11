@@ -11,6 +11,7 @@ import { asTileIndex, type TerrainId, type TileIndex } from './ids.js';
 // Type-only, so the import is erased at runtime and cannot create a runtime
 // cycle with `units.ts` (which reads this module's `RulesetView` the same way).
 import type { BuildingDef } from './cities.js';
+import type { ImprovementDef } from './improvements.js';
 import type { UnitDef } from './units.js';
 
 export const TERRAIN_ROLES = [
@@ -70,6 +71,18 @@ export interface RulesetView {
    * cannot end up accidentally building-less.
    */
   readonly buildings?: readonly BuildingDef[];
+  /**
+   * The improvement catalog, in data order. See `improvements.ts`' `ImprovementDef`.
+   *
+   * **Required**, like `units` and unlike `buildings`, because M4a's `cityYields`
+   * reads it on every call for every worked tile: a view without it is not a view
+   * the engine can compute a city's output from, so the type requires what the
+   * engine actually reads. A ruleset that ships no improvements says so with
+   * `improvements: []` — a catalog, not a missing field — and then every worked
+   * tile yields exactly its terrain, which is what a game with no improvements in
+   * it means.
+   */
+  readonly improvements: readonly ImprovementDef[];
   readonly fidelity: 'tuned' | 'cited-only';
 }
 

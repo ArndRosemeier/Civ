@@ -36,6 +36,20 @@
  *   transcript, which is exactly how the M3 city and goody-hut events would have
  *   arrived: `CityFounded`, `CityGrew`, `CityStarved`, `CityProduced`,
  *   `HutEntered` and `BarbariansSpawned` all hit no case and printed nothing.
+ * - **The worker surface (M4a) is the same arrangement a third time.** `work
+ *   <unitId> <improvementId>` and `cancel <unitId>` parse text, build exactly one
+ *   `Command` (`StartWork` / `CancelWork`) and hand it to `applyCommand`; every
+ *   "legal:" line under a refusal comes from `planStartWork` (and the improvement
+ *   catalog), the same evaluator the applier decides with. What a unit is doing is
+ *   then *shown* wherever a unit is shown — the `units` line, the `units` table and the `state`
+ *   view — through `workSummary` (`@civts/core`), so the REPL does not own a
+ *   second mapping from a job to prose.
+ * - **`work` has two readings, and the arguments pick one.** M3's `work <cityId>
+ *   <x> <y> ...` sets a city's worked tiles; M4a's `work <unitId>
+ *   <improvementId>` puts a worker on a job. They are told apart by the second
+ *   argument — a coordinate is an integer, an improvement id is a word — and
+ *   nothing else in the session is ambiguous. Both readings are documented in
+ *   `help`, and a `work` line whose arguments fit neither says so.
  * - **The transcript is a pure function of (state, lines, flags).** Numbers are
  *   the only variable content and they come from the state; nothing reads the
  *   clock, and the prompt/echo are written for every line whether the input
@@ -60,6 +74,7 @@ import {
   applyCommand,
   asBuildingId,
   asCityId,
+  asImprovementId,
   asUnitId,
   asUnitTypeId,
   buildingCatalog,
@@ -72,6 +87,8 @@ import {
   describe,
   err,
   foodBoxSize,
+  improvementCatalog,
+  improvementDef,
   inBounds,
   indexToX,
   indexToY,
@@ -81,6 +98,7 @@ import {
   planFoundCity,
   planSetProduction,
   planSetWorkedTiles,
+  planStartWork,
   terrainAtIndex,
   tileIndex,
   unitById,
@@ -89,6 +107,7 @@ import {
   unitMoveOptions,
   unitsOnTile,
   visibleTiles,
+  workSummary,
   type Command,
   type CommandOutcome,
   type BuildingId,
@@ -98,6 +117,8 @@ import {
   type GameError,
   type GameMap,
   type GameState,
+  type ImprovementDef,
+  type ImprovementId,
   type MapSize,
   type PlayerId,
   type ProductionItem,
@@ -162,6 +183,7 @@ export const PLAY_USAGE = `usage: civts play [--seed <int>] [--map-size <size>] 
 Commands inside a session (also documented by "help"):
   move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
+  work <unitId> <improve>    cancel <unitId>
   end   units   state   save <path>   help   quit
 `;
 
@@ -266,14 +288,53 @@ const typeName = (ruleset: RulesetView, type: UnitTypeId): string => {
   return def === undefined ? type : def.name;
 };
 
+/**
+ * What a unit is doing, as prose (`mining, 2 turns left`), or `undefined` when it
+ * is idle — never an empty string, so a caller's `job === undefined` test is the
+ * one place "no job" is decided.
+ *
+ * The wording is `@civts/core`'s `workSummary`, the same function `textview` prints
+ * its `work:` line with: the REPL does not own a second mapping from an
+ * improvement to a verb, so the two surfaces cannot describe one job differently.
+ */
+const workOf = (ruleset: RulesetView, unit: Unit): string | undefined => {
+  const work = unit.work;
+  return work === undefined ? undefined : workSummary(ruleset, work);
+};
+
+/** An improvement as prose, with what it costs: `improvement "Mine" (3 turns)`. */
+const improvementLabel = (ruleset: RulesetView, id: ImprovementId): string => {
+  const def = improvementDef(ruleset, id);
+  return def === undefined
+    ? `improvement "${id}"`
+    : `improvement "${def.name}" (${String(def.turns)} turn${def.turns === 1 ? '' : 's'})`;
+};
+
+/** `id (N turns)` for every improvement in the catalog — the catalogue, as data. */
+const improvementCatalogueHint = (ruleset: RulesetView): string => {
+  const rows = improvementCatalog(ruleset).map(
+    (def) =>
+      `"${def.id}" (${String(def.turns)} turn${def.turns === 1 ? '' : 's'}, ` +
+      `${def.allowedRoles.join('/') || 'nowhere'})`,
+  );
+  if (rows.length === 0) {
+    return 'this ruleset can build no improvements at all: its improvement catalog is empty';
+  }
+  return `buildable improvements: ${rows.join('; ')}`;
+};
+
 const unitLabel = (state: GameState, ruleset: RulesetView, unitId: UnitId): string => {
   const unit = unitById(state, unitId);
   if (unit === undefined) return `unit ${String(unitId)}`;
   const def = unitDef(ruleset, unit.type);
   const max = def === undefined ? '?' : `${String(def.movement)} per turn`;
+  const job = workOf(ruleset, unit);
   return (
     `unit ${String(unit.id)} (${typeName(ruleset, unit.type)} at ` +
-    `${coordOf(state.map, unit.tile)}, ${String(unit.movementLeft)}/${max} movement left)`
+    `${coordOf(state.map, unit.tile)}, ${String(unit.movementLeft)}/${max} movement left` +
+    // A working unit says so wherever it is named, because "why can this worker not
+    // start a job?" is answered by the job it already has.
+    `${job === undefined ? '' : `, ${job}`})`
   );
 };
 
@@ -300,9 +361,13 @@ const yourUnitsLines = (context: ErrorContext): readonly string[] => {
   const labels = mine.map((unit) => {
     const def = unitDef(context.ruleset, unit.type);
     const name = def === undefined ? unit.type : def.name;
+    const job = workOf(context.ruleset, unit);
     return (
       `${String(unit.id)} ${name} at ${coordOf(context.state.map, unit.tile)} ` +
-      `(${String(unit.movementLeft)} movement left)`
+      `(${String(unit.movementLeft)} movement left` +
+      // What the unit is doing belongs with where it is: a bad id is a one-line fix,
+      // and "that worker is already mining" is part of the line.
+      `${job === undefined ? '' : `, ${job}`})`
     );
   });
   return [`  your units: ${labels.join('; ')}.`];
@@ -476,12 +541,78 @@ const legalFoundLines = (context: ErrorContext): readonly string[] => {
 };
 
 /* ------------------------------------------------------------------ *
+ * M4a - the legal alternatives for a refused worker command.
+ *
+ * Same arrangement as the city lessons above: `planStartWork` is the
+ * evaluator `applyCommand` refuses with, so a "legal:" line under a
+ * refusal names a job the engine would actually accept. There is no
+ * second reading of "may this worker build this here?" in this file.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The improvements `unitId` may start where it stands, asked of `planStartWork` one
+ * catalog row at a time. Empty when the unit does not exist, is not the actor's, is
+ * not a worker, is already working, has no movement left, or stands on a terrain
+ * role the row does not allow — every one of those is the engine's own answer, not
+ * a rule restated here.
+ */
+const startableImprovements = (context: ErrorContext, unitId: UnitId): readonly ImprovementDef[] =>
+  improvementCatalog(context.ruleset).filter(
+    (def) => planStartWork(context.state, context.ruleset, context.playerId, unitId, def.id).ok,
+  );
+
+/** What one unit could start right now, as the lesson under a refusal about it. */
+const startableLines = (context: ErrorContext, unitId: UnitId | undefined): readonly string[] => {
+  if (unitId === undefined) return [];
+
+  const ready = startableImprovements(context, unitId);
+  if (ready.length === 0) {
+    return [
+      '  legal: that unit can start no job where it stands right now: a worker must be idle,',
+      '  have movement left, and stand where this ruleset allows the improvement.',
+    ];
+  }
+  return [
+    `  legal: ${unitLabel(context.state, context.ruleset, unitId)} can start ` +
+      `${ready.map((def) => improvementLabel(context.ruleset, def.id)).join(', ')}.`,
+  ];
+};
+
+/**
+ * The units of yours that could start *some* job where they stand — the worker
+ * counterpart of `legalFoundLines`, and for the same reason: a refusal about "not a
+ * worker" is only a lesson if it also says which unit could have done it.
+ */
+const legalWorkerLines = (context: ErrorContext): readonly string[] => {
+  const ready = context.state.units.filter(
+    (unit) => unit.owner === context.playerId && startableImprovements(context, unit.id).length > 0,
+  );
+
+  if (ready.length === 0) {
+    return [
+      '  legal: none of your units can start a job where it stands: a worker must be idle,',
+      '  have movement left, and stand where this ruleset allows the improvement.',
+    ];
+  }
+  return [
+    `  legal: these can start a job now: ${ready
+      .map((unit) => unitLabel(context.state, context.ruleset, unit.id))
+      .join('; ')}.`,
+  ];
+};
+
+/* ------------------------------------------------------------------ *
  * M3 - what the two setter verbs accept.
  * ------------------------------------------------------------------ */
 
-/** The unit a command names, when it names one (`move` and `found` do). */
+/** The unit a command names, when it names one (`move`, `found`, the worker verbs). */
 const unitIdOf = (command: Command): UnitId | undefined =>
-  command.type === 'MoveUnit' || command.type === 'FoundCity' ? command.unitId : undefined;
+  command.type === 'MoveUnit' ||
+  command.type === 'FoundCity' ||
+  command.type === 'StartWork' ||
+  command.type === 'CancelWork'
+    ? command.unitId
+    : undefined;
 
 /** The city a command names, when it names one (`work` and `build` do). */
 const cityIdOf = (command: Command): CityId | undefined =>
@@ -728,6 +859,74 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
 
     case 'invalid-argument':
       return [`error: invalid-argument - ${error.detail}`, ...legalMovesLines(context)].join('\n');
+
+    /* ---------------- M4a: workers and tile improvements ---------------- */
+
+    case 'not-a-worker':
+      return [
+        `error: not-a-worker - ${unitLabel(context.state, context.ruleset, error.unitId)} is not`,
+        '  a worker, and only a worker improves a tile. A unit type this ruleset does not',
+        '  describe is not a worker either: the engine cannot see one there.',
+        ...legalWorkerLines(context),
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'already-working': {
+      const unit = unitById(context.state, error.unitId);
+      const doing = unit === undefined ? undefined : workOf(context.ruleset, unit);
+      return [
+        `error: already-working - ${unitLabel(context.state, context.ruleset, error.unitId)} is`,
+        `  already ${doing ?? `working on "${error.improvement}"`}. One job at a time:`,
+        `  "cancel ${String(error.unitId)}" gives the job up first (the turns already spent`,
+        '  are not refunded).',
+        ...legalMovesLines(context),
+      ].join('\n');
+    }
+
+    case 'not-working':
+      return [
+        `error: not-working - ${unitLabel(context.state, context.ruleset, error.unitId)} is not`,
+        '  working, so there is nothing to cancel. The "units" table and the "units:" line',
+        '  under every view say what each unit is doing.',
+        ...startableLines(context, error.unitId),
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'unknown-improvement':
+      return [
+        `error: unknown-improvement - this ruleset cannot build the improvement ` +
+          `"${error.improvement}".`,
+        '  an improvement is buildable when its catalog row exists and its turns are a',
+        `  whole number of at least 1. ${improvementCatalogueHint(context.ruleset)}.`,
+      ].join('\n');
+
+    case 'improvement-not-allowed': {
+      const terrain = terrainDefAt(context.state, context.ruleset, error.tile);
+      const what =
+        terrain === undefined
+          ? `terrain role "${error.role}"`
+          : `"${terrain.name}" (${terrain.role})`;
+      const allows = improvementCatalog(context.ruleset)
+        .filter((def) => def.allowedRoles.includes(error.role))
+        .map((def) => def.id);
+      return [
+        `error: improvement-not-allowed - ${improvementLabel(context.ruleset, error.improvement)}`,
+        `  cannot be built at (${coordOf(context.state.map, error.tile)}), which is ${what}.`,
+        allows.length === 0
+          ? '  this ruleset lets no improvement be built on that terrain role.'
+          : `  this terrain role allows: ${allows.join(', ')}.`,
+        ...startableLines(context, error.unitId),
+      ].join('\n');
+    }
+
+    case 'already-improved':
+      return [
+        `error: already-improved - (${coordOf(context.state.map, error.tile)}) already carries ` +
+          `${improvementLabel(context.ruleset, error.improvement)}.`,
+        '  building it twice is refused rather than quietly ignored: the tile keeps what it',
+        '  has, and the worker keeps the turns it would have spent.',
+        ...startableLines(context, context.unitId),
+      ].join('\n');
   }
 };
 /** A `SetupError` as prose. Shared with the `map` command, so both say the same thing. */
@@ -959,6 +1158,7 @@ export interface ReplSession {
 export const COMMAND_SUMMARY =
   'move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | ' +
   'work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | ' +
+  'work <unitId> <improvementId> | cancel <unitId> | ' +
   'end | units | state | save <path> | help | quit';
 
 const HELP = `commands:
@@ -981,10 +1181,24 @@ const HELP = `commands:
                           "building:<id>"; a bare id is accepted when only one catalog has
                           it ("build 0 granary" means building "Granary", because no unit
                           is called that). Stored shields are kept.
-  end                     end the turn: every city grows and produces, every unit refills
-                          its movement, turn advances.
-  units                   list the units you can see, with position and movement left.
-  state                   print seed, turn, revision, map size, RNG and the state hash.
+  work <unitId> <improvementId>   put that worker to work on the tile it is standing on,
+                          building <improvementId> there. The unit must be a worker with
+                          movement left and no job already; the improvement must be one
+                          this ruleset builds where the unit stands and must not already be
+                          on that tile. Starting spends the unit's whole turn. "work
+                          <unitId> mine" and "work <cityId> <x> <y>" are told apart by the
+                          second argument: an improvement id is a word, a coordinate is a
+                          number.
+  cancel <unitId>         stop that worker's job. Nothing is refunded: the turns already
+                          spent are gone, and the improvement is not built. Moving a
+                          working unit cancels its job the same way.
+  end                     end the turn: every unit's work advances, every city grows and
+                          produces, every unit refills its movement, turn advances. An
+                          improvement finished this turn counts towards this turn.
+  units                   list the units you can see, with position, movement left and
+                          what each one is doing.
+  state                   print seed, turn, revision, map size, RNG, what your units are
+                          doing and the state hash.
   save <path>             write the state to <path> as canonical JSON (parent
                           directories are created).
   help                    print this text.
@@ -994,8 +1208,9 @@ const HELP = `commands:
 notes:
   - coordinates are x,y as ruled above the map: x is the column, y is the row.
   - a digit drawn on the map is that player's STARTING tile. Live unit positions are the
-    "units:" line printed under every view ("*" marks a unit of yours), and your cities are
-    the "cities:" line under it.
+    "units:" line printed under every view ("*" marks a unit of yours), your cities are
+    the "cities:" line under it, and a unit in the middle of a job is named on the
+    "work:" line under that.
   - a refused command prints the typed reason and the choices that were legal, and never
     changes the state.
   - every command goes through the engine's command API; the REPL never edits state.
@@ -1122,6 +1337,27 @@ const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: Ruleset
               `appeared on ${tileList(outcome.state.map, event.tiles, 'nowhere')} near the hut ` +
               `at ${eventPlace(outcome, event.tile)}, owned by ` +
               playerLabel(outcome.state, event.owner);
+
+      case 'WorkStarted':
+        return (
+          `ok: unit ${String(event.unitId)} started ${improvementLabel(ruleset, event.kind)} on ` +
+          `${eventPlace(outcome, event.tile)}: ${String(event.turnsLeft)} turn` +
+          `${event.turnsLeft === 1 ? '' : 's'} left`
+        );
+
+      case 'WorkCancelled':
+        return (
+          `ok: unit ${String(event.unitId)} stopped ${improvementLabel(ruleset, event.kind)} on ` +
+          `${eventPlace(outcome, event.tile)} (${
+            event.reason === 'moved' ? 'the unit moved' : 'cancelled'
+          }), ${String(event.turnsLeft)} turn${event.turnsLeft === 1 ? '' : 's'} of work lost`
+        );
+
+      case 'WorkCompleted':
+        return (
+          `ok: unit ${String(event.unitId)} finished ${improvementLabel(ruleset, event.kind)} on ` +
+          `${eventPlace(outcome, event.tile)}; the tile is improved`
+        );
     }
 
     return assertNever(event);
@@ -1155,6 +1391,14 @@ const appliedCommandText = (
     case 'MoveUnit':
     case 'EndTurn':
     case 'FoundCity':
+      return undefined;
+
+    // M4a: both worker commands emit an event of their own (`WorkStarted`,
+    // `WorkCancelled`), and `outcomeText` renders every event — so there is nothing
+    // left for this function to add. They are listed rather than left to a
+    // `default` so a *new* command is still a compile error here.
+    case 'StartWork':
+    case 'CancelWork':
       return undefined;
 
     case 'SetWorkedTiles': {
@@ -1192,8 +1436,8 @@ const appliedCommandText = (
   return assertNever(command);
 };
 
-/** Column widths for the `units` table: marker, id, type, owner, at, move, terrain. */
-const UNIT_WIDTHS: readonly number[] = [1, 2, 10, 11, 8, 7, 11];
+/** Column widths for the `units` table: marker, id, type, owner, at, move, terrain, job. */
+const UNIT_WIDTHS: readonly number[] = [1, 2, 10, 11, 8, 7, 11, 26];
 
 /** A padded row: every cell but the last is padded to its column's width. */
 const tableRow = (widths: readonly number[], cells: readonly string[]): string =>
@@ -1256,10 +1500,15 @@ export const createSession = (options: SessionOptions): ReplSession => {
       const def = unitDef(ruleset, unit.type);
       const name = def === undefined ? unit.type : def.name;
       const max = def === undefined ? '?' : String(def.movement);
+      const job = workOf(ruleset, unit);
+      // M4a: a worker's job is part of what a unit *is* right now, so it belongs on
+      // the line that names its position and its movement — otherwise "what is my
+      // worker doing?" would need a second command after every step.
+      const suffix = job === undefined ? '' : ` ${job}`;
       return (
         `${unit.owner === playerId ? '*' : ' '}${String(unit.id)} p${String(unit.owner)} ` +
         `${name} @${coordOf(state.map, unit.tile)} ` +
-        `(${String(unit.movementLeft)}/${max} movement)`
+        `(${String(unit.movementLeft)}/${max} movement)${suffix}`
       );
     });
     return `units: ${parts.join('  ')}\n`;
@@ -1301,7 +1550,17 @@ export const createSession = (options: SessionOptions): ReplSession => {
       lines.push('  you have no units, and none of another player is inside what you explored');
     } else {
       lines.push(
-        tableRow(UNIT_WIDTHS, ['m', 'id', 'type', 'owner', 'at', 'move', 'terrain', 'legal']),
+        tableRow(UNIT_WIDTHS, [
+          'm',
+          'id',
+          'type',
+          'owner',
+          'at',
+          'move',
+          'terrain',
+          'job',
+          'legal',
+        ]),
       );
       for (const unit of rows) {
         const def = unitDef(ruleset, unit.type);
@@ -1314,6 +1573,10 @@ export const createSession = (options: SessionOptions): ReplSession => {
             coordOf(state.map, unit.tile),
             `${String(unit.movementLeft)}/${def === undefined ? '?' : String(def.movement)}`,
             terrainDefAt(state, ruleset, unit.tile)?.name ?? '?',
+            // M4a: the job column, so the table answers "what is each of my units
+            // doing?" without a second command. `(idle)` is the same spelling the
+            // city table uses for "building nothing".
+            workOf(ruleset, unit) ?? '(idle)',
             String(unitMoveOptions(state, ruleset, unit.id).length),
           ]),
         );
@@ -1341,6 +1604,26 @@ export const createSession = (options: SessionOptions): ReplSession => {
       .map((player) => `${playerLabel(state, player.id)}${player.id === playerId ? ' <- you' : ''}`)
       .join(', ');
 
+    // M4a: the jobs line. "What are my workers doing?" is the question the `state`
+    // view exists to answer without a second command, so it is answered for the
+    // session's own units — the ones the player can command — and never for
+    // another player's, whose work is not this player's business even where the
+    // tile is explored (the `units:` line under every view names *visible* units,
+    // jobs included, which is where a scout report belongs).
+    const working = state.units.filter(
+      (unit) => unit.owner === playerId && unit.work !== undefined,
+    );
+    const jobs =
+      working.length === 0
+        ? 'none of your units is working (start one with "work <unitId> <improvementId>")'
+        : working
+            .map(
+              (unit) =>
+                `${String(unit.id)} ${typeName(ruleset, unit.type)}@` +
+                `${coordOf(state.map, unit.tile)} ${workOf(ruleset, unit) ?? ''}`,
+            )
+            .join('  ');
+
     return (
       [
         `state: seed=${String(state.seed)} turn=${String(state.turn)} ` +
@@ -1349,6 +1632,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
           `${String(state.map.height)}) civs=${String(civPlayers(state).length)}`,
         `you: ${String(mine)} unit(s), explored ${String(explored)}/${String(size)} tiles, ` +
           `${String(seeing)} visible right now`,
+        `jobs: ${jobs}`,
         `civs: ${civs}`,
         `rng: a=${String(state.rng.a)} b=${String(state.rng.b)} c=${String(state.rng.c)} ` +
           `d=${String(state.rng.d)}`,
@@ -1509,24 +1793,40 @@ export const createSession = (options: SessionOptions): ReplSession => {
         const cityRaw = args[0];
         if (cityRaw === undefined) {
           return malformed(
-            '"work" needs a city id, then one x y pair per citizen (got none)',
-            'usage: work <cityId> [<x> <y>]...  - with no pairs the assignment is cleared',
+            '"work" needs a unit id and an improvement id, or a city id and x y pairs',
+            'usage: work <unitId> <improvementId>  |  work <cityId> [<x> <y>]...',
           );
         }
         const cityId = intOf(cityRaw);
         if (cityId === undefined) {
           return malformed(
-            `city id must be a whole number (got "${cityRaw}")`,
-            'usage: work <cityId> [<x> <y>]...  ("cities" lists your city ids)',
+            `the id must be a whole number (got "${cityRaw}")`,
+            'usage: work <unitId> <improvementId>  |  work <cityId> [<x> <y>]...',
           );
         }
 
         const rest = args.slice(1);
+
+        // One word, two readings (M3's city tiles and M4a's worker jobs), told apart
+        // by the *second* argument: a coordinate is a whole number, an improvement id
+        // is a word. `work 0` and `work 0 1 1` stay the city form exactly as they
+        // were; `work 0 mine` is the worker form — the only argument shape both
+        // readings could claim is a lone word, and a city assignment can never be
+        // one.
+        const only = rest.length === 1 ? rest[0] : undefined;
+        if (only !== undefined && intOf(only) === undefined) {
+          return applied({
+            type: 'StartWork',
+            unitId: asUnitId(cityId),
+            kind: asImprovementId(only),
+          });
+        }
+
         if (rest.length % 2 !== 0) {
           return malformed(
-            `"work" takes whole x y pairs after the city id (got ${String(rest.length)} ` +
-              'coordinate(s), which is not a whole number of pairs)',
-            'usage: work <cityId> [<x> <y>]...  example: work 0 12 9 13 9',
+            `"work" takes either <unitId> <improvementId>, or a city id followed by whole ` +
+              `x y pairs (got "${rest.join(' ')}" after "${cityRaw}")`,
+            `usage: work ${cityRaw} <improvementId>  |  work ${cityRaw} <x> <y> ...`,
           );
         }
 
@@ -1536,7 +1836,8 @@ export const createSession = (options: SessionOptions): ReplSession => {
           const y = intOf(rest[i + 1]);
           if (x === undefined || y === undefined) {
             return malformed(
-              `x and y must be whole numbers (got "${rest[i] ?? ''}" and "${rest[i + 1] ?? ''}")`,
+              `x and y must be whole numbers (got "${rest[i] ?? ''}" and "${rest[i + 1] ?? ''}")` +
+                ' - a lone word after a *unit* id is an improvement id, as in "work 2 mine"',
               'the ruler above the map lists the valid columns and rows',
             );
           }
@@ -1555,6 +1856,25 @@ export const createSession = (options: SessionOptions): ReplSession => {
         }
 
         return applied({ type: 'SetWorkedTiles', cityId: asCityId(cityId), tiles });
+      }
+
+      /* ---------------- M4a: the worker verbs ---------------- */
+
+      case 'cancel': {
+        if (args.length !== 1) {
+          return malformed(
+            `"cancel" needs 1 argument: cancel <unitId> (got ${String(args.length)})`,
+            'example: cancel 2  ("units" lists your unit ids and what each is doing)',
+          );
+        }
+        const unitId = intOf(args[0]);
+        if (unitId === undefined) {
+          return malformed(
+            `unit id must be a whole number (got "${args[0] ?? ''}")`,
+            'example: cancel 2  ("units" lists your unit ids)',
+          );
+        }
+        return applied({ type: 'CancelWork', unitId: asUnitId(unitId) });
       }
 
       case 'build': {

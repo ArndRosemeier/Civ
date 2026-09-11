@@ -93,6 +93,38 @@
  *   copy here. The result is one applied command bumping `revision` exactly once
  *   while emitting up to three events: `UnitMoved`, `HutEntered`, and
  *   `BarbariansSpawned` when the draw produced a band.
+ *
+ * M4a adds two commands — `StartWork` and `CancelWork` — and with them:
+ *
+ * - **One evaluator, two callers, a third time.** `planStartWork` and
+ *   `planCancelWork` state a worker's legality once; `applyCommand` decides with
+ *   them and `actions.ts` advertises with them, so the fifth generator cannot
+ *   drift from the applier (M4a fixes this as the keystone invariant, both
+ *   directions, across five generators).
+ * - **`StartWork` has no target tile, and that is the point.** The job is on the
+ *   unit's *own* tile: a target parameter would only invite a mismatch between
+ *   the unit's position and the tile being improved, and there is nothing it
+ *   could express that moving the worker first does not. `planStartWork` still
+ *   resolves and checks the tile, because the improvement has to be *allowed on
+ *   that terrain role* — the rule that makes a mine a hills-and-mountains job.
+ * - **Starting work spends the unit's whole turn.** It costs the unit's
+ *   remaining movement, so a worker that has moved cannot also start a job and a
+ *   worker that starts a job cannot also move. That is a **placeholder** rule of
+ *   ours (Civ 3's worker movement accounting is not reproduced here, and M4a's
+ *   contract only says "it costs the unit's remaining movement for the turn").
+ * - **Work progress is not this file's idea.** `turn.ts` owns it, as step 1 of
+ *   the turn, because an improvement finished this turn must contribute to this
+ *   turn's yields. This layer only attaches and detaches jobs.
+ * - **Relocation cancels a job, in the event stream.** A step that moves a
+ *   working unit drops its `work` and appends `WorkCancelled` with
+ *   `reason: 'moved'`, so a consumer sees the cancellation rather than having to
+ *   diff the unit to discover it. `CancelWork` emits the same event with
+ *   `reason: 'cancelled'`; both are the *same* event type because they are the
+ *   same fact — the job is over and nothing was refunded.
+ * - **The improvement is added on completion, never on start.** Starting a job
+ *   writes only `work`; the pair lands in `state.improvements` when the last
+ *   turn is paid (in `turn.ts`), which is what makes the job cancellable without
+ *   unpicking anything.
  */
 
 import {
@@ -105,6 +137,12 @@ import {
 } from './cities.js';
 import { visibleTiles, withExplored } from './fog.js';
 import { resolveHutEntry, type HutRewardKind } from './hut.js';
+// Runtime imports, not type-only: `StartWork` asks the catalog what a job *is*
+// (its `turns` and its `allowedRoles`) and whether the tile already carries the
+// improvement, and both answers come from `improvements.ts` — the module that
+// owns the pair list. Keeping those reads there is what stops this file from
+// growing a second opinion about what is built where.
+import { hasImprovement, improvementDef, type ImprovementId } from './improvements.js';
 import {
   asCityId,
   asPlayerId,
@@ -130,7 +168,15 @@ import { itemCostOf } from './production.js';
 import { err, ok, type Result } from './result.js';
 import type { GameState, PlayerState } from './state.js';
 import { advanceTurn } from './turn.js';
-import { unitById, unitDef, unitsOnTile, type Unit } from './units.js';
+import {
+  unitById,
+  unitDef,
+  unitsOnTile,
+  withWork,
+  withoutWork,
+  type Unit,
+  type UnitWork,
+} from './units.js';
 
 /**
  * Every way a player may change the game. An exhaustive union (PLAN.md §4.4) so
@@ -146,7 +192,15 @@ export type Command =
       readonly cityId: CityId;
       readonly tiles: readonly TileIndex[];
     }
-  | { readonly type: 'SetProduction'; readonly cityId: CityId; readonly item: ProductionItem };
+  | { readonly type: 'SetProduction'; readonly cityId: CityId; readonly item: ProductionItem }
+  /**
+   * Put the unit to work improving the tile it stands on (M4a). No `tile`
+   * parameter: the tile *is* the unit's own, which removes the only way a caller
+   * could ask for a job somewhere the unit is not.
+   */
+  | { readonly type: 'StartWork'; readonly unitId: UnitId; readonly kind: ImprovementId }
+  /** Abandon the unit's job. Nothing is refunded: the turns already paid are spent. */
+  | { readonly type: 'CancelWork'; readonly unitId: UnitId };
 
 /**
  * Every way a command can be refused, as a *reason* rather than a message
@@ -221,6 +275,44 @@ export type GameError =
   | { readonly kind: 'unknown-production-item'; readonly item: ProductionItem }
   /** The city already has this building; building it twice is not a no-op. */
   | { readonly kind: 'already-built'; readonly cityId: CityId; readonly building: BuildingId }
+  /**
+   * `StartWork` was asked of a unit that is not a worker — including a unit whose
+   * type the ruleset does not describe, because the engine cannot see a worker
+   * there. Only a `worker`-role unit can improve a tile (M4a, "Workers"); a scout
+   * standing on a hill is not a mine that has not been dug yet.
+   */
+  | { readonly kind: 'not-a-worker'; readonly unitId: UnitId }
+  /** `StartWork` on a unit that is already working: one job at a time. */
+  | {
+      readonly kind: 'already-working';
+      readonly unitId: UnitId;
+      /** The job it is already doing, so the caller can say what to cancel first. */
+      readonly improvement: ImprovementId;
+    }
+  /** `CancelWork` on a unit that is not working: there is nothing to cancel. */
+  | { readonly kind: 'not-working'; readonly unitId: UnitId }
+  /**
+   * `StartWork` naming an improvement this ruleset cannot build: an id no row
+   * defines, or a row whose `turns` is not a usable count (see `workTurnsOf`).
+   * The two are one error kind for the same reason `unknown-production-item`
+   * covers an unusable cost: both mean "this ruleset cannot build that", and the
+   * *fix* is the same — pick an improvement the catalog describes.
+   */
+  | { readonly kind: 'unknown-improvement'; readonly improvement: ImprovementId }
+  /** The improvement cannot be built on this terrain role: a mine needs rock. */
+  | {
+      readonly kind: 'improvement-not-allowed';
+      readonly unitId: UnitId;
+      readonly tile: TileIndex;
+      readonly improvement: ImprovementId;
+      readonly role: TerrainRole;
+    }
+  /** The tile already carries this improvement; building it again is not a no-op. */
+  | {
+      readonly kind: 'already-improved';
+      readonly tile: TileIndex;
+      readonly improvement: ImprovementId;
+    }
   | { readonly kind: 'invalid-argument'; readonly detail: string };
 
 /**
@@ -236,6 +328,14 @@ export type GameError =
  * `hut.ts`. `HutEntered` is emitted **whenever a hut is consumed**, including for
  * the `nothing` reward: "nothing" is a reward, and a consumer that had to infer
  * consumption from the absence of an event would be reading a diff.
+ *
+ * M4a adds three more: `WorkStarted`, `WorkCancelled` and `WorkCompleted`. The
+ * middle one is the reason the event stream exists — a step that relocates a
+ * working unit *cancels* the job, and a consumer that had to diff the unit to
+ * find that out would be reading exactly the kind of change events are for. There
+ * is deliberately no `WorkProgressed` event: a job losing a turn is visible in
+ * the state's `turnsLeft`, and a per-turn event for every worker would be a log
+ * line that says nothing new. Completion is the event; progress is state.
  */
 export type GameEvent =
   | {
@@ -329,7 +429,54 @@ export type GameEvent =
       readonly tile: TileIndex;
       readonly unitIds: readonly UnitId[];
       readonly tiles: readonly TileIndex[];
+    }
+  /**
+   * A worker began a job (M4a): `turnsLeft` is what the command's plan says the
+   * job owes, so a consumer can render "3 turns" without reading the catalog, and
+   * `tile` is the unit's own tile — the one the improvement will land on.
+   */
+  | {
+      readonly type: 'WorkStarted';
+      readonly unitId: UnitId;
+      readonly kind: ImprovementId;
+      readonly tile: TileIndex;
+      readonly turnsLeft: number;
+    }
+  /**
+   * A job ended without producing anything: the unit was told to stop
+   * (`reason: 'cancelled'`) or it relocated, which cancels work by construction
+   * (`reason: 'moved'`). `turnsLeft` is how much of the job was still owed when it
+   * was abandoned — never refunded, which is why it is reported rather than
+   * silently dropped.
+   */
+  | {
+      readonly type: 'WorkCancelled';
+      readonly unitId: UnitId;
+      readonly kind: ImprovementId;
+      readonly tile: TileIndex;
+      readonly turnsLeft: number;
+      readonly reason: WorkCancelledReason;
+    }
+  /**
+   * The last turn of a job was paid and the improvement now exists on `tile`.
+   * Emitted by the turn pipeline, which is where the pair is added to the state,
+   * and *before* growth and production — an improvement finished this turn
+   * contributes to this turn's yields (INTERFACES.md M4a, "advanceTurn order").
+   */
+  | {
+      readonly type: 'WorkCompleted';
+      readonly unitId: UnitId;
+      readonly kind: ImprovementId;
+      readonly tile: TileIndex;
     };
+
+/**
+ * Why a job ended without producing anything. Two members rather than one because
+ * the *caller's* reading differs: `cancelled` is what the player asked for,
+ * `moved` is a consequence of a step the player may not have thought about — the
+ * case INTERFACES.md M4a insists must be visible in the event stream.
+ */
+export type WorkCancelledReason = 'cancelled' | 'moved';
 
 /**
  * The outcome of an applied command: the new state (a fresh object; the input is
@@ -842,6 +989,222 @@ export const planSetProduction = (
   return ok({ city, item, cost });
 };
 
+/* ------------------------------------------------------------------ *
+ * M4a: workers — starting, cancelling and losing a tile improvement job
+ * ------------------------------------------------------------------ */
+
+/**
+ * How many worker turns a catalog row's job costs, or `undefined` when the engine
+ * cannot read a count out of it.
+ *
+ * `validateRuleset` guarantees an integer `turns >= 1`, but a foreign or
+ * hand-built view can carry anything, and `turnsLeft` is written into the state
+ * and therefore into every hash: a fractional or NaN count would put a value into
+ * the state that `canonicalize` cannot represent. Such a row is reported as an
+ * improvement this ruleset cannot build (see `unknown-improvement`), the same
+ * reading `itemCostOf` gives a row with an unusable `cost`.
+ */
+const workTurnsOf = (turns: number): number | undefined =>
+  Number.isInteger(turns) && turns >= 1 ? turns : undefined;
+
+/** `state` with the unit of the same id replaced (`units` is rebuilt, not mutated). */
+const withUnit = (state: GameState, unit: Unit): GameState => ({
+  ...state,
+  units: state.units.map((existing) => (existing.id === unit.id ? unit : existing)),
+});
+
+/**
+ * What `planStartWork` decided: the worker, the tile it stands on (which *is* the
+ * target — there is no target parameter), the improvement, and the `turnsLeft` the
+ * job will start with, straight from the catalog row.
+ */
+export interface StartWorkPlan {
+  readonly unit: Unit;
+  readonly tile: TileIndex;
+  readonly kind: ImprovementId;
+  readonly turnsLeft: number;
+}
+
+/**
+ * Decide whether `unitId` may start building `kind` where it stands — the one
+ * place `StartWork`'s legality is stated, used by `applyCommand` to refuse and by
+ * `actions.ts` to advertise (M4a's fifth generator).
+ *
+ * The checks, in the order they run, and why that order:
+ *
+ * 1. the actor exists, the unit exists, the actor owns it (`unknown-player`,
+ *    `unknown-unit`, `not-your-unit`) — the same three every unit command opens
+ *    with, so a wrong-owner command is refused before anything else is read;
+ * 2. the unit's type resolves and its role is `worker` (`not-a-worker`) — a unit
+ *    type the view does not describe cannot be shown to be a worker, exactly as
+ *    `planFoundCity` reads an undescribed type as not-a-settler;
+ * 3. the unit is idle (`already-working`, naming the job in progress) — one job
+ *    at a time, and a caller that has to cancel first is told what to cancel;
+ * 4. its tile is a whole number on the map (`invalid-argument` /
+ *    `out-of-bounds`), and the ruleset describes the terrain there
+ *    (`invalid-argument`) — because step 5 needs the terrain *role*;
+ * 5. the improvement is one this ruleset can build (`unknown-improvement`), and
+ *    its `allowedRoles` contains that role (`improvement-not-allowed`) — a mine
+ *    needs rock, irrigation needs flat land;
+ * 6. the tile does not already carry it (`already-improved`) — building it twice
+ *    is a typed refusal rather than a silent no-op, the reading M3 fixed for
+ *    buildings;
+ * 7. the worker has movement left (`not-enough-movement`, `needed: 1`) —
+ *    affordability is checked last, as `planMove` does, so the reason reported is
+ *    about the job rather than about the turn's movement whenever both are wrong.
+ *
+ * The plan carries the catalog's `turnsLeft`, so the applier and any caller that
+ * asks "how long will this take?" read one number from one place.
+ *
+ * This is deliberately **not** a check that the tile is unworked, unowned or
+ * inside someone's border: M4a has no tile ownership, and an improvement's
+ * `allowedRoles` is the only territorial rule the contract gives. Nor is it a
+ * check on whether *another* worker is already doing the same job on that tile:
+ * the contract's list above is the whole rule, two workers digging the same mine
+ * is therefore legal, and the second one merely wastes its turns — completion is
+ * idempotent (`withImprovement`), so the tile still ends up with one mine.
+ */
+export const planStartWork = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  unitId: UnitId,
+  kind: ImprovementId,
+): Result<StartWorkPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const unit = unitById(state, unitId);
+  if (unit === undefined) return err({ kind: 'unknown-unit', unitId });
+  if (unit.owner !== playerId) return err({ kind: 'not-your-unit', unitId, owner: unit.owner });
+
+  const def = unitDef(ruleset, unit.type);
+  if (def === undefined || def.role !== 'worker') return err({ kind: 'not-a-worker', unitId });
+
+  const inProgress = unit.work;
+  if (inProgress !== undefined) {
+    return err({ kind: 'already-working', unitId, improvement: inProgress.kind });
+  }
+
+  const tile = unit.tile;
+  if (!Number.isInteger(Number(tile))) {
+    return err({
+      kind: 'invalid-argument',
+      detail: `StartWork needs a unit standing on an integer tile index (unit ${String(unitId)} is on ${String(tile)})`,
+    });
+  }
+  const x = indexToX(state.map, Number(tile));
+  const y = indexToY(state.map, Number(tile));
+  if (!inBounds(state.map, x, y)) return err({ kind: 'out-of-bounds', to: tile });
+
+  const terrain = terrainDefAt(state, ruleset, tile);
+  if (terrain === undefined) {
+    return err({
+      kind: 'invalid-argument',
+      detail: `the ruleset defines no terrain for tile ${String(tile)}, so the improvement cannot be checked against it`,
+    });
+  }
+
+  const improvement = improvementDef(ruleset, kind);
+  if (improvement === undefined) return err({ kind: 'unknown-improvement', improvement: kind });
+
+  const turnsLeft = workTurnsOf(improvement.turns);
+  if (turnsLeft === undefined) return err({ kind: 'unknown-improvement', improvement: kind });
+
+  if (!improvement.allowedRoles.includes(terrain.role)) {
+    return err({
+      kind: 'improvement-not-allowed',
+      unitId,
+      tile,
+      improvement: kind,
+      role: terrain.role,
+    });
+  }
+
+  if (hasImprovement(state, tile, kind)) {
+    return err({ kind: 'already-improved', tile, improvement: kind });
+  }
+
+  // The job costs the unit's remaining movement — all of it (M4a: "it costs the
+  // unit's remaining movement for the turn"), so all that is required is that
+  // there is some left to spend. `needed: 1` states the smallest amount that
+  // would have made this legal, which is what a caller needs to know.
+  if (!Number.isInteger(unit.movementLeft) || unit.movementLeft <= 0) {
+    return err({
+      kind: 'not-enough-movement',
+      unitId,
+      needed: 1,
+      available: unit.movementLeft,
+    });
+  }
+
+  return ok({ unit, tile, kind, turnsLeft });
+};
+
+/** What `planCancelWork` decided: the unit, and the job it is giving up. */
+export interface CancelWorkPlan {
+  readonly unit: Unit;
+  readonly work: UnitWork;
+}
+
+/**
+ * Decide whether `unitId` may stop working — the one place `CancelWork`'s
+ * legality is stated.
+ *
+ * Three checks, the same opening every unit command has: the actor exists, the
+ * unit exists, the actor owns it. The fourth is the command's whole rule: the
+ * unit must actually be working (`not-working` otherwise), because "cancel" on an
+ * idle unit is not a no-op a caller should be able to issue silently — it is a
+ * command aimed at a state that does not exist, and the typed refusal is what
+ * tells a client its picture is stale.
+ *
+ * Nothing here refunds movement, and nothing here removes an improvement: a job
+ * never adds one before it completes (see the module note), so cancelling cannot
+ * leave a half-built improvement behind.
+ */
+export const planCancelWork = (
+  state: GameState,
+  playerId: PlayerId,
+  unitId: UnitId,
+): Result<CancelWorkPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const unit = unitById(state, unitId);
+  if (unit === undefined) return err({ kind: 'unknown-unit', unitId });
+  if (unit.owner !== playerId) return err({ kind: 'not-your-unit', unitId, owner: unit.owner });
+
+  const work = unit.work;
+  if (work === undefined) return err({ kind: 'not-working', unitId });
+
+  return ok({ unit, work });
+};
+
+/**
+ * The `WorkCancelled` event for a unit that is giving up `work`, or `[]` when
+ * there was no job to give up.
+ *
+ * One helper rather than two inline object literals, because the two cancellation
+ * paths (`CancelWork` and relocation) must report the *same* fact in the same
+ * shape; the only thing that differs is `reason`.
+ */
+const workCancelledEvent = (unit: Unit, reason: WorkCancelledReason): readonly GameEvent[] => {
+  const work = unit.work;
+  if (work === undefined) return [];
+  return [
+    {
+      type: 'WorkCancelled',
+      unitId: unit.id,
+      kind: work.kind,
+      tile: work.tile,
+      turnsLeft: work.turnsLeft,
+      reason,
+    },
+  ];
+};
+
 /**
  * Apply a decided move: a new `units` array with the mover replaced (in place,
  * so the array stays sorted by id), `revision` bumped once, and the mover's new
@@ -857,13 +1220,26 @@ export const planSetProduction = (
  *
  * Everything else — map, players, settings, RNG, turn — is shared with the input,
  * which is never touched.
+ *
+ * M4a: **a relocated unit loses its job.** Work happens *on a tile by a unit
+ * standing there*, so a step invalidates it — and the job is not "carried along",
+ * because then a worker could walk away from a half-finished mine and collect it
+ * somewhere else. The `work` key is removed through `withoutWork` (absent, never
+ * `undefined`), and the caller appends the `WorkCancelled` event, because the
+ * event stream — not a diff of the unit — is how a consumer learns about it. A
+ * step to the tile the unit already occupies would leave it alone; `planMove`
+ * refuses non-adjacent destinations, so that case exists only for totality.
  */
 const movedState = (state: GameState, plan: MovePlan): GameState => {
-  const units = state.units.map((unit) =>
-    unit.id === plan.unit.id
-      ? { ...unit, tile: plan.to, movementLeft: unit.movementLeft - plan.cost }
-      : unit,
-  );
+  const units = state.units.map((unit) => {
+    if (unit.id !== plan.unit.id) return unit;
+    const moved: Unit = {
+      ...unit,
+      tile: plan.to,
+      movementLeft: unit.movementLeft - plan.cost,
+    };
+    return unit.tile === plan.to ? moved : withoutWork(moved);
+  });
 
   const moved: GameState = { ...state, revision: state.revision + 1, units };
   return withExplored(moved, plan.unit.owner, visibleTiles(moved, plan.unit.owner));
@@ -906,6 +1282,14 @@ export const applyCommand = (
         },
       ];
 
+      // M4a: the step relocated the unit, so any job it was doing is over.
+      // `movedState` removed the job from the unit; this appends the event that
+      // says so, immediately after the move it is a consequence of (and before the
+      // hut the mover just entered, because the cancellation happened *with* the
+      // step rather than after arriving). `movedState` and this read the same
+      // `plan.value.unit`, so the two cannot disagree about whether there was a job.
+      events.push(...workCancelledEvent(plan.value.unit, 'moved'));
+
       // M3 goody huts. The move has succeeded and the mover is standing on
       // `plan.value.to`, so *this* is where a hut on that tile resolves — and the
       // resolver is handed the post-move state, never the plan's `unit` value,
@@ -917,9 +1301,9 @@ export const applyCommand = (
       //
       // Everything the command layer owns stays here: one `revision` bump for the
       // one applied command (the resolver never touches it), the fog fold that
-      // `movedState` performed, and the event order — the move first, then the hut
-      // it entered, then the band it produced, because that is the order in which
-      // they happened.
+      // `movedState` performed, and the event order — the move first, then the
+      // work it cancelled, then the hut it entered, then the band it produced,
+      // because that is the order in which they happened.
       const entry = resolveHutEntry(moved, ruleset, plan.value.unit.id);
       if (entry !== undefined) events.push(...entry.events);
 
@@ -931,12 +1315,13 @@ export const applyCommand = (
         return err({ kind: 'unknown-player', playerId });
       }
 
-      // The whole of "a turn" lives in `turn.ts` — growth for every city
-      // (city-id order), production for every city (city-id order), every unit's
-      // movement refilled, `turn += 1` — and this case deliberately re-implements
-      // none of it. All this layer adds is the actor's `TurnEnded` event (which
-      // names a player, and so is not a property of the world) and the single
-      // `revision` bump every applied command performs.
+      // The whole of "a turn" lives in `turn.ts` — work progress for every unit
+      // (unit-id order), growth for every city (city-id order), production for
+      // every city (city-id order), every unit's movement refilled, `turn += 1` —
+      // and this case deliberately re-implements none of it. All this layer adds is
+      // the actor's `TurnEnded` event (which names a player, and so is not a
+      // property of the world) and the single `revision` bump every applied command
+      // performs.
       const outcome = advanceTurn(state, ruleset);
       const turn = outcome.state.turn;
       const events: readonly GameEvent[] = [
@@ -1006,6 +1391,51 @@ export const applyCommand = (
           revision: state.revision + 1,
         },
         events: [],
+      });
+    }
+
+    case 'StartWork': {
+      const plan = planStartWork(state, ruleset, playerId, cmd.unitId, cmd.kind);
+      if (!plan.ok) return err(plan.error);
+
+      // The job is attached and the unit's remaining movement is spent. Nothing
+      // else changes: the improvement is *not* added here (it lands when the last
+      // turn is paid, in `turn.ts`), no RNG is drawn, and the tile the job names is
+      // the unit's own, so the record cannot point somewhere the worker is not.
+      const work: UnitWork = {
+        kind: plan.value.kind,
+        tile: plan.value.tile,
+        turnsLeft: plan.value.turnsLeft,
+      };
+      const started: Unit = { ...withWork(plan.value.unit, work), movementLeft: 0 };
+
+      return ok({
+        state: { ...withUnit(state, started), revision: state.revision + 1 },
+        events: [
+          {
+            type: 'WorkStarted',
+            unitId: started.id,
+            kind: work.kind,
+            tile: work.tile,
+            turnsLeft: work.turnsLeft,
+          },
+        ],
+      });
+    }
+
+    case 'CancelWork': {
+      const plan = planCancelWork(state, playerId, cmd.unitId);
+      if (!plan.ok) return err(plan.error);
+
+      // The job is dropped, the unit keeps every movement point it had (nothing is
+      // refunded and nothing is charged — cancelling is free, and the turns already
+      // paid are simply gone), and the improvement is untouched because a job never
+      // added one before completing.
+      const idle = withoutWork(plan.value.unit);
+
+      return ok({
+        state: { ...withUnit(state, idle), revision: state.revision + 1 },
+        events: workCancelledEvent(plan.value.unit, 'cancelled'),
       });
     }
   }

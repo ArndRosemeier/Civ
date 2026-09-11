@@ -81,6 +81,38 @@
  * interface itself is untouched (a scenario already names its `seed` through
  * `settings`, which is what a hut reward is driven by).
  *
+ * M4a extends the builder once more, for the same reason:
+ *
+ * - **`addImprovement(x, y, kind)` places a tile improvement.** The state field
+ *   it writes, `GameState.improvements`, is a *sparse sorted pair list* (M4a,
+ *   "Where improvements live"), and the builder had no producer for it at all —
+ *   so no scenario could start from a tile a worker had already improved, and the
+ *   "building it again is refused" rule (`already-improved`) had no hand-built
+ *   world to be asserted against. Like `addHut`, the cheap half of the rule is
+ *   checked at the call (the coordinates are on the map, the ruleset defines the
+ *   kind, the same pair is not asked for twice) and the half that needs the
+ *   finished map is checked in `build()` (the terrain under the tile must be in
+ *   that improvement's `allowedRoles` — the same rule `StartWork` enforces, so a
+ *   scenario cannot state a tile the command layer could never produce).
+ *
+ *   The pairs are folded in through the engine's own `withImprovement`, never by
+ *   appending to an array here: the ordering (`(tile, kind)`, ascending) and the
+ *   "no duplicate pairs" invariant are the *contract* of that field because the
+ *   list is hashed, and the module that owns it is the module that establishes
+ *   it. The fold also happens **before** cities are built, because
+ *   `autoAssignWorkedTiles` ranks a tile by what it is *worth* — improvements
+ *   included — so a hand-built world must have its improvements in place before a
+ *   city's citizens are assigned, exactly as a played world does.
+ *
+ *   The `Scenario` interface itself is still untouched, and so is the runner: the
+ *   builder gained one method (additive — a scenario written against M2 or M3
+ *   keeps compiling, and `addImprovement` is the only new name on the surface),
+ *   the runner's behaviour did not change, and the events M4a added
+ *   (`WorkStarted`/`WorkCancelled`/`WorkCompleted`) reach a scenario through the
+ *   event list `ScenarioRunResult` already carried. The only other edits here are
+ *   case labels in the two message tables below, so that a refused worker command
+ *   reads as `<verb>: <reason>` rather than as an unrecognised error.
+ *
  * Failure channels — the frozen signature is narrower than the builder's needs,
  * so the split is stated here rather than discovered by a caller:
  *
@@ -98,10 +130,13 @@
  *   impassable terrain, a city for a player that was never added, a city within
  *   `MIN_CITY_DISTANCE` of another, a worked tile outside the radius or claimed
  *   by another city, a production item this ruleset cannot price, a building the
- *   city already has, more worked tiles than citizens — has **no** member in
- *   `SetupError`. Those throw a descriptive `Error` at the offending call where
- *   the world already knows the answer, and at `build()` for the checks that need
- *   the assembled map (terrain under a hut, the geometry of a worked tile).
+ *   city already has, more worked tiles than citizens, an `addImprovement` for a
+ *   kind this ruleset does not define or for the same pair twice — has **no**
+ *   member in `SetupError`. Those throw a descriptive `Error` at the offending
+ *   call where the world already knows the answer, and at `build()` for the checks
+ *   that need the assembled map (terrain under a hut, an improvement whose
+ *   `allowedRoles` does not include its tile's role, the geometry of a worked
+ *   tile).
  *   A scenario is code: a mistake in it should fail at the line that made it, or
  *   as near to it as the information allows. (Escalated for M2: scenarios built
  *   from untrusted data would need a `bad-scenario-setup` variant, or a wider
@@ -148,6 +183,8 @@ import {
   cityRadius,
   distance8,
   err,
+  improvementCatalog,
+  improvementDef,
   inBounds,
   indexToX,
   indexToY,
@@ -158,6 +195,7 @@ import {
   tileIndex,
   unitCatalog,
   unitDef,
+  withImprovement,
   type BuildingId,
   type City,
   type CityId,
@@ -167,6 +205,7 @@ import {
   type GameEvent,
   type GameMap,
   type GameState,
+  type ImprovementId,
   type PlayerKind,
   type PlayerState,
   type ProductionItem,
@@ -240,6 +279,15 @@ export interface ScenarioBuilder {
   setTile(x: number, y: number, role: TerrainRole): ScenarioBuilder;
   /** Place a goody hut on a land tile (M3). Duplicate tiles throw here; water throws at `build()`. */
   addHut(x: number, y: number): ScenarioBuilder;
+  /**
+   * Place a tile improvement (M4a) — the state a worker leaves behind, stated
+   * outright. The kind is an `ImprovementId` (what `StartWork` takes and what
+   * `state.improvements` holds), so a scenario names it exactly as the command
+   * does. Coordinates off the map, a kind this ruleset does not define, and the
+   * same pair twice throw here; a kind that may not be built on that tile's
+   * terrain role throws at `build()`, where the terrain is final.
+   */
+  addImprovement(x: number, y: number, kind: ImprovementId): ScenarioBuilder;
   addUnit(playerIndex: number, type: UnitTypeId, at: readonly [number, number]): ScenarioBuilder;
   /** State a city outright (M3) — the only way a scenario can have a queue at all. */
   addCity(playerIndex: number, at: readonly [number, number], options?: CitySetup): ScenarioBuilder;
@@ -382,6 +430,13 @@ const describeCommand = (command: Command, map: GameMap): string => {
         .join(', ')}]`;
     case 'SetProduction':
       return `SetProduction city ${String(command.cityId)} to ${describeItem(command.item)}`;
+    // M4a's two worker verbs. They name the unit and the improvement, so a
+    // refused `run` command reads as "which worker, which job" rather than as
+    // "some command was refused".
+    case 'StartWork':
+      return `StartWork by unit ${String(command.unitId)} on improvement "${command.kind}"`;
+    case 'CancelWork':
+      return `CancelWork by unit ${String(command.unitId)}`;
     // Unreachable for today's union; kept total so a command added elsewhere
     // degrades to a vague message instead of breaking this module's build.
     default:
@@ -442,6 +497,27 @@ const describeGameError = (error: GameError): string => {
       return `unknown-production-item (${describeItem(error.item)} is not buildable)`;
     case 'already-built':
       return `already-built (city ${String(error.cityId)} already has "${error.building}")`;
+    // M4a's worker refusals. Each names the improvement and the tile or role that
+    // decided it, because "why can this worker not dig here?" is the question a
+    // scenario author is asking.
+    case 'not-a-worker':
+      return `not-a-worker (unit ${String(error.unitId)} is not a worker)`;
+    case 'already-working':
+      return (
+        `already-working (unit ${String(error.unitId)} is already building ` +
+        `"${error.improvement}"; cancel it first)`
+      );
+    case 'not-working':
+      return `not-working (unit ${String(error.unitId)} has no job to cancel)`;
+    case 'unknown-improvement':
+      return `unknown-improvement ("${error.improvement}" is not buildable in this ruleset)`;
+    case 'improvement-not-allowed':
+      return (
+        `improvement-not-allowed ("${error.improvement}" cannot be built on "${error.role}" at ` +
+        `tile ${String(error.tile)}, where unit ${String(error.unitId)} stands)`
+      );
+    case 'already-improved':
+      return `already-improved (tile ${String(error.tile)} already carries "${error.improvement}")`;
     case 'invalid-argument':
       return `invalid-argument (${error.detail})`;
     default:
@@ -489,6 +565,18 @@ interface HutPlacement {
 }
 
 /**
+ * A tile improvement the scenario asked for (M4a), in the coordinates it was
+ * written in. Kept as `(x, y, kind)` rather than a resolved pair so the terrain
+ * under the tile is only consulted in `build()`, once every `setTile` has run —
+ * the same reason `HutPlacement` is coordinates.
+ */
+interface ImprovementPlacement {
+  readonly x: number;
+  readonly y: number;
+  readonly kind: ImprovementId;
+}
+
+/**
  * A city the scenario asked for, with every option resolved to the value the
  * state will carry. `workedTiles` keeps "the author named them" distinct from
  * "the builder assigns them": `undefined` means the latter, and an explicitly
@@ -519,6 +607,8 @@ interface BuilderWorld {
   readonly players: PlayerPlacement[];
   readonly placements: UnitPlacement[];
   readonly huts: HutPlacement[];
+  /** M4a: the improvements the scenario asked for, in the order it asked. */
+  readonly improvements: ImprovementPlacement[];
   readonly cities: CityPlacement[];
 }
 
@@ -757,14 +847,56 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
     explored,
     nextCityId: 0,
     cities: [],
+    // M4a: nothing is built here yet — the scenario's own improvements are folded
+    // in immediately below, through the engine's `withImprovement`, so the field
+    // starts as the empty array every honest state starts with and the ordering
+    // and uniqueness rules of a hashed field are established by the module that
+    // owns them.
+    improvements: [],
   };
+
+  // M4a improvements, before any city exists (see the module note: a city's
+  // citizens are assigned by what a tile is *worth*, improvements included).
+  //
+  // The rule that needs the finished map is the terrain one: which roles a tile
+  // carries is only final once every `fillTerrain`/`setTile` has run, and the role
+  // must be one the improvement's catalog row allows — the same rule `StartWork`
+  // enforces, so a hand-built world cannot contain a mine on grassland, a tile the
+  // command layer could never produce.
+  //
+  // The catalog lookup is repeated from `addImprovement` on purpose: this loop is
+  // the only writer of the field, and a pair no row describes contributes no
+  // yields at all, so a scenario asserting "the mine added a shield" would be
+  // asserting about a mine the engine cannot see. `addImprovement` reports it at
+  // the line that named the kind; this states it where the pair is written.
+  let state = base;
+  for (const placed of world.improvements) {
+    const index = tileIndex(world.width, placed.x, placed.y);
+    const role = world.roles[index] ?? DEFAULT_FILL_ROLE;
+    const def = improvementDef(world.ruleset, placed.kind);
+    if (def === undefined) {
+      throw new Error(
+        `scenario builder: addImprovement(${String(placed.x)}, ${String(placed.y)}, ` +
+          `"${placed.kind}") names an improvement this ruleset does not define, so nothing would ` +
+          'read its yields; add the row to the ruleset or drop the call',
+      );
+    }
+    if (!def.allowedRoles.includes(role)) {
+      throw new Error(
+        `scenario builder: addImprovement(${String(placed.x)}, ${String(placed.y)}, ` +
+          `"${placed.kind}") puts it on "${role}", which is not in its allowedRoles ` +
+          `(${def.allowedRoles.join(', ')}) — StartWork would refuse this tile, so the world is ` +
+          'one the command layer cannot produce',
+      );
+    }
+    state = withImprovement(state, asTileIndex(index), placed.kind);
+  }
 
   // Cities, in creation order, so ids are dense and `cities` stays sorted by id.
   // A city is added to a *working* state before its worked tiles are resolved, so
   // `autoAssignWorkedTiles` and `cityRadius` can see it (the same order
   // `FoundCity` writes: create the city, then assign its citizens) and so each
   // city's claims are visible to the next one's assignment.
-  let state = base;
   for (let index = 0; index < world.cities.length; index += 1) {
     const placed = world.cities[index];
     if (placed === undefined) continue;
@@ -829,6 +961,7 @@ export const createScenarioBuilder = (
     players: [],
     placements: [],
     huts: [],
+    improvements: [],
     cities: [],
   };
 
@@ -909,6 +1042,46 @@ export const createScenarioBuilder = (
       // Land and impassability are checked in `build()`: a later `setTile` can
       // still change what this tile is, so the answer is not known yet.
       world.huts.push({ x, y });
+      return builder;
+    },
+
+    addImprovement(x, y, kind) {
+      checkTile(x, y);
+
+      // A kind this ruleset does not describe would be a pair nothing can price —
+      // `improvementDef` would answer `undefined` and the tile would contribute no
+      // yields — so a scenario asserting "the mine added a shield" would be
+      // asserting about a mine the engine cannot see. Reported here, where the
+      // author wrote the kind, exactly as `addUnit` reports an unknown unit type.
+      if (improvementDef(world.ruleset, kind) === undefined) {
+        const known = improvementCatalog(world.ruleset)
+          .map((improvement) => improvement.id)
+          .join(', ');
+        throw new Error(
+          `scenario builder: the ruleset defines no improvement "${kind}"` +
+            (known === '' ? ' (it defines no improvements)' : ` (it defines: ${known})`),
+        );
+      }
+
+      // The same pair twice is an authoring mistake and not a second improvement:
+      // `state.improvements` holds unique pairs (`withImprovement` is idempotent),
+      // so a repeated call would silently place nothing and the scenario would
+      // measure a world it did not describe.
+      if (
+        world.improvements.some(
+          (placed) => placed.x === x && placed.y === y && placed.kind === kind,
+        )
+      ) {
+        throw new Error(
+          `scenario builder: addImprovement(${String(x)}, ${String(y)}, "${kind}") is called twice ` +
+            'for one tile; a tile holds a given improvement once (several *different* kinds may ' +
+            'share it)',
+        );
+      }
+
+      // The terrain role is checked in `build()`: a later `setTile` can still
+      // change what this tile is, so the answer is not known yet.
+      world.improvements.push({ x, y, kind });
       return builder;
     },
 

@@ -14,6 +14,7 @@ export * from './rng.js';
 export * from './map.js';
 export * from './gen.js';
 export * from './state.js';
+export * from './improvements.js';
 export * from './cities.js';
 export * from './growth.js';
 export * from './production.js';

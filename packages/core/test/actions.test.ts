@@ -30,9 +30,20 @@
  *   that would be a bug — a setter the applier accepts but the plan refuses, or
  *   the reverse — fails there.
  *
- * The walk covers six states — a hand-built board, one with cities, a starved
- * one, a rich one, the unknown-type one, and real `newGame` boards — and applies
- * every candidate to the state it came from.
+ * M4a adds the work commands, and they extend the enumerated half rather than the
+ * queried one: a job is named by an improvement kind, so "every way this worker
+ * may start work" is a finite list read from the catalog, and the universe below
+ * enumerates exactly that list (plus an unknown kind, plus `CancelWork` for every
+ * unit, so the refusals are swept too). That makes the keystone property span
+ * **five generators** — `unitMoveOptions`, `unitActions`, `legalActions`,
+ * `planStartWork` and `planCancelWork` — and `assertWorkAgreement` states the two
+ * new evaluators' agreement directly, including that an accepted work command
+ * *is* advertised, which the setters' half deliberately does not claim.
+ *
+ * The walk covers eight states — a hand-built board, one with cities, a starved
+ * one, a rich one, the unknown-type one, real `newGame` boards, and the M4a worker
+ * boards (idle, working, and on an already-improved tile) — and applies every
+ * candidate to the state it came from.
  *
  * The hand-built board is the one from `commands.test.ts`: width 4, tile index
  * `y * 4 + x`, every `explored` row `false` so that legality is visibly not a fog
@@ -44,8 +55,10 @@ import { legalActions, unitActions, unitMoveOptions } from '../src/actions.js';
 import { cityRadius, type City, type ProductionItem } from '../src/cities.js';
 import {
   applyCommand,
+  planCancelWork,
   planSetProduction,
   planSetWorkedTiles,
+  planStartWork,
   type Command,
   type GameError,
 } from '../src/commands.js';
@@ -60,6 +73,12 @@ import {
   type PlayerId,
 } from '../src/ids.js';
 import {
+  asImprovementId,
+  improvementCatalog,
+  type ImprovementDef,
+  type ImprovementId,
+} from '../src/improvements.js';
+import {
   TERRAIN_ROLES,
   type GameMap,
   type RulesetView,
@@ -69,7 +88,7 @@ import {
 import type { Result } from '../src/result.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { SCHEMA_VERSION, newGame, type GameState, type PlayerState } from '../src/state.js';
-import type { Unit, UnitDef, UnitRole } from '../src/units.js';
+import { withWork, type Unit, type UnitDef, type UnitRole, type UnitWork } from '../src/units.js';
 
 const TERRAIN_ROWS: readonly (readonly [TerrainRole, number, boolean])[] = [
   ['ocean', 1, true],
@@ -133,14 +152,50 @@ const makeDef = (id: string, role: UnitRole, movement: number): UnitDef => ({
 const SETTLER = makeDef('settler', 'settler', 2);
 const SCOUT = makeDef('scout', 'scout', 3);
 const WARRIOR = makeDef('warrior', 'military', 2);
+/** Movement 1: enough to start a job or take one step, never both. */
+const WORKER = makeDef('worker', 'worker', 1);
+
+/**
+ * The improvement catalog, in the order the generator enumerates it. **Placeholder
+ * rows of ours** (M4a): the turn counts are fixture numbers, the deltas are single
+ * +1s, and the roles are our reading of which terrain suits which improvement —
+ * none of it is sourced from Civ 3.
+ */
+const IMPROVEMENTS: readonly ImprovementDef[] = [
+  {
+    id: asImprovementId('road'),
+    kind: 'road',
+    name: 'Road',
+    turns: 2,
+    yields: { food: 0, shields: 0, commerce: 1 },
+    allowedRoles: ['grassland', 'plains', 'hills', 'mountains'],
+  },
+  {
+    id: asImprovementId('mine'),
+    kind: 'mine',
+    name: 'Mine',
+    turns: 3,
+    yields: { food: 0, shields: 1, commerce: 0 },
+    allowedRoles: ['hills', 'mountains'],
+  },
+  {
+    id: asImprovementId('irrigation'),
+    kind: 'irrigation',
+    name: 'Irrigation',
+    turns: 2,
+    yields: { food: 1, shields: 0, commerce: 0 },
+    allowedRoles: ['grassland', 'plains'],
+  },
+];
 
 const RULESET: RulesetView = {
   terrains: TERRAINS,
-  units: [SETTLER, SCOUT, WARRIOR],
+  units: [SETTLER, SCOUT, WARRIOR, WORKER],
   buildings: [
     { id: asBuildingId('granary'), name: 'Granary', cost: 10 },
     { id: asBuildingId('library'), name: 'Library', cost: 20 },
   ],
+  improvements: IMPROVEMENTS,
   fidelity: 'tuned',
 };
 
@@ -204,6 +259,7 @@ const STATE: GameState = {
   explored: [seen(false), seen(false)],
   nextCityId: 0,
   cities: [],
+  improvements: [],
 };
 
 const P0 = asPlayerId(0);
@@ -237,6 +293,17 @@ const setProduction = (cityId: number, item: ProductionItem): Command => ({
 const unitItem = (id: string): ProductionItem => ({ kind: 'unit', id: asUnitTypeId(id) });
 const buildingItem = (id: string): ProductionItem => ({ kind: 'building', id: asBuildingId(id) });
 
+const startWork = (unitId: number, kind: string): Command => ({
+  type: 'StartWork',
+  unitId: asUnitId(unitId),
+  kind: asImprovementId(kind),
+});
+
+const cancelWork = (unitId: number): Command => ({ type: 'CancelWork', unitId: asUnitId(unitId) });
+
+/** An improvement kind no row in this file's catalog describes. */
+const UNKNOWN_KIND = 'space-elevator';
+
 /** `state` with `cities`, and `nextCityId` past the highest id present. */
 const withCities = (state: GameState, cities: readonly City[]): GameState => ({
   ...state,
@@ -260,6 +327,49 @@ const SHARED_STATE: GameState = withCities(STATE, [
   city(1, 1, 5, { population: 1, workedTiles: [asTileIndex(8)] }),
 ]);
 
+/** `state` with `units`, keeping `nextUnitId` past the highest id present. */
+const withUnits = (state: GameState, units: readonly Unit[]): GameState => ({
+  ...state,
+  units: [...units].sort((a, b) => Number(a.id) - Number(b.id)),
+  nextUnitId: units.reduce((next, existing) => Math.max(next, Number(existing.id) + 1), 0),
+});
+
+/**
+ * Player 0's worker on tile 1 (hills) — the M4a board.
+ *
+ * Tile 1 is chosen because it puts the work commands' acceptance in one place: a
+ * `mine` and a `road` are allowed on hills, an `irrigation` is not, and its
+ * neighbours offer exactly two affordable steps (4 and 5, both grassland at cost
+ * 1; 0 and 2 are impassable and 6 holds player 1's warrior).
+ */
+const WORKER_TILE = 1;
+const WORKER_STATE: GameState = withUnits(STATE, [
+  ...STATE.units,
+  unit(3, WORKER, 0, WORKER_TILE, WORKER.movement),
+]);
+
+/** A job, in the shape the engine stores: `turnsLeft` is the count still owed. */
+const mineWork = (turnsLeft: number): UnitWork => ({
+  kind: asImprovementId('mine'),
+  tile: asTileIndex(WORKER_TILE),
+  turnsLeft,
+});
+
+/** `state` with unit 3 already working on its own tile. */
+const digging = (state: GameState, work: UnitWork): GameState => ({
+  ...state,
+  units: state.units.map((u) => (u.id === asUnitId(3) ? withWork(u, work) : u)),
+});
+
+/** The worker mid-job: it may cancel, and it may step — which cancels the job. */
+const WORKING_STATE: GameState = digging(WORKER_STATE, mineWork(2));
+
+/** The worker idle on a tile that already carries a mine, so only a road is left. */
+const MINED_STATE: GameState = {
+  ...WORKER_STATE,
+  improvements: [{ tile: asTileIndex(WORKER_TILE), kind: asImprovementId('mine') }],
+};
+
 /**
  * The ruleset map generation actually runs with: all six terrain roles (or
  * `newGame` fails with `missing-terrain-role`) and the one unit role it places.
@@ -273,6 +383,10 @@ const GEN_TERRAINS: readonly TerrainDef[] = TERRAIN_ROLES.map((role) => {
 const GEN_RULESET: RulesetView = {
   terrains: GEN_TERRAINS,
   units: [SETTLER],
+  // A generated board carries no improvements, so the catalog is empty here and
+  // every existing count on those boards is unchanged by M4a: a new game still
+  // starts with an empty `improvements` list and a settler that cannot work.
+  improvements: [],
   fidelity: 'tuned',
 };
 
@@ -352,8 +466,9 @@ const assertEveryUnitActionApplies = (state: GameState, ruleset: RulesetView): n
 
 /**
  * A stable identity for a command, so generators and appliers can be compared as
- * sets. Total over the M3 union, including the two city setters, so a comparison
- * that included one could not silently collapse it onto another shape.
+ * sets. Total over the M4a union, including the two city setters and the two work
+ * commands, so a comparison that included one could not silently collapse it onto
+ * another shape.
  */
 const commandKey = (cmd: Command): string => {
   switch (cmd.type) {
@@ -367,6 +482,10 @@ const commandKey = (cmd: Command): string => {
       return `SetWorkedTiles:${String(Number(cmd.cityId))}:${cmd.tiles.map(Number).join(',')}`;
     case 'SetProduction':
       return `SetProduction:${String(Number(cmd.cityId))}:${cmd.item.kind}:${cmd.item.id}`;
+    case 'StartWork':
+      return `StartWork:${String(Number(cmd.unitId))}:${cmd.kind}`;
+    case 'CancelWork':
+      return `CancelWork:${String(Number(cmd.unitId))}`;
   }
 };
 
@@ -374,7 +493,8 @@ const commandKey = (cmd: Command): string => {
  * A superset of every command the generators *could* produce for `playerId`:
  * every tile index from one before the board to one past it for each of the
  * player's units, one non-integer index (a `TileIndex` is a number at runtime,
- * and a client can hand over 1.5), and `EndTurn`.
+ * and a client can hand over 1.5), `FoundCity`, one `StartWork` per catalog kind
+ * **plus one for a kind no row describes**, `CancelWork`, and `EndTurn`.
  *
  * It is deliberately wider than the generator's output — that is what makes the
  * completeness check meaningful: the applier must reject everything here that the
@@ -382,9 +502,17 @@ const commandKey = (cmd: Command): string => {
  * purpose, because the generators never yield them and `not-your-unit` is a
  * separate property (asserted in `commands.test.ts`).
  */
-const candidateCommands = (state: GameState, playerId: PlayerId): readonly Command[] => {
+const candidateCommands = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): readonly Command[] => {
   const size = state.map.width * state.map.height;
   const candidates: Command[] = [];
+  const kinds: readonly (ImprovementId | string)[] = [
+    ...improvementCatalog(ruleset).map((def) => def.id),
+    UNKNOWN_KIND,
+  ];
 
   for (const owner of state.units) {
     if (owner.owner !== playerId) continue;
@@ -393,6 +521,11 @@ const candidateCommands = (state: GameState, playerId: PlayerId): readonly Comma
     // M3: founding is one entry per unit — a unit either can found where it
     // stands or it cannot — so the universe stays exhaustive without exploding.
     candidates.push(foundCity(Number(owner.id)));
+    // M4a: a job is named by its kind, so the work space *is* the catalog (plus one
+    // kind nothing describes, so the `unknown-improvement` refusal is swept too),
+    // and the cancel is one entry per unit.
+    for (const kind of kinds) candidates.push(startWork(Number(owner.id), kind));
+    candidates.push(cancelWork(Number(owner.id)));
   }
   candidates.push({ type: 'EndTurn' });
 
@@ -530,6 +663,71 @@ const assertSetterAgreement = (
   return { checked, accepted, yielded: yielded.size };
 };
 
+/** What one work sweep measured, so a caller can prove it was not vacuous. */
+interface WorkTotals {
+  readonly checked: number;
+  readonly accepted: number;
+  readonly refused: number;
+}
+
+/**
+ * M4a's half of the keystone property, and the reason it is asserted here as well
+ * as in the candidate sweep: `planStartWork` and `planCancelWork` are the fourth
+ * and fifth generators, so for every candidate of either command —
+ *
+ * - the applier's verdict must be the plan evaluator's, with the *same* typed
+ *   refusal (so a worker refused with `improvement-not-allowed` by one and
+ *   `already-improved` by the other fails here), and
+ * - an accepted one must be advertised by `legalActions`, which is the
+ *   completeness claim the setters deliberately do not make — a worker's job *is*
+ *   enumerable, so an accepted `StartWork` that no generator yielded would be a
+ *   real bug.
+ */
+const assertWorkAgreement = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): WorkTotals => {
+  const yielded = new Set([...legalActions(state, ruleset, playerId)].map(commandKey));
+  const kinds: readonly (ImprovementId | string)[] = [
+    ...improvementCatalog(ruleset).map((def) => def.id),
+    UNKNOWN_KIND,
+  ];
+
+  let checked = 0;
+  let accepted = 0;
+
+  for (const unit of state.units) {
+    if (unit.owner !== playerId) continue;
+    const candidates: readonly Command[] = [
+      ...kinds.map((kind) => startWork(Number(unit.id), kind)),
+      cancelWork(Number(unit.id)),
+    ];
+
+    for (const cmd of candidates) {
+      checked += 1;
+      const applied = applyCommand(state, playerId, cmd, ruleset);
+      const planned =
+        cmd.type === 'StartWork'
+          ? planStartWork(state, ruleset, playerId, cmd.unitId, cmd.kind)
+          : cmd.type === 'CancelWork'
+            ? planCancelWork(state, playerId, cmd.unitId)
+            : undefined;
+      if (planned === undefined) throw new Error(`not a work command: ${cmd.type}`);
+
+      expect(applied.ok).toBe(planned.ok);
+      if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+
+      if (applied.ok) {
+        accepted += 1;
+        expect(yielded.has(commandKey(cmd))).toBe(true);
+      }
+    }
+  }
+
+  return { checked, accepted, refused: checked - accepted };
+};
+
 /**
  * The other direction of the keystone property: every command `applyCommand`
  * *accepts* out of the candidate universe must be one the generator yields. An
@@ -549,7 +747,7 @@ const assertGeneratorIsComplete = (
   const yielded = new Set([...legalActions(state, ruleset, playerId)].map(commandKey));
 
   let accepted = 0;
-  for (const cmd of candidateCommands(state, playerId)) {
+  for (const cmd of candidateCommands(state, ruleset, playerId)) {
     const outcome = applyCommand(state, playerId, cmd, ruleset);
     if (!outcome.ok) continue;
     accepted += 1;
@@ -648,9 +846,90 @@ describe('unitActions', () => {
     ]);
   });
 
+  it('offers an idle worker its jobs in catalog order, then its steps', () => {
+    // The catalog is road, mine, irrigation; the worker stands on hills, so
+    // irrigation is not buildable there and is not offered. Moves come last: a step
+    // relocates the unit, and M4a cancels a job when a unit relocates, so the
+    // actions that leave the worker in place are listed first.
+    expect(unitActions(WORKER_STATE, RULESET, asUnitId(3))).toEqual([
+      startWork(3, 'road'),
+      startWork(3, 'mine'),
+      move(3, 4),
+      move(3, 5),
+    ]);
+  });
+
+  it('offers a working unit its cancel first, and still offers the steps that would cancel for it', () => {
+    expect(unitActions(WORKING_STATE, RULESET, asUnitId(3))).toEqual([
+      cancelWork(3),
+      move(3, 4),
+      move(3, 5),
+    ]);
+    // No StartWork while a job is running, whatever the kind.
+    expect(
+      unitActions(WORKING_STATE, RULESET, asUnitId(3)).some((cmd) => cmd.type === 'StartWork'),
+    ).toBe(false);
+  });
+
+  it('offers StartWork for exactly the kinds the applier accepts, and nowhere else', () => {
+    const offers = (state: GameState, unitId: number, kind: string): boolean =>
+      unitActions(state, RULESET, asUnitId(unitId)).some(
+        (cmd) => cmd.type === 'StartWork' && cmd.kind === asImprovementId(kind),
+      );
+    const applies = (state: GameState, unitId: number, kind: string): boolean =>
+      applyCommand(state, P0, startWork(unitId, kind), RULESET).ok;
+
+    const kinds: readonly string[] = ['road', 'mine', 'irrigation', UNKNOWN_KIND];
+    const boards: readonly GameState[] = [
+      WORKER_STATE,
+      WORKING_STATE,
+      MINED_STATE,
+      withMovement(WORKER_STATE, 3, 0),
+      CITY_STATE,
+    ];
+
+    for (const board of boards) {
+      for (const unitId of [0, 1, 3]) {
+        for (const kind of kinds) {
+          expect(offers(board, unitId, kind)).toBe(applies(board, unitId, kind));
+        }
+      }
+    }
+
+    // …and the sweep above is not a comparison of two constants: it sees both
+    // verdicts, on the same board and on different ones.
+    expect(offers(WORKER_STATE, 3, 'mine')).toBe(true);
+    expect(offers(WORKER_STATE, 3, 'irrigation')).toBe(false);
+    expect(offers(WORKER_STATE, 3, UNKNOWN_KIND)).toBe(false);
+    expect(offers(MINED_STATE, 3, 'mine')).toBe(false);
+    expect(offers(MINED_STATE, 3, 'road')).toBe(true);
+    expect(offers(WORKING_STATE, 3, 'road')).toBe(false);
+    expect(offers(WORKER_STATE, 0, 'mine')).toBe(false); // a settler is not a worker
+    expect(offers(withMovement(WORKER_STATE, 3, 0), 3, 'road')).toBe(false);
+  });
+
+  it('offers CancelWork exactly where cancelling is legal, and nowhere else', () => {
+    const offers = (state: GameState, unitId: number): boolean =>
+      unitActions(state, RULESET, asUnitId(unitId)).some((cmd) => cmd.type === 'CancelWork');
+    const applies = (state: GameState, unitId: number): boolean =>
+      applyCommand(state, P0, cancelWork(unitId), RULESET).ok;
+
+    for (const board of [WORKER_STATE, WORKING_STATE, MINED_STATE, CITY_STATE, STATE]) {
+      for (const unitId of [0, 1, 3, 99]) {
+        expect(offers(board, unitId)).toBe(applies(board, unitId));
+      }
+    }
+
+    expect(offers(WORKING_STATE, 3)).toBe(true);
+    expect(offers(WORKER_STATE, 3)).toBe(false);
+  });
+
   it('has no actions for a unit that has none', () => {
     expect(unitActions(STATE, RULESET, asUnitId(1))).toEqual([]);
     expect(unitActions(STATE, RULESET, asUnitId(99))).toEqual([]);
+    // A worker that has spent its movement and is not working has nothing left: no
+    // job (it costs movement) and no step (nothing affordable).
+    expect(unitActions(withMovement(WORKER_STATE, 3, 0), RULESET, asUnitId(3))).toEqual([]);
   });
 
   it('offers FoundCity exactly where founding is legal, and nowhere else', () => {
@@ -824,6 +1103,93 @@ describe('keystone — the generator and the applier agree, in both directions',
     expect(assertEveryLegalActionApplies(rich, RULESET, [P0, P1])).toBe(14);
     expect(assertKeystone(rich, RULESET, P0)).toEqual({ yielded: 13, accepted: 13 });
     expect(assertKeystone(rich, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
+  });
+
+  it('holds on the M4a worker boards, exhaustively, for both players', () => {
+    // Soundness: the settler's FoundCity plus 5 settler moves, the worker's 2 jobs
+    // (road, then mine — irrigation is not hills work) plus 2 worker moves, and one
+    // EndTurn: 11 for player 0. Player 1's warrior has spent its movement and can
+    // neither found nor work, so it has the EndTurn alone. Completeness: the applier
+    // accepts those same 11 and nothing else — so the walk cannot pass vacuously.
+    expect(assertEveryLegalActionApplies(WORKER_STATE, RULESET, [P0, P1])).toBe(12);
+    expect(assertEveryUnitActionApplies(WORKER_STATE, RULESET)).toBe(10);
+    expect(assertKeystone(WORKER_STATE, RULESET, P0)).toEqual({ yielded: 11, accepted: 11 });
+    expect(assertKeystone(WORKER_STATE, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
+
+    // A worker mid-job: the two jobs are gone, the cancel takes their place, and the
+    // steps stay — a step is still legal, and it cancels the job (M4a), which is
+    // exactly why the generator must keep offering it.
+    expect(assertEveryLegalActionApplies(WORKING_STATE, RULESET, [P0, P1])).toBe(11);
+    expect(assertEveryUnitActionApplies(WORKING_STATE, RULESET)).toBe(9);
+    expect(assertKeystone(WORKING_STATE, RULESET, P0)).toEqual({ yielded: 10, accepted: 10 });
+
+    // A tile that already carries a mine: that job is refused, the road is not.
+    expect(assertEveryLegalActionApplies(MINED_STATE, RULESET, [P0, P1])).toBe(11);
+    expect(assertEveryUnitActionApplies(MINED_STATE, RULESET)).toBe(9);
+    expect(assertKeystone(MINED_STATE, RULESET, P0)).toEqual({ yielded: 10, accepted: 10 });
+  });
+
+  it('holds for a worker with no movement left: no job, no step, and no command the applier would take', () => {
+    const spent = withMovement(WORKER_STATE, 3, 0);
+
+    expect(unitActions(spent, RULESET, asUnitId(3))).toEqual([]);
+    // Four units' worth of nothing to do plus the two EndTurns: the settler's
+    // FoundCity and five steps, and nothing else.
+    expect(assertEveryLegalActionApplies(spent, RULESET, [P0, P1])).toBe(8);
+    expect(assertKeystone(spent, RULESET, P0)).toEqual({ yielded: 7, accepted: 7 });
+  });
+
+  it('agrees for the two work evaluators — the fourth and fifth generators', () => {
+    // Each worker board accepts *and* refuses, so both directions are being compared.
+    for (const board of [WORKER_STATE, WORKING_STATE, MINED_STATE]) {
+      const totals = assertWorkAgreement(board, RULESET, P0);
+
+      expect(totals.checked).toBeGreaterThan(0);
+      expect(totals.accepted).toBeGreaterThan(0);
+      expect(totals.refused).toBeGreaterThan(0);
+    }
+
+    // A board with no worker at all: the sweep still asks its two units (10
+    // candidates) and accepts nothing, which is the right verdict for a settler and
+    // a scout.
+    for (const board of [STATE, CITY_STATE]) {
+      expect(assertWorkAgreement(board, RULESET, P0)).toEqual({
+        checked: 10,
+        accepted: 0,
+        refused: 10,
+      });
+    }
+
+    // The exact shape on the worker board: three units of player 0's (0, 1 and 3),
+    // each asked 4 kinds plus a cancel — 15 candidates — of which only the worker's
+    // road and mine are accepted, and only those two are advertised.
+    expect(assertWorkAgreement(WORKER_STATE, RULESET, P0)).toEqual({
+      checked: 15,
+      accepted: 2,
+      refused: 13,
+    });
+    // Mid-job: the two jobs are refused (`already-working`) and the cancel is the one
+    // accepted command; on an already-mined tile the mine is refused and only the
+    // road is accepted. Same universe size, different acceptances — which is what
+    // makes these sweeps about the state rather than about the fixture.
+    expect(assertWorkAgreement(WORKING_STATE, RULESET, P0)).toEqual({
+      checked: 15,
+      accepted: 1,
+      refused: 14,
+    });
+    expect(assertWorkAgreement(MINED_STATE, RULESET, P0)).toEqual({
+      checked: 15,
+      accepted: 1,
+      refused: 14,
+    });
+    // Player 1's warrior can neither work nor cancel: the sweep is not vacuous (it
+    // checks a unit) and accepts nothing, which is the correct verdict for a unit
+    // that is not a worker.
+    expect(assertWorkAgreement(WORKER_STATE, RULESET, P1)).toEqual({
+      checked: 5,
+      accepted: 0,
+      refused: 5,
+    });
   });
 
   it('holds when a unit type is missing from the ruleset (the sweep’s counterexample)', () => {

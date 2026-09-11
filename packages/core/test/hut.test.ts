@@ -123,10 +123,17 @@ const SETTLER = unitDefOf('settler', 'settler', 'land', 2);
 const WARRIOR = unitDefOf('warrior', 'military', 'land', 2);
 const GALLEY = unitDefOf('galley', 'military', 'sea', 3);
 
-/** The catalog order is the rule: the first `military` **land** row is the reward. */
+/**
+ * The catalog order is the rule: the first `military` **land** row is the reward.
+ *
+ * No improvements: a hut reward has nothing to do with a worker's job (M4a), and
+ * an empty catalog is how a view says so — `RulesetView.improvements` is required,
+ * so the field is stated rather than left out.
+ */
 const RULESET: RulesetView = {
   terrains: TERRAINS,
   units: [SETTLER, WARRIOR, GALLEY],
+  improvements: [],
   fidelity: 'tuned',
 };
 
@@ -200,6 +207,10 @@ const board = (options: BoardOptions = {}): GameState => {
     explored: players.map(() => GRID.map(() => false)),
     nextCityId: 0,
     cities: options.cities ?? [],
+    // M4a: nothing is built on this hand-built board. The key is present and
+    // *empty* — an absent key would make a state that predates M4a, which
+    // `improvements.ts` tolerates but which is not the shape `newGame` writes.
+    improvements: [],
   };
 };
 

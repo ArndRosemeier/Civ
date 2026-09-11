@@ -1,7 +1,8 @@
 /**
- * `applyCommand` — movement, the M3 city commands, the turn pipeline, purity and
- * the turn advance (docs/INTERFACES.md M2, "Core — commands, errors, legal
- * actions"; M3, "Commands", "Growth", "Production", "Turn pipeline").
+ * `applyCommand` — movement, the M3 city commands, the M4a worker commands, the
+ * turn pipeline, purity and the turn advance (docs/INTERFACES.md M2, "Core —
+ * commands, errors, legal actions"; M3, "Commands", "Growth", "Production",
+ * "Turn pipeline"; M4a, "Workers", "Commands", "advanceTurn order").
  *
  * The board is hand-built rather than generated so every assertion reads as "on
  * this map, that command gives this answer": tile indices are `y * 4 + x`, and
@@ -11,13 +12,14 @@
  * out of the legality rule, so every movement assertion below is also evidence
  * that legality does not consult what a player has seen.
  *
- * The M3 sections live here rather than in a `growth.test.ts`/`production.test.ts`
- * of their own because this test file is the one the workstream owns; they are
- * sectioned by module, and every number they assert is a **placeholder** rule of
- * ours (the 10 + 5·(pop−1) food box, the food-first auto-assignment, the shield
- * carry-over) pinned so that an intentional retune has to change a test on
- * purpose. None of it is claimed to be Civ 3's, and the Civ IV growth formula is
- * explicitly asserted *against* (`foodBoxSize`).
+ * The M3 and M4a sections live here rather than in a
+ * `growth.test.ts`/`production.test.ts`/`work.test.ts` of their own because this
+ * test file is the one the workstream owns; they are sectioned by module, and
+ * every number they assert is a **placeholder** rule of ours (the 10 + 5·(pop−1)
+ * food box, the food-first auto-assignment, the shield carry-over, the worker turn
+ * counts and where each improvement may be built) pinned so that an intentional
+ * retune has to change a test on purpose. None of it is claimed to be Civ 3's, and
+ * the Civ IV growth formula is explicitly asserted *against* (`foodBoxSize`).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -25,10 +27,12 @@ import { canonicalize, hashValue } from '@civts/testing';
 import { MIN_CITY_DISTANCE, cityById, type City, type ProductionItem } from '../src/cities.js';
 import {
   applyCommand,
+  planCancelWork,
   planFoundCity,
   planMove,
   planSetProduction,
   planSetWorkedTiles,
+  planStartWork,
   type Command,
   type CommandOutcome,
   type GameError,
@@ -47,6 +51,14 @@ import {
   asUnitTypeId,
   type PlayerId,
 } from '../src/ids.js';
+import {
+  asImprovementId,
+  hasImprovement,
+  improvementsAt,
+  withImprovement,
+  type ImprovementDef,
+  type ImprovementId,
+} from '../src/improvements.js';
 import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { applyProduction, itemCost, itemCostOf } from '../src/production.js';
 import { isOk, type Result } from '../src/result.js';
@@ -54,7 +66,15 @@ import { nextBelow, seedRng } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import { SCHEMA_VERSION, type GameState, type PlayerState } from '../src/state.js';
 import { advanceTurn } from '../src/turn.js';
-import { spawnUnit, type Unit, type UnitDef, type UnitRole } from '../src/units.js';
+import {
+  spawnUnit,
+  withWork,
+  withoutWork,
+  type Unit,
+  type UnitDef,
+  type UnitRole,
+  type UnitWork,
+} from '../src/units.js';
 
 /** Move cost per role; ocean/coast/mountains are impassable. */
 const TERRAIN_ROWS: readonly (readonly [TerrainRole, number, boolean])[] = [
@@ -158,6 +178,8 @@ const makeDef = (id: string, role: UnitRole, movement: number, cost: number): Un
 const SETTLER = makeDef('settler', 'settler', 2, 3);
 const SCOUT = makeDef('scout', 'scout', 3, 2);
 const WARRIOR = makeDef('warrior', 'military', 2, 2);
+/** Movement 1: enough to start a job or take one step, never both. */
+const WORKER = makeDef('worker', 'worker', 1, 2);
 
 /** Building costs (shields), as placeholder rows of ours. */
 const GRANARY_COST = 10;
@@ -168,11 +190,56 @@ const BUILDINGS = [
   { id: asBuildingId('library'), name: 'Library', cost: LIBRARY_COST },
 ];
 
-/** The engine's view of a ruleset: terrain, a unit catalog, and buildings. */
+/**
+ * Tile improvements, as **placeholder** rows of ours (M4a, "Rules — improvement
+ * catalog"): every `turns` count here is a fixture number chosen to make a job's
+ * progress observable in three turns, and the `yields` deltas are single +1s so
+ * that a change in a city's output is attributable to exactly one completed
+ * improvement. None of these numbers is Civ 3's, and the `allowedRoles` lists are
+ * our reading of which terrain suits which improvement (a mine needs rock,
+ * irrigation needs flat land), not a sourced rule.
+ *
+ * Catalog order (`road`, `mine`, `irrigation`) matches the shipped content
+ * package's, because a generator enumerates the catalog in order and the tests
+ * below assert the resulting command order.
+ */
+const ROAD_TURNS = 2;
+const MINE_TURNS = 3;
+const IRRIGATION_TURNS = 2;
+
+const ROAD: ImprovementDef = {
+  id: asImprovementId('road'),
+  kind: 'road',
+  name: 'Road',
+  turns: ROAD_TURNS,
+  yields: { food: 0, shields: 0, commerce: 1 },
+  allowedRoles: ['grassland', 'plains', 'hills', 'mountains'],
+};
+const MINE: ImprovementDef = {
+  id: asImprovementId('mine'),
+  kind: 'mine',
+  name: 'Mine',
+  turns: MINE_TURNS,
+  yields: { food: 0, shields: 1, commerce: 0 },
+  allowedRoles: ['hills', 'mountains'],
+};
+const IRRIGATION: ImprovementDef = {
+  id: asImprovementId('irrigation'),
+  kind: 'irrigation',
+  name: 'Irrigation',
+  turns: IRRIGATION_TURNS,
+  yields: { food: 1, shields: 0, commerce: 0 },
+  allowedRoles: ['grassland', 'plains'],
+};
+
+const IMPROVEMENTS: readonly ImprovementDef[] = [ROAD, MINE, IRRIGATION];
+
+/** The engine's view of a ruleset: terrain, a unit catalog, buildings, improvements. */
 const RULESET: RulesetView = {
   terrains: TERRAINS,
-  units: [SETTLER, SCOUT, WARRIOR],
+  units: [SETTLER, SCOUT, WARRIOR, WORKER],
   buildings: BUILDINGS,
+  improvements: IMPROVEMENTS,
   fidelity: 'tuned',
 };
 
@@ -241,6 +308,7 @@ const STATE: GameState = {
   explored: [UNSEEN, UNSEEN],
   nextCityId: 0,
   cities: [],
+  improvements: [],
 };
 
 /**
@@ -364,6 +432,62 @@ const deepFreeze = (value: unknown): void => {
   Object.freeze(value);
   for (const child of Object.values(value)) deepFreeze(child);
 };
+
+/* ------------------------------------------------------------------ *
+ * M4a — the worker fixture
+ * ------------------------------------------------------------------ */
+
+const startWork = (unitId: number, kind: string): Command => ({
+  type: 'StartWork',
+  unitId: asUnitId(unitId),
+  kind: asImprovementId(kind),
+});
+
+const cancelWork = (unitId: number): Command => ({ type: 'CancelWork', unitId: asUnitId(unitId) });
+
+/** The job `unitId` is doing, or `undefined` — never a key that is present and empty. */
+const workOf = (state: GameState, unitId: number): UnitWork | undefined =>
+  state.units.find((u) => u.id === asUnitId(unitId))?.work;
+
+/** `state` with `units`, keeping `nextUnitId` past the highest id present. */
+const withUnits = (state: GameState, units: readonly Unit[]): GameState => ({
+  ...state,
+  units: [...units].sort((a, b) => Number(a.id) - Number(b.id)),
+  nextUnitId: units.reduce((next, existing) => Math.max(next, Number(existing.id) + 1), 0),
+});
+
+/**
+ * Player 0's worker, standing on tile 1 (hills) at full movement.
+ *
+ * Tile 1 is the interesting tile: a `mine` and a `road` are allowed there, an
+ * `irrigation` is not (irrigation is flat-land work), and its neighbours are 0
+ * (ocean, impassable), 2 (mountains, impassable), 4 (grassland, cost 1), 5
+ * (grassland, cost 1 — and player 0's settler stands there, which is legal to
+ * stack on), 6 (grassland, held by player 1's warrior, so not enterable). So the
+ * worker offers exactly two jobs and two steps, which is small enough to assert
+ * action by action.
+ */
+const WORKER_TILE = 1;
+const worker = (movementLeft: number): Unit => unit(3, WORKER, 0, WORKER_TILE, movementLeft);
+
+/** `STATE` plus player 0's worker on the hills — the board every M4a test starts from. */
+const WORK_STATE: GameState = withUnits(STATE, [...STATE.units, worker(WORKER.movement)]);
+
+/** The same board with player 0's city on 13, so a mine's effect on yields is visible. */
+const WORK_CITY_STATE: GameState = withCities(WORK_STATE, [CITY]);
+
+/** A job, in the shape the engine stores: `turnsLeft` is the count still owed. */
+const mineWork = (turnsLeft: number): UnitWork => ({
+  kind: MINE.id,
+  tile: asTileIndex(WORKER_TILE),
+  turnsLeft,
+});
+
+/** `state` with the worker (unit 3) already working on its own tile. */
+const digging = (state: GameState, work: UnitWork): GameState => ({
+  ...state,
+  units: state.units.map((u) => (u.id === asUnitId(3) ? withWork(u, work) : u)),
+});
 
 describe('applyCommand — MoveUnit', () => {
   it('moves a unit one step onto adjacent grassland and pays its cost', () => {
@@ -1314,6 +1438,480 @@ describe('the city plan evaluators agree with applyCommand', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * M4a — applyCommand: StartWork
+ * ------------------------------------------------------------------ */
+
+describe('applyCommand — StartWork', () => {
+  it('starts a job on the unit’s own tile, spends its whole turn, and says so in one event', () => {
+    const outcome = mustOk(apply(WORK_STATE, P0, startWork(3, 'mine')));
+
+    const started = outcome.state.units.find((u) => u.id === asUnitId(3));
+    if (started === undefined) throw new Error('the worker disappeared');
+    expect(started.work).toStrictEqual({
+      kind: MINE.id,
+      tile: asTileIndex(WORKER_TILE),
+      turnsLeft: MINE_TURNS,
+    });
+    // The job costs the unit's remaining movement — *all* of it (M4a: "it costs the
+    // unit's remaining movement for the turn"). The worker had 1, so it has 0.
+    expect(movementLeftOf(outcome.state, 3)).toBe(0);
+
+    expect(outcome.state.revision).toBe(WORK_STATE.revision + 1);
+    expect(outcome.state.turn).toBe(WORK_STATE.turn);
+    expect(outcome.events).toStrictEqual([
+      {
+        type: 'WorkStarted',
+        unitId: asUnitId(3),
+        kind: MINE.id,
+        tile: asTileIndex(WORKER_TILE),
+        turnsLeft: MINE_TURNS,
+      },
+    ]);
+
+    // Nothing is built yet: the pair lands when the job completes (turn.ts).
+    expect(outcome.state.improvements).toEqual([]);
+    expect(improvementsAt(outcome.state, asTileIndex(WORKER_TILE))).toEqual([]);
+    expect(hasImprovement(outcome.state, asTileIndex(WORKER_TILE), MINE.id)).toBe(false);
+
+    // …and nothing else in the state moved: every other unit is the same object.
+    for (const unit of STATE.units) {
+      expect(outcome.state.units.find((u) => u.id === unit.id)).toBe(unit);
+    }
+    expect(outcome.state.map).toBe(WORK_STATE.map);
+    expect(outcome.state.cities).toBe(WORK_STATE.cities);
+
+    // Hashable: `work` is a real value, never a key holding `undefined`.
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+    expect(hashValue(outcome.state)).not.toBe(hashValue(WORK_STATE));
+  });
+
+  it('takes the job length from the catalog row, not from a constant here', () => {
+    const outcome = mustOk(apply(WORK_STATE, P0, startWork(3, 'road')));
+    const started = outcome.state.units.find((u) => u.id === asUnitId(3));
+
+    expect(started?.work).toStrictEqual({
+      kind: ROAD.id,
+      tile: asTileIndex(WORKER_TILE),
+      turnsLeft: ROAD_TURNS,
+    });
+    expect(ROAD_TURNS).not.toBe(MINE_TURNS); // so the two rows are told apart
+  });
+
+  it('refuses a unit that is not a worker, including one whose type the ruleset cannot resolve', () => {
+    // 0 is a settler, 1 a scout: neither can improve a tile however it stands.
+    for (const unitId of [0, 1]) {
+      expect(refusedAs(apply(WORK_STATE, P0, startWork(unitId, 'mine')), 'not-a-worker')).toEqual({
+        kind: 'not-a-worker',
+        unitId: asUnitId(unitId),
+      });
+    }
+
+    // A type the view does not describe cannot be *shown* to be a worker, so it is
+    // refused as `not-a-worker` rather than assumed to be one — the same reading
+    // `planFoundCity` applies to an undescribed settler.
+    const ghost = makeDef('ghost-worker', 'worker', 1, 2);
+    const board = withUnits(WORK_STATE, [...STATE.units, unit(3, ghost, 0, WORKER_TILE, 1)]);
+    expect(refusedAs(apply(board, P0, startWork(3, 'mine')), 'not-a-worker')).toStrictEqual({
+      kind: 'not-a-worker',
+      unitId: asUnitId(3),
+    });
+  });
+
+  it('refuses an unknown unit, an unknown player, and another player’s worker', () => {
+    refusedAs(apply(WORK_STATE, P0, startWork(99, 'mine')), 'unknown-unit');
+    refusedAs(apply(WORK_STATE, asPlayerId(9), startWork(3, 'mine')), 'unknown-player');
+
+    const rival = withUnits(WORK_STATE, [...STATE.units, unit(4, WORKER, 1, WORKER_TILE, 1)]);
+    expect(refusedAs(apply(rival, P0, startWork(4, 'mine')), 'not-your-unit')).toStrictEqual({
+      kind: 'not-your-unit',
+      unitId: asUnitId(4),
+      owner: P1,
+    });
+    // …while its own owner may start it: the refusal is ownership, not the tile.
+    expect(apply(rival, P1, startWork(4, 'mine')).ok).toBe(true);
+  });
+
+  it('refuses a unit that is already working, naming the job in progress', () => {
+    const busy = digging(WORK_STATE, mineWork(2));
+
+    expect(refusedAs(apply(busy, P0, startWork(3, 'road')), 'already-working')).toStrictEqual({
+      kind: 'already-working',
+      unitId: asUnitId(3),
+      improvement: MINE.id,
+    });
+    // Asking again for the *same* job is refused the same way: one job at a time,
+    // and "start over" is a cancel first.
+    expect(refusedAs(apply(busy, P0, startWork(3, 'mine')), 'already-working').kind).toBe(
+      'already-working',
+    );
+  });
+
+  it('refuses an improvement this ruleset does not describe', () => {
+    expect(
+      refusedAs(apply(WORK_STATE, P0, startWork(3, 'space-elevator')), 'unknown-improvement'),
+    ).toStrictEqual({
+      kind: 'unknown-improvement',
+      improvement: asImprovementId('space-elevator'),
+    });
+  });
+
+  it('refuses a catalog row whose turn count is not a usable number of turns', () => {
+    // `validateRuleset` guarantees an integer >= 1, but a foreign or hand-built view
+    // can carry anything, and `turnsLeft` is written into the state — a fractional
+    // or NaN count would put a value into the state that cannot be hashed. Such a
+    // row is an improvement this ruleset cannot build, exactly as an unusable
+    // `cost` is an item it cannot build.
+    for (const turns of [0, -1, 1.5, Number.NaN]) {
+      const broken: RulesetView = {
+        ...RULESET,
+        improvements: [{ ...MINE, turns }, ROAD],
+      };
+      const refused = refusedAs(
+        apply(WORK_STATE, P0, startWork(3, 'mine'), broken),
+        'unknown-improvement',
+      );
+      expect(refused).toStrictEqual({ kind: 'unknown-improvement', improvement: MINE.id });
+      // The usable row beside it is untouched by its neighbour's problem.
+      expect(apply(WORK_STATE, P0, startWork(3, 'road'), broken).ok).toBe(true);
+    }
+  });
+
+  it('refuses an improvement the tile’s terrain does not allow, naming the role', () => {
+    // The worker stands on hills: a mine is allowed there, irrigation is not
+    // (irrigation is flat-land work — a placeholder reading of ours).
+    const before = hashValue(WORK_STATE);
+    expect(
+      refusedAs(apply(WORK_STATE, P0, startWork(3, 'irrigation')), 'improvement-not-allowed'),
+    ).toStrictEqual({
+      kind: 'improvement-not-allowed',
+      unitId: asUnitId(3),
+      tile: asTileIndex(WORKER_TILE),
+      improvement: IRRIGATION.id,
+      role: 'hills',
+    });
+    // M4a's acceptance evidence: an illegal `StartWork` leaves the state hash
+    // unchanged — a refusal is not a partial application.
+    expect(hashValue(WORK_STATE)).toBe(before);
+
+    // …and the mirror image: on grassland the same worker cannot dig a mine.
+    const flat = withUnits(STATE, [unit(3, WORKER, 0, 4, 1)]);
+    expect(
+      refusedAs(apply(flat, P0, startWork(3, 'mine')), 'improvement-not-allowed'),
+    ).toStrictEqual({
+      kind: 'improvement-not-allowed',
+      unitId: asUnitId(3),
+      tile: asTileIndex(4),
+      improvement: MINE.id,
+      role: 'grassland',
+    });
+    expect(apply(flat, P0, startWork(3, 'irrigation')).ok).toBe(true);
+  });
+
+  it('refuses an improvement the tile already carries, while allowing a different one there', () => {
+    // Written through the state helper, so the pair list under test is the shape
+    // `turn.ts` actually writes when a job completes.
+    const mined: GameState = withImprovement(WORK_STATE, asTileIndex(WORKER_TILE), MINE.id);
+    const before = hashValue(mined);
+
+    expect(refusedAs(apply(mined, P0, startWork(3, 'mine')), 'already-improved')).toStrictEqual({
+      kind: 'already-improved',
+      tile: asTileIndex(WORKER_TILE),
+      improvement: MINE.id,
+    });
+    // A tile may hold several improvements (a road *and* a mine), so the second
+    // kind is still buildable — this is what the pair list exists for.
+    expect(apply(mined, P0, startWork(3, 'road')).ok).toBe(true);
+    // …and the refusal above changed nothing, the hash included.
+    expect(hashValue(mined)).toBe(before);
+  });
+
+  it('refuses a worker with no movement left, reporting what it needed and what it had', () => {
+    const spent = withUnits(STATE, [unit(3, WORKER, 0, WORKER_TILE, 0)]);
+
+    expect(refusedAs(apply(spent, P0, startWork(3, 'mine')), 'not-enough-movement')).toStrictEqual({
+      kind: 'not-enough-movement',
+      unitId: asUnitId(3),
+      needed: 1,
+      available: 0,
+    });
+  });
+
+  it('refuses a tile that is off the map, not a tile, or not in the terrain catalog', () => {
+    const away = withUnits(STATE, [unit(3, WORKER, 0, 99, 1)]);
+    refusedAs(apply(away, P0, startWork(3, 'mine')), 'out-of-bounds');
+
+    const fractional = withUnits(STATE, [unit(3, WORKER, 0, 1.5, 1)]);
+    expect(detailOf(apply(fractional, P0, startWork(3, 'mine')))).toContain('integer tile index');
+
+    // The tile exists and the worker is on it; the view simply cannot say what is
+    // there, so the role rule cannot be checked and the command is refused rather
+    // than assumed to be legal.
+    const noHills: RulesetView = {
+      ...RULESET,
+      terrains: TERRAINS.filter((terrain) => terrain.role !== 'hills'),
+    };
+    expect(detailOf(apply(WORK_STATE, P0, startWork(3, 'mine'), noHills))).toContain(
+      'defines no terrain',
+    );
+  });
+
+  it('never mutates a deeply frozen board, and a refusal changes nothing at all', () => {
+    const board: GameState = structuredClone(WORK_STATE);
+    const snapshot = structuredClone(board);
+    deepFreeze(board);
+
+    const started = mustOk(apply(board, P0, startWork(3, 'mine')));
+    expect(started.state.revision).toBe(board.revision + 1);
+    expect(() => canonicalize(started.state)).not.toThrow();
+
+    const refused = apply(board, P0, startWork(3, 'irrigation'));
+    expect(refused.ok).toBe(false);
+    expect(board).toEqual(snapshot);
+    expect(hashValue(board)).toBe(hashValue(snapshot));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4a — applyCommand: CancelWork
+ * ------------------------------------------------------------------ */
+
+describe('applyCommand — CancelWork', () => {
+  it('clears the job, refunds nothing, and reports the job it dropped', () => {
+    // A worker mid-job that has already spent its turn: the job was started this
+    // turn, which is what took the movement.
+    const busy = digging(withUnits(STATE, [unit(3, WORKER, 0, WORKER_TILE, 0)]), mineWork(2));
+    const outcome = mustOk(apply(busy, P0, cancelWork(3)));
+
+    const idle = outcome.state.units.find((u) => u.id === asUnitId(3));
+    const before = busy.units.find((u) => u.id === asUnitId(3));
+    if (idle === undefined || before === undefined) throw new Error('the worker disappeared');
+    expect('work' in idle).toBe(false);
+    expect(workOf(outcome.state, 3)).toBeUndefined();
+    // The unit afterwards is exactly the unit before, with the job taken off it.
+    expect(idle).toStrictEqual(withoutWork(before));
+    // Cancelling is free but refunds nothing: the movement the job spent is gone.
+    expect(idle.movementLeft).toBe(0);
+    // A job never added an improvement before completing, so cancelling cannot
+    // leave a half-built one behind.
+    expect(outcome.state.improvements).toEqual([]);
+
+    expect(outcome.state.revision).toBe(busy.revision + 1);
+    expect(outcome.events).toStrictEqual([
+      {
+        type: 'WorkCancelled',
+        unitId: asUnitId(3),
+        kind: MINE.id,
+        tile: asTileIndex(WORKER_TILE),
+        turnsLeft: 2,
+        reason: 'cancelled',
+      },
+    ]);
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+    expect(hashValue(outcome.state)).not.toBe(hashValue(busy));
+  });
+
+  it('lets the worker start a different job afterwards, without a turn in between', () => {
+    // Cancelling does not spend movement, so a worker that still has some may
+    // immediately start something else — which is the point of a cancel that costs
+    // nothing.
+    const busy = digging(WORK_STATE, mineWork(2));
+    const cancelled = mustOk(apply(busy, P0, cancelWork(3))).state;
+
+    const restarted = mustOk(apply(cancelled, P0, startWork(3, 'road')));
+    expect(workOf(restarted.state, 3)).toStrictEqual({
+      kind: ROAD.id,
+      tile: asTileIndex(WORKER_TILE),
+      turnsLeft: ROAD_TURNS,
+    });
+  });
+
+  it('refuses an idle unit, an unknown unit, an unknown player, and another player’s worker', () => {
+    expect(refusedAs(apply(WORK_STATE, P0, cancelWork(3)), 'not-working')).toStrictEqual({
+      kind: 'not-working',
+      unitId: asUnitId(3),
+    });
+    refusedAs(apply(WORK_STATE, P0, cancelWork(99)), 'unknown-unit');
+    refusedAs(apply(WORK_STATE, asPlayerId(9), cancelWork(3)), 'unknown-player');
+
+    const rival = withUnits(WORK_STATE, [
+      ...STATE.units,
+      withWork(unit(4, WORKER, 1, WORKER_TILE, 1), mineWork(2)),
+    ]);
+    expect(refusedAs(apply(rival, P0, cancelWork(4)), 'not-your-unit')).toStrictEqual({
+      kind: 'not-your-unit',
+      unitId: asUnitId(4),
+      owner: P1,
+    });
+    expect(apply(rival, P1, cancelWork(4)).ok).toBe(true);
+  });
+
+  it('never mutates its input', () => {
+    const board: GameState = structuredClone(digging(WORK_STATE, mineWork(2)));
+    const snapshot = structuredClone(board);
+    deepFreeze(board);
+
+    mustOk(apply(board, P0, cancelWork(3)));
+    expect(board).toEqual(snapshot);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4a — relocation cancels a job
+ * ------------------------------------------------------------------ */
+
+describe('applyCommand — relocation cancels work', () => {
+  it('a step by a working unit drops the job and says so, right after the move', () => {
+    const busy = digging(WORK_STATE, mineWork(2));
+    const outcome = mustOk(apply(busy, P0, move(3, 4)));
+
+    expect(outcome.events).toStrictEqual([
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(3),
+        from: asTileIndex(WORKER_TILE),
+        to: asTileIndex(4),
+        cost: 1,
+        movementLeft: 0,
+      },
+      // The same fact `CancelWork` reports, with the reason that says it was the
+      // step that ended the job. A consumer that had to diff the unit to notice
+      // would be reading exactly what events exist to avoid.
+      {
+        type: 'WorkCancelled',
+        unitId: asUnitId(3),
+        kind: MINE.id,
+        tile: asTileIndex(WORKER_TILE),
+        turnsLeft: 2,
+        reason: 'moved',
+      },
+    ]);
+
+    const moved = outcome.state.units.find((u) => u.id === asUnitId(3));
+    if (moved === undefined) throw new Error('the worker disappeared');
+    expect('work' in moved).toBe(false);
+    expect(moved.tile).toBe(asTileIndex(4));
+    // Work is *not* carried along the way a stack would be: it happened on tile 1
+    // and nothing was built there.
+    expect(outcome.state.improvements).toEqual([]);
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+  });
+
+  it('says nothing about work when the unit that steps was idle', () => {
+    const outcome = mustOk(apply(WORK_STATE, P0, move(3, 4)));
+
+    expect(outcome.events.map((event) => event.type)).toEqual(['UnitMoved']);
+  });
+
+  it('cancels the job before the hut the mover steps onto is resolved', () => {
+    // A hut on the destination tile makes the event order observable: the step, the
+    // job it ended, then what the hut paid.
+    const board: GameState = {
+      ...digging(WORK_STATE, mineWork(2)),
+      map: { ...WORK_STATE.map, huts: [asTileIndex(4)] },
+    };
+    const outcome = mustOk(apply(board, P0, move(3, 4)));
+
+    expect(outcome.events.slice(0, 2).map((event) => event.type)).toEqual([
+      'UnitMoved',
+      'WorkCancelled',
+    ]);
+    expect(outcome.events.some((event) => event.type === 'HutEntered')).toBe(true);
+    expect(workOf(outcome.state, 3)).toBeUndefined();
+  });
+
+  it('is reproducible: the same step twice gives the same state and the same events', () => {
+    const busy = digging(WORK_STATE, mineWork(2));
+    const first = mustOk(apply(busy, P0, move(3, 4)));
+    const second = mustOk(apply(busy, P0, move(3, 4)));
+
+    expect(second.state).toStrictEqual(first.state);
+    expect(second.events).toStrictEqual(first.events);
+    expect(hashValue(second.state)).toBe(hashValue(first.state));
+    // …and a cancellation is a real change: the state is not the input.
+    expect(hashValue(first.state)).not.toBe(hashValue(busy));
+    expect(apply(busy, P0, move(3, 4)).ok).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4a — the work plan evaluators agree with applyCommand
+ * ------------------------------------------------------------------ */
+
+describe('the work plan evaluators agree with applyCommand', () => {
+  /**
+   * The keystone property's local half for M4a, mirroring the city section below:
+   * everything the applier accepts, the shared evaluator accepts (and vice versa),
+   * with the same typed refusal when it refuses. `actions.test.ts` runs the
+   * exhaustive sweep, including the commands' legality from the generators' side.
+   */
+  const boards: readonly GameState[] = [
+    WORK_STATE,
+    digging(WORK_STATE, mineWork(2)),
+    withUnits(STATE, [unit(3, WORKER, 0, WORKER_TILE, 0)]),
+    withUnits(STATE, [unit(3, WORKER, 0, 4, 1)]),
+    { ...WORK_STATE, improvements: [{ tile: asTileIndex(WORKER_TILE), kind: MINE.id }] },
+    WORK_CITY_STATE,
+  ];
+
+  const kinds: readonly ImprovementId[] = [
+    MINE.id,
+    ROAD.id,
+    IRRIGATION.id,
+    asImprovementId('space-elevator'),
+  ];
+
+  it('StartWork: the plan’s verdict is the applier’s, for every board and every kind', () => {
+    for (const board of boards) {
+      for (const kind of kinds) {
+        const planned = planStartWork(board, RULESET, P0, asUnitId(3), kind);
+        const applied = apply(board, P0, startWork(3, kind));
+
+        expect(applied.ok).toBe(planned.ok);
+        if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+        if (applied.ok && planned.ok) {
+          // The plan carries the tile, the kind and the count the state will hold.
+          expect(workOf(applied.value.state, 3)).toStrictEqual({
+            kind: planned.value.kind,
+            tile: planned.value.tile,
+            turnsLeft: planned.value.turnsLeft,
+          });
+        }
+      }
+    }
+  });
+
+  it('CancelWork: the plan’s verdict is the applier’s, on every board', () => {
+    for (const board of boards) {
+      const planned = planCancelWork(board, P0, asUnitId(3));
+      const applied = apply(board, P0, cancelWork(3));
+
+      expect(applied.ok).toBe(planned.ok);
+      if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+      if (applied.ok && planned.ok) expect(workOf(applied.value.state, 3)).toBeUndefined();
+    }
+  });
+
+  it('is not vacuous: the boards above both accept and refuse, in both evaluators', () => {
+    const startable = boards.filter(
+      (board) => planStartWork(board, RULESET, P0, asUnitId(3), MINE.id).ok,
+    );
+    const unstartable = boards.filter(
+      (board) => !planStartWork(board, RULESET, P0, asUnitId(3), MINE.id).ok,
+    );
+    const cancellable = boards.filter((board) => planCancelWork(board, P0, asUnitId(3)).ok);
+    const uncancellable = boards.filter((board) => !planCancelWork(board, P0, asUnitId(3)).ok);
+
+    // Both verdicts occur on both commands, so the agreement assertions above are
+    // comparing real acceptances and real refusals rather than a constant.
+    for (const group of [startable, unstartable, cancellable, uncancellable]) {
+      expect(group.length).toBeGreaterThan(0);
+    }
+    expect(startable.length + unstartable.length).toBe(boards.length);
+    expect(cancellable.length + uncancellable.length).toBe(boards.length);
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * M3 — growth.ts: the food box
  * ------------------------------------------------------------------ */
 
@@ -1749,22 +2347,51 @@ describe('production.ts — shields and completion', () => {
  * ------------------------------------------------------------------ */
 
 describe('turn.ts — the single definition of a turn', () => {
-  it('runs growth, then production, then the refill, then turn += 1 — in that order', () => {
-    // One board that makes the order observable. Growth first: population 1 with a
-    // box of 8 grows to 2 on a surplus of 2, and the new citizen is assigned tile
-    // 5, so the city's shields for this turn are 1 (centre) + 1 (tile 4) + 1
-    // (tile 5) = 3. Production second: 1 stored + 3 = 4 buys the 2-shield scout and
-    // leaves 2. Had production run first it would have seen 1 + 2 = 3 and left 1 —
-    // the leftover is the fingerprint of the order.
-    const board = withCities(STATE, [
-      city(0, 0, 13, {
-        population: 1,
-        workedTiles: [asTileIndex(4)],
-        foodBox: 8,
-        shields: 1,
-        production: unitItem('scout'),
-      }),
-    ]);
+  /**
+   * The M4a order board: player 0's city on the hills at 9, population 2, working
+   * the hills at 1 (where the worker stands) and the grassland at 4, building
+   * nothing.
+   *
+   * Its numbers, from the fixture's terrain rows:
+   *
+   * - food: centre 1 (hills, floored at 1) + 1 (tile 1) + 2 (tile 4) = 4, against
+   *   2·2 = 4 eaten — a surplus of 0, so the city neither grows nor starves and the
+   *   growth step contributes no event and no yield change. That quietness is what
+   *   makes the *work* step's effect the only thing moving in the assertions below.
+   * - shields: centre 2 (hills) + 2 (tile 1) + 1 (tile 4) = 5, and 6 once the mine
+   *   on tile 1 is built — the single shield that tells the two orders apart.
+   */
+  const ORDER_BOARD: GameState = withCities(WORK_STATE, [
+    city(0, 0, 9, {
+      population: 2,
+      workedTiles: [asTileIndex(WORKER_TILE), asTileIndex(4)],
+    }),
+  ]);
+
+  it('runs work, then growth, then production, then the refill, then turn += 1 — in that order', () => {
+    // One board that makes every step of the order observable, M4a's step included.
+    //
+    // Work first: the worker on tile 1 owes its last turn of a mine, so the mine is
+    // built *before* anything counts yields. Growth second: population 1 with a box
+    // of 8 grows to 2 on a surplus of 2, and the new citizen is assigned tile 5, so
+    // the city's shields for this turn are 1 (centre) + 1 (tile 4) + 1 (tile 5) =
+    // 3. Production third: 1 stored + 3 = 4 buys the 2-shield scout and leaves 2.
+    //
+    // Had production run before growth it would have seen 1 + 2 = 3 and left 1; had
+    // work run after growth and production the mine's shield would arrive a turn
+    // late. The leftovers are the fingerprint of the order.
+    const board = withUnits(
+      withCities(STATE, [
+        city(0, 0, 13, {
+          population: 1,
+          workedTiles: [asTileIndex(4)],
+          foodBox: 8,
+          shields: 1,
+          production: unitItem('scout'),
+        }),
+      ]),
+      [...STATE.units, withWork(worker(WORKER.movement), mineWork(1))],
+    );
 
     const outcome = advanceTurn(board, RULESET);
     const assigned = cityOf(outcome.state, 0);
@@ -1775,17 +2402,29 @@ describe('turn.ts — the single definition of a turn', () => {
     expect(assigned.production).toBeUndefined();
     expect(assigned.workedTiles.map(Number)).toEqual([4, 5]);
 
+    // The job finished and the mine is on the map — added by step 1, before the
+    // growth and production that just consumed it.
+    expect(workOf(outcome.state, 3)).toBeUndefined();
+    expect(outcome.state.improvements).toStrictEqual([{ tile: asTileIndex(1), kind: MINE.id }]);
+
     // Movement is refilled for every unit, the produced one included.
     expect(outcome.state.units.map((u) => u.movementLeft)).toEqual([
       SETTLER.movement,
       SCOUT.movement,
       WARRIOR.movement,
+      WORKER.movement,
       SCOUT.movement,
     ]);
     expect(outcome.state.turn).toBe(board.turn + 1);
 
-    // Events follow the pipeline: growth, then production.
+    // Events follow the pipeline: work, then growth, then production.
     expect(outcome.events).toStrictEqual([
+      {
+        type: 'WorkCompleted',
+        unitId: asUnitId(3),
+        kind: MINE.id,
+        tile: asTileIndex(1),
+      },
       { type: 'CityGrew', cityId: asCityId(0), owner: P0, population: 2, foodBox: 0 },
       {
         type: 'CityProduced',
@@ -1793,16 +2432,152 @@ describe('turn.ts — the single definition of a turn', () => {
         owner: P0,
         item: unitItem('scout'),
         shields: 2,
-        unitId: asUnitId(3),
+        unitId: asUnitId(4),
         tile: asTileIndex(13),
       },
     ]);
+  });
+
+  it('pays a finished improvement into this turn’s yields — the reason work is step 1', () => {
+    const completing = digging(ORDER_BOARD, mineWork(1));
+    const outcome = advanceTurn(completing, RULESET);
+
+    // The mine is on tile 1, it is built, and the city that works that tile counts
+    // its shield *this* turn: centre 2 + hills 2 + mine 1 + grassland 1 = 6. With
+    // growth and production running first (the order this contract rejects) the same
+    // board would store 5 and the mine would pay out a turn late — so 6 is not a
+    // detail, it is the order.
+    expect(outcome.state.improvements).toStrictEqual([{ tile: asTileIndex(1), kind: MINE.id }]);
+    expect(hasImprovement(outcome.state, asTileIndex(1), MINE.id)).toBe(true);
+    expect(cityOf(outcome.state, 0).shields).toBe(6);
+
+    expect(outcome.events).toStrictEqual([
+      { type: 'WorkCompleted', unitId: asUnitId(3), kind: MINE.id, tile: asTileIndex(1) },
+    ]);
+
+    // The worker is idle again and refilled, so it can start the next job next turn
+    // (or this turn, if its owner ends the turn and moves again).
+    expect(workOf(outcome.state, 3)).toBeUndefined();
+    expect(movementLeftOf(outcome.state, 3)).toBe(WORKER.movement);
+    expect(outcome.state.turn).toBe(completing.turn + 1);
+  });
+
+  it('leaves a job that still owes a turn alone, and its improvement is not in this turn’s yields', () => {
+    const pending = digging(ORDER_BOARD, mineWork(2));
+    const outcome = advanceTurn(pending, RULESET);
+
+    // The counterfactual to the test above, one turn of work short: nothing
+    // completes, nothing is built, and the city stores one shield less.
+    expect(outcome.events).toEqual([]);
+    expect(workOf(outcome.state, 3)).toStrictEqual({
+      kind: MINE.id,
+      tile: asTileIndex(WORKER_TILE),
+      turnsLeft: 1,
+    });
+    expect(outcome.state.improvements).toEqual([]);
+    expect(cityOf(outcome.state, 0).shields).toBe(5);
+    expect(outcome.state.turn).toBe(pending.turn + 1);
+  });
+
+  it('pays jobs in unit-id order, whatever order the units array is in', () => {
+    // Two workers finish on this turn. Unit 4's irrigation is on the *lower* tile
+    // index and a shorter job, so an implementation that walked the array or sorted
+    // by tile would report a different order — the contract names unit id.
+    const board = digging(
+      withUnits(ORDER_BOARD, [
+        ...ORDER_BOARD.units,
+        withWork(unit(4, WORKER, 0, 4, 1), {
+          kind: IRRIGATION.id,
+          tile: asTileIndex(4),
+          turnsLeft: 1,
+        }),
+      ]),
+      mineWork(1),
+    );
+    const reversed: GameState = { ...board, units: [...board.units].reverse() };
+
+    const outcome = advanceTurn(reversed, RULESET);
+
+    expect(
+      outcome.events.map((event) => (event.type === 'WorkCompleted' ? Number(event.unitId) : -1)),
+    ).toEqual([3, 4]);
+    // Both improvements landed, in the state's own `(tile, kind)` order rather than
+    // in completion order — the hash must be a function of the pairs, not of who
+    // finished first.
+    expect(outcome.state.improvements).toStrictEqual([
+      { tile: asTileIndex(1), kind: MINE.id },
+      { tile: asTileIndex(4), kind: IRRIGATION.id },
+    ]);
+    // And the units array comes back sorted by id, as the state invariant requires.
+    expect(outcome.state.units.map((u) => Number(u.id))).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('is total: a job completes however its unit’s type or its kind is described', () => {
+    // A worker whose type the ruleset does not define still owes its turns and still
+    // pays the last one: a job is a property of the *unit*, not of its catalog row,
+    // and the refill's totality (M2) has the same shape. The pair is recorded even
+    // though no row describes the kind, because the state says what was built — the
+    // catalog only says what it yields.
+    const ghost = makeDef('ghost-worker', 'worker', 1, 2);
+    const board = withUnits(STATE, [
+      withWork(unit(3, ghost, 0, WORKER_TILE, 0), { ...mineWork(1), kind: IRRIGATION.id }),
+    ]);
+
+    const outcome = advanceTurn(board, RULESET);
+
+    expect(outcome.events).toStrictEqual([
+      { type: 'WorkCompleted', unitId: asUnitId(3), kind: IRRIGATION.id, tile: asTileIndex(1) },
+    ]);
+    expect(outcome.state.improvements).toStrictEqual([
+      { tile: asTileIndex(1), kind: IRRIGATION.id },
+    ]);
+    expect(workOf(outcome.state, 3)).toBeUndefined();
+    // Its movement is left alone, for the reason the refill is total.
+    expect(movementLeftOf(outcome.state, 3)).toBe(0);
+    expect(outcome.state.turn).toBe(board.turn + 1);
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+  });
+
+  it('treats a job whose count is not a positive whole number as due, and never writes one back', () => {
+    // `planStartWork` refuses a catalog row with an unusable count, so the engine
+    // never creates such a job; a hand-built state can still carry one, and the
+    // pipeline must not copy a NaN or a fraction into the state it returns (that
+    // would make the state unhashable). Such a job finishes this turn instead.
+    for (const turnsLeft of [0, -2, 0.5, Number.NaN]) {
+      const board = withUnits(STATE, [
+        withWork(worker(1), { kind: MINE.id, tile: asTileIndex(WORKER_TILE), turnsLeft }),
+      ]);
+
+      const outcome = advanceTurn(board, RULESET);
+
+      expect(workOf(outcome.state, 3)).toBeUndefined();
+      expect(outcome.state.improvements).toStrictEqual([{ tile: asTileIndex(1), kind: MINE.id }]);
+      expect(() => canonicalize(outcome.state)).not.toThrow();
+      expect(hashValue(outcome.state)).toBe(hashValue(advanceTurn(board, RULESET).state));
+    }
   });
 
   it('does not touch revision: a turn is part of a command, and the command counts it', () => {
     const outcome = advanceTurn(STATE, RULESET);
     expect(outcome.state.revision).toBe(STATE.revision);
     expect(outcome.state.turn).toBe(STATE.turn + 1);
+  });
+
+  it('carries over a job that names a tile which is not a whole index, rather than inventing one', () => {
+    // `planStartWork` requires the unit's tile to be a whole index on the map, so no
+    // command can create this job; a hand-built state can. Completion writes the pair
+    // into `state.improvements`, and the pipeline must not put a tile nothing could
+    // stand on into the state — nor silently drop the job, which is what a
+    // cancellation looks like. So the worker keeps its job, exactly as it was.
+    const job: UnitWork = { kind: MINE.id, tile: asTileIndex(1.5), turnsLeft: 1 };
+    const board = withUnits(STATE, [withWork(worker(1), job)]);
+
+    const outcome = advanceTurn(board, RULESET);
+
+    expect(outcome.events).toEqual([]);
+    expect(workOf(outcome.state, 3)).toStrictEqual(job);
+    expect(outcome.state.improvements).toEqual([]);
+    expect(outcome.state.turn).toBe(board.turn + 1);
   });
 
   it('is exactly what EndTurn does — plus the actor’s event and one revision bump', () => {
@@ -2138,20 +2913,23 @@ describe('applyCommand — M3 goody huts', () => {
 
 describe('applyCommand — M3 purity and revision', () => {
   it('never mutates a deeply frozen state, and bumps revision exactly once per command', () => {
-    const board: GameState = structuredClone(CITY_STATE);
+    const board: GameState = structuredClone(WORK_CITY_STATE);
     const snapshot = structuredClone(board);
     deepFreeze(board);
 
     const founding = withCities(board, []);
-    const commands: readonly Command[] = [
-      foundCity(0),
-      setWorkedTiles(0, [4, 8]),
-      setProduction(0, unitItem('warrior')),
-      END_TURN,
+    /** Each command with the board it is legal on, so every one of them applies. */
+    const commands: readonly (readonly [Command, GameState])[] = [
+      [foundCity(0), founding],
+      [setWorkedTiles(0, [4, 8]), board],
+      [setProduction(0, unitItem('warrior')), board],
+      // M4a: attaching a job and, on the board where one exists, dropping it.
+      [startWork(3, 'mine'), board],
+      [cancelWork(3), digging(board, mineWork(2))],
+      [END_TURN, board],
     ];
 
-    for (const cmd of commands) {
-      const target = cmd.type === 'FoundCity' ? founding : board;
+    for (const [cmd, target] of commands) {
       const outcome = mustOk(apply(target, P0, cmd));
       expect(outcome.state).not.toBe(target);
       expect(outcome.state.revision).toBe(target.revision + 1);

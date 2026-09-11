@@ -32,6 +32,7 @@ import {
   applyCommand,
   asBuildingId,
   asCityId,
+  asImprovementId,
   asPlayerId,
   asTileIndex,
   asUnitId,
@@ -41,12 +42,16 @@ import {
   cityYields,
   civPlayers,
   foodBoxSize,
+  hasImprovement,
   hutAt,
+  improvementDef,
+  improvementsAt,
   isExplored,
   isPlaceholder,
   nextBelow,
   seedRng,
   tileIndex,
+  tileYields,
   unitById,
   unitDef,
   unitsOnTile,
@@ -57,11 +62,13 @@ import {
   type GameError,
   type GameState,
   type HutRewardKind,
+  type ImprovementId,
   type PlayerId,
   type ProductionItem,
   type Result,
   type RulesetView,
   type TileIndex,
+  type UnitWork,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
 import {
@@ -121,6 +128,10 @@ const RULESET: RulesetView = (() => {
 const RULESET_WITHOUT_MOUNTAINS: RulesetView = {
   terrains: CATALOG.terrains.filter((terrain) => terrain.role !== 'mountains'),
   units: CATALOG.units,
+  // M4a made `improvements` a required field of the engine's view, so a hand-built
+  // view must carry one: the same catalog's rows, untouched, because this fixture
+  // is about a missing *terrain* role and not about improvements.
+  improvements: CATALOG.improvements,
   fidelity: 'tuned',
 };
 
@@ -2287,5 +2298,1329 @@ describe('the M3 scenario assertions discriminate (they are not decoration)', ()
     expect(new Set(HUT_CASES.map((testCase) => testCase.reward))).toEqual(
       new Set(['unit', 'barbarians', 'nothing']),
     );
+  });
+});
+
+/* ================================================================== *
+ * M4a acceptance evidence — workers, tile improvements and the yields
+ * ================================================================== */
+
+/**
+ * Every number in this section is the shipped catalog's **placeholder** content
+ * (PLAN.md §6.2, INTERFACES.md M4a's provenance paragraph): the improvement turn
+ * counts and yield deltas are ours, chosen to be playable, and none of them is a
+ * Civ 3 figure. What the scenarios below assert is the *engine's rules* over
+ * those rows — that an improvement pays out on the turn it completes, that each
+ * turn costs exactly one, that a term of work is cancelled by moving the worker,
+ * that an illegal job is refused with a typed reason and changes nothing — not
+ * that the numbers are right. The catalog assertions (`turns === 3`, a `+1`
+ * shield delta) are there so a change to the content shows up as a changed test
+ * rather than as a silently different game.
+ */
+
+/** M4a's two commands, spelled the way the DSL spells the M3 ones. */
+const startWork = (unitId: number, kind: ImprovementId): Command => ({
+  type: 'StartWork',
+  unitId: asUnitId(unitId),
+  kind,
+});
+
+const WORKER = asUnitTypeId('worker'); // movement 2 in the shipped catalog
+
+/** The three improvement rows the shipped catalog defines (all placeholders). */
+const MINE = asImprovementId('mine'); // 3 worker turns, +1 shield
+const IRRIGATION = asImprovementId('irrigation'); // 2 worker turns, +1 food
+const ROAD = asImprovementId('road'); // 2 worker turns, +1 commerce
+const NOT_AN_IMPROVEMENT = asImprovementId('nope');
+
+/** The job a unit is doing, or `undefined` when it is idle (the key is absent then). */
+const workOf = (state: GameState, unitId: number): UnitWork | undefined =>
+  unitById(state, asUnitId(unitId))?.work;
+
+/**
+ * Does the unit carry a `work` key at all?
+ *
+ * The distinction between "absent" and "present but `undefined`" is the bug class
+ * that has cost this project three hunts: a key holding `undefined` cannot survive
+ * a JSON round trip, so `canonicalize` rejects it and the state becomes
+ * unhashable. `workOf` cannot see the difference (`?.work` answers `undefined`
+ * either way), which is why an idle unit is asserted through this and not through
+ * the value.
+ */
+const hasWorkKey = (state: GameState, unitId: number): boolean => {
+  const unit = unitById(state, asUnitId(unitId));
+  return unit !== undefined && Object.hasOwn(unit, 'work');
+};
+
+/**
+ * The typed error a command was refused with, or `undefined` when it was applied.
+ *
+ * The refusal scenarios use this rather than the throwing `refusal` helper: a
+ * *failing expectation* is what a scenario reports, and an unexpectedly applied
+ * command must show up as a failed assertion (`"the refusal I expected did not
+ * happen"`) instead of as an exception escaping the `assert` callback.
+ */
+const errorOf = (result: Result<CommandOutcome, GameError>): GameError | undefined =>
+  result.ok ? undefined : result.error;
+
+/* ------------------------------------------------------------------ *
+ * 8. Mine yield
+ * ------------------------------------------------------------------ */
+
+/** The city centre: grassland, so the centre is 2 food / 1 shield / 1 commerce. */
+const MINE_CITY = at(5, 5);
+/** The hill the city's single citizen works, and the tile the worker mines. */
+const MINE_TILE = at(6, 5);
+
+/**
+ * MINE YIELD. A hand-built city with **one** citizen works a hill, and a worker
+ * stands on that same hill digging a mine. The arithmetic, all of it the
+ * engine's, from the shipped catalog's placeholder values:
+ *
+ * - the centre is always worked and free, and grassland's 2/1/1 is above the
+ *   1/1/1 floor, so it contributes **1 shield**;
+ * - hills are 0 food / 2 shields / 0 commerce, so the city makes **3 shields a
+ *   turn**, and 2 food against the 2 its citizen eats — a surplus of exactly 0, so
+ *   it neither grows nor starves and the shield total is not entangled with
+ *   either;
+ * - a mine is a **+1 shield** delta on the tile it sits on, so once it is finished
+ *   the same city makes **4 shields a turn**;
+ * - a mine takes **3 worker turns**, and step 1 of `advanceTurn` pays one per turn
+ *   *before* growth and production, so it is built during the third `EndTurn` —
+ *   the state that call returns is at turn 4 — and its +1 shield is counted on
+ *   **that same turn**: 3 + 3 + 4 = **10** shields, not 9.
+ *
+ * That last number is the point of M4a's order rule. An implementation that ran
+ * production before work would still finish the mine on the third turn but would
+ * pay 9. `run` therefore stops one turn *before* the completion and the `assert`
+ * callback pins both sides of the boundary: the last turn without a mine, and the
+ * turn it appears on.
+ */
+const mineYieldScenario = defineScenario({
+  name: 'mine-yield-pays-out-on-the-turn-it-completes',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(6, 5, 'hills') // the worked tile, and the tile the worker stands on
+      .addUnit(0, WORKER, [6, 5]) // unit 0 — the digger
+      .addUnit(1, WARRIOR, [20, 20]) // unit 1 — Carthage's, far away
+      .addCity(0, [5, 5], { population: 1, workedTiles: [MINE_TILE] }),
+  run: [startWork(0, MINE), endTurn(), endTurn()],
+  assert: (after, ruleset) => {
+    const cityId = asCityId(0);
+    const city = cityById(after, cityId);
+    const mineDef = improvementDef(ruleset, MINE);
+    const hills = TERRAIN_BY_ROLE(ruleset, 'hills');
+    if (city === undefined || mineDef === undefined || hills === undefined) {
+      return [check(false, 'the ruleset or the world is missing a row this scenario needs')];
+    }
+
+    // Where the run stopped: two of the mine's three turns are paid.
+    const before = cityYields(after, ruleset, cityId);
+    const hillBefore = tileYields(after, ruleset, MINE_TILE);
+    const inProgress = workOf(after, 0);
+
+    // The third turn: the mine's last turn is paid, and that same turn's
+    // production counts it.
+    const third = romeApply(after, ruleset, endTurn());
+    const completed = third?.state;
+    const completedCity = completed === undefined ? undefined : cityById(completed, cityId);
+    const afterYields =
+      completed === undefined ? undefined : cityYields(completed, ruleset, cityId);
+    const hillAfter =
+      completed === undefined ? undefined : tileYields(completed, ruleset, MINE_TILE);
+    const completedEvent = third?.events.find((event) => event.type === 'WorkCompleted');
+    const idle = completed === undefined ? undefined : unitById(completed, asUnitId(0));
+
+    // "Exactly once": asking for the same mine on the same tile again is refused,
+    // and the pair list is still one entry long afterwards.
+    const again =
+      completed === undefined
+        ? undefined
+        : errorOf(applyCommand(completed, ROME, startWork(0, MINE), ruleset));
+
+    return [
+      check(
+        mineDef.turns === 3 &&
+          mineDef.yields.shields === 1 &&
+          mineDef.yields.food === 0 &&
+          mineDef.yields.commerce === 0,
+        `the catalog's mine is a PLACEHOLDER row: 3 worker turns for a +1 shield delta, no food and no commerce (turns ${String(mineDef.turns)}, yields ${JSON.stringify(mineDef.yields)})`,
+      ),
+      check(
+        hills.yields.shields === 2 && hills.yields.food === 0,
+        `hills are a PLACEHOLDER 0 food / 2 shields, which is what makes the mine's +1 shield visible in a city's output (${JSON.stringify(hills.yields)})`,
+      ),
+      check(
+        city.tile === MINE_CITY &&
+          after.cities.length === 1 &&
+          city.workedTiles.length === 1 &&
+          city.workedTiles[0] === MINE_TILE,
+        `the world is the one the scenario described: one city on ${label(5, 5)} whose single citizen works the hill at ${label(6, 5)} (tile ${String(city.tile)}, worked ${JSON.stringify(city.workedTiles)})`,
+      ),
+      check(
+        after.turn === 3 && city.shields === 6,
+        `the run stopped after two of the mine's three turns: state turn 3, the city has banked 3 + 3 = 6 shields (turn ${String(after.turn)}, shields ${String(city.shields)})`,
+      ),
+      check(
+        inProgress !== undefined &&
+          inProgress.kind === MINE &&
+          inProgress.tile === MINE_TILE &&
+          inProgress.turnsLeft === 1,
+        `the job is in progress on the worker's own tile with exactly one turn left (got ${JSON.stringify(inProgress)})`,
+      ),
+      check(
+        after.improvements.length === 0 && !hasImprovement(after, MINE_TILE, MINE),
+        `no improvement exists yet: a job adds nothing to the tile when it starts (pairs: ${JSON.stringify(after.improvements)})`,
+      ),
+      check(
+        before.shields === 3 && before.food === 2 && before.foodSurplus === 0,
+        `BEFORE the mine the city makes 3 shields a turn (grassland centre 1 + hill 2) and 2 food against 2 eaten, so the surplus is 0 and growth cannot move the shield total (got ${JSON.stringify(before)})`,
+      ),
+      check(
+        hillBefore !== undefined &&
+          hillBefore.shields === 2 &&
+          hillAfter !== undefined &&
+          hillAfter.shields === 3,
+        `the worked tile itself goes from 2 to 3 shields when the mine is finished (before ${JSON.stringify(hillBefore)}, after ${JSON.stringify(hillAfter)})`,
+      ),
+      check(
+        completed !== undefined && completed.turn === 4,
+        `the mine completes on the third turn: the state that call returns is at turn 4 (got ${String(completed?.turn)})`,
+      ),
+      check(
+        afterYields !== undefined &&
+          afterYields.shields === 4 &&
+          afterYields.shields - before.shields === mineDef.yields.shields,
+        `AFTER the mine the same city makes 4 shields a turn — exactly the mine's +1 delta more (before ${String(before.shields)}, after ${String(afterYields?.shields)})`,
+      ),
+      check(
+        completedCity !== undefined && completedCity.shields === 10,
+        `the completing turn pays at the improved rate: 6 banked + 4 = 10 shields (got ${String(completedCity?.shields)}; production running before work would leave 9)`,
+      ),
+      check(
+        completed !== undefined &&
+          completed.improvements.length === 1 &&
+          completed.improvements[0]?.tile === MINE_TILE &&
+          completed.improvements[0].kind === MINE &&
+          improvementsAt(completed, MINE_TILE).length === 1 &&
+          hasImprovement(completed, MINE_TILE, MINE),
+        `the improvement appears in the state exactly once, as (tile ${String(Number(MINE_TILE))}, mine) and nowhere else (pairs: ${JSON.stringify(completed?.improvements)})`,
+      ),
+      check(
+        idle !== undefined && !Object.hasOwn(idle, 'work') && idle.movementLeft === 2,
+        `the worker is idle again — the \`work\` key is ABSENT rather than holding undefined — and step 4 of the turn refilled its movement to 2 (unit ${JSON.stringify(idle)})`,
+      ),
+      check(
+        completedEvent !== undefined &&
+          completedEvent.unitId === asUnitId(0) &&
+          completedEvent.kind === MINE &&
+          completedEvent.tile === MINE_TILE,
+        `the engine's own account of it: WorkCompleted(unit 0, mine, tile ${String(Number(MINE_TILE))}) (got ${JSON.stringify(completedEvent)})`,
+      ),
+      check(
+        again !== undefined &&
+          again.kind === 'already-improved' &&
+          again.tile === MINE_TILE &&
+          again.improvement === MINE,
+        `re-issuing the same job is refused with already-improved(tile ${String(Number(MINE_TILE))}, mine) (got ${again === undefined ? 'the command applied' : JSON.stringify(again)})`,
+      ),
+      check(
+        completed !== undefined &&
+          completed.improvements.length === 1 &&
+          improvementsAt(completed, MINE_TILE).length === 1,
+        `and the refused re-issue left the pair list at exactly one entry (pairs: ${JSON.stringify(completed?.improvements)})`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 9. Work cancelled by movement
+ * ------------------------------------------------------------------ */
+
+/** The hill worker 0 mines before walking away from it. */
+const CANCEL_HILL = at(6, 5);
+/** The grassland worker 1 works, and stays on: the control for the cancellation. */
+const CANCEL_FLAT = at(4, 5);
+/** Where the digger walks to: one step east of the hill, ordinary grassland. */
+const CANCEL_DESTINATION = at(7, 5);
+
+/**
+ * WORK CANCELLED BY MOVEMENT. Two workers start jobs on one turn, a turn passes,
+ * and then **one of them walks away**. The contract (M4a, "Moving a working unit,
+ * or any other action that would relocate it, cancels its work. Say so in the
+ * event stream rather than silently dropping it") is three claims at once, and the
+ * scenario pins all three:
+ *
+ * 1. the mover's job is gone from the state, and the `work` key is **absent**
+ *    rather than holding `undefined`;
+ * 2. nothing was built — a job never adds a pair before its last turn, so a
+ *    cancelled job leaves no half-finished mine behind;
+ * 3. the cancellation is caused by the *relocation* and not by the turn passing:
+ *    the worker that did not move is still working, with its count down by exactly
+ *    the one turn that passed.
+ *
+ * The typed `WorkCancelled` event is asserted in two places, deliberately: the
+ * runner's own event list for the scripted move (`{ reason: 'moved', turnsLeft: 2 }`
+ * — the job was two thirds done and nothing is refunded), and, inside `assert`, the
+ * event a *second* relocation produces, so the claim is about relocation rather
+ * than about one particular command sequence.
+ */
+const workCancelledScenario = defineScenario({
+  name: 'work-is-cancelled-by-movement-and-nothing-is-built',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(6, 5, 'hills')
+      .addUnit(0, WORKER, [6, 5]) // unit 0 — digs a mine, then walks away
+      .addUnit(0, WORKER, [4, 5]) // unit 1 — irrigates, and stays put
+      .addUnit(1, WARRIOR, [20, 20]), // unit 2
+  run: [startWork(0, MINE), startWork(1, IRRIGATION), endTurn(), move(0, CANCEL_DESTINATION)],
+  assert: (after, ruleset) => {
+    const mover = unitById(after, asUnitId(0));
+    const control = unitById(after, asUnitId(1));
+    const controlJob = workOf(after, 1);
+    if (mover === undefined || control === undefined) {
+      return [check(false, 'the world is missing a worker this scenario needs')];
+    }
+
+    // The control worker is moved *inside* the assertion, so the same fact is
+    // checked again on a relocation the scenario's `run` did not perform.
+    const probed = romeApply(after, ruleset, move(1, at(3, 5)));
+    const probedCancelled = probed?.events.find((event) => event.type === 'WorkCancelled');
+
+    return [
+      check(
+        mover.tile === CANCEL_DESTINATION && mover.movementLeft === 1,
+        `the digger really did move: it is on ${label(7, 5)} with 2 - 1 = 1 movement left (tile ${String(mover.tile)}, movement ${String(mover.movementLeft)})`,
+      ),
+      check(
+        !Object.hasOwn(mover, 'work') && workOf(after, 0) === undefined,
+        `its job is GONE — the \`work\` key is absent, not present-and-undefined — so a worker cannot carry a half-finished mine somewhere else (unit ${JSON.stringify(mover)})`,
+      ),
+      check(
+        after.improvements.length === 0 && !hasImprovement(after, CANCEL_HILL, MINE),
+        `and no improvement was added: a cancelled job leaves the tile exactly as it found it (pairs: ${JSON.stringify(after.improvements)})`,
+      ),
+      check(
+        control.tile === CANCEL_FLAT &&
+          controlJob !== undefined &&
+          controlJob.kind === IRRIGATION &&
+          controlJob.tile === CANCEL_FLAT &&
+          controlJob.turnsLeft === 1,
+        `the worker that did NOT move still has its job, one turn further along (irrigation was 2 turns: one turn passed) — so the disappearance above is the relocation and not the turn (control ${JSON.stringify(controlJob)})`,
+      ),
+      check(
+        hasWorkKey(after, 1),
+        'the control worker still carries a `work` key, which is the absent-vs-undefined distinction stated the other way round',
+      ),
+      check(
+        probed !== undefined && unitById(probed.state, asUnitId(1))?.tile === at(3, 5),
+        `moving the control worker applied (it is on ${label(3, 5)}), so the probe above is a real relocation and not a refusal (tile ${String(probed === undefined ? 'not applied' : unitById(probed.state, asUnitId(1))?.tile)})`,
+      ),
+      check(
+        probedCancelled !== undefined &&
+          probedCancelled.unitId === asUnitId(1) &&
+          probedCancelled.kind === IRRIGATION &&
+          probedCancelled.tile === CANCEL_FLAT &&
+          probedCancelled.turnsLeft === 1 &&
+          probedCancelled.reason === 'moved',
+        `the engine's own typed account: WorkCancelled(unit 1, irrigation, tile ${String(Number(CANCEL_FLAT))}, turnsLeft 1, reason "moved") (got ${JSON.stringify(probedCancelled)})`,
+      ),
+      check(
+        probed !== undefined && !hasWorkKey(probed.state, 1),
+        'and the probe\u2019s own state carries no `work` key on that unit either',
+      ),
+      check(
+        probed !== undefined &&
+          probed.state.improvements.length === 0 &&
+          !hasImprovement(probed.state, CANCEL_FLAT, IRRIGATION),
+        `the second cancellation built nothing either — the irrigation tile is still bare (pairs: ${JSON.stringify(probed?.state.improvements)})`,
+      ),
+      check(
+        after.revision === 4 && after.turn === 2,
+        `four applied commands and exactly one turn: revision ${String(after.revision)}, turn ${String(after.turn)} (two StartWork, one EndTurn, one MoveUnit)`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 10. Illegal work refused
+ * ------------------------------------------------------------------ */
+
+/** Grassland: a mine may not be built here (its `allowedRoles` are hills, mountains). */
+const WRONG_ROLE_TILE = at(5, 5);
+/** Hills that already carry a mine — the DSL states a worker's earlier job outright. */
+const IMPROVED_HILL = at(7, 5);
+/** Grassland, where irrigation *is* allowed: the control that keeps the refusals specific. */
+const CONTROL_TILE = at(9, 5);
+
+/**
+ * ILLEGAL WORK REFUSED. No `run` commands at all: a refused command in `run` is a
+ * failing run, and this scenario is *about* refusals, so each one is probed and
+ * asserted with its exact typed error — the same shape the M2 blocked-move
+ * scenario uses.
+ *
+ * The five refusals, in `planStartWork`'s check order:
+ *
+ * 1. a mine on grassland — `improvement-not-allowed`, naming the role that decided
+ *    it (`grassland`), because that is the rule that makes a mine a rock job;
+ * 2. irrigation on hills — the same error, naming `hills`, so the rule is not
+ *    "mines need hills" but "every improvement names the terrain it may be built
+ *    on";
+ * 3. a mine on a hill that already carries one — `already-improved`, which is
+ *    reachable only because a scenario can now *state* a pre-built improvement
+ *    (`addImprovement`); the tile is asserted to be hills, so the refusal is about
+ *    the pair and not about the terrain;
+ * 4. an id no catalog row defines — `unknown-improvement`;
+ * 5. a warrior told to dig — `not-a-worker`, because a scout (or a warrior) on a
+ *    hill is not a mine that has not been dug yet.
+ *
+ * Then the two claims that make the refusals *evidence* rather than decoration:
+ * the canonical state hash is byte-identical before and after all five (a refusal
+ * changes nothing, and `hashValue` is the same digest the goldens use), and the
+ * very same command shape is **accepted** where it is legal — so the refusals are
+ * specific and not a blanket "work never starts".
+ */
+const illegalWorkScenario = defineScenario({
+  name: 'illegal-work-is-refused-with-a-typed-error-and-leaves-the-state-alone',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(7, 5, 'hills')
+      .addImprovement(7, 5, MINE) // a job finished earlier, stated by the DSL
+      .addUnit(0, WORKER, [5, 5]) // unit 0 — mine on grassland: wrong terrain role
+      .addUnit(0, WORKER, [7, 5]) // unit 1 — mine on a mined hill; irrigation on a hill
+      .addUnit(0, WORKER, [9, 5]) // unit 2 — irrigation is legal here (the control)
+      .addUnit(1, WARRIOR, [20, 20]), // unit 3 — not a worker
+  assert: (after, ruleset) => {
+    const hills = TERRAIN_BY_ROLE(ruleset, 'hills');
+    if (hills === undefined) {
+      return [check(false, 'the ruleset is missing the hills row this scenario needs')];
+    }
+
+    // The hash before anything is attempted, so "a refusal changes nothing" is
+    // checked against the state itself rather than against a field count.
+    const hashBefore = hashValue(after);
+
+    const wrongRole = errorOf(applyCommand(after, ROME, startWork(0, MINE), ruleset));
+    const irrigationOnHills = errorOf(applyCommand(after, ROME, startWork(1, IRRIGATION), ruleset));
+    const alreadyImproved = errorOf(applyCommand(after, ROME, startWork(1, MINE), ruleset));
+    const unknown = errorOf(applyCommand(after, ROME, startWork(0, NOT_AN_IMPROVEMENT), ruleset));
+    const notAWorker = errorOf(applyCommand(after, CARTHAGE, startWork(3, MINE), ruleset));
+
+    // The control: the same command shape, on a tile where the catalog allows it.
+    const control = romeApply(after, ruleset, startWork(2, IRRIGATION));
+    const controlJob = control === undefined ? undefined : workOf(control.state, 2);
+
+    // And a *second* job for a worker already digging: `already-working`, naming
+    // the job in progress. `road` is allowed on grassland, so the only reason to
+    // refuse is the job the unit already has — one job at a time, and a caller that
+    // must cancel first is told what to cancel.
+    const second = errorOf(
+      applyCommand(control?.state ?? after, ROME, startWork(2, ROAD), ruleset),
+    );
+
+    return [
+      check(
+        wrongRole !== undefined &&
+          wrongRole.kind === 'improvement-not-allowed' &&
+          wrongRole.unitId === asUnitId(0) &&
+          wrongRole.tile === WRONG_ROLE_TILE &&
+          wrongRole.improvement === MINE &&
+          wrongRole.role === 'grassland',
+        `a mine on grassland is refused with improvement-not-allowed(unit 0, tile ${String(Number(WRONG_ROLE_TILE))}, mine, role "grassland") (got ${JSON.stringify(wrongRole)})`,
+      ),
+      check(
+        irrigationOnHills !== undefined &&
+          irrigationOnHills.kind === 'improvement-not-allowed' &&
+          irrigationOnHills.unitId === asUnitId(1) &&
+          irrigationOnHills.tile === IMPROVED_HILL &&
+          irrigationOnHills.improvement === IRRIGATION &&
+          irrigationOnHills.role === 'hills',
+        `irrigation on hills is refused the same way, reporting "hills": every improvement names the terrain it may be built on (got ${JSON.stringify(irrigationOnHills)})`,
+      ),
+      check(
+        alreadyImproved !== undefined &&
+          alreadyImproved.kind === 'already-improved' &&
+          alreadyImproved.tile === IMPROVED_HILL &&
+          alreadyImproved.improvement === MINE,
+        `a mine on a hill that already carries one is refused with already-improved(tile ${String(Number(IMPROVED_HILL))}, mine) (got ${JSON.stringify(alreadyImproved)})`,
+      ),
+      check(
+        after.map.terrain[Number(IMPROVED_HILL)] === hills.id &&
+          hills.yields.shields === 2 &&
+          !hills.impassable,
+        `and that refusal is about the pair and not the terrain: the tile really is hills, where a mine is allowed and the worker could stand (role ${hills.role})`,
+      ),
+      check(
+        unknown !== undefined &&
+          unknown.kind === 'unknown-improvement' &&
+          unknown.improvement === NOT_AN_IMPROVEMENT,
+        `an id no catalog row defines is refused with unknown-improvement("nope") (got ${JSON.stringify(unknown)})`,
+      ),
+      check(
+        notAWorker !== undefined &&
+          notAWorker.kind === 'not-a-worker' &&
+          notAWorker.unitId === asUnitId(3),
+        `Carthage's warrior cannot dig: not-a-worker(unit 3) (got ${JSON.stringify(notAWorker)})`,
+      ),
+      check(
+        hashValue(after) === hashBefore,
+        `all five refusals left the state byte-for-byte identical: the canonical hash is still ${hashBefore}`,
+      ),
+      check(
+        after.revision === 0 &&
+          after.improvements.length === 1 &&
+          after.improvements[0]?.tile === IMPROVED_HILL &&
+          after.improvements[0].kind === MINE,
+        `revision is still 0 and the pair list is exactly the one pre-placed mine (revision ${String(after.revision)}, pairs ${JSON.stringify(after.improvements)})`,
+      ),
+      check(
+        !hasWorkKey(after, 0) && !hasWorkKey(after, 1) && !hasWorkKey(after, 2),
+        'no refused command gave a unit a job, and no unit grew a `work` key holding undefined',
+      ),
+      check(
+        control !== undefined && control.state.revision === 1 && control.state.turn === 1,
+        `the CONTROL applies: irrigation on grassland is a legal job, so the refusals above are specific rather than a blanket "work is refused" (revision ${String(control?.state.revision)})`,
+      ),
+      check(
+        controlJob !== undefined &&
+          controlJob.kind === IRRIGATION &&
+          controlJob.tile === CONTROL_TILE &&
+          controlJob.turnsLeft === 2,
+        `and it starts with the catalog's own 2 turns on the unit's own tile ${label(9, 5)} (got ${JSON.stringify(controlJob)})`,
+      ),
+      check(
+        control !== undefined &&
+          control.state.improvements.length === 1 &&
+          !hasImprovement(control.state, CONTROL_TILE, IRRIGATION),
+        `starting a legal job still builds nothing: the pair lands when its last turn is paid, not when it starts (pairs: ${JSON.stringify(control?.state.improvements)})`,
+      ),
+      check(
+        second !== undefined &&
+          second.kind === 'already-working' &&
+          second.unitId === asUnitId(2) &&
+          second.improvement === IRRIGATION,
+        `a worker already digging cannot be handed a second job: already-working(unit 2, irrigation) — the job in progress, so a client knows what to cancel (got ${JSON.stringify(second)})`,
+      ),
+      check(
+        second !== undefined &&
+          controlJob !== undefined &&
+          workOf(control?.state ?? after, 2)?.kind === IRRIGATION &&
+          (control?.state.improvements.length ?? -1) === 1,
+        `and the refusal did not quietly replace the job or build anything: unit 2 is still irrigating and the pair list is unchanged (job ${JSON.stringify(controlJob)})`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 11. Work timing
+ * ------------------------------------------------------------------ */
+
+/** The hill a 3-turn mine is dug on. */
+const TIMING_HILL = at(6, 5);
+/** The grassland a 2-turn irrigation is dug on. */
+const TIMING_FLAT = at(4, 5);
+
+/**
+ * WORK TIMING. Two workers start jobs of **different lengths** on the same turn —
+ * a mine (3 turns) and an irrigation (2 turns) — and every turn is walked
+ * individually, asserting the pair `(mine.turnsLeft, irrigation.turnsLeft)` after
+ * each one, what is built, and which job finished.
+ *
+ * Different lengths are the point: if the same length were used, "each turn costs
+ * exactly one" and "the job finishes on turn 3" would be indistinguishable from
+ * "the job finishes after three turns however they are counted". With 3 and 2, the
+ * expected sequences are `[(2,1), (1,none), (none,none)]` and the completions land
+ * on two different turns — an implementation that decremented twice a turn would
+ * produce `[(1,none), (none,none), ...]`, and one that completed a turn early
+ * would build the first improvement after turn 1.
+ *
+ * `-1` in the recorded sequence means "no `work` key at all": a finished job is
+ * absent from the unit, never present with a zero count (`turn.ts` completes on
+ * reaching zero, so a count of 0 never reaches the state).
+ */
+const workTimingScenario = defineScenario({
+  name: 'work-timing-pays-one-turn-a-turn-and-finishes-on-the-catalog-turn',
+  settings: DUEL_SETTINGS,
+  setup: (b) =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(6, 5, 'hills')
+      .addUnit(0, WORKER, [6, 5]) // unit 0 — the mine: the longer job
+      .addUnit(0, WORKER, [4, 5]) // unit 1 — the irrigation: the shorter one
+      .addUnit(1, WARRIOR, [20, 20]), // unit 2
+  run: [startWork(0, MINE), startWork(1, IRRIGATION)],
+  assert: (after, ruleset) => {
+    const mineDef = improvementDef(ruleset, MINE);
+    const irrigationDef = improvementDef(ruleset, IRRIGATION);
+    if (mineDef === undefined || irrigationDef === undefined) {
+      return [check(false, 'the ruleset is missing an improvement row this scenario needs')];
+    }
+
+    const started = [workOf(after, 0), workOf(after, 1)];
+
+    const turnsLeft: (readonly [number, number])[] = [];
+    const built: string[][] = [];
+    const movement: (readonly [number, number])[] = [];
+    const completionTurns: number[] = [];
+    const completionKinds: ImprovementId[] = [];
+    const hashes: string[] = [];
+
+    let state = after;
+    for (let turn = 0; turn < 3; turn += 1) {
+      const step = romeApply(state, ruleset, endTurn());
+      if (step === undefined) {
+        return [check(false, 'EndTurn must apply to a world with two working units')];
+      }
+      state = step.state;
+
+      turnsLeft.push([workOf(state, 0)?.turnsLeft ?? -1, workOf(state, 1)?.turnsLeft ?? -1]);
+      built.push(state.improvements.map((pair) => `${String(Number(pair.tile))}:${pair.kind}`));
+      movement.push([
+        unitById(state, asUnitId(0))?.movementLeft ?? -1,
+        unitById(state, asUnitId(1))?.movementLeft ?? -1,
+      ]);
+      // Every intermediate state is hashed, not only the last one: `canonicalize`
+      // refuses `undefined` anywhere, so a `work` key written as
+      // `work: undefined` when a job finishes — the bug class that has cost this
+      // project three hunts — would throw here on the very turn it happened.
+      hashes.push(hashValue(state));
+      for (const event of step.events) {
+        if (event.type === 'WorkCompleted') {
+          completionTurns.push(state.turn);
+          completionKinds.push(event.kind);
+        }
+      }
+    }
+    hashes.push(hashValue(after));
+
+    // What each turn must build, in `(tile, kind)` order — the order the state's
+    // pair list is hashed in.
+    const flat = String(Number(TIMING_FLAT));
+    const hill = String(Number(TIMING_HILL));
+    const expectedBuilt: string[][] = [
+      [],
+      [`${flat}:${IRRIGATION}`],
+      [`${flat}:${IRRIGATION}`, `${hill}:${MINE}`],
+    ];
+
+    return [
+      check(
+        mineDef.turns === 3 && irrigationDef.turns === 2,
+        `the catalog's PLACEHOLDER turn counts differ — mine 3, irrigation 2 — which is what makes "exactly one turn a turn" observable (got ${String(mineDef.turns)} and ${String(irrigationDef.turns)})`,
+      ),
+      check(
+        after.turn === 1 &&
+          after.revision === 2 &&
+          started[0] !== undefined &&
+          started[0].turnsLeft === mineDef.turns &&
+          started[0].tile === TIMING_HILL &&
+          started[1] !== undefined &&
+          started[1].turnsLeft === irrigationDef.turns &&
+          started[1].tile === TIMING_FLAT,
+        `the run only STARTED the two jobs, on turn 1: each carries the catalog's full count on the unit's own tile (${JSON.stringify(started)})`,
+      ),
+      check(
+        after.improvements.length === 0,
+        `and neither job has built anything yet (pairs: ${JSON.stringify(after.improvements)})`,
+      ),
+      check(
+        JSON.stringify(turnsLeft) ===
+          JSON.stringify([
+            [2, 1],
+            [1, -1],
+            [-1, -1],
+          ]),
+        `each turn pays exactly one turn of each job and no more: [(2,1), (1,none), (none,none)] (got ${JSON.stringify(turnsLeft)}; -1 means the \`work\` key is gone)`,
+      ),
+      check(
+        JSON.stringify(built) === JSON.stringify(expectedBuilt),
+        `the improvements appear on the exact turn their last turn is paid, in (tile, kind) order: nothing, then the irrigation on tile ${flat}, then that plus the mine on tile ${hill} (got ${JSON.stringify(built)})`,
+      ),
+      check(
+        JSON.stringify(completionTurns) === JSON.stringify([3, 4]) &&
+          JSON.stringify(completionKinds) === JSON.stringify([IRRIGATION, MINE]),
+        `work finishes on the catalog's own turn: the 2-turn irrigation on the second turn (state turn 3) and the 3-turn mine on the third (state turn 4), one WorkCompleted each (turns ${JSON.stringify(completionTurns)}, kinds ${JSON.stringify(completionKinds)})`,
+      ),
+      check(
+        JSON.stringify(movement) ===
+          JSON.stringify([
+            [2, 2],
+            [2, 2],
+            [2, 2],
+          ]),
+        `a job costs no movement per turn: step 4 refills both workers to the catalog's 2 every turn (got ${JSON.stringify(movement)})`,
+      ),
+      check(
+        state.turn === 4 &&
+          !hasWorkKey(state, 0) &&
+          !hasWorkKey(state, 1) &&
+          state.improvements.length === 2,
+        `after the third turn both workers are idle with no \`work\` key at all, and the state holds exactly the two pairs (turn ${String(state.turn)}, pairs ${JSON.stringify(state.improvements)})`,
+      ),
+      check(
+        state.improvements.map((pair) => pair.kind).join(',') === `${IRRIGATION},${MINE}`,
+        `and they are ordered by tile, then kind — the order the pair list is hashed in (kinds: ${state.improvements.map((pair) => pair.kind).join(',')})`,
+      ),
+      check(
+        hashes.length === 4 && hashes.every((hash) => /^[0-9a-f]{16}$/.test(hash)),
+        `every state along the way — each turn, a job at two different counts, an idle worker whose \`work\` key is gone — canonicalises and hashes, so no state in this sequence carries a key holding undefined (hashes: ${JSON.stringify(hashes)})`,
+      ),
+    ];
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * The four M4a scenarios, as tests
+ * ------------------------------------------------------------------ */
+
+describe('M4a scenario: mine yield', () => {
+  it('pays exactly one shield more a turn from the turn the mine is finished', () => {
+    const result = runScenario(mineYieldScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the mine scenario must build a state');
+
+    // Two of the mine's three turns are paid, and nothing is built yet.
+    expect(after.turn).toBe(3);
+    expect(after.revision).toBe(3);
+    expect(after.improvements).toEqual([]);
+    expect(cityYields(after, RULESET, asCityId(0))).toEqual({
+      food: 2,
+      shields: 3,
+      commerce: 1,
+      foodSurplus: 0,
+    });
+    expect(cityById(after, asCityId(0))?.shields).toBe(6);
+    expect(workOf(after, 0)).toEqual({ kind: MINE, tile: MINE_TILE, turnsLeft: 1 });
+
+    // Progress is state, not an event: the run emitted the `WorkStarted` and the
+    // two `TurnEnded`s and nothing else — no per-turn progress event, and no
+    // completion before the last turn is paid.
+    expect(result.events).toEqual([
+      { type: 'WorkStarted', unitId: asUnitId(0), kind: MINE, tile: MINE_TILE, turnsLeft: 3 },
+      { type: 'TurnEnded', playerId: ROME, turn: 2 },
+      { type: 'TurnEnded', playerId: ROME, turn: 3 },
+    ]);
+  });
+
+  it('walks the job by hand: one turn a turn, 4 shields on the last one, and the pair exactly once', () => {
+    const built = createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(6, 5, 'hills')
+      .addUnit(0, WORKER, [6, 5])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], { population: 1, workedTiles: [MINE_TILE] })
+      .build();
+    if (!built.ok) throw new Error(`the mine fixture must build: ${JSON.stringify(built.error)}`);
+
+    const started = romeApply(built.value, RULESET, startWork(0, MINE));
+    if (started === undefined) throw new Error('StartWork must apply to an idle worker on hills');
+    expect(started.state.turn).toBe(1);
+    expect(started.state.improvements).toEqual([]);
+    expect(workOf(started.state, 0)).toEqual({ kind: MINE, tile: MINE_TILE, turnsLeft: 3 });
+    // Starting the job spends the unit's whole turn (M4a: "it costs the unit's
+    // remaining movement for the turn") and builds nothing.
+    expect(unitById(started.state, asUnitId(0))?.movementLeft).toBe(0);
+
+    const shields: number[] = [];
+    const turnsLeft: number[] = [];
+    const pairs: number[] = [];
+    const completedOn: number[] = [];
+    let state = started.state;
+    for (let turn = 0; turn < 3; turn += 1) {
+      const step = romeApply(state, RULESET, endTurn());
+      if (step === undefined) throw new Error('EndTurn must apply');
+      state = step.state;
+
+      shields.push(cityById(state, asCityId(0))?.shields ?? -1);
+      // `-1` is "no `work` key at all"; the engine completes a job on reaching 0,
+      // so a count of 0 never reaches the state.
+      turnsLeft.push(workOf(state, 0)?.turnsLeft ?? -1);
+      pairs.push(state.improvements.length);
+      if (step.events.some((event) => event.type === 'WorkCompleted')) {
+        completedOn.push(state.turn);
+      }
+    }
+
+    expect(shields).toEqual([3, 6, 10]);
+    expect(turnsLeft).toEqual([2, 1, -1]);
+    expect(pairs).toEqual([0, 0, 1]);
+    expect(completedOn).toEqual([4]); // the third turn, and only that turn
+    expect(state.turn).toBe(4);
+    expect(state.improvements).toEqual([{ tile: MINE_TILE, kind: MINE }]);
+    expect(hasWorkKey(state, 0)).toBe(false);
+
+    // The mine keeps paying: the next turn banks the same 4 shields.
+    const fourth = romeApply(state, RULESET, endTurn());
+    expect(fourth?.state.turn).toBe(5);
+    expect(cityById(fourth?.state ?? state, asCityId(0))?.shields).toBe(14);
+  });
+});
+
+describe('M4a scenario: work cancelled by movement', () => {
+  it('cancels the job with a typed WorkCancelled and builds nothing', () => {
+    const result = runScenario(workCancelledScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the cancellation scenario must build a state');
+
+    // The engine's own account, in the order it happened: the move, then the
+    // cancellation it caused (reason `moved`, and the two turns still owed are
+    // reported rather than refunded).
+    expect(result.events).toEqual([
+      { type: 'WorkStarted', unitId: asUnitId(0), kind: MINE, tile: CANCEL_HILL, turnsLeft: 3 },
+      {
+        type: 'WorkStarted',
+        unitId: asUnitId(1),
+        kind: IRRIGATION,
+        tile: CANCEL_FLAT,
+        turnsLeft: 2,
+      },
+      { type: 'TurnEnded', playerId: ROME, turn: 2 },
+      {
+        type: 'UnitMoved',
+        unitId: asUnitId(0),
+        from: CANCEL_HILL,
+        to: CANCEL_DESTINATION,
+        cost: 1,
+        movementLeft: 1,
+      },
+      {
+        type: 'WorkCancelled',
+        unitId: asUnitId(0),
+        kind: MINE,
+        tile: CANCEL_HILL,
+        turnsLeft: 2,
+        reason: 'moved',
+      },
+    ]);
+
+    // The state says the same thing: no job key, no pair, and the worker that
+    // stayed is still working.
+    expect(hasWorkKey(after, 0)).toBe(false);
+    expect(unitById(after, asUnitId(0))?.tile).toBe(CANCEL_DESTINATION);
+    expect(workOf(after, 1)).toEqual({
+      kind: IRRIGATION,
+      tile: CANCEL_FLAT,
+      turnsLeft: 1,
+    });
+    expect(after.improvements).toEqual([]);
+    expect(hasImprovement(after, CANCEL_HILL, MINE)).toBe(false);
+    expect(hasImprovement(after, CANCEL_FLAT, IRRIGATION)).toBe(false);
+  });
+});
+
+describe('M4a scenario: illegal work refused', () => {
+  it('refuses each illegal job with its exact typed error and leaves the hash unchanged', () => {
+    const result = runScenario(illegalWorkScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the illegal-work scenario must build a state');
+
+    // No `run` command at all: the scenario refuses everything by probing, so the
+    // runner's event list is empty and the built world is untouched.
+    expect(result.events).toEqual([]);
+    expect(after.revision).toBe(0);
+    expect(after.improvements).toEqual([{ tile: IMPROVED_HILL, kind: MINE }]);
+
+    // The exact errors, deep-equal, so a changed field is a changed test.
+    expect(refusal(applyCommand(after, ROME, startWork(0, MINE), RULESET))).toEqual({
+      kind: 'improvement-not-allowed',
+      unitId: asUnitId(0),
+      tile: WRONG_ROLE_TILE,
+      improvement: MINE,
+      role: 'grassland',
+    });
+    expect(refusal(applyCommand(after, ROME, startWork(1, IRRIGATION), RULESET))).toEqual({
+      kind: 'improvement-not-allowed',
+      unitId: asUnitId(1),
+      tile: IMPROVED_HILL,
+      improvement: IRRIGATION,
+      role: 'hills',
+    });
+    expect(refusal(applyCommand(after, ROME, startWork(1, MINE), RULESET))).toEqual({
+      kind: 'already-improved',
+      tile: IMPROVED_HILL,
+      improvement: MINE,
+    });
+    expect(refusal(applyCommand(after, ROME, startWork(0, NOT_AN_IMPROVEMENT), RULESET))).toEqual({
+      kind: 'unknown-improvement',
+      improvement: NOT_AN_IMPROVEMENT,
+    });
+    expect(refusal(applyCommand(after, CARTHAGE, startWork(3, MINE), RULESET))).toEqual({
+      kind: 'not-a-worker',
+      unitId: asUnitId(3),
+    });
+
+    // The keystone pair, outside the scenario: the same command shape is accepted
+    // where it is legal, so the refusals above are specific.
+    const hashBefore = hashValue(after);
+    const legal = applyCommand(after, ROME, startWork(2, IRRIGATION), RULESET);
+    expect(legal.ok).toBe(true);
+    if (legal.ok) {
+      expect(legal.value.state.revision).toBe(1);
+      expect(workOf(legal.value.state, 2)).toEqual({
+        kind: IRRIGATION,
+        tile: CONTROL_TILE,
+        turnsLeft: 2,
+      });
+      // Starting a job builds nothing: the pair lands when its last turn is paid.
+      expect(legal.value.state.improvements).toEqual([{ tile: IMPROVED_HILL, kind: MINE }]);
+    }
+    // A refused command leaves the state alone — and the refusals happened before
+    // this control, so the hash is the same one it started with.
+    expect(hashValue(after)).toBe(hashBefore);
+
+    // `already-working` is reachable only once a job exists, so it is probed from
+    // the applied control rather than from the built world: a worker may hold one
+    // job at a time, and the refusal names the job it already has.
+    const working = applyCommand(after, ROME, startWork(2, IRRIGATION), RULESET);
+    expect(working.ok).toBe(true);
+    if (working.ok) {
+      expect(refusal(applyCommand(working.value.state, ROME, startWork(2, ROAD), RULESET))).toEqual(
+        {
+          kind: 'already-working',
+          unitId: asUnitId(2),
+          improvement: IRRIGATION,
+        },
+      );
+      expect(workOf(working.value.state, 2)).toEqual({
+        kind: IRRIGATION,
+        tile: CONTROL_TILE,
+        turnsLeft: 2,
+      });
+    }
+  });
+});
+
+describe('M4a scenario: work timing', () => {
+  it('pays one turn of each job a turn and finishes each on its catalog turn', () => {
+    const result = runScenario(workTimingScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const after = result.finalState;
+    if (after === undefined) throw new Error('the timing scenario must build a state');
+
+    expect(after.turn).toBe(1);
+    expect(after.revision).toBe(2);
+    expect(after.improvements).toEqual([]);
+    expect(workOf(after, 0)).toEqual({ kind: MINE, tile: TIMING_HILL, turnsLeft: 3 });
+    expect(workOf(after, 1)).toEqual({ kind: IRRIGATION, tile: TIMING_FLAT, turnsLeft: 2 });
+
+    // `WorkStarted` reports the catalog's own count, so a consumer can render
+    // "3 turns" without reading the ruleset — and the run emitted no completion,
+    // because no turn has been paid yet.
+    expect(result.events).toEqual([
+      { type: 'WorkStarted', unitId: asUnitId(0), kind: MINE, tile: TIMING_HILL, turnsLeft: 3 },
+      {
+        type: 'WorkStarted',
+        unitId: asUnitId(1),
+        kind: IRRIGATION,
+        tile: TIMING_FLAT,
+        turnsLeft: 2,
+      },
+    ]);
+
+    // Outside the scenario: two turns take the shorter job and three the longer
+    // one, with the pair list growing one entry at a time.
+    const second = endTurnsFrom(after, RULESET, 2);
+    expect(second?.turn).toBe(3);
+    expect(second?.improvements).toEqual([{ tile: TIMING_FLAT, kind: IRRIGATION }]);
+    expect(workOf(second ?? after, 0)).toEqual({ kind: MINE, tile: TIMING_HILL, turnsLeft: 1 });
+    expect(hasWorkKey(second ?? after, 1)).toBe(false);
+
+    const third = second === undefined ? undefined : endTurnsFrom(second, RULESET, 1);
+    expect(third?.turn).toBe(4);
+    expect(third?.improvements).toEqual([
+      { tile: TIMING_FLAT, kind: IRRIGATION },
+      { tile: TIMING_HILL, kind: MINE },
+    ]);
+    expect(hasWorkKey(third ?? after, 0)).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The builder's M4a addition, and what it refuses
+ * ------------------------------------------------------------------ */
+
+describe('the scenario builder states M4a worlds', () => {
+  /** A world ready to improve: two civilizations, one hill, a worker on it. */
+  const m4aWorld = (): ScenarioBuilder =>
+    createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(6, 5, 'hills')
+      .setTile(8, 5, 'hills')
+      .addUnit(0, WORKER, [6, 5])
+      .addUnit(1, WARRIOR, [20, 20]);
+
+  it('starts with nothing built, and says so with an empty list rather than a missing key', () => {
+    const built = m4aWorld().build();
+    if (!built.ok) throw new Error(`the M4a fixture must build: ${JSON.stringify(built.error)}`);
+
+    expect(built.value.improvements).toEqual([]);
+    expect(Object.hasOwn(built.value, 'improvements')).toBe(true);
+    // An empty array of pairs is hashable, which is why "nothing is built" is an
+    // empty list and not an `undefined` (canonicalize refuses `undefined`).
+    expect(hashValue(built.value)).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('places improvements as sorted, unique pairs, whatever order they were written in', () => {
+    const built = m4aWorld()
+      .addImprovement(8, 5, MINE)
+      .addImprovement(6, 5, ROAD)
+      .addImprovement(6, 5, MINE)
+      .build();
+    if (!built.ok)
+      throw new Error(`the improvement fixture must build: ${JSON.stringify(built.error)}`);
+    const state = built.value;
+
+    // Sorted by (tile, kind), unique pairs: `withImprovement` establishes the order
+    // the pair list is hashed in, and the builder goes through it rather than
+    // appending an array of its own.
+    expect(state.improvements).toEqual([
+      { tile: at(6, 5), kind: ROAD },
+      { tile: at(6, 5), kind: MINE },
+      { tile: at(8, 5), kind: MINE },
+    ]);
+    // Two different kinds share one tile — that is why this is a list of pairs.
+    expect(improvementsAt(state, at(6, 5))).toEqual([ROAD, MINE]);
+    expect(improvementsAt(state, at(8, 5))).toEqual([MINE]);
+    expect(improvementsAt(state, at(5, 5))).toEqual([]);
+    expect(hasImprovement(state, at(6, 5), MINE)).toBe(true);
+    expect(hasImprovement(state, at(6, 5), IRRIGATION)).toBe(false);
+
+    // Plain data: the pairs survive a JSON round trip, so the state stays hashable
+    // (an `undefined` anywhere in the field would make `canonicalize` throw).
+    const roundTripped: unknown = JSON.parse(JSON.stringify(state));
+    expect(hashValue(roundTripped)).toBe(hashValue(state));
+
+    // The builder places improvements *before* it assigns citizens, so a
+    // hand-built world matches a played one: `autoAssignWorkedTiles` ranks a tile
+    // by what it is worth, improvements included.
+    const irrigated = m4aWorld()
+      .addImprovement(4, 5, IRRIGATION)
+      .addCity(0, [5, 5], { population: 1 })
+      .build();
+    if (!irrigated.ok) throw new Error('the irrigated fixture must build');
+    expect(tileYields(irrigated.value, RULESET, at(4, 5))).toEqual({
+      food: 3,
+      shields: 1,
+      commerce: 1,
+    });
+    expect(cityById(irrigated.value, asCityId(0))?.workedTiles).toEqual([at(4, 5)]);
+
+    // Control: the same city with nothing built takes the lowest-index grassland
+    // (2 food), because the irrigated tile's 3 food no longer outranks anything.
+    const plain = m4aWorld().addCity(0, [5, 5], { population: 1 }).build();
+    expect(plain.ok ? cityById(plain.value, asCityId(0))?.workedTiles : undefined).toEqual([
+      at(4, 3),
+    ]);
+  });
+
+  it('leaves the city centre alone, because the centre is not a worked tile', () => {
+    // M4a: "The city centre is unaffected by improvements — it is not a worked
+    // tile." A mine on a hills centre is a world the command layer *can* produce
+    // (a worker standing in the city could dig there), so the yields must show it
+    // buys the city nothing.
+    const withCentreMine = createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(5, 5, 'hills')
+      .addImprovement(5, 5, MINE)
+      .addUnit(0, WORKER, [30, 30])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], { population: 1, workedTiles: [at(4, 5)] })
+      .build();
+    if (!withCentreMine.ok) throw new Error('the hills-centre fixture must build');
+
+    // Centre: hills floored to 1 food / 2 shields / 1 commerce; worked tile:
+    // grassland 2 food / 1 shield / 1 commerce.
+    expect(cityYields(withCentreMine.value, RULESET, asCityId(0))).toEqual({
+      food: 3,
+      shields: 3,
+      commerce: 2,
+      foodSurplus: 1,
+    });
+    // The pair is really there — 3 shields is what the *city* makes, and 4 would
+    // be the number if the centre counted improvements.
+    expect(hasImprovement(withCentreMine.value, at(5, 5), MINE)).toBe(true);
+    expect(tileYields(withCentreMine.value, RULESET, at(5, 5))).toEqual({
+      food: 0,
+      shields: 3,
+      commerce: 0,
+    });
+
+    const withoutMine = createScenarioBuilder(RULESET, DUEL_SETTINGS)
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(5, 5, 'hills')
+      .addUnit(0, WORKER, [30, 30])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], { population: 1, workedTiles: [at(4, 5)] })
+      .build();
+    if (!withoutMine.ok) throw new Error('the control fixture must build');
+    expect(cityYields(withoutMine.value, RULESET, asCityId(0))).toEqual(
+      cityYields(withCentreMine.value, RULESET, asCityId(0)),
+    );
+  });
+
+  it('refuses an improvement it cannot place honestly', () => {
+    expect(() => m4aWorld().addImprovement(DUEL.width, 0, MINE)).toThrow(
+      /outside this world's 40x40 map/,
+    );
+    expect(() => m4aWorld().addImprovement(0, -1, ROAD)).toThrow(/outside this world's 40x40 map/);
+    expect(() => m4aWorld().addImprovement(6, 5, NOT_AN_IMPROVEMENT)).toThrow(
+      /defines no improvement "nope"/,
+    );
+    expect(() => m4aWorld().addImprovement(6, 5, MINE).addImprovement(6, 5, MINE)).toThrow(
+      /called twice for one tile/,
+    );
+
+    // The terrain under the tile is only final once every setTile has run, so the
+    // allowedRoles rule — the same rule `StartWork` enforces — is checked at build().
+    expect(() => m4aWorld().addImprovement(4, 4, MINE).build()).toThrow(
+      /not in its allowedRoles \(hills, mountains\)/,
+    );
+    expect(() => m4aWorld().addImprovement(6, 5, IRRIGATION).build()).toThrow(
+      /not in its allowedRoles \(grassland, plains\)/,
+    );
+    expect(() => m4aWorld().setTile(4, 4, 'ocean').addImprovement(4, 4, ROAD).build()).toThrow(
+      /not in its allowedRoles/,
+    );
+    // A later setTile can rescue an earlier addImprovement: the check is at build().
+    expect(m4aWorld().addImprovement(4, 4, MINE).setTile(4, 4, 'hills').build().ok).toBe(true);
+
+    // Controls: the same calls where the terrain does allow it build, and several
+    // different kinds may share one tile.
+    expect(m4aWorld().addImprovement(6, 5, MINE).build().ok).toBe(true);
+    expect(m4aWorld().addImprovement(4, 4, IRRIGATION).build().ok).toBe(true);
+    expect(m4aWorld().setTile(4, 4, 'plains').addImprovement(4, 4, IRRIGATION).build().ok).toBe(
+      true,
+    );
+    expect(m4aWorld().addImprovement(4, 4, ROAD).build().ok).toBe(true);
+    expect(m4aWorld().addImprovement(6, 5, MINE).addImprovement(6, 5, ROAD).build().ok).toBe(true);
+  });
+
+  it('reports M4a refusals by name, so a refused run command is readable', () => {
+    const illegal: Scenario = {
+      name: 'run-a-mine-on-grassland',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .addUnit(0, WORKER, [5, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [startWork(0, MINE)],
+      assert: () => [check(true, 'the assert callback still runs after a refused command')],
+    };
+
+    const result = runScenario(illegal);
+
+    expect(result.passed).toBe(false);
+    expect(result.assertions[0]?.message).toBe(
+      'run[0] StartWork by unit 0 on improvement "mine" was refused: ' +
+        `improvement-not-allowed ("mine" cannot be built on "grassland" at tile ${String(Number(at(5, 5)))}, where unit 0 stands)`,
+    );
+    expect(result.finalState?.revision).toBe(0);
+
+    const cancelAnIdleUnit: Scenario = {
+      name: 'run-cancel-on-an-idle-worker',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .addUnit(0, WORKER, [5, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [{ type: 'CancelWork', unitId: asUnitId(0) }],
+      assert: () => [check(true, 'the assert callback still runs after a refused command')],
+    };
+
+    const cancelled = runScenario(cancelAnIdleUnit);
+    expect(cancelled.passed).toBe(false);
+    expect(cancelled.assertions[0]?.message).toBe(
+      'run[0] CancelWork by unit 0 was refused: not-working (unit 0 has no job to cancel)',
+    );
+    expect(cancelled.finalState?.revision).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Falsification: the M4a scenarios' assertions must be able to fail
+ * ------------------------------------------------------------------ */
+
+describe('the M4a scenario assertions discriminate (they are not decoration)', () => {
+  it('the mine-yield assertions fail when the city does not work the mined tile', () => {
+    // The mine is still dug on the hill at (6,5), but the citizen works the
+    // grassland at (4,3): the improved tile is not the tile the city counts, so
+    // the shield rate and the completing turn's total must both disagree. This is
+    // the difference between "a mine appeared somewhere" and "the worked tile got
+    // better".
+    const variant: Scenario = {
+      name: 'mine-yield-on-an-unworked-tile',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTile(6, 5, 'hills')
+          .addUnit(0, WORKER, [6, 5])
+          .addUnit(1, WARRIOR, [20, 20])
+          .addCity(0, [5, 5], { population: 1, workedTiles: [at(4, 3)] }),
+      run: [startWork(0, MINE), endTurn(), endTurn()],
+      assert: assertOf(mineYieldScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/BEFORE the mine the city makes 3 shields a turn/);
+    expect(text).toMatch(/the completing turn pays at the improved rate/);
+
+    // The world itself is the one the scenario described, and the job is one turn
+    // from done — so those failures are about the *yields* and not about a mine
+    // that was never dug. (`run` stops before the completing turn, so the pair is
+    // still absent from the final state; the `assert` callback's own probe is what
+    // completes it.)
+    const finalState = result.finalState;
+    if (finalState === undefined) {
+      throw new Error('the unworked-tile variant must still build a world');
+    }
+    expect(finalState.turn).toBe(3);
+    expect(workOf(finalState, 0)?.turnsLeft).toBe(1);
+    expect(finalState.improvements).toEqual([]);
+  });
+
+  it('the cancellation assertions fail when the worker is never moved', () => {
+    // The same two jobs and one turn, but the digger does not walk away: its job
+    // survives, its tile stays bare only because nothing finished, and every
+    // "cancelled by movement" expectation has to break.
+    const variant: Scenario = {
+      name: 'work-survives-because-nothing-moved',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTile(6, 5, 'hills')
+          .addUnit(0, WORKER, [6, 5])
+          .addUnit(0, WORKER, [4, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [startWork(0, MINE), startWork(1, IRRIGATION), endTurn(), endTurn()],
+      assert: assertOf(workCancelledScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/its job is GONE/);
+    expect(text).toMatch(/no improvement was added/);
+
+    // The digger's job is still in the state, which is what makes the assertion
+    // above a real claim about the move rather than about the turn passing.
+    const finalState = result.finalState;
+    if (finalState === undefined) {
+      throw new Error('the never-moved variant must still build a world');
+    }
+    expect(unitById(finalState, asUnitId(0))?.work?.turnsLeft).toBe(1);
+  });
+
+  it('the illegal-work assertions fail when the terrain does allow the job', () => {
+    // The same world with a hill under the worker the scenario says is on the
+    // wrong terrain: the mine is now legal, applies, and the typed refusal that
+    // was expected must not be silently tolerated.
+    const variant: Scenario = {
+      name: 'illegal-work-that-is-actually-legal',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTile(5, 5, 'hills') // the one difference: worker 0 now stands on rock
+          .setTile(7, 5, 'hills')
+          .addImprovement(7, 5, MINE)
+          .addUnit(0, WORKER, [5, 5])
+          .addUnit(0, WORKER, [7, 5])
+          .addUnit(0, WORKER, [9, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      assert: assertOf(illegalWorkScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(
+      /a mine on grassland is refused with improvement-not-allowed/,
+    );
+  });
+
+  it('the work-timing assertions fail when a turn has already been paid', () => {
+    // The same two jobs, but one `EndTurn` is inside the run: every count and
+    // every completion turn is then one off, which is exactly what the scenario's
+    // per-turn sequence exists to catch.
+    const variant: Scenario = {
+      name: 'work-timing-with-a-turn-already-paid',
+      settings: DUEL_SETTINGS,
+      setup: (b) =>
+        b
+          .addPlayer('Rome')
+          .addPlayer('Carthage')
+          .fillTerrain('grassland')
+          .setTile(6, 5, 'hills')
+          .addUnit(0, WORKER, [6, 5])
+          .addUnit(0, WORKER, [4, 5])
+          .addUnit(1, WARRIOR, [20, 20]),
+      run: [startWork(0, MINE), startWork(1, IRRIGATION), endTurn()],
+      assert: assertOf(workTimingScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/the run only STARTED the two jobs, on turn 1/);
+    expect(text).toMatch(/each turn pays exactly one turn of each job and no more/);
   });
 });

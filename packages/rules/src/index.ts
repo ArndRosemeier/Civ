@@ -9,9 +9,11 @@
  */
 
 import {
+  IMPROVEMENT_KINDS,
   TERRAIN_ROLES,
   UNIT_ROLES,
   asBuildingId,
+  asImprovementId,
   asTerrainId,
   asUnitTypeId,
   err,
@@ -21,6 +23,8 @@ import {
   cited,
   type BuildingDef,
   type Fidelity,
+  type ImprovementDef,
+  type ImprovementKind,
   type Provenance,
   type Result,
   type TerrainId,
@@ -36,6 +40,17 @@ import {
  */
 export { UNIT_ROLES };
 export type { UnitRole };
+
+/**
+ * The improvement kinds and their ids, re-exported from `core` for the same
+ * reason: `ImprovementKind` is a `core` concept (the engine's structural
+ * `ImprovementDef` carries it), so a second list here would be a second answer to
+ * "what may a worker build?" — free to drift from the one `validateRuleset` and
+ * the engine actually use. Content code and the engine therefore cannot disagree
+ * about the set of kinds by construction.
+ */
+export { IMPROVEMENT_KINDS };
+export type { ImprovementKind };
 
 export interface Yields {
   readonly food: number;
@@ -73,6 +88,15 @@ export interface Catalog {
    * carries provenance like every other rules row (PLAN.md §6.2).
    */
   readonly buildings: readonly BuildingSpec[];
+  /**
+   * The improvement catalog. Required, like `units` and `buildings`, and for the
+   * same reason: `RulesetView.improvements` is required, because M4a's
+   * `cityYields` reads it for every worked tile — so a catalog that left it out
+   * would not be a view the engine could compute city output from. A catalog that
+   * ships no improvements says so with `improvements: []`, and validation rejects
+   * that as an empty catalog like any other (PLAN.md §6.2).
+   */
+  readonly improvements: readonly ImprovementSpec[];
 }
 
 /**
@@ -110,6 +134,29 @@ export interface BuildingSpec extends BuildingDef {
   readonly provenance: Provenance;
 }
 
+/**
+ * A tile improvement — what a worker spends its turns building, and what that
+ * does to the tile it sits on (INTERFACES.md M4a, "Rules — improvement catalog").
+ *
+ * `yields` is a **delta**, not a replacement: a mine adds shields to a hill
+ * rather than turning the hill into something else, which is why
+ * `core`'s `ImprovementDef.yields` is applied as a sum and clamped at zero per
+ * component.
+ *
+ * As with `UnitSpec` and `BuildingSpec`, the row `extends` the engine's
+ * structural `ImprovementDef` so the compile-time proof that content ships what
+ * the engine reads is the type itself, and `provenance` is required — a row
+ * without one does not compile.
+ *
+ * **Every number below is placeholder.** Worker turn counts, yield deltas and
+ * terrain restrictions are guesses chosen to be playable, and the provenance note
+ * on each row says outright that the value is unsourced and ours rather than Civ
+ * 3's (PLAN.md §6.2). `fidelity: 'cited-only'` rejects every one of them.
+ */
+export interface ImprovementSpec extends ImprovementDef {
+  readonly provenance: Provenance;
+}
+
 export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
@@ -133,6 +180,7 @@ export interface Ruleset {
   readonly terrains: readonly TerrainSpec[];
   readonly units: readonly UnitSpec[];
   readonly buildings: readonly BuildingSpec[];
+  readonly improvements: readonly ImprovementSpec[];
   readonly fidelity: Fidelity;
 }
 
@@ -322,6 +370,73 @@ export const CATALOG: Catalog = {
       ),
     },
   ],
+  /**
+   * Tile improvement rows — all PLACEHOLDER, every number ours (PLAN.md §6.2).
+   *
+   * The *shape* is deliberate: one row per engine kind, so each value of
+   * `IMPROVEMENT_KINDS` is exercised by the shipped catalog rather than only by a
+   * test's stand-in. The numbers are tuning choices, not sourced figures:
+   *
+   * - **`turns`** is small (2-3 worker turns) because a worker's whole job is one
+   *   improvement, and a build that outlasts the early game is not playable at
+   *   this scale. Civ 3's own worker turn counts are unverified here and are not
+   *   reproduced.
+   * - **`yields`** is a single +1 in one component, which is the smallest delta
+   *   that is visible in a city's per-turn output at this catalog's terrain
+   *   values. A delta in *two* components would double the effect of one worker
+   *   turn and make the placeholder numbers do more work than they can support.
+   * - **`allowedRoles`** follows the terrain each improvement is about: a mine
+   *   needs rock (hills, mountains), irrigation needs flat, workable land
+   *   (grassland, plains), and a road may be built anywhere a land unit can go —
+   *   including mountains, which are impassable to *movement* in M4a but are land
+   *   all the same. None of the three includes a water role, because M4a's worker
+   *   is a land unit with no sea transport.
+   *
+   * **What these rows deliberately do not claim.** Civ 3's road changes movement
+   * cost; M4a does not model road movement at all (it is M4b's, with the economy),
+   * so the road row's effect here is commerce and its provenance note says so
+   * rather than implying a movement discount that does not exist. Resource
+   * connection, irrigation-under-rail, and every other Civ 3 improvement
+   * interaction are likewise absent, not silently approximated.
+   */
+  improvements: [
+    {
+      id: asImprovementId('road'),
+      kind: 'road',
+      name: 'Road',
+      turns: 2,
+      yields: { food: 0, shields: 0, commerce: 1 },
+      allowedRoles: ['grassland', 'plains', 'hills', 'mountains'],
+      provenance: placeholder(
+        'unsourced: this delta and turn count are ours, chosen to be playable; ' +
+          'Civ 3 roads also cut movement, which M4a does not model',
+      ),
+    },
+    {
+      id: asImprovementId('mine'),
+      kind: 'mine',
+      name: 'Mine',
+      turns: 3,
+      yields: { food: 0, shields: 1, commerce: 0 },
+      allowedRoles: ['hills', 'mountains'],
+      provenance: placeholder(
+        'unsourced: this delta and turn count are ours, chosen to be playable; ' +
+          'not traced to Civ 3 and not claimed to match it',
+      ),
+    },
+    {
+      id: asImprovementId('irrigation'),
+      kind: 'irrigation',
+      name: 'Irrigation',
+      turns: 2,
+      yields: { food: 1, shields: 0, commerce: 0 },
+      allowedRoles: ['grassland', 'plains'],
+      provenance: placeholder(
+        'unsourced: this delta and turn count are ours, chosen to be playable; ' +
+          'Civ 3 restricts irrigation by water access, which M4a does not model',
+      ),
+    },
+  ],
 };
 
 /**
@@ -476,13 +591,82 @@ const checkBuilding = (b: BuildingSpec): readonly RulesetError[] => {
 };
 
 /**
+ * Is this a kind the engine knows? Compares the *strings*, because
+ * `IMPROVEMENT_KINDS` is a tuple of string literals and the value tested may be
+ * one the type system never saw (a JSON catalog, a `Partial` patch). The plain
+ * strings are what both are at runtime; nothing is widened away here.
+ */
+const isKnownImprovementKind = (kind: string): boolean =>
+  IMPROVEMENT_KINDS.some((known) => known === kind);
+
+/**
+ * An improvement row has to be buildable and has to mean something:
+ *
+ * - **`turns >= 1` and an integer.** A worker turn count is a simulation number
+ *   (it is decremented into `UnitWork.turnsLeft`, which is part of every state
+ *   hash), so a fraction would put an unhashable value in the state and a `0`
+ *   would mean an improvement that completes the instant it is started — a free
+ *   tile, not a job.
+ * - **Each `yields` component a non-negative integer.** Non-integer for the same
+ *   determinism reason as terrain yields; negative because the contract's
+ *   "clamped at zero per component" rule exists for *foreign* data, and a shipped
+ *   row that relies on the clamp to stop it subtracting from a tile is a row
+ *   whose author meant something else.
+ * - **A known `kind`.** `ImprovementKind` makes an unknown one a compile error,
+ *   but a catalog can arrive as JSON or from a test's `Partial` patch, and the
+ *   engine's ordering (`improvements.ts`' kind rank) is defined in terms of the
+ *   known kinds — so an unknown one is rejected here, naming the field, rather
+ *   than sorting somewhere arbitrary.
+ * - **A non-empty `allowedRoles`.** A row that lists no terrain is not "allowed
+ *   anywhere", it is allowed *nowhere*: `StartWork` checks membership in this
+ *   list, so an empty one silently makes the improvement unbuildable. "Anywhere"
+ *   is spelled by listing the roles.
+ *
+ * Every other role in `allowedRoles` is deliberately **not** checked against the
+ * terrain catalog: an improvement may legitimately be buildable on a role this
+ * particular catalog happens not to ship (M4b adds terrain), and reporting that as
+ * a data error would force content to be written in one order.
+ */
+const checkImprovement = (i: ImprovementSpec): readonly RulesetError[] => {
+  const errors: RulesetError[] = [];
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'improvements',
+    id: i.id,
+    field,
+    detail,
+  });
+
+  if (!Number.isInteger(i.turns)) errors.push(bad('turns', 'must be an integer'));
+  if (i.turns < 1) errors.push(bad('turns', 'must be >= 1'));
+
+  for (const [field, value] of Object.entries(i.yields)) {
+    if (!Number.isInteger(value)) errors.push(bad(`yields.${field}`, 'must be an integer'));
+    if (value < 0) errors.push(bad(`yields.${field}`, 'must not be negative'));
+  }
+
+  if (!isKnownImprovementKind(i.kind)) {
+    errors.push(
+      bad('kind', `must be one of ${IMPROVEMENT_KINDS.join(', ')} (got ${JSON.stringify(i.kind)})`),
+    );
+  }
+
+  if (i.allowedRoles.length === 0) {
+    errors.push(bad('allowedRoles', 'must list at least one terrain role'));
+  }
+
+  return errors;
+};
+
+/**
  * Validate a catalog. In `cited-only` mode any placeholder row is a hard error,
  * which is what makes "is this Civ 3-shaped or Civ 3-exact?" checkable.
  *
- * Terrains are checked before units, and units before buildings, so the first
- * error a caller sees comes from the catalog that would stop a game earliest:
- * a terrain hole stops generation, a unit hole stops `newGame` placing a
- * settler, and a building hole only stops production later.
+ * Terrains are checked before units, units before buildings, and buildings before
+ * improvements, so the first error a caller sees comes from the catalog that
+ * would stop a game earliest: a terrain hole stops generation, a unit hole stops
+ * `newGame` placing a settler, and a building or improvement hole only stops
+ * production or a worker later.
  */
 export const validateRuleset = (
   catalog: Catalog,
@@ -497,6 +681,8 @@ export const validateRuleset = (
     ...checkSeaUnits(catalog.units, catalog.terrains),
     ...checkRows('buildings', catalog.buildings),
     ...catalog.buildings.flatMap(checkBuilding),
+    ...checkRows('improvements', catalog.improvements),
+    ...catalog.improvements.flatMap(checkImprovement),
   ];
 
   if (fidelity === 'cited-only') {
@@ -530,16 +716,27 @@ export const validateRuleset = (
         });
       }
     }
+    for (const i of catalog.improvements) {
+      if (isPlaceholder(i.provenance)) {
+        errors.push({
+          kind: 'placeholder-in-cited-only',
+          catalog: 'improvements',
+          id: i.id,
+          note: i.provenance.note,
+        });
+      }
+    }
   }
 
-  // The annotation states the contract `UnitSpec extends UnitDef` encodes, and
-  // keeps the return type honest: what leaves validation is the engine's view.
+  // The annotations state the contract each `extends` encodes, and keep the
+  // return type honest: what leaves validation is the engine's view.
   const units: readonly UnitSpec[] = catalog.units;
   const buildings: readonly BuildingSpec[] = catalog.buildings;
+  const improvements: readonly ImprovementSpec[] = catalog.improvements;
 
   return errors.length > 0
     ? err(errors)
-    : ok({ terrains: catalog.terrains, units, buildings, fidelity });
+    : ok({ terrains: catalog.terrains, units, buildings, improvements, fidelity });
 };
 
 export interface ProvenanceSummary {
@@ -605,11 +802,12 @@ export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection
   sectionOf('terrains', catalog.terrains),
   sectionOf('units', catalog.units),
   sectionOf('buildings', catalog.buildings),
+  sectionOf('improvements', catalog.improvements),
 ];
 
 /**
- * Count **every** row in the catalog — terrain, unit and building alike. The number
- * answers
+ * Count **every** row in the catalog — terrain, unit, building and improvement
+ * alike. The number answers
  * "how much of what the engine runs on is traced to a source?", so a summary
  * that quietly skipped a catalog would be exactly the half-truth PLAN.md §6.2
  * exists to prevent.

@@ -32,6 +32,13 @@
  */
 
 import type { BuildingId, CityId, PlayerId, TileIndex, UnitTypeId } from './ids.js';
+// The improvement-aware tile read. `terrainYields` below is the *terrain*-only
+// half, which the centre needs; a worked tile goes through `tileYields`, so how an
+// improvement changes a tile is stated once, in the module that owns
+// improvements (`improvements.ts`). The import is a value import, but
+// `improvements.ts` imports `GameState` from `state.ts` type-only and declares no
+// runtime dependency on this module, so there is no runtime cycle.
+import { tileYields } from './improvements.js';
 import {
   inBounds,
   indexToX,
@@ -229,10 +236,17 @@ export const cityRadius = (state: GameState, tile: TileIndex): readonly TileInde
 };
 
 /**
- * The terrain yields of one tile, or `undefined` when the tile is off the map or
- * its terrain id is not in the ruleset.
+ * The terrain yields of one tile, **without improvements**, or `undefined` when
+ * the tile is off the map or its terrain id is not in the ruleset.
+ *
+ * This is the *terrain* read, and only the city centre uses it: the centre is not
+ * a worked tile, so M4a's improvements do not touch it (INTERFACES.md M4a,
+ * "Yields with improvements"). A worked tile asks `tileYields` in
+ * `improvements.ts` instead, which is this same lookup plus the improvement
+ * deltas — one statement of "what is this tile worth", in the module that owns
+ * improvements.
  */
-const tileYields = (
+const terrainYields = (
   state: GameState,
   ruleset: RulesetView,
   tile: TileIndex,
@@ -248,9 +262,15 @@ const tileYields = (
  *
  * - The **centre is always worked and free**, and its terrain yields are floored
  *   at `CENTRE_MIN_YIELD` in each category (placeholder) so that a city on a
- *   barren tile still produces something.
- * - Every other entry of `workedTiles` contributes its terrain's yields exactly,
- *   integers only.
+ *   barren tile still produces something. **Improvements do not touch it**: the
+ *   centre is not a worked tile, so a mine on a city's own tile changes nothing
+ *   (M4a, "Yields with improvements"). Its floor is read from the *terrain*
+ *   alone, which is why it uses `terrainYields` and not `tileYields`.
+ * - Every other entry of `workedTiles` contributes its terrain's yields **plus
+ *   every improvement's delta on that tile**, clamped at zero per component — an
+ *   improvement may never make a worked tile yield a negative amount, and that
+ *   clamp lives in `tileYields` (`improvements.ts`), the one place a tile's worth
+ *   is computed. Integers only.
  * - At most `population` tiles are counted, in the stored order: one citizen
  *   works one tile. Entries a city could not legally work — its own centre, a
  *   repeated tile, a tile outside `cityRadius`, or one past the citizen count —
@@ -269,7 +289,7 @@ export const cityYields = (state: GameState, ruleset: RulesetView, cityId: CityI
   const city = cityById(state, cityId);
   if (city === undefined) return NO_YIELDS;
 
-  const centre = tileYields(state, ruleset, city.tile);
+  const centre = terrainYields(state, ruleset, city.tile);
   let food = Math.max(CENTRE_MIN_YIELD, centre?.food ?? 0);
   let shields = Math.max(CENTRE_MIN_YIELD, centre?.shields ?? 0);
   let commerce = Math.max(CENTRE_MIN_YIELD, centre?.commerce ?? 0);
@@ -337,6 +357,10 @@ export const autoAssignWorkedTiles = (
 
   const candidates = cityRadius(state, city.tile).filter((tile) => !claimed.has(Number(tile)));
 
+  // Improvement-aware: a citizen values the tile as it *is*, so a mine already
+  // built inside the radius ranks above the bare hill it sits on. Ranking the
+  // bare terrain would make the assignment blind to everything a worker has done,
+  // which is exactly the state M4a adds.
   const rank = (tile: TileIndex): TerrainYields =>
     tileYields(state, ruleset, tile) ?? { food: 0, shields: 0, commerce: 0 };
 

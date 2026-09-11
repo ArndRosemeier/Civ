@@ -71,6 +71,15 @@
  * from `@civts/core` rather than restating them, so a future sourced rehash
  * changes one place. `20 + 2*pop` is Civ IV, not Civ III, and is not asserted
  * anywhere in this file.
+ *
+ * Migrated for M4a (docs/INTERFACES.md M4a) by the integration owner, because this
+ * file's author had finished before the shape changed — the F6 rule's failure mode.
+ * Two things needed it and nothing else did: `cmdKey`'s deliberately exhaustive
+ * `switch` over `Command` gained `StartWork`/`CancelWork` (a typecheck failure, not
+ * a silent hole — exactly what that switch is for), and the pinned golden hashes
+ * were re-pinned to the M4a values for the deliberate `SCHEMA_VERSION` 4 rehash.
+ * Every other assertion here still holds unchanged, which is itself evidence that
+ * M4a added a field without disturbing M3's rules.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -220,6 +229,16 @@ const cmdKey = (cmd: Command): string => {
       return `SetWorkedTiles ${String(cmd.cityId)} [${cmd.tiles.map(String).join(',')}]`;
     case 'SetProduction':
       return `SetProduction ${String(cmd.cityId)} ${cmd.item.kind}:${String(cmd.item.id)}`;
+    // M4a's two worker commands. The switch is exhaustive on purpose (see the
+    // note above), so a `Command` variant this comparator cannot key is a
+    // typecheck failure — which is exactly what these two cases fix, and why the
+    // keys name the *kind*: "start a road" and "start a mine" are different
+    // commands, and a comparator that collapsed them would call a generator
+    // complete when it offered only one of the two.
+    case 'StartWork':
+      return `StartWork ${String(cmd.unitId)} ${String(cmd.kind)}`;
+    case 'CancelWork':
+      return `CancelWork ${String(cmd.unitId)}`;
   }
 };
 
@@ -2247,20 +2266,46 @@ const runGoldenHarness = (corrupt: boolean): GoldenHarnessRun => {
   }
 };
 
+/**
+ * The hashes this build produces for the three golden scenarios, **pinned by name
+ * and by value**.
+ *
+ * They moved once per persisted-shape change, never for any other reason: M3's
+ * foundation commit took `SCHEMA_VERSION` 2 -> 3 (`nextCityId`, `cities`,
+ * `PlayerState.kind`, the barbarian player, `GameMap.huts`) and M4a's took it
+ * 3 -> 4 (`GameState.improvements`). Both were deliberate, contract-mandated
+ * rehashes regenerated through the harness's own opt-in path; the M4a values below
+ * are the ones `packages/testing/goldens/state.json` now stores.
+ *
+ * A hash that moves *without* a shape change is a semantic bug and must not be
+ * re-pinned — that is the whole point of writing the digits down rather than
+ * comparing the file against itself.
+ */
+const PINNED_GOLDENS: readonly { readonly name: string; readonly hash: string }[] = [
+  { name: 'tiny-civs2-seed1', hash: '831e0e3c07bf668f' },
+  { name: 'tiny-civs2-seed42', hash: '206e27796f4f7aa9' },
+  { name: 'tiny-civs2-seed1337', hash: 'd814838fe71c6a3a' },
+];
+
 describe('goldens — still a gate, still refusing to auto-write', () => {
   it('stores the three pinned hashes, and they are the ones this build produces', () => {
     const stored = loadGoldens();
     expect(stored).toBeDefined();
     if (stored === undefined) return;
 
-    const computed = [1, 42, 1337].map((seed) => hashValue(generatedFor(seed)));
+    const states = [1, 42, 1337].map((seed) => generatedFor(seed));
+    const computed = states.map((state) => hashValue(state));
     console.log('m3 golden hashes:', computed.join(' '));
 
-    // The three hashes the milestone pinned: M3 changed the persisted shape (and
-    // therefore every hash) exactly once, at the foundation commit. This
-    // milestone adds no state, so a hash that moves here is a semantic bug, not a
-    // rehash to be regenerated.
-    expect(computed).toEqual(['ba34136f4060eb63', '180cf4a0776af053', '1a1255383b7b747c']);
+    // M3 changed the persisted shape once, at its foundation commit, and M4a
+    // changed it once more (`improvements`, SCHEMA_VERSION 4). Both moved every
+    // hash deliberately, through the harness's opt-in path, and both are recorded
+    // in the milestone's `rehash:` note. Nothing else may move them.
+    expect(computed).toEqual(PINNED_GOLDENS.map((entry) => entry.hash));
+    // Named as well as positional: a pin is only meaningful if the hash is the one
+    // the scenario the name describes produces.
+    expect(stored.entries).toEqual(PINNED_GOLDENS);
+    // And the store agrees with the build, which is the gate the harness runs.
     expect(stored.entries.map((entry) => entry.hash)).toEqual(computed);
   });
 
@@ -2275,10 +2320,14 @@ describe('goldens — still a gate, still refusing to auto-write', () => {
     const broken = runGoldenHarness(true);
     expect(broken.status, 'a corrupted golden did not fail the run').not.toBe(0);
     // The failure has to be the *gate* failing, with the pair a human needs, not
-    // a crash in the copy.
+    // a crash in the copy. The "actual" half is the pinned seed-1 hash, so this
+    // checks the message names what this build really produced rather than any
+    // 16 hex characters.
     expect(broken.stdout).toContain('golden state hashes differ');
     expect(broken.stdout).toContain('deadbeefdeadbeef');
-    expect(broken.stdout).toContain('ba34136f4060eb63');
+    const seedOne = PINNED_GOLDENS.find((entry) => entry.name === 'tiny-civs2-seed1');
+    expect(seedOne, 'the pinned set has no seed-1 entry').toBeDefined();
+    if (seedOne !== undefined) expect(broken.stdout).toContain(seedOne.hash);
     expect(broken.stdout).toContain('rehash: <reason>');
     // And it did not "fix" the file for itself: a golden that rewrites itself
     // cannot fail, and therefore cannot detect anything.

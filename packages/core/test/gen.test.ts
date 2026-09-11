@@ -71,17 +71,19 @@ const TERRAINS: readonly TerrainDef[] = [
 ];
 
 /**
- * A `RulesetView` around a terrain catalog, with no units.
+ * A `RulesetView` around a terrain catalog, with no units and no improvements.
  *
- * `RulesetView.units` is required (M2's post-review amendment), and an empty
- * catalog is how a view says "no units" — which is exactly what generation needs:
- * it resolves terrain roles and never looks at a unit. Spelling the construction
- * once keeps every view in this file honest instead of three copies of a literal
- * that could drift apart.
+ * `RulesetView.units` is required (M2's post-review amendment) and
+ * `RulesetView.improvements` is required from M4a on, and an empty catalog is how
+ * a view says "none of those" — which is exactly what generation needs: it
+ * resolves terrain roles and never looks at a unit or an improvement. Spelling the
+ * construction once keeps every view in this file honest instead of three copies of
+ * a literal that could drift apart.
  */
 const view = (terrains: readonly TerrainDef[]): RulesetView => ({
   terrains,
   units: [],
+  improvements: [],
   fidelity: 'tuned',
 });
 
