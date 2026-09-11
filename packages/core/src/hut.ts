@@ -40,13 +40,24 @@
  *   `Unit` value (one still on the tile it started the step from) cannot decide
  *   the wrong tile.
  * - **A reward unit the ruleset cannot supply degenerates to nothing.** The band
- *   and the free unit are both "the first `military`-role land unit in the
- *   ruleset's catalog order" (see `rewardUnitDef`); a view with no such row gives
+ *   and the free unit are both "the **cheapest** `military`-role land unit in the
+ *   ruleset, ties broken by id" (see `rewardUnitDef`); a view with no such row gives
  *   the player nothing, and the event says `nothing`, because the event reports
  *   what the player got rather than which branch the draw selected. Inventing a
  *   unit type would be content this engine does not have.
+ * - **The pick is canonical, not positional.** The engine's behaviour must be a
+ *   pure function of the **ruleset's identity**: price and id are content, so
+ *   reordering, re-inserting or shuffling the catalog's rows cannot change which
+ *   unit a hut pays. A row *position* is not content, and reading one would make a
+ *   choice no reader of the rows could predict. (Two catalogs that differ only in
+ *   row order do have different identities — `hashValue(validateRuleset(CATALOG))`
+ *   is `e69bfbaab6d3bba4` and the same catalog with `resources` and `units` reversed
+ *   is `0b6d39501ac57528` — so their differing *is* legal; see `gen.ts`' resources
+ *   site, where that fact is what makes a replay against the wrong ordering
+ *   detectable. The point here is narrower: a difference the reader cannot predict
+ *   from the content is a difference nobody can review.)
  * - **Everything numeric here is a placeholder of ours.** The three-way reward
- *   split, the band size, and "the first military land unit" are chosen to be
+ *   split, the band size, and "the cheapest military land unit" are chosen to be
  *   playable and are **not** sourced from Civ 3 — see `HUT_REWARD_PROVENANCE`,
  *   which states that in machine-readable form, and every constant below.
  */
@@ -101,7 +112,7 @@ export const BARBARIAN_BAND_SIZE = 2;
 /**
  * What the hut rules claim, in the project's provenance vocabulary. Every number
  * this module introduces is ours: the 1-in-3 reward split, the band size of 2,
- * and "the first `military` land unit in catalog order" as the reward unit. None
+ * and "the cheapest `military` land unit in the ruleset" as the reward unit. None
  * of them is traced to a source, and Civ 3's real hut probabilities (which vary
  * by difficulty and by whether the hut is inside a city radius) are unverified
  * here. `gold` is named because M3 leaves it out on purpose (no treasury until
@@ -109,7 +120,7 @@ export const BARBARIAN_BAND_SIZE = 2;
  */
 export const HUT_REWARD_PROVENANCE: Provenance = placeholder(
   'Unsourced placeholder, chosen to be playable: the 1-in-3 hut reward split, the band size of 2, ' +
-    'and "the first military-role land unit in the ruleset catalog" as the reward unit are our own ' +
+    'and "the cheapest military-role land unit in the ruleset" as the reward unit are our own ' +
     'tuned values, NOT traced to Civ 3 (whose hut outcomes vary by difficulty and by whether the ' +
     'hut sits inside a city radius, and are unverified here). The `gold` reward is deliberately ' +
     'absent in M3 because there is no treasury until M4.',
@@ -130,26 +141,60 @@ export const hutAt = (state: GameState, tile: number): boolean =>
   state.map.huts.some((hut) => Number(hut) === tile);
 
 /**
- * The unit a hut gives away or spawns: the first `military`-role **land** unit in
- * the ruleset's catalog order, or `undefined` when the ruleset provides none.
+ * Is `candidate` the better hut reward than `best`? **Cheapest first, then lowest
+ * id** — both of them content, neither of them a row position.
  *
- * Catalog order is data order, never RNG order, so which unit becomes a reward is
- * a property of the ruleset alone. `military` rather than `scout` or `settler`: a
- * hut that handed out settlers would let a player skip the game's central
- * decision, and a band of scouts would be a band nothing can fight. On the
- * catalog this project ships that selects the **warrior**, the first military row;
- * the galley below it is also `military` and is skipped by the `domain` half of
- * the rule, because a band of galleys dropped on land tiles would be a unit the
- * engine cannot place honestly (`spawnUnit` takes the caller's word for *where*,
- * and M4 owns domains). A ruleset that listed a swordsman before its warrior would
- * hand out the swordsman: which unit a hut pays is the catalog's business, not
- * this module's.
+ * The id comparison is `String` code-unit order on purpose: it is a pure function of
+ * the two ids, identical in every JavaScript engine and every locale. A collator or
+ * `localeCompare` would order by the environment's locale, which would make a hash
+ * depend on where the game was run.
+ */
+const beatsAsReward = (candidate: UnitDef, best: UnitDef): boolean => {
+  if (candidate.cost !== best.cost) return candidate.cost < best.cost;
+  return String(candidate.id) < String(best.id);
+};
+
+/**
+ * The unit a hut gives away or spawns: the **cheapest** `military`-role **land** unit
+ * in the ruleset, ties broken by unit id, or `undefined` when the ruleset provides
+ * none.
+ *
+ * **A canonical pick, not a positional one.** The engine's behaviour must be a pure
+ * function of the **ruleset's identity**, and a row's *position* is not part of a row.
+ * Until this rule changed, the reward was "the first `military` land row", so
+ * reversing `CATALOG.units` made huts pay swordsmen instead of warriors on the same
+ * seed: a semantic change no reader could predict from the content and no test of the
+ * content would report. Price and id are the rows themselves, so the choice is now
+ * invariant under reordering, appending, or shuffling the catalog — while a ruleset
+ * that genuinely ships different *content* still gives a different answer, which is
+ * what a ruleset is for. (Content and row order are not the same lever: two catalogs
+ * differing only in row order already have different identities —
+ * `hashValue(validateRuleset(CATALOG))` is `e69bfbaab6d3bba4`, and with `resources`
+ * and `units` reversed `0b6d39501ac57528` — so a replay against the wrong ordering is
+ * detectable. `gen.ts`' resources site states that coupling and `gen.test.ts` pins
+ * it; this rule removes one dependence that was merely accidental.)
+ *
+ * `military` rather than `scout` or `settler`: a hut that handed out settlers would
+ * let a player skip the game's central decision, and a band of scouts would be a band
+ * nothing can fight. On the catalog this project ships the cheapest military land row
+ * is the **warrior** (`warrior@1`, `swordsman@3`, and the galley at 2 is excluded by
+ * the `domain` half of the rule because a band of galleys dropped on land tiles would
+ * be a unit the engine cannot place honestly — `spawnUnit` takes the caller's word for
+ * *where*, and M4 owns domains). That is the same unit the old positional rule
+ * selected, so on shipped content this is behaviour-preserving and only the *reason*
+ * changed.
  *
  * **Placeholder**, like everything else here: this is our choice, not a rule
  * traced to a source.
  */
-const rewardUnitDef = (ruleset: RulesetView): UnitDef | undefined =>
-  unitCatalog(ruleset).find((def) => def.role === 'military' && def.domain === 'land');
+const rewardUnitDef = (ruleset: RulesetView): UnitDef | undefined => {
+  let best: UnitDef | undefined;
+  for (const def of unitCatalog(ruleset)) {
+    if (def.role !== 'military' || def.domain !== 'land') continue;
+    if (best === undefined || beatsAsReward(def, best)) best = def;
+  }
+  return best;
+};
 
 /** The barbarian player, or `undefined` in a state that has none (a hand-built one). */
 const barbarianPlayer = (state: GameState): PlayerState | undefined =>

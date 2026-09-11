@@ -26,9 +26,11 @@
  *    FINDING C). A catalog's row positions are not part of what it says, so the same
  *    seed must play the same game with the rows reversed and with them shuffled:
  *    asserted at the level of the policy's commands (on identical states) *and* at
- *    the level of whole runs — and where a run still moves, the section responsible
- *    is pinned by measurement to an engine rule that reads row order, with the
- *    mechanism reproduced beside it and reported rather than compensated for here.
+ *    the level of whole runs. One section is left: `resources`, where the generator
+ *    draws its placement from the map RNG once per row in row order, so the world is a
+ *    function of that order — deliberately, and detectably, because the ruleset hash
+ *    covers row order. That single remaining section is pinned by measurement, named in
+ *    the complement assertion, and reported rather than compensated for here.
  */
 
 import {
@@ -37,7 +39,6 @@ import {
   applyCommand,
   asImprovementId,
   asPlayerId,
-  asUnitTypeId,
   civPlayers,
   improvementDef,
   newGame,
@@ -369,14 +370,17 @@ describe('the simple policy is tunable', () => {
  *    downstream can then differ for a reason the policy owns;
  * 3. **whole runs**, 12 turns of the shipped content, are identical in hash, in
  *    every metrics row and in the final state under every row order of `terrains`,
- *    `buildings` and `improvements`;
- * 4. and the two sections that still move a run are pinned, by measurement, to
- *    ENGINE rules that read row order — `hut.ts`' `rewardUnitDef` ("the first
- *    `military` land unit in the catalog") and `gen.ts`' resource placement, which
- *    draws from the map RNG once per resource row **in row order**. Those are
- *    reported, not compensated for here: a policy that worked around them would be
- *    hiding an engine defect behind an AI quirk, and the fix belongs in the engine.
- *    Each is reproduced from a state with no policy involved at all.
+ *    `buildings`, `improvements` and `units`;
+ * 4. and the one section that still moves a run is pinned, by measurement, to an
+ *    ENGINE rule that reads row order — `gen.ts`' resource placement, which draws from
+ *    the map RNG once per resource row **in row order** — and is reproduced from a
+ *    state with no policy involved at all. It is reported rather than compensated for
+ *    here: a policy that worked around it would be hiding an engine dependence behind
+ *    an AI quirk. It is also safe by construction rather than by luck, since the ruleset
+ *    hash covers row order (`gen.ts`' placement site, `core/test/gen.test.ts`), and the
+ *    second engine reader this list used to name — `hut.ts`' `rewardUnitDef`, formerly
+ *    "the first `military` land unit in the catalog" — is now a canonical pick, so the
+ *    row-order probe for `units` asserts identity rather than a residual difference.
  */
 
 /** The five row sections a catalog is made of. */
@@ -496,10 +500,17 @@ const ROW_ORDERS: readonly RowOrder[] = ROW_SECTIONS.flatMap((section) =>
  *   now chooses by price and `(kind, id)`, and the applier looks rows up by id;
  * - `improvements` — the same, and this is the section whose reversal moved the run
  *   before the fix: `unitActions` lists one `StartWork` per catalog kind in row
- *   order, and this policy took the first.
+ *   order, and this policy took the first;
+ * - `units` — the two readers were the policy's production choice (now `cheapestOfRole`,
+ *   content-keyed) and the ENGINE's goody-hut reward, which is now the cheapest
+ *   `military` land row with the id as tie-break rather than the first one, so a hut pays
+ *   the same unit whatever order the rows hold.
  *
- * `units` and `resources` are deliberately absent, and the two tests after this one
- * pin *why*: neither is the policy's doing.
+ * `resources` alone is deliberately absent, and the test after this one pins *why*: the
+ * generator draws its placement from the map RNG once per resource row in row order, so
+ * the WORLD is a function of that order — deliberately, and safely, because the ruleset
+ * hash covers row order and a replay against the wrong ordering is therefore detected
+ * (see `gen.ts`' placement site and `core/test/gen.test.ts`).
  */
 const RUN_NEUTRAL_ORDERS: readonly string[] = [
   'terrains×reversed',
@@ -508,6 +519,8 @@ const RUN_NEUTRAL_ORDERS: readonly string[] = [
   'buildings×shuffled',
   'improvements×reversed',
   'improvements×shuffled',
+  'units×reversed',
+  'units×shuffled',
 ];
 
 /**
@@ -713,30 +726,36 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
         }
       }
 
-      // The comparisons really happened: 3 seeds × 7 row orders of an order the engine
-      // is neutral to (six single-section permutations and the three-section shuffle).
+      // The comparisons really happened: 3 seeds × 9 row orders of an order the engine
+      // is neutral to (eight single-section permutations and the three-section shuffle).
       expect(compared).toBe(seeds.length * neutral.length);
       expect(neutral.map((candidate) => candidate.label)).toContain(COMBINED_ORDER_LABEL);
 
-      // And the complement — the orders NOT asserted identical above — is exactly the
-      // two sections the ENGINE reads by row position, by name, so a *new* order
-      // dependence introduced later (a fresh `find`, a positional `[0]`) fails this
-      // assertion instead of passing unnoticed among the exceptions.
+      // And the complement — the orders NOT asserted identical above — is exactly the one
+      // section the generator reads by row position, by name, so a *new* order dependence
+      // introduced later (a fresh `find`, a positional `[0]`) fails this assertion instead
+      // of passing unnoticed among the exceptions. `units` was in this list when the hut
+      // reward was "the first military land row"; the canonical pick moved it to the
+      // neutral half above, which is the assertion getting stronger rather than the list
+      // being trimmed.
       expect(
         ROW_ORDERS.filter((candidate) => !RUN_NEUTRAL_ORDERS.includes(candidate.label)).map(
           (candidate) => candidate.label,
         ),
-      ).toEqual(['units×reversed', 'units×shuffled', 'resources×reversed', 'resources×shuffled']);
+      ).toEqual(['resources×reversed', 'resources×shuffled']);
     },
   );
 
-  it('FINDING C (engine, hut.ts): a hut hands out whichever unit row comes FIRST', () => {
+  it('FINDING C (engine, hut.ts): a hut hands out the same unit whatever row it holds', () => {
     // No policy is involved anywhere in this test: the state is hand-built from a real
     // one, the RNG is chosen so the hut's single draw selects its `unit` reward, and
     // `resolveHutEntry` is called directly — it is `commands.ts` that calls it inside
-    // `MoveUnit`. What moves the answer is only the *order* of `CATALOG.units`, because
-    // `hut.ts`' `rewardUnitDef` is `unitCatalog(ruleset).find(role === 'military' &&
-    // domain === 'land')` — "the first military land unit in catalog order".
+    // `MoveUnit`. This test used to pin the OPPOSITE fact — that `hut.ts`' `rewardUnitDef`
+    // was `unitCatalog(ruleset).find(role === 'military' && domain === 'land')`, "the
+    // first military land unit in catalog order", so reversing `CATALOG.units` handed out
+    // the swordsman instead of the warrior. The rule is now canonical — the **cheapest**
+    // military land row, ties broken by id — so the same state and the same draw give the
+    // same unit under both orders, which is the stronger statement this test now makes.
     const seed = 1;
     const created = newGame(seed, settingsFor(seed), RULESET);
     if (!created.ok) throw new Error(`newGame(${String(seed)}) failed: ${created.error.kind}`);
@@ -783,18 +802,32 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
     expect(canonicalize(withFirstRow.events)).toContain('"reward":"unit"');
     expect(canonicalize(withLastRow.events)).toContain('"reward":"unit"');
 
-    // The measured fact: the SAME state, the SAME draw, a different unit — because
-    // content's row order decided it.
+    // The measured fact, after the fix: the SAME state, the SAME draw, the SAME unit —
+    // because the answer is a function of the rows' content (price, then id) and not of
+    // their position. Non-vacuity: the reversed catalog really does put a different row
+    // first, so the old positional rule would have handed out the swordsman here, and the
+    // two orders really are two different rulesets (their hashes differ).
     expect(spawned(withFirstRow)).toEqual(['warrior']);
-    expect(spawned(withLastRow)).toEqual(['swordsman']);
+    expect(spawned(withLastRow)).toEqual(['warrior']);
+    const firstMilitaryLand = (ruleset: Ruleset): string | undefined => {
+      const row = ruleset.units.find(
+        (candidate) => candidate.role === 'military' && candidate.domain === 'land',
+      );
+      return row === undefined ? undefined : String(row.id);
+    };
+    expect(firstMilitaryLand(RULESET)).toBe('warrior');
+    expect(firstMilitaryLand(reversedSets)).toBe('swordsman');
+    expect(hashValue(reversedSets)).not.toBe(hashValue(RULESET));
 
     // ...and nothing else about the outcome moved: the hut was consumed, the RNG
-    // advanced identically, and every unit is the same unit but for the reward's type.
+    // advanced identically, and the two outcomes are the same state.
     expect(canonicalize(withLastRow.state.map)).toBe(canonicalize(withFirstRow.state.map));
     expect(canonicalize(withLastRow.state.rng)).toBe(canonicalize(withFirstRow.state.rng));
     expect(withLastRow.state.units.map((unit) => String(unit.id))).toEqual(
       withFirstRow.state.units.map((unit) => String(unit.id)),
     );
+    expect(canonicalize(withLastRow.state)).toBe(canonicalize(withFirstRow.state));
+    expect(canonicalize(withLastRow.events)).toBe(canonicalize(withFirstRow.events));
   });
 
   it('FINDING C (engine, gen.ts): the WORLD is a function of the resources row order', () => {
@@ -844,63 +877,42 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
     expect(baseline.finalState.cities).toEqual([]); // the baseline decided nothing at all
   });
 
-  it('FINDING C (engine): the residual units-row difference is the hut reward, and not the AI', () => {
-    // What is left of FINDING C after the fix, measured so it is not mistaken for a
-    // policy one: with the rows of `units` reversed, the whole 12-turn game is
-    // identical — same unit ids, same cities, same tiles, same RNG — except for the
-    // TYPE of the units the huts handed out (the engine rule pinned above). The old
-    // symptom, an AI fielding an armada of galleys, is gone.
+  it('FINDING C (engine): a reversed units row order no longer moves the run at all', () => {
+    // The last trace of FINDING C, measured so its absence is evidence rather than a hope.
+    // With the rows of `units` reversed the whole 12-turn game used to differ in exactly
+    // one way — the TYPE of the units the huts handed out (the engine rule pinned above,
+    // which took the first military land row) — while everything else was identical, and
+    // the old symptom, an AI fielding an armada of galleys, was already gone. The hut
+    // reward is now canonical, so the whole run is byte-identical: same units, same ids,
+    // same types, same cities, same tiles, same RNG, same hash. The assertion got
+    // STRONGER with the fix, not weaker: it no longer needs a type-blind comparison to say
+    // that row order is inert here.
     const seed = 1;
     const turns = 12;
+    const reversedSets = validatedRuleset(catalogInOrder('units', 'reversed'), 'units (reversed)');
     const baseline = runFor(seed, RULESET, turns);
-    const flipped = runFor(
-      seed,
-      validatedRuleset(catalogInOrder('units', 'reversed'), 'units (reversed)'),
-      turns,
-    );
+    const flipped = runFor(seed, reversedSets, turns);
 
+    // Non-vacuity, without which the equality below would be a claim about two runs that
+    // never differed: the reversal really reorders the section, the two rulesets really
+    // are different rulesets, and the run really holds units for the huts to have paid
+    // for (asserted before the comparison, so it is not read off the equality).
+    expect(sectionIds(reversedSets, 'units')).not.toEqual(sectionIds(RULESET, 'units'));
+    expect([...sectionIds(reversedSets, 'units')].sort()).toEqual(
+      [...sectionIds(RULESET, 'units')].sort(),
+    );
+    expect(hashValue(reversedSets)).not.toBe(hashValue(RULESET));
+    expect(baseline.finalState.units.length).toBeGreaterThan(1);
+
+    expect(flipped.finalHash).toBe(baseline.finalHash);
+    expect(canonicalize(flipped.finalState)).toBe(canonicalize(baseline.finalState));
+    expect(canonicalize(flipped.metrics)).toBe(canonicalize(baseline.metrics));
+    expect(flipped.turnsPlayed).toBe(baseline.turnsPlayed);
+    expect(flipped.stoppedBecause).toBe(baseline.stoppedBecause);
+    expect(flipped.violations).toEqual(baseline.violations);
     const types = (result: SimulationResult): readonly string[] =>
       result.finalState.units.map((unit) => String(unit.type));
-    const baseTypes = types(baseline);
-    const flippedTypes = types(flipped);
-
-    // The same game: the same units in the same order, so a type-by-type comparison
-    // below is comparing like with like.
-    expect(flippedTypes.length).toBe(baseTypes.length);
-    expect(flipped.finalState.units.map((unit) => String(unit.id))).toEqual(
-      baseline.finalState.units.map((unit) => String(unit.id)),
-    );
-    // The only difference is which unit a hut gave: the warrior became the swordsman
-    // (the reversed catalog's first military land row). Both are `military` land units
-    // with the same movement, which is why the game around them is unchanged.
-    const lost = new Set(baseTypes.filter((type, index) => type !== mustRow(flippedTypes, index)));
-    const gained = new Set(
-      flippedTypes.filter((type, index) => type !== mustRow(baseTypes, index)),
-    );
-    expect([...lost]).toEqual(['warrior']);
-    expect([...gained]).toEqual(['swordsman']);
-    expect(flippedTypes).not.toContain('galley');
-    expect(baseTypes).not.toContain('galley');
-
-    // And the state with every unit TYPE blanked to one value is identical, field for
-    // field: the AI's play, the cities, the ground, the money and the RNG are the same
-    // game in both orders. Blanked to a placeholder id rather than deleted, because a
-    // key holding `undefined` is not representable in the canonical form these hashes
-    // are taken over (and would not be hashable) — and the `lost`/`gained` sets above
-    // are what stop this from hiding a *policy* difference: a galley built instead of a
-    // warrior would be a `warrior`→`galley` pair here, which the assertions name.
-    const typeBlind = (result: SimulationResult): string =>
-      canonicalize({
-        ...result.finalState,
-        units: result.finalState.units.map((unit) => ({
-          ...unit,
-          type: asUnitTypeId('any-unit'),
-        })),
-      });
-    expect(typeBlind(flipped)).toBe(typeBlind(baseline));
-
-    // The hash still moves — the difference is real and is reported rather than
-    // hidden — and it moves for the reason pinned above, not because of a decision.
-    expect(flipped.finalHash).not.toBe(baseline.finalHash);
+    expect(types(flipped)).toEqual(types(baseline));
+    expect(types(baseline)).not.toContain('galley');
   });
 });

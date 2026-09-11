@@ -45,10 +45,13 @@
  *   threshold whose `growth-food` building was completed or demolished later in the
  *   same turn — the transition arithmetic is **skipped**, and the checks that do not
  *   depend on it (event/state agreement, population accounting, box bounds) still
- *   run. Each such case is named in the check's own doc comment. The *same* slice makes
- *   `city-food-box-within-threshold` drop its stricter of two bounds rather than its
- *   whole claim: see that check for why a single end-of-turn threshold is one turn too
- *   strict when production runs after growth.
+ *   run. Each such case is named in the check's own doc comment. That slice is also why
+ *   the growth threshold has **two** predicates rather than one
+ *   (`foodBoxThresholdRecoverable` for `city-food-box-within-threshold`,
+ *   `thresholdRecoverable` for `city-food-conservation`): the completion half is the
+ *   only case that can excuse a full box, while a demolition can only *raise* the
+ *   threshold, so the box check does not inherit it — see that check's doc comment for
+ *   the arithmetic and for what the shared predicate used to suppress.
  *
  * Per-command as well as per-turn granularity therefore works: the arithmetic
  * invariants only engage when the transition's events show that the turn pipeline
@@ -440,41 +443,79 @@ const surplusReadings = (
 };
 
 /**
- * Is the growth threshold recoverable from the after-state — that is, **is the
- * building list the state carries the list the growth pass measured against?**
+ * Did this city's owner report a `TreasuryShortfall` this turn — that is, did the money
+ * step run `disbandBuildings` for it?
  *
- * Two ways it is not, and both are the *end* of a turn rather than the growth step:
- * a `growth-food` building completed this turn joined the city **after** growth ran
- * (so the row is in the state and was not in the pass's input), and a bankrupt
- * player's buildings are demolished after production, which can take a granary away
- * again. In either case the state's own building list is not the list growth measured
- * against.
- *
- * **Two checks read this, for the same reason and in opposite directions.**
- * `city-food-conservation` skips its transition arithmetic when the threshold is not
- * recoverable (it cannot recompute what growth did), and `city-food-box-within-threshold`
- * declines to hold the box to the *reduced* threshold when it is not (the box was
- * measured against the threshold in force earlier in the turn, which is a different
- * number). Neither check may simply ignore the transition: both keep the claims that do
- * not depend on the threshold.
- *
- * The demolition half is deliberately coarse. `disbandBuildings` picks the building to
- * demolish by walking each city's list from the end and taking the first row with
- * maintenance to pay, and the ledger reports *that a player was short*, never which
- * buildings left — so "the owner went short this turn" is the finest statement the
- * events support, and it is used rather than guessing which rows were taken. For the
- * shape check that is a relaxation only: the bare bound below is claimed unconditionally,
- * including for a bankrupt owner's cities.
+ * The ledger reports *that a player was short*, never which buildings left, so this is
+ * the finest statement the events support about a demolition. One check needs it (see
+ * `thresholdRecoverable`); the food-box bound deliberately does not, and its doc comment
+ * says why.
  */
-const thresholdRecoverable = (ctx: InvariantContext, cityAfter: City): boolean => {
-  if (shortfallEvents(ctx.events).some((event) => event.playerId === cityAfter.owner)) return false;
-  return !producedEvents(ctx.events).some(
+const ownerWentShort = (ctx: InvariantContext, cityAfter: City): boolean =>
+  shortfallEvents(ctx.events).some((event) => event.playerId === cityAfter.owner);
+
+/**
+ * Did a `growth-food` building **join this city** during this turn's production step?
+ *
+ * `advanceTurn` runs growth before production, so such a row was not in the list growth
+ * measured the box against: it lowers the threshold *after* the box was filled, which is
+ * the shipped false positive this exemption exists for (five runs of the first fifty
+ * seeds of `sim --map-size tiny --turns 20` stopped on it before it was fixed).
+ */
+const growthFoodCompleted = (ctx: InvariantContext, cityAfter: City): boolean =>
+  producedEvents(ctx.events).some(
     (event) =>
       event.cityId === cityAfter.id &&
       event.item.kind === 'building' &&
       growthFoodOfRow(ctx.rulesetView, event.item.id) > 0,
   );
-};
+
+/**
+ * **The growth threshold, and the two checks that read it.** A growth threshold is
+ * `max(MIN_GROWTH_FOOD, bare - the city's growth-food reduction)`, so it depends on
+ * *which buildings the city held when growth measured the box* — and the after-state's
+ * building list is not always that list, because production and the money step run
+ * after growth (`turn.ts`' frozen order). Exactly two things can move it, and they move
+ * it in opposite directions:
+ *
+ * 1. a `growth-food` building **completes** this turn and joins the city after growth
+ *    ran. That *lowers* the threshold, so the box the turn ends with may legitimately be
+ *    at or above the threshold the state's own rows now imply. This is the case
+ *    `growthFoodCompleted` names, and it is the only one that can excuse a full box.
+ * 2. a bankrupt owner's buildings are **demolished** before the turn ends, which can
+ *    only *raise* the threshold: removing rows removes reductions and never adds one. On
+ *    shipped content the row taken is never the granary — it pays no maintenance, and
+ *    `disbandBuildings` skips every row whose maintenance is `<= 0` — and even a
+ *    `growth-food` row a demolition did take could only raise the threshold, which
+ *    cannot make a box at or above the after-state's threshold legal.
+ *
+ * So the two checks claim exactly what those facts allow, and they no longer share one
+ * predicate:
+ *
+ * - **`city-food-box-within-threshold` claims `foodBoxThresholdRecoverable`** — case 1
+ *   alone. Because case 2 only *raises* the threshold, a box at or above the reduced
+ *   threshold the state carries now was at or above the threshold growth saw, so growth
+ *   should have spent it. Inheriting case 2 gave the check an exemption it could not
+ *   need: a box in `[reduced, bare)` — a box the growth pass should have spent — escaped
+ *   the reduced bound on any turn whose owner reported a shortfall, which is a real loss
+ *   of detection, not a relaxation of precision.
+ * - **`city-food-conservation` claims `thresholdRecoverable`** — both cases. It cannot
+ *   skip them: it *recomputes* the growth arithmetic against the after-state's rows
+ *   (`growthRequirement`), so a demolition in the same turn leaves it unable to know what
+ *   growth did. (A late completion it also cannot recompute. The events name the player
+ *   who went short and never the rows that left, which is why this check skips the
+ *   arithmetic rather than subtracting a guessed threshold.)
+ *
+ * Splitting the predicate is what lets each doc comment be true rather than
+ * approximately true: one claim is shared where it is genuinely shared, and dropped
+ * where it was only ever suppressing a real violation.
+ */
+const foodBoxThresholdRecoverable = (ctx: InvariantContext, cityAfter: City): boolean =>
+  !growthFoodCompleted(ctx, cityAfter);
+
+/** The wider exemption `city-food-conservation` needs: a completion *or* a demolition. */
+const thresholdRecoverable = (ctx: InvariantContext, cityAfter: City): boolean =>
+  !ownerWentShort(ctx, cityAfter) && foodBoxThresholdRecoverable(ctx, cityAfter);
 
 /* ------------------------------------------------------------------ *
  * Shape invariants
@@ -585,21 +626,28 @@ const cityPopulationAtLeastOne = (ctx: InvariantContext): readonly string[] =>
  *    less this city's own `growth-food` rows, floored at `MIN_GROWTH_FOOD` — because
  *    that is the stricter of the two statements and a granary city sitting one food
  *    short of a citizen it should have gained is a growth bug the bare bound would
- *    accept. This is claimed **except when `thresholdRecoverable` says the state's
- *    building list is not the list growth measured against**: a `growth-food` building
- *    completed this turn lowered the threshold after growth ran (the shipped false
- *    positive), and a bankrupt owner's demolition is the symmetric case — it *raises*
- *    the threshold, which cannot make this bound fail, but the events name the player
- *    and not the buildings, so which rows left is not knowable from the transition and
- *    the reduced bound is not claimed for that city this turn. The bare bound above
- *    still applies to both, so nothing illegal slips through: what the exemption gives
- *    up is precision between the two bounds, never the bound itself.
+ *    accept. This is claimed **except when the state's building list is not the list
+ *    growth measured against in the direction that can excuse a full box** — that is,
+ *    except when a `growth-food` building completed this turn, lowering the threshold
+ *    after growth ran (`foodBoxThresholdRecoverable`). A **demolition** is deliberately
+ *    *not* an exemption here, and the reason is arithmetic rather than optimism:
+ *    demolishing rows can only *raise* the threshold, so a box at or above the
+ *    after-state's reduced threshold was at or above the threshold growth saw, and growth
+ *    spends the box whenever it reaches its requirement. The earlier version of this
+ *    check inherited the demolition exemption from the shared predicate, which meant a
+ *    box in `[reduced, bare)` — a box the growth pass should have spent — escaped the
+ *    reduced bound on any turn whose owner reported a shortfall: an exemption that could
+ *    only ever *suppress* a violation, never prevent a false one (on shipped content the
+ *    demolished row is never the granary, which pays no maintenance and so is skipped by
+ *    `disbandBuildings`). The bare bound above still applies in every one of those
+ *    configurations, so nothing illegal was ever invisible; what was lost was the
+ *    stricter of the two bounds, and it is no longer lost.
  *
  * Someone will eventually read bound 2 alone, see that it "obviously" subsumes bound 1,
  * and simplify — which reintroduces five false positives in the first fifty seeds. The
  * two claims are not one claim with a fallback; they are the claim that holds always
- * (bound 1) and the claim that holds whenever the transition's events let the check
- * know which threshold growth saw (bound 2).
+ * (bound 1) and the claim that holds whenever no growth-food building arrived after
+ * growth ran (bound 2).
  *
  * ## The one limit bound 2 has, stated rather than discovered later
  *
@@ -641,12 +689,13 @@ const cityFoodBoxWithinThreshold = (ctx: InvariantContext): readonly string[] =>
 
     const reduced = growthRequirement(ctx.rulesetView, city, city.population);
     if (box < reduced) return [];
-    if (!thresholdRecoverable(ctx, city)) return [];
+    if (!foodBoxThresholdRecoverable(ctx, city)) return [];
     return [
       `${label} has food box ${String(box)}, outside [0, ${String(reduced)}) — the threshold this ` +
         `city's own growth-food buildings leave for population ${String(city.population)} — and no ` +
-        `growth-food building was completed or demolished in this turn's events, so the pass that ` +
-        `filled this box measured it against the same threshold the state carries now`,
+        `growth-food building was completed in this turn's events, so the pass that filled this box ` +
+        `measured it against the same threshold the state carries now (a demolition can only raise ` +
+        `that threshold, so it cannot make a box this full legal)`,
     ];
   });
 
@@ -889,26 +938,47 @@ const unitMovementInRange = (ctx: InvariantContext): readonly string[] => {
   return problems;
 };
 
-/** Where a kind sorts: its index in `IMPROVEMENT_KINDS`, or -1 for a kind not in it. */
+/**
+ * Where a stored improvement id sorts, restated here rather than imported from the
+ * writer's private comparison: the position of the **kind it names** in
+ * `IMPROVEMENT_KINDS` (`road`, `mine`, `irrigation` — the vocabulary's editorial order,
+ * which is deliberately not code-unit order), or `-1` for an id that names no kind.
+ *
+ * The vocabulary is imported because it is the *engine's* list, not the ruleset under
+ * test; the order the modules must agree on is what is restated.
+ *
+ * The spelling tie-break is part of the rule rather than an implementation detail: two
+ * ids that name no kind both rank `-1`, and without a tie-break the *insertion* order
+ * would decide theirs — the one thing a hashed order may never depend on. `String`
+ * comparison, never `localeCompare`: a collator would order by the environment's locale.
+ */
 const IMPROVEMENT_KIND_NAMES: readonly string[] = IMPROVEMENT_KINDS;
-const improvementKindRank = (kind: ImprovementId): number => IMPROVEMENT_KIND_NAMES.indexOf(kind);
+const improvementIdRank = (id: ImprovementId): number => IMPROVEMENT_KIND_NAMES.indexOf(id);
+const compareImprovementIds = (a: ImprovementId, b: ImprovementId): number => {
+  const byKind = improvementIdRank(a) - improvementIdRank(b);
+  if (byKind !== 0) return byKind;
+  const left = String(a);
+  const right = String(b);
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+};
 
 /**
  * `improvements-sorted-and-unique` — the improvement pair list is in its contract
  * order and free of duplicates.
  *
  * The order is part of the contract because the list is hashed: *tile ascending, then
- * kind by its position in `IMPROVEMENT_KINDS`*. It is restated here (rather than
- * imported from the writer's private comparison) on purpose — an invariant that asked
- * the module under test what order it meant would agree with any order that module
- * produced.
+ * the rank of the kind the stored id names, then the id itself*. It is restated here
+ * (rather than imported from the writer's private comparison) on purpose — an invariant
+ * that asked the module under test what order it meant would agree with any order that
+ * module produced.
  *
  * Each entry is also required to *be* a `(tile, kind)` pair: a one-element list makes no
  * claim about order, and a `null` or a kind that is not a string is a corruption a
  * consecutive-entry comparison would never look at. A kind the catalog does not describe
  * is deliberately not reported here — that is a foreign ruleset's business, not the
- * pair list's — but it cannot hide a malformed entry either, which is the case this
- * guard exists for.
+ * pair list's — but its *rank* is still checked, because the state-level order is an
+ * order on ids and every id therefore has one.
  */
 const improvementsSortedAndUnique = (ctx: InvariantContext): readonly string[] => {
   const problems: string[] = [];
@@ -928,12 +998,13 @@ const improvementsSortedAndUnique = (ctx: InvariantContext): readonly string[] =
     const pair = pairs[index];
     if (previous === undefined || pair === undefined) continue;
     const tileDelta = Number(pair.tile) - Number(previous.tile);
-    const kindDelta = improvementKindRank(pair.kind) - improvementKindRank(previous.kind);
+    const kindDelta = compareImprovementIds(pair.kind, previous.kind);
     if (tileDelta < 0 || (tileDelta === 0 && kindDelta <= 0)) {
       problems.push(
         `improvements[${String(index)}] is (tile ${String(pair.tile)}, ${String(pair.kind)}), which ` +
           `does not follow (tile ${String(previous.tile)}, ${String(previous.kind)}) in the ` +
-          `contract order (tile ascending, then kind) — and a duplicate pair is not stored twice`,
+          `contract order (tile ascending, then the kind the id names, then the id) — and a ` +
+          `duplicate pair is not stored twice`,
       );
     }
   }
@@ -1705,7 +1776,7 @@ export const CORE_INVARIANTS: readonly Invariant[] = [
     name: 'city-food-box-within-threshold',
     description:
       'A food box is below the bare growth curve, and below its own reduced threshold ' +
-      'unless a growth-food building moved this turn.',
+      'unless a growth-food building completed this turn.',
     check: cityFoodBoxWithinThreshold,
   },
   {

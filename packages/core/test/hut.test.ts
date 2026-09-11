@@ -26,6 +26,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { CATALOG, validateRuleset } from '@civts/rules';
 import { canonicalize, hashValue } from '@civts/testing';
 import type { City } from '../src/cities.js';
 import {
@@ -131,7 +132,10 @@ const WARRIOR = unitDefOf('warrior', 'military', 'land', 2);
 const GALLEY = unitDefOf('galley', 'military', 'sea', 3);
 
 /**
- * The catalog order is the rule: the first `military` **land** row is the reward.
+ * The REWARD rule is canonical, not positional (see the describe block at the foot of
+ * this file): the cheapest `military` **land** row, ties broken by id. In this fixture
+ * the warrior is the only military land row, so it is the reward whatever position the
+ * rows hold.
  *
  * No improvements: a hut reward has nothing to do with a worker's job (M4a), and
  * an empty catalog is how a view says so — `RulesetView.improvements` is required,
@@ -328,8 +332,9 @@ describe('hut.ts — the three rewards', () => {
     expect(outcome.state.revision).toBe(state.revision);
     expect(outcome.state.turn).toBe(state.turn);
 
-    // The reward unit is the first military **land** catalog row, at full movement,
-    // standing on the hut tile with the mover — M2 lets a player's own units stack.
+    // The reward unit is the cheapest military **land** row — here the warrior, the
+    // only one — at full movement, standing on the hut tile with the mover: M2 lets a
+    // player's own units stack.
     expect(outcome.state.units).toStrictEqual([
       {
         id: asUnitId(0),
@@ -604,5 +609,151 @@ describe('hut.ts — totality', () => {
     // The band's units are the type a move could pick up: nothing marks them out.
     const band = outcome.state.units.filter((candidate) => Number(candidate.owner) === 2);
     for (const member of band) expect(unitDef(RULESET, member.type)?.name).toBe('Warrior');
+  });
+});
+
+/**
+ * **Which unit a hut pays is a function of the ruleset's content, never of where a row
+ * sits in the catalog.**
+ *
+ * The rule used to be "the first `military` land row", so a catalog with the very same
+ * rows in a different order paid a different unit for the same hut on the same seed —
+ * a semantic change no reader could predict from the content, and one no test of the
+ * content would have reported. It is now "the cheapest `military` land row, ties broken
+ * by id": both keys are fields of the rows themselves, so reordering, appending or
+ * shuffling a catalog cannot move the answer. (Differing row order is still a different
+ * *ruleset* — its hash covers row order, pinned in `gen.test.ts` — so this is about a
+ * difference a reviewer can see in the content, not about identity.)
+ *
+ * There are two claims here and the shipped catalog is the reason for both:
+ *
+ * - on the catalog this project ships the pick is the **warrior**, the same unit the old
+ *   positional rule selected, so the change is behaviour-preserving on shipped content;
+ * - the old rule would have answered **swordsman** on the reversed catalog, which is
+ *   asserted below rather than asserted away — that is what "behaviour-preserving" means
+ *   when it is a measurement instead of a hope.
+ */
+describe('hut.ts — the reward unit is a canonical pick, not a row position', () => {
+  /** A military land row with a chosen price: the two keys of the canonical rule. */
+  const row = (id: string, cost: number, spec: readonly [UnitRole, 'land' | 'sea']): UnitDef => ({
+    ...unitDefOf(id, spec[0], spec[1], 2),
+    cost,
+  });
+
+  /**
+   * The view with its military rows replaced. The settler stays in the catalog: the
+   * mover is a settler, and a ruleset that does not describe the moving unit's type
+   * never triggers a hut at all — which would make every test below vacuous.
+   */
+  const viewWithUnits = (units: readonly UnitDef[]): RulesetView => ({
+    ...RULESET,
+    units: [SETTLER, ...units],
+  });
+
+  /** The type of the free unit a `unit`-reward entry handed out, read off the state. */
+  const freeUnitType = (ruleset: RulesetView): string => {
+    const outcome = mustResolve(board({ rng: rngFor('unit') }), ruleset, asUnitId(0));
+    const spawned = outcome.state.units.find((candidate) => Number(candidate.id) !== 0);
+    if (spawned === undefined) throw new Error('the unit branch spawned nothing');
+    return String(spawned.type);
+  };
+
+  /** The first `military` land row in catalog order: the rule this one replaced. */
+  const firstRowWouldBe = (ruleset: RulesetView): string | undefined => {
+    const def = ruleset.units.find(
+      (candidate) => candidate.role === 'military' && candidate.domain === 'land',
+    );
+    return def === undefined ? undefined : String(def.id);
+  };
+
+  it('picks the cheapest military land row, wherever the rows sit', () => {
+    // Three military rows, two of them land: the sea one is cheaper than both, so the
+    // `domain` half of the rule is exercised rather than merely stated.
+    const rows: readonly UnitDef[] = [
+      row('warrior', 2, ['military', 'land']),
+      row('swordsman', 3, ['military', 'land']),
+      row('galley', 1, ['military', 'sea']),
+    ];
+    const orders: readonly (readonly UnitDef[])[] = [
+      rows,
+      [...rows].reverse(),
+      // The same content in a third order, written out rather than indexed: a
+      // `rows[i]` read would be `UnitDef | undefined` for no reason.
+      [
+        row('galley', 1, ['military', 'sea']),
+        row('warrior', 2, ['military', 'land']),
+        row('swordsman', 3, ['military', 'land']),
+      ],
+    ];
+
+    for (const units of orders) {
+      expect(freeUnitType(viewWithUnits(units))).toBe('warrior');
+    }
+
+    // Non-vacuity: the orders really differ, and the positional rule this replaced
+    // would have disagreed with the canonical one on the reversed order.
+    expect(orders[0]?.map((def) => String(def.id))).toEqual(['warrior', 'swordsman', 'galley']);
+    expect(orders[1]?.map((def) => String(def.id))).toEqual(['galley', 'swordsman', 'warrior']);
+    expect(firstRowWouldBe(viewWithUnits(rows))).toBe('warrior');
+    expect(firstRowWouldBe(viewWithUnits([...rows].reverse()))).toBe('swordsman');
+  });
+
+  it('breaks a price tie by id, not by position', () => {
+    // Two land rows at one price. The lower id wins in both orders: without the
+    // tie-break the answer would be the row that came first, which is the defect this
+    // rule exists to remove.
+    const zeta = row('zeta', 4, ['military', 'land']);
+    const alpha = row('alpha', 4, ['military', 'land']);
+
+    expect(freeUnitType(viewWithUnits([zeta, alpha]))).toBe('alpha');
+    expect(freeUnitType(viewWithUnits([alpha, zeta]))).toBe('alpha');
+    // ...and the tie really is a tie, so the assertion above is about the tie-break.
+    expect(zeta.cost).toBe(alpha.cost);
+    expect(String(zeta.id) > String(alpha.id)).toBe(true);
+  });
+
+  it('arms the barbarian band with the same canonical row', () => {
+    // One rule, two branches: a band of a different type than the free unit would be
+    // two rules that could drift apart.
+    const rows: readonly UnitDef[] = [
+      row('galley', 1, ['military', 'sea']),
+      row('swordsman', 3, ['military', 'land']),
+      row('warrior', 2, ['military', 'land']),
+    ];
+    const outcome = mustResolve(
+      board({ rng: rngFor('barbarians') }),
+      viewWithUnits(rows),
+      asUnitId(0),
+    );
+    const band = outcome.state.units.filter((candidate) => candidate.id !== asUnitId(0));
+
+    expect(band).toHaveLength(BARBARIAN_BAND_SIZE);
+    for (const member of band) expect(String(member.type)).toBe('warrior');
+    expect(freeUnitType(viewWithUnits(rows))).toBe('warrior');
+  });
+
+  it('picks the warrior on the SHIPPED catalog, in both row orders', () => {
+    // The measurement the change rests on, taken from real content rather than from a
+    // fixture: `warrior@1`, `swordsman@3`, and the galley at 2 excluded by `domain` —
+    // so the canonical rule agrees with the old positional one on shipped content, and
+    // the two disagree the moment the rows are reversed.
+    const shipped = validateRuleset(CATALOG, 'tuned');
+    if (!shipped.ok) throw new Error('the shipped catalog does not validate');
+    const reversed = validateRuleset({ ...CATALOG, units: [...CATALOG.units].reverse() }, 'tuned');
+    if (!reversed.ok) throw new Error('the reversed catalog does not validate');
+
+    const warrior = CATALOG.units.find((unit) => unit.id === asUnitTypeId('warrior'));
+    const swordsman = CATALOG.units.find((unit) => unit.id === asUnitTypeId('swordsman'));
+    expect(warrior?.cost).toBe(1);
+    expect(swordsman?.cost).toBe(3);
+    expect(warrior?.role).toBe('military');
+    expect(warrior?.domain).toBe('land');
+
+    expect(freeUnitType(shipped.value)).toBe('warrior');
+    expect(freeUnitType(reversed.value)).toBe('warrior');
+    // The old rule, on the same two catalogs: the warrior, then the swordsman. So the
+    // canonical pick preserved shipped behaviour and removed a dependence on order.
+    expect(firstRowWouldBe(shipped.value)).toBe('warrior');
+    expect(firstRowWouldBe(reversed.value)).toBe('swordsman');
   });
 });

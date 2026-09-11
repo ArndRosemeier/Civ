@@ -1,4 +1,10 @@
 import { describe, expect, it } from 'vitest';
+// The shipped catalog and the hasher are read by the LAST describe block only, which
+// pins the row-order contract against real content. Nothing in `packages/core/src`
+// reads `@civts/rules`; this is evidence about the contract, not a dependency of the
+// engine on that package.
+import { CATALOG, validateRuleset, type Catalog, type Ruleset } from '@civts/rules';
+import { canonicalize, hashValue } from '@civts/testing';
 import { generateWorld, type GenOptions } from '../src/gen.js';
 import {
   asResourceId,
@@ -606,6 +612,121 @@ describe('generateWorld — resources', () => {
     expect(withResources.map.huts).toEqual(without.map.huts);
     expect(without.map.resources).toEqual([]);
     expect(withResources.map.resources.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * **Row order is part of the ruleset's identity, and that is what makes the
+ * row-ordered placement loop above safe.**
+ *
+ * The resource loop draws from the map RNG `perRow` times per row *in row order*, so
+ * permuting `CATALOG.resources` permutes the world: the same seed places different
+ * resources before any player has moved. That coupling between catalog order and the
+ * simulated game is real, and it is deliberate rather than accidental — the ruleset
+ * hash covers row order, so two catalogs differing only in row order are two
+ * different rulesets, and a replay (M11) run against the wrong ordering is
+ * **detected** by its identity instead of quietly producing a different game under
+ * what looks like the same ruleset.
+ *
+ * So this is the property the generator's design depends on, asserted where a reader
+ * of the generator will find it:
+ *
+ * 1. **the identity covers row order in every catalog section** — reversing any one
+ *    section yields a different ruleset hash (measured on the shipped catalog:
+ *    `e69bfbaab6d3bba4` as shipped, `0b6d39501ac57528` with `resources` and `units`
+ *    reversed), and reversing twice returns the shipped hash, so the difference is
+ *    genuinely the order and not an artefact of the hasher;
+ * 2. **a row-order-only difference is a real difference in the world** — same seed,
+ *    same terrain, same huts, same starts, different resources — which is why the
+ *    identity check is what a replay needs;
+ * 3. **and the catalogs really do differ only in row order**, so (1) and (2) are
+ *    about order and not about edited content.
+ */
+describe('generateWorld — row order is part of the ruleset identity', () => {
+  /** A validated catalog, or a loud failure naming the label. */
+  const validated = (catalog: Catalog, label: string): Ruleset => {
+    const result = validateRuleset(catalog, 'tuned');
+    if (!result.ok) {
+      throw new Error(
+        `${label} does not validate: ${result.error.map((issue) => issue.kind).join(', ')}`,
+      );
+    }
+    return result.value;
+  };
+
+  type Section = 'terrains' | 'units' | 'buildings' | 'improvements' | 'resources';
+  const SECTIONS: readonly Section[] = [
+    'terrains',
+    'units',
+    'buildings',
+    'improvements',
+    'resources',
+  ];
+
+  /**
+   * `catalog` with one section's rows reversed. Written per section rather than
+   * through a computed key, because a computed spread would need a cast to get back
+   * into `Catalog` — the same reasoning `packages/sim`'s row-order probe states.
+   */
+  const reversed = (catalog: Catalog, section: Section): Catalog =>
+    section === 'terrains'
+      ? { ...catalog, terrains: [...catalog.terrains].reverse() }
+      : section === 'units'
+        ? { ...catalog, units: [...catalog.units].reverse() }
+        : section === 'buildings'
+          ? { ...catalog, buildings: [...catalog.buildings].reverse() }
+          : section === 'improvements'
+            ? { ...catalog, improvements: [...catalog.improvements].reverse() }
+            : { ...catalog, resources: [...catalog.resources].reverse() };
+
+  const SHIPPED = validated(CATALOG, 'the shipped catalog');
+  const SHIPPED_HASH = hashValue(SHIPPED);
+
+  it('covers row order in the ruleset hash, for every catalog section', () => {
+    // A hash in the documented form, so "the identities differ" below is a statement
+    // about a real 16-hex-character identity and not about two empty strings.
+    expect(SHIPPED_HASH).toMatch(/^[0-9a-f]{16}$/);
+    // The hash is a function of the ruleset, not of the hasher's mood: validating the
+    // same catalog again yields the same identity.
+    expect(hashValue(validated(CATALOG, 'again'))).toBe(SHIPPED_HASH);
+
+    for (const section of SECTIONS) {
+      const once = reversed(CATALOG, section);
+      const flipped = validated(once, `${section} reversed`);
+      // Non-vacuity: the reversed catalog really is a permutation — same rows, same
+      // order-independent content — so what makes the identities differ is the order.
+      expect(canonicalize([...once[section]].reverse())).toBe(canonicalize(CATALOG[section]));
+      expect(hashValue(flipped)).not.toBe(SHIPPED_HASH);
+      // ...and reversing twice is the shipped catalog again, so the difference is the
+      // order itself rather than a reformatting the validator does on the way through.
+      expect(hashValue(validated(reversed(once, section), `${section} twice`))).toBe(SHIPPED_HASH);
+    }
+  });
+
+  it('is a different WORLD when only the resource rows move — which is why the identity must be checked', () => {
+    // The world half of the contract, measured rather than argued: no policy, no
+    // command, only the order of six resource rows. `gen.ts` documents this at the
+    // placement site; the difference is legal only because the identities differ.
+    const options: GenOptions = { width: 40, height: 40, seed: 42, civCount: 4 };
+    const reordered = validated(reversed(CATALOG, 'resources'), 'resources reversed');
+    const shipped = generateWorld(options, SHIPPED);
+    const moved = generateWorld(options, reordered);
+
+    // Non-vacuity: the world really holds resources in both orders.
+    expect(shipped.map.resources.length).toBeGreaterThan(0);
+    expect(moved.map.resources.length).toBeGreaterThan(0);
+
+    // Everything the generator places before the resource loop is identical, because
+    // terrain comes from position hashes and the huts and starts are drawn before it.
+    expect(moved.map.terrain).toEqual(shipped.map.terrain);
+    expect(moved.map.huts).toEqual(shipped.map.huts);
+    expect(moved.starts).toEqual(shipped.starts);
+
+    // The resources are not, and neither is the identity that licenses it: a replay
+    // holding the shipped hash and handed the reordered ruleset sees a mismatch here
+    // rather than a silently different game.
+    expect(moved.map.resources).not.toEqual(shipped.map.resources);
+    expect(hashValue(reordered)).not.toBe(SHIPPED_HASH);
   });
 });
 

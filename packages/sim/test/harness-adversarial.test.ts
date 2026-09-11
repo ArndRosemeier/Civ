@@ -75,18 +75,24 @@
  *   fixture or a loaded save is checked against. The "FINDING B" test in section 3 pins
  *   the fire case, the paired clean case, that it is the *only* check that sees it, and
  *   that the registry's size is 21 — the count the CLI prints and this file's prose quotes.
- * - **FINDING C — catalog row order was an input to every run. NARROWED to the engine.**
- *   Reversing `CATALOG.units` changed the game (the AI fielded galleys instead of
- *   warriors), reversing `improvements` or `resources` changed the hash, while reversing
- *   `terrains` or `buildings` did not. `policies.ts`' `cheapest` documented
- *   order-independence as a goal ("a reordered catalog must not silently change a
- *   simulation's outcome") and achieved it; its sibling `firstOfRole`, and the
+ * - **FINDING C — catalog row order was an input to every run. NARROWED to the engine,
+ *   and now to ONE section.** Reversing `CATALOG.units` changed the game (the AI fielded
+ *   galleys instead of warriors), reversing `improvements` or `resources` changed the
+ *   hash, while reversing `terrains` or `buildings` did not. `policies.ts`' `cheapest`
+ *   documented order-independence as a goal ("a reordered catalog must not silently
+ *   change a simulation's outcome") and achieved it; its sibling `firstOfRole`, and the
  *   `StartWork` choice taken off `unitActions`, inherited content order — and both are now
- *   decisions from the candidates' own content (`cheapestOfRole`, `compareJobs`). What
- *   remains is engine-side and is *reported rather than compensated for*: `gen.ts` draws
- *   its resource placement from the map RNG once per resource row **in row order**, and
- *   `hut.ts`' `rewardUnitDef` is "the first `military` land unit in the catalog". Pinned in
- *   the "FINDING C" test in section 1, and reproduced with no policy involved at all in
+ *   decisions from the candidates' own content (`cheapestOfRole`, `compareJobs`). The
+ *   engine's two readers were then dealt with on their own terms: `hut.ts`'
+ *   `rewardUnitDef` picked "the first `military` land unit in the catalog", which no hashed
+ *   value depended on, so it now takes the **cheapest** such row with the id as tie-break
+ *   and `units` is inert as well; `gen.ts`' resource placement draws from the map RNG once
+ *   per resource row **in row order**, which IS hashed, so it is left as it is and the
+ *   coupling is instead made explicit and tested — the ruleset hash covers row order
+ *   (`e69bfbaab6d3bba4` shipped vs `0b6d39501ac57528` with `resources` and `units`
+ *   reversed), so a replay against the wrong ordering is detected rather than silently
+ *   different (`gen.ts`' placement site, `core/test/gen.test.ts`). Pinned in the "FINDING
+ *   C" test in section 1, and reproduced with no policy involved at all in
  *   `policies.test.ts`' own FINDING C section, which owns the mechanism. **Mutation-checked
  *   during re-verification**: deleting `cheapest`'s id tie-break turns four tests red
  *   (three of them pre-existing), so the identical-outcome-under-a-reordered-catalog claim
@@ -119,24 +125,26 @@
  *   very event that exempts the reduced one) and the row-order fix moved decisions to the
  *   candidates' content rather than dropping the decisions.
  * - **the one thing this pass found that the fixes did not already say, stated plainly
- *   rather than buried**: FINDING A's exemption has two triggers and only one of them is
- *   as narrow as the finding. The **completion** trigger is exactly right. The
- *   **shortfall** trigger — `thresholdRecoverable` yielding when the city's owner reported
- *   a `TreasuryShortfall` — is deliberate and already pinned in `invariants.test.ts` as
- *   "a bankrupt owner's buildings are demolished after production, which can take a
- *   growth-food building away". For the granary that justification does not hold: a
- *   `granary` pays no maintenance and `disbandBuildings` skips every row whose maintenance
- *   is `<= 0`, so the demolition can never take a granary's `growth-food` reduction away
- *   (it can take the Pyramids', which costs 2 a turn) and the state's threshold is the one
- *   growth saw — which means that clause can only ever SUPPRESS the reduced bound.
- *   Measured, both ways round: a box at `bare - growthFood` (a box the growth pass should
- *   have spent) escapes when its owner reports a shortfall and is caught when it does not
- *   (pinned in section 3), and deleting the clause leaves the whole 50-seed batch at
- *   **0 violations and one horizon**, so on the shipped content it prevents no false
- *   positive. It is not simply removable — the same predicate is shared with
- *   `city-food-conservation`, which genuinely cannot recompute its arithmetic after a
- *   demolition — so the fix is to split the predicate, and that belongs to the invariant's
- *   owner rather than to a verification file.
+ *   rather than buried, and since CLOSED by the invariant's owner**: FINDING A's exemption
+ *   had two triggers and only one of them was as narrow as the finding. The
+ *   **completion** trigger is exactly right. The **shortfall** trigger —
+ *   `thresholdRecoverable` yielding when the city's owner reported a `TreasuryShortfall` —
+ *   was deliberate and pinned in `invariants.test.ts` as "a bankrupt owner's buildings are
+ *   demolished after production, which can take a growth-food building away". For the
+ *   granary that justification did not hold: a `granary` pays no maintenance and
+ *   `disbandBuildings` skips every row whose maintenance is `<= 0`, so the demolition can
+ *   never take a granary's `growth-food` reduction away (it can take the Pyramids', which
+ *   costs 2 a turn) — and more generally a demolition can only *raise* a threshold, so
+ *   that clause could only ever SUPPRESS the reduced bound. Measured, both ways round: a
+ *   box at `bare - growthFood` (a box the growth pass should have spent) escaped when its
+ *   owner reported a shortfall and was caught when it did not, and deleting the clause
+ *   left the whole 50-seed batch at **0 violations and one horizon**. It was not simply
+ *   removable — the same predicate was shared with `city-food-conservation`, which
+ *   genuinely cannot recompute its arithmetic after a demolition — so the predicates are
+ *   now SPLIT: `foodBoxThresholdRecoverable` (the completion case alone) for the box
+ *   bound, `thresholdRecoverable` (both cases) for the conservation check. The assertions
+ *   in section 3 that pinned the escape are flipped, and the box at `bare - growthFood` is
+ *   now caught by name under a shortfall.
  *
  * No finding is invented, and each is stated at the strength it was measured: nothing
  * here is called a bug that is not demonstrated, and where a probe found nothing the
@@ -585,7 +593,7 @@ console.log('RESULT ' + [
     // metrics-sequence difference in the five-run and fresh-process checks above.
   }, 120_000);
 
-  it('FINDING C (narrowed): row order now reaches only the ENGINE — gen.ts and hut.ts', () => {
+  it('FINDING C (narrowed): row order now reaches ONLY gen.ts’ resource placement', () => {
     // `policies.ts`' `cheapest` says the id tie-break is "what makes the choice
     // independent of catalog order … a reordered catalog must not silently change a
     // simulation's outcome". This probe reverses each section independently and
@@ -641,31 +649,33 @@ console.log('RESULT ' + [
     // policy's two row-position readers were replaced by decisions taken from the
     // candidates' own content (`policies.ts`' `cheapestOfRole` for a production item,
     // `compareJobs` for a worker's job), so reversing `improvements` is now inert as well.
-    // `terrains` and `buildings` are read by id or by role (`find`) and always were. The
-    // two sections that still move a run move it through the ENGINE, not through the
-    // policy, and `policies.test.ts`' "FINDING C — the catalog's ROW ORDER is not an input
-    // to the AI" section reproduces both from a state with no policy involved and owns the
-    // detailed mechanism: `resources` through world generation (`gen.ts` draws from the map
-    // RNG once per resource row, in row order) and `units` through the goody-hut reward
-    // (`hut.ts`' `rewardUnitDef` is "the first `military` land unit in catalog order").
-    expect(changed).toEqual(['units', 'resources']);
+    // `terrains` and `buildings` are read by id or by role (`find`) and always were. Of the
+    // engine's two remaining readers, one is gone as well: `hut.ts`' `rewardUnitDef` now
+    // takes the cheapest `military` land row with the id as its tie-break instead of the
+    // first one, so `units` is inert too and the *only* section left that moves a run is
+    // `resources` — through world generation (`gen.ts` draws from the map RNG once per
+    // resource row, in row order), which is deliberate and legal because the ruleset hash
+    // covers row order (see `gen.ts`' placement site and `core/test/gen.test.ts`).
+    expect(changed).toEqual(['resources']);
 
     // The symptom this section named is gone, and its absence is asserted rather than
     // assumed: a reversed `units` array no longer puts a sea unit in the field, because the
-    // policy's choice is a function of price and id and not of row position. What is left
-    // is the *type* the engine's hut reward hands out — the same units with the same ids in
-    // the same places, one type swapped — so the hash still differs and is reported.
+    // policy's choice is a function of price and id and not of row position — and the hut
+    // reward is now the same unit in both orders too, so the whole run is byte-identical
+    // rather than differing by one unit's type. That is the stronger statement, so it is
+    // the one asserted.
     const unitsReversed = run(reversed('units'));
     expect(galleyCount(baseline)).toBe(0);
     expect(galleyCount(unitsReversed)).toBe(0);
     expect(unitsReversed.finalState.units.map((unit) => unit.id)).toEqual(
       baseline.finalState.units.map((unit) => unit.id),
     );
-    expect(unitsReversed.finalHash).not.toBe(baseline.finalHash);
+    expect(unitsReversed.finalHash).toBe(baseline.finalHash);
+    expect(unitsReversed.finalState).toEqual(baseline.finalState);
     console.log(
       `  mechanism: galleys baseline=${String(galleyCount(baseline))}, ` +
-        `units-reversed=${String(galleyCount(unitsReversed))} (row order no longer reaches ` +
-        `the policy); the residual difference is the hut reward's unit type`,
+        `units-reversed=${String(galleyCount(unitsReversed))}; row order no longer reaches ` +
+        `the policy OR the hut reward, so a reversed units catalog is now a neutral order`,
     );
   }, 240_000);
 
@@ -1552,7 +1562,7 @@ describe('3. invariants actually fire', () => {
     expect(batchMs).toBeLessThan(600_000);
   }, 240_000);
 
-  it('FINDING A (non-vacuity): both bounds fire BY NAME — and the exemption has two triggers, one narrow and one broader', () => {
+  it('FINDING A (non-vacuity): both bounds fire BY NAME, and the exemption is now only the completion case', () => {
     // The test above proves the food-box check is *silent* on shipped content. Silence is
     // the weaker half of the claim, and on its own it is exactly what a **removed** check
     // looks like: deleting `city-food-box-within-threshold` from the registry would make
@@ -1566,36 +1576,27 @@ describe('3. invariants actually fire', () => {
     //      FINDING A relaxation used to report, now correctly reported only when the
     //      transition's events do not explain it.
     //
-    // Then the exemption itself, trigger by trigger, because the predicate it lives in has
-    // TWO (`thresholdRecoverable`: a `growth-food` completion for that city, or a
-    // `TreasuryShortfall` for its owner) and they are not equally narrow:
+    // Then the exemption, trigger by trigger. The predicate this check reads now has ONE
+    // trigger rather than two (`foodBoxThresholdRecoverable`), because the second one was
+    // only ever suppressing real violations:
     //
-    //   - the COMPLETION trigger is exactly as wide as FINDING A needs — one turn, one
-    //     bound: the same box with a `CityProduced` event completing the granary is legal
-    //     (growth measured it against the pre-completion threshold), the same event leaves
-    //     the bare bound in force, and without the event the box fires again;
-    //   - the SHORTFALL trigger is deliberate (`invariants.test.ts` pins it, and the
-    //     invariant's doc comment explains it as "a bankrupt owner's buildings are
-    //     demolished after production, which can take a growth-food building away"), but
-    //     for a GRANARY that justification does not hold, and this test pins the
-    //     consequence rather than leaving it to be discovered: a `granary` pays no
-    //     maintenance, and `disbandBuildings` skips every row whose maintenance is `<= 0`,
-    //     so the demolition that trigger is written for can never take a granary's
-    //     `growth-food` reduction away (the Pyramids, at 2 a turn, it can) — the state's
-    //     threshold is the one growth saw, and the exemption can therefore only ever
-    //     SUPPRESS the reduced bound. A box at `bare - growthFood` (a box the growth pass
-    //     should have spent) escapes when the owner reports a shortfall that turn, and
-    //     fires when it does not.
+    //   - the COMPLETION trigger stands, and is exactly as wide as FINDING A needs — one
+    //     turn, one bound: the same box with a `CityProduced` event completing the granary
+    //     is legal (growth measured it against the pre-completion threshold), the same
+    //     event leaves the bare bound in force, and without the event the box fires again;
+    //   - the SHORTFALL trigger is gone from THIS check (it is kept by
+    //     `city-food-conservation`, which cannot recompute after a demolition). It never
+    //     prevented a false positive here: a demolition removes rows, removing rows removes
+    //     `growth-food` reductions, so the after-state's threshold is at or ABOVE the one
+    //     growth measured the box against — and on shipped content the demolished row is
+    //     never the granary at all, because it pays no maintenance and `disbandBuildings`
+    //     skips every row whose maintenance is `<= 0`. What it did do is let a box at
+    //     `bare - growthFood` (a box the growth pass should have spent) escape whenever its
+    //     owner reported a shortfall, which is the assertion that flipped here.
     //
-    // That last point is the honest limit of the FINDING A fix and it is asserted, not
-    // implied: the check is corrected, not weakened away — the bare bound still fires in
-    // exactly that configuration, and the exemption is player-scoped — but the module's own
-    // doc comment ("the bare bound above still applies to both, so nothing illegal slips
-    // through: what the exemption gives up is precision between the two bounds, never the
-    // bound itself") is too strong for the shortfall half, and narrowing that clause is
-    // work for the invariant's owner rather than something a verification file may do.
-    // If this clause is narrowed or dropped, the EXPECTATIONS BELOW ARE THE ONES TO FLIP:
-    // the illegal box should then be caught by name even with the shortfall event.
+    // So the check is corrected rather than weakened: the illegal box is caught by name
+    // under a shortfall, under another player's shortfall, and with no events at all, while
+    // the completion case and a box below the reduced threshold stay legal.
     const clean = playedState(1, 8);
     const target = mustFind(clean.cities[0], 'a city');
     const bare = foodBoxSize(target.population);
@@ -1646,9 +1647,7 @@ describe('3. invariants actually fire', () => {
     //     cannot be what fires here — this is the reduced bound doing its own work.
     expect(namesFor(withBox(reduced), [])).toEqual(['city-food-box-within-threshold']);
     expect(firstMessage(withBox(reduced), [])).toContain(`outside [0, ${String(reduced)})`);
-    expect(firstMessage(withBox(reduced), [])).toContain(
-      'no growth-food building was completed or demolished',
-    );
+    expect(firstMessage(withBox(reduced), [])).toContain('no growth-food building was completed');
 
     // (3) the exemption, as FINDING A described it — and its edge. The same box, with the
     //     granary completing in this turn's production step, is legal (growth measured the
@@ -1668,9 +1667,13 @@ describe('3. invariants actually fire', () => {
     //     the very same box fires again.
     expect(namesFor(withBox(reduced), [])).toEqual(['city-food-box-within-threshold']);
 
-    // (5) the exemption's OTHER trigger — a shortfall for the city's owner — and its width.
-    //     Asserted as measured, with the over-broad reading stated in the header comment
-    //     above: this is a *pinned limit*, not a behaviour this file endorses.
+    // (5) the exemption's OTHER trigger — a shortfall for the city's owner — is GONE from
+    //     this check, and what replaced it is the arithmetic that made it unnecessary: a
+    //     demolition removes rows, and removing rows removes `growth-food` reductions, so
+    //     the threshold the state carries is at or above the one growth measured the box
+    //     against. The predica was SPLIT rather than narrowed, because
+    //     `city-food-conservation` genuinely cannot recompute after a demolition; that half
+    //     is pinned in `invariants.test.ts`.
     const ownerShortfall: GameEvent = {
       type: 'TreasuryShortfall',
       playerId: target.owner,
@@ -1687,15 +1690,18 @@ describe('3. invariants actually fire', () => {
       playerId: otherPlayer,
       unpaid: 5,
     };
-    // The illegal box escapes bound (2) when its OWNER reported a shortfall...
-    expect(namesFor(withBox(reduced), [ownerShortfall])).toEqual([]);
-    // ...but the exemption is scoped to that owner: another player's shortfall leaves the
-    // box caught, so this is not a blanket mute of the check on any bankruptcy turn.
+    // The illegal box is now caught under its OWN owner's shortfall too — the state that
+    // used to escape the reduced bound.
+    expect(namesFor(withBox(reduced), [ownerShortfall])).toEqual([
+      'city-food-box-within-threshold',
+    ]);
+    // ...and another player's shortfall leaves it caught as well, so the assertion above is
+    // about the bound and not about which player is bankrupt.
     expect(namesFor(withBox(reduced), [otherShortfall])).toEqual([
       'city-food-box-within-threshold',
     ]);
-    // And the unconditional bound is untouched by it — the property that keeps the escape
-    // a loss of precision rather than a loss of the check.
+    // And the unconditional bound is untouched by any of it — the property that keeps the
+    // reduced bound a loss of *precision* at most, never of the check itself.
     expect(namesFor(withBox(bare), [ownerShortfall])).toEqual(['city-food-box-within-threshold']);
     // A box below the reduced threshold is legal in every one of these configurations, so
     // the assertions above are about the bound and not about "a hand-built state fires".
@@ -1704,10 +1710,10 @@ describe('3. invariants actually fire', () => {
     console.log(
       `food-box bounds: bare ${String(bare)} caught at the boundary; reduced ` +
         `${String(reduced)} (granary, growthFood ${String(growthFood)}) caught with no ` +
-        `growth-food event, exempt with a granary completion, and ALSO exempt with a ` +
-        `shortfall for its owner (over-broad: a granary pays no maintenance, so the ` +
-        `demolition that clause stands for can never take its reduction away); a shortfall ` +
-        `for the OTHER player does not exempt it, and a box at ` +
+        `growth-food event, exempt with a granary completion, and now ALSO caught with a ` +
+        `shortfall for its owner (the demolition that clause stood for can only RAISE a ` +
+        `threshold, and a granary pays no maintenance, so it can never take the reduction ` +
+        `away); a shortfall for the OTHER player does not exempt it either, and a box at ` +
         `${String(bare - growthFood - 1)} is clean either way`,
     );
   }, 240_000);

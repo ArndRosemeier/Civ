@@ -27,13 +27,26 @@
  *   index in `IMPROVEMENT_KINDS` — the catalog's editorial order, which for the
  *   shipped catalog is road, mine, irrigation and is therefore *not* code-unit
  *   order (that would be irrigation, mine, road). The difference is observable in
- *   every state hash, so `kindRank` below is the one statement of it; a reader who
- *   "corrects" the comparison to code units would move every golden. Duplicate
+ *   every state hash, so `rankOfStoredId` below is the one statement of it; a reader
+ *   who "corrects" the comparison to code units would move every golden. Duplicate
  *   pairs never appear. `withImprovement` establishes that order, never depends on
  *   the caller's insertion order, and is idempotent: adding a pair that is already
  *   there returns an equal state. A hash that moved when a worker re-built a road
  *   would make every save and every golden depend on how the player happened to
  *   play, not on what happened.
+ * - **The state stores an improvement *id*, and this module can only rank ids.** An
+ *   id is a name for a *row*; its `kind` is a field of that row, and reading the field
+ *   needs the ruleset — which the frozen helper signatures (`withImprovement(state,
+ *   tile, kind)`) do not take, because the state layer must be able to order its own
+ *   pairs without one. So the stored order is an order **on ids**, and
+ *   `IMPROVEMENT_KINDS` supplies the rank of an id that names a kind. That identity
+ *   (`id === kind`) is the shipped catalog's convention and is *not* a rule the type
+ *   system enforces (`ImprovementSpec` allows an id that spells something else), so
+ *   `rankOfStoredId` derives the kind where it can, says so, and gives every other id
+ *   a total order by spelling rather than a tie. A consumer that *does* have the
+ *   ruleset should read the row's own `kind` field instead
+ *   (`improvementDef(ruleset, id)?.kind` — the reading `packages/sim`'s worker-job
+ *   ranking takes), which is the proper derivation and the one this module cannot do.
  * - **Nothing here validates a tile index against the map.** These are the state
  *   layer's primitives, and the *rules* — an improvement must be allowed on the
  *   tile's terrain role, a worker must stand on the tile, work starts only where
@@ -140,34 +153,72 @@ export const improvementDef = (
 ): ImprovementDef | undefined => improvementCatalog(ruleset).find((def) => def.id === id);
 
 /**
- * Where `kind` sorts relative to the other kinds: its index in
- * `IMPROVEMENT_KINDS`, or `-1` for a kind this engine does not know.
+ * The improvement KIND a stored id names, or `undefined` for an id that names none.
  *
- * An index rather than a string comparison, because the order is then the
- * statement of `IMPROVEMENT_KINDS` (editorial, readable, and stable) rather than
- * a property of the character encoding. A kind outside the list sorts before
- * everything, which is arbitrary but *total* — a foreign state is still ordered
- * the same way on every engine, so its hash cannot move.
+ * The stored value is an **id** (`TileImprovement.kind` is an `ImprovementId`) and
+ * the sort needs a **kind**, so this is the one place the two are related — and it is
+ * a derivation, not an assertion: an id is read as the kind it spells, and an id that
+ * spells no kind is honestly reported as unknown rather than being mistaken for one.
+ * It is the best a module without a ruleset can do (see the module doc), and it is
+ * exactly right for the shipped catalog, whose rows are named after their kinds.
  *
- * `IMPROVEMENT_KINDS` is a `readonly ['road','mine','irrigation']`, and
- * `ImprovementId` is a *branded string*, which is not assignable to its literal
- * element type — so the membership test is written against the plain strings,
- * which is what both values are at runtime. That is a widening for a membership
- * test, not a cast around the type system: the array is still the literal tuple,
- * and no `as` is used to silence a complaint.
+ * The parameter is widened to `string` because `IMPROVEMENT_KINDS` is a literal tuple
+ * and `ImprovementId` is a *branded* string: neither is assignable to the other, and
+ * the membership test is about the characters, which is what both values are at
+ * runtime. That is a widening for a comparison, not a cast around the type system —
+ * no `as` is used, and the result is typed as the union of real kinds.
  */
-const KIND_NAMES: readonly string[] = IMPROVEMENT_KINDS;
-
-const kindRank = (kind: ImprovementId): number => KIND_NAMES.indexOf(kind);
+const kindNamedBy = (id: ImprovementId): ImprovementKind | undefined => {
+  const name: string = id;
+  return IMPROVEMENT_KINDS.find((kind) => kind === name);
+};
 
 /**
- * The catalog order of a pair: tile first (ascending), then kind. This is the one
- * comparison the module sorts and inserts by, so the stored order cannot depend
- * on which helper wrote an entry.
+ * Where a stored improvement id sorts: the position of the **kind it names** in
+ * `IMPROVEMENT_KINDS`, or `-1` for an id that names no kind.
+ *
+ * An index rather than a string comparison, because the order is then the statement of
+ * `IMPROVEMENT_KINDS` (editorial, readable, and stable) rather than a property of the
+ * character encoding — and because the shipped order (road, mine, irrigation) is
+ * deliberately not code-unit order.
+ *
+ * An id outside the vocabulary sorts before every one inside it, which is arbitrary
+ * but *fixed*: it is the same answer on every engine for every such id, so a foreign
+ * save's order cannot move between runs. Two ids outside the vocabulary are separated
+ * by `comparePairs`' spelling tie-break below, never by insertion order.
+ */
+const rankOfStoredId = (id: ImprovementId): number => {
+  const kind = kindNamedBy(id);
+  return kind === undefined ? -1 : IMPROVEMENT_KINDS.indexOf(kind);
+};
+
+/**
+ * The stored order of a pair: tile first (ascending), then the rank of the id's kind,
+ * then the id's own spelling. This is the one comparison the module sorts and inserts
+ * by, so the stored order cannot depend on which helper wrote an entry — nor, because
+ * of the tie-break, on the order the entries were added in.
+ *
+ * The tie-break exists for ids that name no kind, which all rank `-1`: without it, two
+ * such ids on one tile compare equal in both directions and the list keeps whichever
+ * order they arrived in. That would make the stored order — and therefore every state
+ * hash — a function of insertion order for exactly the states this module is most
+ * careful about (a save written by another build, a hand-built fixture). With it, the
+ * order is a function of the pair *set*, which is what the module claims everywhere
+ * else. On the shipped catalog it changes nothing: every id names a kind, so no two
+ * entries on one tile ever reach the tie-break.
+ *
+ * The spelling comparison is `String` code-unit order, never `localeCompare`: a
+ * collator would order by the environment's locale and make a hash depend on where the
+ * game was run.
  */
 const comparePairs = (a: TileImprovement, b: TileImprovement): number => {
   if (a.tile !== b.tile) return Number(a.tile) - Number(b.tile);
-  return kindRank(a.kind) - kindRank(b.kind);
+  const byKind = rankOfStoredId(a.kind) - rankOfStoredId(b.kind);
+  if (byKind !== 0) return byKind;
+  const left = String(a.kind);
+  const right = String(b.kind);
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 };
 
 /**

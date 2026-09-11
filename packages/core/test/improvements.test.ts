@@ -23,6 +23,11 @@
  */
 
 import { describe, expect, it } from 'vitest';
+// The shipped catalog is read by ONE test below, which pins the coincidence the
+// state-level ordering depends on (`id === kind` for every shipped row). Nothing in
+// `packages/core/src` reads this package.
+import { CATALOG } from '@civts/rules';
+import { hashValue } from '@civts/testing';
 import { cityYields, type City } from '../src/cities.js';
 import { asCityId, asPlayerId, asTerrainId, asTileIndex, asUnitTypeId } from '../src/ids.js';
 import {
@@ -451,6 +456,103 @@ describe('improvement helpers', () => {
     // The store is per (tile, kind): the tile order leads, and only then the kind.
     const tileOrder = scrambled.improvements.map((entry) => Number(entry.tile));
     expect([...tileOrder]).toEqual([...tileOrder].sort((a, b) => a - b));
+  });
+
+  it('ranks a stored id by the KIND it names, and not by its spelling', () => {
+    // The second key is the position of the id's kind in `IMPROVEMENT_KINDS`
+    // (road, mine, irrigation): editorial order, and deliberately *not* code-unit
+    // order, which would put irrigation first and move every golden. Built by adding
+    // the two rows in the order a spelling comparison would have produced.
+    const board = withImprovement(
+      withImprovement(state([]), asTileIndex(WORKED), IRRIGATION),
+      asTileIndex(WORKED),
+      ROAD,
+    );
+
+    expect(improvementsAt(board, asTileIndex(WORKED))).toEqual([ROAD, IRRIGATION]);
+    // Non-vacuity: the two spellings really do sort the other way round, and the two
+    // kinds really are in the other order in the vocabulary.
+    expect([...['road', 'irrigation']].sort()).toEqual(['irrigation', 'road']);
+    expect(IMPROVEMENT_KINDS.indexOf('road')).toBeLessThan(IMPROVEMENT_KINDS.indexOf('irrigation'));
+  });
+
+  it('orders ids the kind vocabulary does not contain by id, never by insertion order', () => {
+    // The state layer ranks *ids*. This module never sees a ruleset — the frozen
+    // helpers take `(state, tile, kind)` and the state must be able to order its own
+    // pairs without a catalog — so an id that names no kind has no rank, and it is
+    // separated from another such id by its spelling rather than by the order it
+    // arrived in. Without that tie-break, two unknown ids on one tile compare equal in
+    // both directions, and the stored order — which is hashed — becomes a function of
+    // insertion order for exactly the states this module is careful about (a hand-built
+    // fixture, a save written by another build).
+    const forward = withImprovement(
+      withImprovement(state([]), asTileIndex(WORKED), asImprovementId('zeta')),
+      asTileIndex(WORKED),
+      asImprovementId('alpha'),
+    );
+    const backward = withImprovement(
+      withImprovement(state([]), asTileIndex(WORKED), asImprovementId('alpha')),
+      asTileIndex(WORKED),
+      asImprovementId('zeta'),
+    );
+
+    expect(improvementsAt(forward, asTileIndex(WORKED))).toEqual([
+      asImprovementId('alpha'),
+      asImprovementId('zeta'),
+    ]);
+    // The two builds are the same state, not merely the same list.
+    expect(backward).toEqual(forward);
+    expect(hashValue(backward)).toBe(hashValue(forward));
+  });
+
+  it('puts an id that names no kind before every kind it does know', () => {
+    // An unknown id ranks `-1`, before the vocabulary: arbitrary, but fixed — the same
+    // answer on every engine — so a foreign save's order cannot move between runs.
+    const board = withImprovement(
+      withImprovement(state([]), asTileIndex(WORKED), ROAD),
+      asTileIndex(WORKED),
+      asImprovementId('space-elevator'),
+    );
+
+    expect(improvementsAt(board, asTileIndex(WORKED))).toEqual([
+      asImprovementId('space-elevator'),
+      ROAD,
+    ]);
+  });
+
+  it('states the shipped catalog’s coincidence: every shipped row is named after its kind', () => {
+    // The state-level ranking above reads an id against the *kind* vocabulary, which is
+    // only the same question as "which kind is this row?" while `id` and `kind` agree —
+    // and the shipped catalog is exactly that case. Pinned rather than assumed, because
+    // it is a coupling between content and the hashed stored order: renaming a shipped
+    // row's id would change where that row's pairs sort (its id would rank `-1`), which
+    // is a behaviour change nobody would see in a diff of the catalog alone. A consumer
+    // that has the ruleset reads the row's own `kind` field instead
+    // (`improvementDef(ruleset, id)?.kind` — `packages/sim`'s worker-job ranking), and
+    // that reading is the proper derivation of a kind from a stored id.
+    const catalog = CATALOG.improvements;
+    expect(catalog.length).toBeGreaterThan(0);
+    for (const row of catalog) expect(row.id).toBe(row.kind);
+    // ...and the engine's vocabulary contains every kind the catalog uses, so no
+    // shipped row can be the `-1` case.
+    for (const row of catalog) expect(IMPROVEMENT_KINDS).toContain(row.kind);
+
+    // The same statement against a *renamed* catalog, which is what the caveat above
+    // is about: the rows' kinds are unchanged, but the stored order now follows the ids.
+    const renamed: readonly ImprovementDef[] = catalog.map((row) => ({
+      ...row,
+      id: asImprovementId(`zz-${row.kind}`),
+    }));
+    const board = withImprovement(
+      withImprovement(state([]), asTileIndex(WORKED), asImprovementId('zz-road')),
+      asTileIndex(WORKED),
+      asImprovementId('zz-mine'),
+    );
+    expect(improvementsAt(board, asTileIndex(WORKED))).toEqual([
+      asImprovementId('zz-mine'),
+      asImprovementId('zz-road'),
+    ]);
+    expect(renamed.map((row) => row.kind)).toEqual(catalog.map((row) => row.kind));
   });
 
   it('never stores the same pair twice, and is idempotent', () => {

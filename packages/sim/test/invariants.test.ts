@@ -28,6 +28,7 @@
 
 import {
   DEFAULT_SETTINGS,
+  IMPROVEMENT_KINDS,
   MIN_GROWTH_FOOD,
   applyCommand,
   asCityId,
@@ -63,8 +64,8 @@ import {
 import { CATALOG, validateRuleset, type Catalog, type Ruleset } from '@civts/rules';
 import { describe, expect, it } from 'vitest';
 
-import { CORE_INVARIANTS, checkInvariants } from '@civts/sim';
-import type { Invariant, InvariantContext, Violation } from '@civts/sim';
+import { CORE_INVARIANTS, SIMPLE_POLICY, checkInvariants, runSimulation } from '@civts/sim';
+import type { Invariant, InvariantContext, SimulationResult, Violation } from '@civts/sim';
 
 /* ------------------------------------------------------------------ *
  * Fixtures
@@ -749,7 +750,7 @@ describe('every invariant fires on a deliberately broken state', () => {
     );
     expect(full).toHaveLength(1);
     expect(full[0]).toContain(`outside [0, ${String(reduced)})`);
-    expect(full[0]).toContain('no growth-food building was completed or demolished');
+    expect(full[0]).toContain('no growth-food building was completed');
 
     // Clean: one food below it. The pair is what makes the case above evidence.
     expect(
@@ -768,35 +769,198 @@ describe('every invariant fires on a deliberately broken state', () => {
       ),
     ).toEqual([]);
 
-    // The symmetric case: a bankrupt owner's buildings are demolished after production,
-    // which can take a growth-food building away and *raise* the threshold again. The
-    // ledger names the player, never the buildings, so the reduced bound is not claimed
-    // for that city this turn — the bare bound above still is.
+    // **A shortfall is NOT an exemption, and this is the configuration that used to
+    // escape.** The check formerly shared its threshold predicate with
+    // `city-food-conservation`, which genuinely needs the shortfall case; the box bound
+    // inherited it and could therefore only ever *suppress a real violation*. It cannot
+    // need it: a demolition removes rows, and removing rows removes `growth-food`
+    // reductions, so the after-state's threshold is **at or above** the one growth
+    // measured the box against — and growth spends a box that reaches its requirement.
+    // On shipped content the demolished row is never the granary either (it pays no
+    // maintenance, and `disbandBuildings` skips every row whose maintenance is `<= 0`).
+    const shortfall: readonly GameEvent[] = [
+      { type: 'TreasuryShortfall', playerId: held.owner, unpaid: 3 },
+    ];
+    const caught = messagesOf(
+      'city-food-box-within-threshold',
+      contextFor({ state: withBox(reduced), events: shortfall }),
+    );
+    expect(caught).toHaveLength(1);
+    expect(caught[0]).toContain(`outside [0, ${String(reduced)})`);
+    expect(caught[0]).toContain('growth-food building was completed');
+
+    // ...and it is scoped to the events, not to bankruptcy in general: ANOTHER player's
+    // shortfall leaves the same box caught too (it always did — this is the paired case
+    // that shows the exemption was player-scoped, not a blanket mute).
+    const otherPlayer = mustFind(
+      BASE.players.find((player) => player.id !== held.owner && player.kind === 'civ'),
+      'a second civilization',
+    );
     expect(
       messagesOf(
         'city-food-box-within-threshold',
         contextFor({
           state: withBox(reduced),
-          events: [{ type: 'TreasuryShortfall', playerId: held.owner, unpaid: 3 }],
+          events: [{ type: 'TreasuryShortfall', playerId: otherPlayer.id, unpaid: 3 }],
         }),
       ),
-    ).toEqual([]);
+    ).toHaveLength(1);
 
-    // ...and that exemption is a relaxation between the bounds, never of them: a box at
-    // the bare size still fires for the same bankrupt owner.
+    // A box below the reduced threshold is legal in every one of these configurations,
+    // so the assertions above are about the bound and not about "any hand-built box
+    // fires".
     expect(
       messagesOf(
         'city-food-box-within-threshold',
-        contextFor({
-          state: withBox(bare),
-          events: [{ type: 'TreasuryShortfall', playerId: held.owner, unpaid: 3 }],
-        }),
+        contextFor({ state: withBox(reduced - 1), events: shortfall }),
+      ),
+    ).toEqual([]);
+
+    // ...and the unconditional bound is untouched by any of it: a box at the bare size
+    // still fires for the same bankrupt owner.
+    expect(
+      messagesOf(
+        'city-food-box-within-threshold',
+        contextFor({ state: withBox(bare), events: shortfall }),
       ),
     ).toHaveLength(1);
 
     // Clean on the played state as it stands — the paired case for every branch above.
     expect(messagesOf('city-food-box-within-threshold', contextFor({ state: BASE }))).toEqual([]);
   });
+
+  it('city-food-conservation keeps the shortfall exemption the box bound gave up', () => {
+    // The other half of the split, and the reason the predicate was SPLIT rather than
+    // narrowed: this check re-runs the growth arithmetic against the after-state's rows,
+    // so a demolition in the same turn leaves it unable to know what growth did — and
+    // the ledger names the player who went short, never the rows that left. A shared,
+    // narrowed predicate would make this check report a false positive on a real
+    // bankruptcy turn, which is why the two checks no longer share one.
+    const city = mustFind(FINAL.state.cities[0], 'a city in the final state');
+    const polluted = withCity(FINAL.state, city.id, (candidate) => ({
+      ...candidate,
+      foodBox: candidate.foodBox + 1,
+    }));
+    const unexplained: readonly GameEvent[] = [
+      ...FINAL.events,
+      { type: 'TreasuryShortfall', playerId: city.owner, unpaid: 5 },
+    ];
+
+    // The same bookkeeping error, with and without the demolition the shortfall stands
+    // for: caught in the one case, skipped in the other. Both directions asserted, so
+    // the exemption cannot be a blanket mute.
+    expect(
+      messagesOf(
+        'city-food-conservation',
+        contextFor({ state: polluted, previous: FINAL.previous, events: FINAL.events }),
+      ),
+    ).toHaveLength(1);
+    expect(
+      messagesOf(
+        'city-food-conservation',
+        contextFor({ state: polluted, previous: FINAL.previous, events: unexplained }),
+      ),
+    ).toEqual([]);
+  });
+
+  /**
+   * **The 200-seed safety sweep.** The bound the box check gave up its exemption for is
+   * *wider* than it was, so the risk it introduces is a false positive on ordinary play —
+   * a false alarm stops a run, truncates its horizon, and turns every aggregate folded
+   * over the batch into a mean over games of different lengths (the FINDING A
+   * consequence). This drives 200 real games of 20 turns each through the same runner the
+   * CLI uses, with the shipped catalog, and asserts the whole registry stays quiet.
+   *
+   * The sweep is deliberately a *safety* net rather than the sensitivity evidence:
+   * shipped play covers a shortfall by disbanding units (M4b), so few or no turns in it
+   * carry the `TreasuryShortfall` the changed clause was about. Sensitivity lives in the
+   * two tests above — the targeted `reduced`-box-with-a-shortfall configuration, and the
+   * forced-bankruptcy branch test, where a demolition really happens — and in the probe
+   * below, which rebuilds that configuration from every city in this very sweep.
+   */
+  const SWEEP_SEEDS: readonly number[] = Array.from({ length: 200 }, (_, index) => index + 1);
+  const SWEEP_TURNS = 20;
+  let sweepCache:
+    readonly { readonly seed: number; readonly result: SimulationResult }[] | undefined;
+  const sweep = (): readonly { readonly seed: number; readonly result: SimulationResult }[] => {
+    sweepCache ??= SWEEP_SEEDS.map((seed) => ({
+      seed,
+      result: runSimulation({
+        seed,
+        settings: { ...DEFAULT_SETTINGS, seed, mapSize: 'tiny', civCount: 2 },
+        ruleset: RULESET,
+        policies: [SIMPLE_POLICY, SIMPLE_POLICY],
+        maxTurns: SWEEP_TURNS,
+      }),
+    }));
+    return sweepCache;
+  };
+
+  it('reports nothing across 200 seeds of real play (the widened bound is quiet)', () => {
+    const runs = sweep();
+    expect(runs).toHaveLength(200);
+
+    // Every violation of every turn of every game, by name: the CLI's 0-violations claim
+    // over four times the seeds of the acceptance run.
+    const violations = runs.flatMap(({ result }) => result.violations);
+    expect(
+      violations.map((violation) => `${violation.invariant}@${String(violation.turn)}`),
+    ).toEqual([]);
+    // ...and every run reached its horizon, so nothing was truncated and no aggregate is
+    // a mean over games of different lengths.
+    expect([...new Set(runs.map(({ result }) => result.stoppedBecause))]).toEqual(['max-turns']);
+
+    // Non-vacuity, so "nothing fired" is not "nothing happened": the sweep really played
+    // 8000 player-turns, cities were founded and grew, and buildings were put up — which
+    // is what the food-box check needs in order to have anything to say.
+    const rows = runs.flatMap(({ result }) => result.metrics);
+    expect(rows).toHaveLength(SWEEP_SEEDS.length * SWEEP_TURNS * 2);
+    expect(rows.filter((row) => row.population > 0).length).toBeGreaterThan(0);
+    expect(rows.reduce((total, row) => total + row.population, 0)).toBeGreaterThan(rows.length);
+    expect(rows.reduce((total, row) => total + row.buildings, 0)).toBeGreaterThan(0);
+  }, 300_000);
+
+  it('fires for every reduced-threshold city in that sweep, shortfall or not (the escape is closed)', () => {
+    // The configuration the old shared predicate let through, rebuilt from *real* cities
+    // rather than from one fixture: every city in the 200-seed sweep whose buildings
+    // genuinely lower its threshold, with its box set exactly at that threshold — caught
+    // when nothing happened this turn, and (the fix) caught identically when its owner
+    // reported a shortfall. The two message lists must be the same list, so the clause is
+    // gone rather than merely reordered.
+    const probes = sweep().flatMap(({ seed, result }) =>
+      result.finalState.cities.flatMap((city) => {
+        const bare = foodBoxSize(city.population);
+        const reduced = reducedThreshold(city);
+        if (reduced >= bare) return []; // no growth-food row: this bound is not stricter here
+        return [{ seed, state: result.finalState, city, reduced }];
+      }),
+    );
+    // Non-vacuity: the sweep really contains cities a `growth-food` building lowers the
+    // threshold for, so the loop below is not an empty loop.
+    expect(probes.length).toBeGreaterThan(0);
+
+    for (const { state, city, reduced } of probes) {
+      const full = withCity(state, city.id, (candidate) => ({ ...candidate, foodBox: reduced }));
+      const plain = messagesOf('city-food-box-within-threshold', contextFor({ state: full }));
+      const withShortfall = messagesOf(
+        'city-food-box-within-threshold',
+        contextFor({
+          state: full,
+          events: [{ type: 'TreasuryShortfall', playerId: city.owner, unpaid: 1 }],
+        }),
+      );
+
+      expect(plain).toHaveLength(1);
+      expect(plain[0]).toContain(`outside [0, ${String(reduced)})`);
+      expect(withShortfall).toEqual(plain);
+    }
+
+    console.log(
+      `food-box sweep: ${String(probes.length)} reduced-threshold city probes over ` +
+        `${String(SWEEP_SEEDS.length)} seeds x ${String(SWEEP_TURNS)} turns, all caught with and ` +
+        `without the owner's shortfall`,
+    );
+  }, 300_000);
 
   it('city-shields-non-negative: a negative shield pool', () => {
     const ctx = contextFor({
@@ -1001,6 +1165,43 @@ describe('every invariant fires on a deliberately broken state', () => {
     });
     expect(messagesOf('improvements-sorted-and-unique', duplicated)[0]).toContain('contract order');
     expect(messagesOf('improvements-sorted-and-unique', contextFor({ state: BASE }))).toEqual([]);
+  });
+
+  it('improvements-sorted-and-unique: ids the kind vocabulary does not contain still have an order', () => {
+    // The pair list is an order on **ids**, and the kind vocabulary is only the first key
+    // (a stored id that names a kind ranks by that kind's position; see the writer in
+    // `core/improvements.ts`). Two ids that name no kind both rank `-1`, and the spelling
+    // tie-break is what separates them — without it the writer's insert position would
+    // decide their order, and the invariant would either miss a real disorder or reject
+    // the order the writer itself produced. Both directions are asserted here, so the two
+    // statements cannot drift: the spelling order passes, the reverse is reported.
+    const alpha = asImprovementId('alpha');
+    const zeta = asImprovementId('zeta');
+    const tile = asTileIndex(321);
+    const ordered = contextFor({
+      state: {
+        ...BASE,
+        improvements: [
+          { tile, kind: alpha },
+          { tile, kind: zeta },
+        ],
+      },
+    });
+    const reversed = contextFor({
+      state: {
+        ...BASE,
+        improvements: [
+          { tile, kind: zeta },
+          { tile, kind: alpha },
+        ],
+      },
+    });
+
+    expect(messagesOf('improvements-sorted-and-unique', ordered)).toEqual([]);
+    expect(messagesOf('improvements-sorted-and-unique', reversed)[0]).toContain('contract order');
+    // Non-vacuity: the two ids really are outside the vocabulary, so the case above is
+    // about the tie-break rather than about two ranked kinds.
+    for (const id of [alpha, zeta]) expect(IMPROVEMENT_KINDS).not.toContain(String(id));
   });
 
   it('resources-sorted-and-unique: two resources on one tile, and an unordered list', () => {

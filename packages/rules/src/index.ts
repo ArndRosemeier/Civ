@@ -407,10 +407,16 @@ export const CATALOG: Catalog = {
       // that declares `requiresResource`, so "a city connected by road to a
       // strategic resource may build the unit that needs it, and one that is not
       // may not" is a rule a real game exercises rather than one only a hand-built
-      // ruleset view can reach. It is **appended deliberately**: `hut.ts` gives
-      // away and spawns "the first `military`-role land unit in catalog order",
-      // which must stay the warrior, and the REPL lists catalog rows in data
-      // order.
+      // ruleset view can reach. It is **appended deliberately**, and the reason is
+      // recorded rather than left as a habit: at the time it was added `hut.ts` gave
+      // away and spawned "the first `military`-role land unit in catalog order", so
+      // appending was what kept the free unit the warrior. That reader is now
+      // canonical — "the **cheapest** `military`-role land unit, ties broken by id"
+      // — and the swordsman costs 3 against the warrior's 1, so appending is no
+      // longer load-bearing for hut rewards; it is kept because the REPL lists
+      // catalog rows in data order and because the order is part of the ruleset's
+      // hashed identity, where a gratuitous move would be a behaviour change nobody
+      // could see in a diff.
       id: asUnitTypeId('swordsman'),
       role: 'military',
       name: 'Swordsman',

@@ -540,6 +540,36 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
   //    A view with no resource catalog places nothing: `resourceCatalog` is the
   //    one place that decides what "no catalog" means, and an M2-era structural
   //    stand-in is precisely a world with no resources in it.
+  //
+  //    **ROW ORDER IS PART OF THE RULESET'S IDENTITY, and this loop is where that
+  //    is a stated rule rather than an accident.** The draws below come from the
+  //    map RNG `perRow` times per row *in row order*, so permuting
+  //    `CATALOG.resources` permutes the world: the same seed on the same terrain
+  //    places different resources, before any player has moved. That coupling is
+  //    deliberate, and the reason it is safe is that the ruleset hash covers row
+  //    order — two catalogs that differ *only* in row order have different
+  //    identities by construction. Measured on the shipped catalog:
+  //
+  //      hashValue(validateRuleset(CATALOG))                      -> e69bfbaab6d3bba4
+  //      the same catalog with `resources` and `units` reversed  -> 0b6d39501ac57528
+  //
+  //    `gen.test.ts` pins that property (and the world difference it licenses). So a
+  //    replay (M11) run against a differently-ordered catalog is *detected* by the
+  //    identity check — the two runs' identities differ — rather than silently
+  //    producing a different game that looks like the same ruleset. The engine's
+  //    behaviour is a pure function of the ruleset's *identity*, and "content plus
+  //    row order" is that identity; what must never happen is a dependence on
+  //    something *outside* it, such as a sort's stability, a hash map's iteration
+  //    order, or the order in which rows happened to be appended.
+  //
+  //    The algorithm itself is deliberately left row-ordered rather than made
+  //    canonical per row: a different draw schedule would move every golden and
+  //    every world, which is a behaviour change nobody asked for and which buys
+  //    nothing here — the row order is already inside the hashed identity. What was
+  //    missing was not a different algorithm but this paragraph and the test that
+  //    checks the property. (`hut.ts`' `rewardUnitDef` is the opposite case and was
+  //    changed: no hashed value depended on which military row a hut picked, so that
+  //    pick was free to become canonical.)
   const resourceRows = resourceCatalog(ruleset);
   const resources: TileResource[] = [];
 
