@@ -29,7 +29,6 @@ import {
   type MapSize,
   type Result,
   type RulesetView,
-  type SettingsIssue,
 } from '@civts/core';
 import {
   CATALOG,
@@ -38,7 +37,6 @@ import {
   validateRuleset,
   type ProvenanceRow,
   type ProvenanceSection,
-  type RulesetError,
 } from '@civts/rules';
 import { hashValue } from '@civts/testing';
 
@@ -52,6 +50,7 @@ import {
   runInteractive,
   runScript,
 } from './repl.js';
+import { SIM_POLICIES, formatRulesetError, formatSettingsIssue, runSimCommand } from './sim-cli.js';
 
 const USAGE = `civts — headless tooling
 
@@ -62,7 +61,10 @@ Commands:
                improvements)
   map          generate a world, render it as ASCII, print its state hash
   play         interactive text REPL: play the game from a terminal or a script
-  run          headless AI-vs-AI game                     (arrives in M7)
+  sim          run a batch of headless games and report per-metric aggregates and
+               every invariant's verdict; see "civts sim --help"
+  run          headless AI-vs-AI game                     (arrives in M7; "sim" is the
+               batch harness that exists today)
 
 Options:
   -h, --help   show this help
@@ -80,6 +82,23 @@ play options:
   --god               render the whole map and ignore fog  (default: off)
   --script <file>     run a command file, print the transcript, exit 0
 
+sim options (the full text is in "civts sim --help"):
+  --seeds <spec>      games to run: "1..50", "3", "1,4,7", "1..3,9" (default: 1..10)
+  --map-size <size>   ${MAP_SIZES.join('|')}  (default: tiny)
+  --civs <int>        civilizations per game               (default: 2)
+  --turns <int>       turns to play per game               (default: 20)
+  --policy <name>     ${SIM_POLICIES.join('|')}  (default: simple)
+  --sample-every <n>  sample metrics every n turns          (default: 1)
+  --override <p>=<v>  change ONE catalog number for the batch, e.g.
+                      --override units.settler.cost=4 (repeatable)
+  --fault <name>      append a deliberately failing invariant named <name>, so the
+                      violation path can be watched firing end to end (self-test)
+  --json              emit one canonical JSON report (sorted keys) instead of text
+
+  a violation anywhere in the batch is named, with its seed and turn, and exits 1;
+  that is the command working, not failing. "exit 0" means every run held every
+  invariant.
+
 play commands (inside a session; "help" prints the same list with detail):
   move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
@@ -94,6 +113,9 @@ Examples:
   pnpm map --seed 42
   pnpm play --seed 42 --map-size tiny --civs 2 --player 0
   pnpm play --seed 42 --script session.txt
+  npx tsx packages/headless/src/cli.ts sim --seeds 1..10 --turns 20
+  npx tsx packages/headless/src/cli.ts sim --seeds 1..3 --override units.settler.cost=4 --json
+  npx tsx scripts/balance-sweep.ts
 `;
 
 const MAP_USAGE = `usage: civts map [--seed <int>] [--map-size <size>] [--civs <int>]
@@ -102,21 +124,6 @@ const MAP_USAGE = `usage: civts map [--seed <int>] [--map-size <size>] [--civs <
   --map-size <size>   one of ${MAP_SIZES.join('|')} (default tiny)
   --civs <int>        number of civilizations, 2..16 (default 2)
 `;
-
-const formatError = (e: RulesetError): string => {
-  switch (e.kind) {
-    case 'empty-catalog':
-      return `empty catalog: ${e.catalog}`;
-    case 'duplicate-id':
-      return `duplicate id in ${e.catalog}: ${e.id}`;
-    case 'placeholder-in-cited-only':
-      return `placeholder row in cited-only mode: ${e.catalog}/${e.id} (${e.note})`;
-    case 'invalid-value':
-      return `invalid value: ${e.catalog}/${e.id}.${e.field} — ${e.detail}`;
-    case 'missing-role':
-      return `no terrain fills role "${e.role}"`;
-  }
-};
 
 /** Width of the provenance kind column: `placeholder` is the longest kind. */
 const PROVENANCE_KIND_WIDTH = 11;
@@ -157,7 +164,7 @@ const provenanceSectionLines = (section: ProvenanceSection, idWidth: number): re
 const commandProvenance = (): number => {
   const validated = validateRuleset(CATALOG, 'tuned');
   if (!validated.ok) {
-    for (const e of validated.error) console.error(`ruleset error: ${formatError(e)}`);
+    for (const e of validated.error) console.error(`ruleset error: ${formatRulesetError(e)}`);
     return 1;
   }
 
@@ -231,9 +238,6 @@ const parseMapArgs = (args: readonly string[]): Result<MapFlags, string> => {
   return ok({ seed, mapSize, civCount });
 };
 
-const formatSettingsIssue = (issue: SettingsIssue): string =>
-  `${issue.path === '' ? '<root>' : issue.path}: ${issue.message}`;
-
 /**
  * The one place output goes. `process.exitCode` (never `process.exit`) is used by
  * `main`'s caller so that stdout is fully flushed before the process ends —
@@ -274,7 +278,7 @@ const commandMap = (args: readonly string[]): number => {
 
   const validated = validateRuleset(CATALOG, settings.value.fidelity);
   if (!validated.ok) {
-    for (const e of validated.error) console.error(`ruleset error: ${formatError(e)}`);
+    for (const e of validated.error) console.error(`ruleset error: ${formatRulesetError(e)}`);
     return 1;
   }
 
@@ -344,7 +348,7 @@ const commandPlay = async (args: readonly string[]): Promise<number> => {
 
   const validated = validateRuleset(CATALOG, settings.value.fidelity);
   if (!validated.ok) {
-    for (const e of validated.error) console.error(`ruleset error: ${formatError(e)}`);
+    for (const e of validated.error) console.error(`ruleset error: ${formatRulesetError(e)}`);
     return 1;
   }
 
@@ -389,6 +393,36 @@ const commandPlay = async (args: readonly string[]): Promise<number> => {
   return runInteractive(session, writeOut);
 };
 
+/* ------------------------------------------------------------------ *
+ * `sim` — a batch of headless games, and the report over it.
+ *
+ * Every part of this command lives in `sim-cli.ts` (flags, the run, the
+ * structured report, the text renderer), and this function is the wiring the
+ * other commands' functions are: it writes the text it was handed and returns
+ * the exit code it was handed. Nothing here interprets a report, so there is no
+ * second place where a figure could be recomputed and disagree with the engine —
+ * the M2 provenance bug, which the standing requirement's "Reporting" paragraph
+ * exists to prevent.
+ * ------------------------------------------------------------------ */
+
+const commandSim = (args: readonly string[]): number => {
+  const result = runSimCommand(args);
+  if (!result.ok) {
+    for (const line of result.error.lines) console.error(line);
+    if (result.error.usage !== undefined) {
+      console.error('');
+      console.error(result.error.usage);
+    }
+    return result.error.exitCode;
+  }
+
+  process.stdout.write(result.value.stdout);
+  // In `--json` mode the machine-readable report is on stdout and the shout about a
+  // violation is on stderr, so a pipeline that parses stdout still sees the warning.
+  if (result.value.stderr !== '') process.stderr.write(result.value.stderr);
+  return result.value.exitCode;
+};
+
 const main = async (argv: readonly string[]): Promise<number> => {
   const [command, ...rest] = argv;
 
@@ -404,8 +438,12 @@ const main = async (argv: readonly string[]): Promise<number> => {
       return commandMap(rest);
     case 'play':
       return commandPlay(rest);
+    case 'sim':
+      return commandSim(rest);
     case 'run':
-      console.log('run: the headless self-play harness arrives in M7.');
+      console.log(
+        'run: the M7 self-play harness is not built yet; "sim" runs batches headlessly today.',
+      );
       return 0;
     default:
       console.error(`unknown command: ${command}`);

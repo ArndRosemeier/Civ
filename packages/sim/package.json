@@ -1,15 +1,14 @@
 {
-  "name": "@civts/headless",
+  "name": "@civts/sim",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/cli.ts"
+    ".": "./src/index.ts"
   },
   "dependencies": {
     "@civts/core": "workspace:*",
     "@civts/rules": "workspace:*",
-    "@civts/sim": "workspace:*",
     "@civts/testing": "workspace:*"
   }
 }

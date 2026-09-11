@@ -1,0 +1,354 @@
+/**
+ * `runSimulation` — the simulation loop.
+ * See docs/INTERFACES.md, "STANDING REQUIREMENT — simulation-first" (point 1,
+ * "Runnable without a UI, at scale, deterministically") and its "`@civts/sim`
+ * contract" (`SimulationOptions` / `SimulationResult`).
+ *
+ * ## What a run is
+ *
+ * A game is a pure function of `(seed, settings, ruleset, policies)`. This module
+ * is that function written out: `newGame` builds the world, then for up to
+ * `maxTurns` turns each **civilization** is polled in **player-id order**, every
+ * command it returns is applied through `applyCommand` (never by mutating state),
+ * the world advances with `advanceTurn`, and **every invariant runs on every
+ * turn** — checked in flight rather than only at the end, which is what makes a
+ * violation be caught where it happened.
+ *
+ * ## The five decisions this file had to make, and why
+ *
+ * 1. **A violation is recorded, never swallowed, and stops the run.** Every
+ *    violation the registry returns on the violating turn is appended to the
+ *    result and the loop breaks, so `finalState` *is* the state that broke and can
+ *    be inspected (hashed, diffed, replayed). Nothing is filtered, deduplicated or
+ *    summarised: an invariant's own message is the evidence.
+ * 2. **Only a violation truncates a run.** The run otherwise plays exactly
+ *    `maxTurns` turns. `stoppedBecause: 'no-commands'` is therefore a *report*, not
+ *    an early exit: it says no command was ever applied — every policy was silent,
+ *    or everything it proposed was refused — so the turns that were played contain
+ *    no decisions at all. Stopping early on a quiet turn was rejected: a turn in
+ *    which nobody has anything to do is a normal turn (a city between builds, an
+ *    army out of movement), and truncating there would make the length of a batch's
+ *    runs depend on a policy's tempo rather than on `maxTurns`.
+ * 3. **The turn boundary belongs to the runner, not to a policy.** A command of
+ *    type `EndTurn` returned by a policy is dropped, with this reason: the runner
+ *    advances the world itself immediately after the poll, so applying a policy's
+ *    `EndTurn` as well would play two turns for one iteration — and every metric
+ *    row and violation is numbered by the turn, so "one iteration, one turn" is
+ *    structural rather than cosmetic. The shipped policies never return one.
+ * 4. **A refused command is not applied and is not recorded.** `applyCommand` is
+ *    pure and total-or-typed: a refusal returns the input state, so nothing moves,
+ *    no revision is bumped and no event appears. The frozen `SimulationResult` has
+ *    no field for refusals and `Violation` is defined as *an invariant's* message,
+ *    so inventing either would be a contract change rather than an improvement —
+ *    what the runner guarantees instead is that a refusal cannot change the
+ *    *state*, and `policies.test.ts` asserts the shipped policies propose nothing
+ *    the applier refuses. It also counts: a run in which every proposal was refused
+ *    reports `'no-commands'`.
+ * 5. **Simultaneous turns, sequential within a turn.** Every civilization plays the
+ *    *same* world turn, and each is polled against the state as it stands when its
+ *    turn to act comes — so player 1 sees player 0's commands of that turn. The
+ *    alternative (polling everyone against one snapshot) would need a merge rule
+ *    the engine does not have: there is no "apply a list of commands atomically"
+ *    in the contract, and inventing one here would be a second applier.
+ *
+ * ## The policy RNG stream, and the one thing it must never touch
+ *
+ * A policy draws from **its own** stream, never `state.rng`. If a policy consumed
+ * the world's stream, changing the AI would change the world, and two policies
+ * could not be compared on the same seed — which is the whole point of having
+ * policies. `policyRngFor` derives that stream from the seed alone:
+ *
+ * - one stream **per (seed, player)** — the contract's own example, `seed + player
+ *   index`, expanded through the engine's `seedRng` (sfc32);
+ * - advanced **one draw per turn**, so a civilization's stream is a real sequence
+ *   across a game rather than the same four words replayed;
+ * - and it is a **pure function of `(seed, playerId, turn)`**, with no cursor
+ *   carried by the loop. That is the strongest spelling of "derived from the seed":
+ *   there is no shared mutable stream whose advance could depend on how many
+ *   commands a policy happened to return, no way for one civilization's draws to
+ *   shift another's, and no way for a policy's own randomness to perturb the world.
+ *   The price is `O(turn)` sfc32 steps per poll, which at any simulation length this
+ *   engine plays is nothing (a 32-bit mix each).
+ *
+ * ## What the runner does not do
+ *
+ * No I/O, no clock, no `Math.random`, no console: a run is a value. Reporting is a
+ * renderer over the result (`@civts/sim`'s reporting half), never a `console.log`
+ * inside the loop — the standing requirement's "one source of truth" rule, which
+ * the M2 provenance summary broke by computing a figure the structured value did
+ * not carry.
+ */
+
+import {
+  advanceTurn,
+  applyCommand,
+  civPlayers,
+  newGame,
+  nextUint32,
+  seedRng,
+  type GameEvent,
+  type GameState,
+  type PlayerId,
+  type RngState,
+  type RulesetView,
+  type SetupError,
+} from '@civts/core';
+import { hashValue } from '@civts/testing';
+
+import { CORE_INVARIANTS, checkInvariants } from './invariants.js';
+import { sampleTurn } from './metrics.js';
+import type {
+  Policy,
+  PolicyContext,
+  SimulationOptions,
+  SimulationResult,
+  StopReason,
+  TurnMetrics,
+  Violation,
+} from './types.js';
+
+/* ------------------------------------------------------------------ *
+ * The policy RNG stream
+ * ------------------------------------------------------------------ */
+
+/**
+ * The stream policy `playerId` draws from on turn `turn` of a game seeded `seed`.
+ *
+ * `seed + player index`, expanded through the engine's `seedRng` (sfc32) — the
+ * contract's own example — then stepped forward one draw per turn, so a
+ * civilization's stream is a sequence across the game rather than a fixed four
+ * words.
+ *
+ * **Pure in all three arguments**, deliberately: the runner keeps no cursor, so the
+ * stream a policy is handed cannot depend on how many draws another policy made, on
+ * the order civilizations were polled, or on how many commands were returned. Two
+ * runs of the same seed therefore hand every policy the same series of streams, and
+ * a policy can be swapped without moving any stream but its own — which is the
+ * property `runner.test.ts` proves directly.
+ */
+export const policyRngFor = (seed: number, playerId: PlayerId, turn: number): RngState => {
+  let cursor = seedRng(seed + Number(playerId));
+  // Turn 1 is the stream's first state, turn 2 its second, and so on. A non-positive
+  // or fractional `turn` (a caller sampling outside a run) collapses to the first
+  // state rather than throwing: this is a derivation, and its totality is what keeps
+  // it usable from a test that only wants "the stream for player 0".
+  const steps = Number.isInteger(turn) && turn > 1 ? turn - 1 : 0;
+  for (let step = 0; step < steps; step += 1) {
+    cursor = nextUint32(cursor)[1];
+  }
+  return cursor;
+};
+
+/* ------------------------------------------------------------------ *
+ * Arguments
+ * ------------------------------------------------------------------ */
+
+/** How a setup failure reads in the thrown message. */
+const describeSetupError = (error: SetupError): string => {
+  switch (error.kind) {
+    case 'missing-terrain-role':
+      return `the ruleset describes no terrain for role "${error.role}", so no world can be generated`;
+    case 'missing-unit-role':
+      return `the ruleset describes no unit for role "${error.role}", so no game can be started`;
+    case 'no-valid-starts':
+      return `the world has no valid start position for ${String(error.civCount)} civilizations`;
+    case 'too-few-start-candidates':
+      return 'the world has too few candidate start positions for the civilizations asked for';
+  }
+};
+
+/**
+ * The metrics sampling stride, validated rather than trusted.
+ *
+ * A stride of `0` or a fraction would silently sample nothing (or sample on a
+ * comparison that never holds), and a balance report that quietly contains no rows
+ * is worse than a thrown argument error — the same reading `nextBelow` takes of its
+ * bound, and the reason numeric flags are validated in the CLI.
+ */
+const samplingStride = (sampleEvery: number | undefined): number => {
+  if (sampleEvery === undefined) return 1;
+  if (!Number.isInteger(sampleEvery) || sampleEvery < 1) {
+    throw new Error(
+      `sampleEvery must be a positive integer (a sampling stride), got ${String(sampleEvery)}`,
+    );
+  }
+  return sampleEvery;
+};
+
+/**
+ * The seed, validated rather than trusted: a seed is a whole number.
+ *
+ * `seedRng` narrows with `| 0` and `generateWorld` mixes 32-bit words, so a
+ * fractional seed is *silently truncated* for the randomness while the state stores
+ * the fraction it was given as `state.seed` — the state's own record of its seed
+ * would then disagree with the stream it was generated from, and two "different"
+ * seeds 0.5 apart would produce the same world. A seed that is not a whole number is
+ * a typo, and a typo that produces a plausible game is the one failure a simulation
+ * harness must not have — so it is refused, and `runner.test.ts` pins the refusal.
+ */
+const checkedSeed = (seed: number): number => {
+  if (!Number.isInteger(seed)) {
+    throw new Error(
+      `seed must be a whole number (a fractional seed is truncated by the RNG while the ` +
+        `state stores it verbatim), got ${String(seed)}`,
+    );
+  }
+  return seed;
+};
+
+/**
+ * `maxTurns`, validated: a non-negative whole number.
+ *
+ * A fractional cap would play a different number of turns than it named (the loop
+ * counts whole turns), and a negative one would play none — both are "the caller
+ * asked for something and got something else", which is worse than a thrown
+ * argument error. `Infinity` is rejected with them: this is a turn *cap*, and a
+ * caller that wants a long run passes a long run's number.
+ */
+const checkedMaxTurns = (maxTurns: number): number => {
+  if (!Number.isInteger(maxTurns) || maxTurns < 0) {
+    throw new Error(
+      `maxTurns must be a non-negative whole number of turns, got ${String(maxTurns)}`,
+    );
+  }
+  return maxTurns;
+};
+
+/** The policy for `playerId`, or a thrown message naming the caller's mistake. */
+const policyFor = (policies: readonly Policy[], playerId: PlayerId): Policy => {
+  const policy = policies[Number(playerId)];
+  if (policy === undefined) {
+    throw new Error(
+      `policies must supply one policy per civilization, indexed by player id: player ` +
+        `${String(playerId)} has none (policies.length = ${String(policies.length)})`,
+    );
+  }
+  return policy;
+};
+
+/* ------------------------------------------------------------------ *
+ * The run
+ * ------------------------------------------------------------------ */
+
+/**
+ * Play a game headlessly and report what happened.
+ *
+ * The returned `finalState` is the state the loop stopped on: the end of the last
+ * turn played, or — when an invariant fired — the state that broke, which is the
+ * point of stopping there rather than carrying on.
+ *
+ * Throws (there is no failure channel in the frozen result shape) when
+ * `newGame` reports a setup failure, when a civilization has no policy, or when
+ * `sampleEvery` is not a positive integer. All three are caller bugs that would
+ * otherwise produce a *plausible* result — an empty game, a run where one player
+ * never acts, a report with no rows — and a plausible wrong number is the worst
+ * outcome a balance loop can have.
+ */
+export const runSimulation = (options: SimulationOptions): SimulationResult => {
+  const rulesetView: RulesetView = options.ruleset;
+  const seed = checkedSeed(options.seed);
+  const maxTurns = checkedMaxTurns(options.maxTurns);
+
+  const created = newGame(seed, options.settings, rulesetView);
+  if (!created.ok) {
+    throw new Error(
+      `runSimulation: newGame(seed ${String(seed)}, ${options.settings.mapSize}, ` +
+        `${String(options.settings.civCount)} civs) failed — ${describeSetupError(created.error)}`,
+    );
+  }
+
+  const invariants = options.invariants ?? CORE_INVARIANTS;
+  const stride = samplingStride(options.sampleEvery);
+  const metrics: TurnMetrics[] = [];
+  const violations: Violation[] = [];
+
+  let state: GameState = created.value;
+  let turnsPlayed = 0;
+  let appliedCommands = 0;
+  let stopped: StopReason = 'max-turns';
+
+  // Resolve every policy up front, before a single turn is played: a run that would
+  // die on turn 30 because the caller forgot player 2's policy has already burned
+  // 29 turns, and the message is the same either way.
+  for (const player of civPlayers(state)) policyFor(options.policies, player.id);
+
+  for (let step = 0; step < maxTurns; step += 1) {
+    // The turn boundary: what every transition invariant is measured against. It is
+    // taken before any command of this turn, because the commands are exactly what
+    // the checks cannot see (see `invariants.ts` on why `previous` is a boundary
+    // rather than the state the pipeline started from).
+    //
+    // Note that this is **also** the first turn's `previous` — the `newGame` state.
+    // The contract's `InvariantContext` comment ("absent on the first turn") describes
+    // a harness checking a state with no transition behind it; this loop never does
+    // that, because a check only happens after a turn has been played. Handing the
+    // boundary over on turn 1 rather than `undefined` is deliberate: the first turn is
+    // the one that founds cities, and a transition check that skipped it would leave
+    // the busiest transition of a run unchecked.
+    const previous = state;
+    const events: GameEvent[] = [];
+
+    // Civilizations only, in player-id order: barbarians are a player but not a
+    // civilization, and they are never polled (`civPlayers` is the one definition of
+    // "who is a civilization" — re-deriving it here is how the count drifts).
+    for (const player of civPlayers(state)) {
+      const policy = policyFor(options.policies, player.id);
+      const ctx: PolicyContext = {
+        state,
+        playerId: player.id,
+        ruleset: options.ruleset,
+        rng: policyRngFor(seed, player.id, state.turn),
+      };
+
+      for (const command of policy.chooseCommands(ctx)) {
+        // The runner owns the turn boundary — see the module note.
+        if (command.type === 'EndTurn') continue;
+        const outcome = applyCommand(state, player.id, command, rulesetView);
+        if (!outcome.ok) continue;
+        state = outcome.value.state;
+        events.push(...outcome.value.events);
+        appliedCommands += 1;
+      }
+    }
+
+    const advanced = advanceTurn(state, rulesetView);
+    state = advanced.state;
+    events.push(...advanced.events);
+    turnsPlayed += 1;
+
+    // Sampled after the pipeline, so a row describes a fully settled turn: this
+    // turn's income and upkeep ledger is in `events`, and the state is the one the
+    // next turn begins from. The row's `turn` is the state's own turn, so the first
+    // row of a run is turn 2 — turn 1 is `newGame`'s state and nobody played it.
+    if ((turnsPlayed - 1) % stride === 0) metrics.push(...sampleTurn(state, rulesetView, events));
+
+    const found = checkInvariants(
+      {
+        state,
+        previous,
+        ruleset: options.ruleset,
+        rulesetView,
+        events,
+        turn: state.turn,
+      },
+      invariants,
+    );
+    if (found.length > 0) {
+      violations.push(...found);
+      stopped = 'violation';
+      break;
+    }
+  }
+
+  if (stopped !== 'violation' && appliedCommands === 0) stopped = 'no-commands';
+
+  return {
+    seed,
+    turnsPlayed,
+    finalHash: hashValue(state),
+    finalState: state,
+    metrics,
+    violations,
+    stoppedBecause: stopped,
+  };
+};

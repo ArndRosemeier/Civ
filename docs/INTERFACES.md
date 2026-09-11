@@ -1085,3 +1085,157 @@ is regenerated once more (SCHEMA_VERSION 5 → 6). Named owners:
 `packages/core/src/textview.ts`, `packages/rules/src/index.ts`, and the hand-built
 literals in `packages/core/test/*.test.ts`, `packages/testing/test/*.test.ts` and
 `packages/headless/test/repl.test.ts`.
+
+---
+
+# STANDING REQUIREMENT — simulation-first (applies to every wave from here on)
+
+The principal's instruction: *systems must be simulation friendly so they can be
+tested and balanced.* This is not a milestone, it is a property of everything we
+build from M5 onward, and it is cheapest to honour now, while the game is headless
+and there is no UI to keep in sync.
+
+Every future system must satisfy all four:
+
+1. **Runnable without a UI, at scale, deterministically.** A game is a pure function
+   of `(seed, settings, ruleset, policies)`. No wall-clock, no ambient randomness, no
+   console dependency. If a system cannot be exercised headlessly, it is not finished.
+2. **Observable.** A system emits structured, machine-readable state it did not have
+   before, so its effect can be *measured* rather than eyeballed. "It seems to work"
+   is not evidence; a metric is.
+3. **Tunable.** Every magnitude it introduces lives in the rules catalog (or an
+   explicit override), never as a literal buried in logic, so a value can be swept
+   without editing code.
+4. **Checkable in flight, not only at the end.** Its invariants are expressed as
+   named predicates that a simulation can run *every turn*, so a violation is caught
+   where it happens rather than at the final state.
+
+Concretely this is delivered by a new package, **`@civts/sim`**, plus the standing
+rule that **the AI is a replaceable `Policy`, never hard-wired into the engine** —
+M7's self-play needs to swap strategies, and balance work needs to run the same seed
+under different ones.
+
+## `@civts/sim` contract — FROZEN
+
+```ts
+// A named, machine-checkable property of a state.
+export interface Invariant {
+  readonly name: string;                 // stable, kebab-case; appears in output
+  readonly description: string;          // one line, plain language
+  readonly check: (ctx: InvariantContext) => readonly string[];  // violations, empty = holds
+}
+export interface InvariantContext {
+  readonly state: GameState;
+  readonly previous: GameState | undefined;   // absent on the first turn
+  readonly ruleset: Ruleset;
+  readonly rulesetView: RulesetView;
+  readonly events: readonly GameEvent[];      // what just happened
+  readonly turn: number;
+}
+export const CORE_INVARIANTS: readonly Invariant[];
+```
+
+An invariant **returns violations, it does not throw** — so a run reports every
+broken property at once instead of dying on the first. `previous` is what makes
+*transition* invariants (conservation of gold, food and shields) expressible, and a
+conservation invariant that cannot see the previous state is not a conservation
+invariant.
+
+**This closes M3's accepted debt**: the long-run economy checks currently live as
+one-off assertions inside `m3-adversarial.test.ts`. They must be lifted here, so the
+same definitions run in tests *and* every turn of every simulation.
+
+```ts
+export interface Policy {
+  readonly name: string;
+  readonly chooseCommands: (ctx: PolicyContext) => readonly Command[];
+}
+export interface PolicyContext {
+  readonly state: GameState;
+  readonly playerId: PlayerId;
+  readonly ruleset: Ruleset;
+  readonly rng: RngState;        // per-policy, derived from the seed; NEVER the state RNG
+}
+```
+
+A policy draws from its **own** RNG stream, never `state.rng`. If a policy consumed
+the state RNG, changing the AI would change the world, and two policies could not be
+compared on the same seed — which is the whole point of having policies.
+
+```ts
+export interface SimulationOptions {
+  readonly seed: number;
+  readonly settings: Settings;
+  readonly ruleset: Ruleset;
+  readonly policies: readonly Policy[];   // by player index; barbarians are never polled
+  readonly maxTurns: number;
+  readonly invariants?: readonly Invariant[];
+  readonly sampleEvery?: number;          // metrics sampling stride, default 1
+}
+export interface SimulationResult {
+  readonly seed: number;
+  readonly turnsPlayed: number;
+  readonly finalHash: string;
+  readonly finalState: GameState;
+  readonly metrics: readonly TurnMetrics[];
+  readonly violations: readonly Violation[];
+  readonly stoppedBecause: 'max-turns' | 'violation' | 'no-commands';
+}
+```
+
+`runSimulation` runs the frozen turn pipeline, polling each civilization's policy in
+**player-id order**, applying commands through `applyCommand` (never mutating state
+directly), advancing with `advanceTurn`, and checking every invariant every turn.
+A violation is RECORDED, not swallowed, and the run stops after the first violating
+turn so the state that broke can be inspected.
+
+`TurnMetrics` (per turn, per civilization) must be enough to balance from:
+population, city count, unit count, treasury, beakers, luxuries, per-channel income,
+maintenance, units supported, food/shield/commerce totals, buildings held, and the
+state hash. Structured, sorted keys, JSON-round-trippable.
+
+Batch running and aggregation:
+
+```ts
+export function runBatch(options: BatchOptions): BatchResult;   // seeds, aggregate
+```
+
+`BatchResult` carries per-seed results **plus** aggregates (mean/median/min/max for
+each metric, win counts when a victory condition exists), ordered deterministically.
+Aggregation must never depend on object key order or on floating-point summation
+order — state how you guarantee that.
+
+## Balance knobs
+
+`@civts/sim` provides ruleset overrides so one number can be swept without editing
+the catalog:
+
+```ts
+export function applyOverrides(catalog: Catalog, patch: RulesetPatch): Catalog;
+```
+
+`RulesetPatch` is a deep-partial of the catalog by id (e.g. change one unit's cost or
+one tech's price), applied **before** `validateRuleset`, so an override that would
+produce an invalid ruleset fails the same way a hand-edited catalog would. Every
+override is recorded in the result, because a balance number without the ruleset that
+produced it is meaningless.
+
+## Reporting
+
+Human-readable and machine-readable output from ONE source of truth: a structured
+result value plus a text renderer over it. The text renderer must never compute a
+figure the structured value does not contain — that is how the M2 provenance summary
+came to disagree with the CLI.
+
+## Acceptance evidence for this wave
+
+- The same seed and policies give an identical final hash in-process and in a fresh
+  process, and a **different policy changes only the game, never the world's RNG
+  stream**.
+- At least one invariant is proven to FIRE: a deliberately corrupted state (or an
+  override producing an invalid ruleset) is caught by name, not silently accepted.
+  An invariant set that has never failed is not evidence of anything.
+- A batch of 50+ games runs headlessly in a bounded time and reports aggregates.
+- A balance sweep demonstrates the loop end to end: vary one catalog number, run a
+  batch, and show the measured effect. This is the deliverable the principal asked
+  for — the ability to *test and balance* systems, not merely to run them.

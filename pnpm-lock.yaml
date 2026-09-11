@@ -50,6 +50,9 @@ importers:
       '@civts/rules':
         specifier: workspace:*
         version: link:../rules
+      '@civts/sim':
+        specifier: workspace:*
+        version: link:../sim
       '@civts/testing':
         specifier: workspace:*
         version: link:../testing
@@ -59,6 +62,18 @@ importers:
       '@civts/core':
         specifier: workspace:*
         version: link:../core
+
+  packages/sim:
+    dependencies:
+      '@civts/core':
+        specifier: workspace:*
+        version: link:../core
+      '@civts/rules':
+        specifier: workspace:*
+        version: link:../rules
+      '@civts/testing':
+        specifier: workspace:*
+        version: link:../testing
 
   packages/testing:
     dependencies:

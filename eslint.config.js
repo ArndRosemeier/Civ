@@ -35,7 +35,19 @@ export default tseslint.config(
     //   - exponentiation via the `**` operator (pow semantics);
     //   - anything smuggled through a string (`eval`, `Function`) or `globalThis`.
     // Documenting the limit is the point: this is a guardrail, not a sandbox.
-    files: ['packages/core/src/**/*.ts'],
+    //
+    // `packages/sim` is included because it is **simulation infrastructure**, where
+    // the determinism rule is total rather than merely advisable: a run must be a pure
+    // function of `(seed, settings, ruleset, policies)`, so an ambient read anywhere in
+    // its `src/` would make a balance number unreproducible. It was outside this
+    // `files` list when the package landed — `Math.random()` in its `src/` linted
+    // clean, which is exactly the "a new package that escapes the gate" failure this
+    // guard exists to prevent. `packages/sim/test/**` is deliberately NOT listed: a
+    // test may legitimately *measure* the harness with a clock (the invariant-cost
+    // probe in `test/harness-adversarial.test.ts` does), and a ban that stopped a test
+    // from timing anything would be a ban on evidence. The shipped scripts are not
+    // listed either, for the same reason — they report, they do not simulate.
+    files: ['packages/core/src/**/*.ts', 'packages/sim/src/**/*.ts'],
     rules: {
       'no-restricted-properties': [
         'error',

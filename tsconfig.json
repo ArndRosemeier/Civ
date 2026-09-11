@@ -26,8 +26,20 @@
     "paths": {
       "@civts/core": ["packages/core/src/index.ts"],
       "@civts/rules": ["packages/rules/src/index.ts"],
-      "@civts/testing": ["packages/testing/src/index.ts"]
+      "@civts/testing": ["packages/testing/src/index.ts"],
+      "@civts/sim": ["packages/sim/src/index.ts"]
     }
   },
-  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "vitest.config.ts"]
+  // `scripts/` is listed because the balance sweep (`scripts/balance-sweep.ts`, the
+  // standing requirement's "vary one catalog number, run a batch" evidence) is shipped
+  // code that lives outside `packages/`. While it was omitted, `pnpm typecheck` — the
+  // gate — never looked at it: the file was linted and formatted but a type error in it
+  // would have shipped. `scripts/tsconfig.json` extends this file for editors; this
+  // entry is what makes the gate itself cover the directory.
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "scripts/**/*.ts",
+    "vitest.config.ts"
+  ]
 }
