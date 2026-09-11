@@ -293,13 +293,54 @@ and shows the world RNG trajectory is byte-identical while the game differs.
   changed paths were reached*, since a comparison that never enters the changed code
   proves nothing.
 
-## M5 — Technology — **NEXT**
+## M5 — Technology — **DONE** (commit `8a46798`)
 
-- [ ] a tech tree with prerequisites, costs and era progression
-- [ ] research accumulates beakers (inert since M4b) and completes techs
-- [ ] techs gate units, buildings, improvements and resources
-- [ ] a played, city-bearing golden world (see the M4c finding above)
-- [ ] balance evidence for the tech curve produced by the harness, not by eye
+- [x] a 17-tech tree across four ordered eras, with prerequisite **cycle detection** and era ordering
+- [x] research spends the beakers that have been inert since M4b, carrying the surplus
+- [x] tech gating on units, buildings, improvements and resources — one verdict, asked everywhere
+- [x] **a played, city-bearing golden** (fourth hash), closing the measured M4c gap
+- [x] real gate tiers: fast 42.3s / full 93.9s, both inside alpha criterion A5
+- [x] balance evidence from the harness (`scripts/tech-balance-sweep.ts`), not by eye
+
+**The ambiguity I created, and the answer I got back.** My frozen M5 contract said
+research "reads the pool the split just filled" while also placing research *before*
+the money loop in the pipeline — the two halves contradicted each other. I required
+the ambiguity be reported rather than silently resolved, and the implementing agent
+gave the right reading: beakers have exactly one writer and one spender, so research
+consumes what the *previous* turn's money loop banked, meaning a tech completes at
+the start of a turn. Moving research after the money loop would satisfy my literal
+wording but reorder a frozen pipeline. Pinned by a test that discriminates the two:
+2 beakers/turn and 4 banked completes a 5-cost tech on turn 2 with 1 left, not turn 1.
+
+**Two real defects, both invisible to play tests** because no shipped row declares
+`requiresTech` yet: `planSetProduction` asked only the resource gate, so
+`applyCommand` **accepted orders that `cityProductionOptions` refused** — a live
+generator/applier disagreement, the exact keystone property this project exists to
+hold; and `planStartWork` ignored the tech gate entirely, letting a worker start an
+improvement its owner could never finish. Both now ask the single verdict.
+
+**Ruling I made** on an escalated contract question: M4c deliberately refused to
+re-check gating at production completion, deferring the question of whether a
+half-built unit's shields are lost, kept or refunded. M5 made that call — the item
+waits, nothing is charged, shields keep banking, the item is requeued — because it
+also closes the disagreement above. Two texts still asserted the old behaviour,
+including a finding inside `m4c-adversarial.test.ts`; I corrected both myself,
+keeping M4c's original reasoning quoted so the change stays auditable.
+
+### M5 limits
+
+- No shipped row declares `requiresTech` yet, so gating is exercised by ruleset
+  overrides rather than by real content. That is why the two defects above survived
+  play testing, and it is worth remembering when adding gated content in M6+.
+- Luxury resources and `luxuries` remain inert until M9.
+
+## M6 — Combat & barbarians — **NEXT**
+
+- [ ] combat resolution: attack/defence, hit points, terrain and fortification modifiers
+- [ ] unit damage, experience/promotions, and destruction
+- [ ] city capture, and what happens to a captured city's buildings and population
+- [ ] barbarian behaviour driven by the engine, not by a policy
+- [ ] a `combat` balance sweep through `@civts/sim`, with the harness producing the evidence
 
 ## Later milestones
 
