@@ -197,14 +197,57 @@ precedent before defending the wording.**
   cost is the keystone's ~1.0M-call candidate universe; judged worth it, trimmable
   on request.
 
-## M4c — Buildings, wonders & resources — **NEXT**
+## M4c — Buildings, wonders & resources — **DONE** (commit `2a5137c`)
 
-- [ ] building `maintenance` (makes `TreasuryShortfall` reachable from real content)
-- [ ] building effects v1: commerce/beaker/shield multipliers, growth food
-- [ ] wonders v1: globally unique, never rebuilt
-- [ ] strategic / luxury / bonus resources placed on the map
-- [ ] road connection from a city to a resource, and unit gating on strategic resources
-- [ ] bonus resources add tile yields
+- [x] building `maintenance` + `effects` (commerce/beaker/shield multipliers, growth-food)
+- [x] wonders v1: globally unique, never rebuilt, re-buildable after a bankruptcy disband
+- [x] strategic / luxury / bonus resources placed on the map, and bonus yields stack on a tile
+- [x] road connection by deterministic 8-way BFS — **one** implementation, nothing re-derives it
+- [x] strategic resources gate production in the same place legality is decided, so the generator
+      and the applier cannot disagree
+- [x] seven shipped buildings declare maintenance > 0, closing M4b's `TreasuryShortfall` debt
+- [x] REPL: fog-honest resource glyph, per-building maintenance, gated refusals naming the resource
+
+**Contract violation found by adversarial review and fixed before shipping.**
+`growth-food` was declared by the shipped granary **and by the Pyramids** — M4c's
+only wonder, whose sole effect it is — validated, and applied to **nothing**:
+`applyGrowth` compared against the bare `foodBoxSize(population)`, and
+`cityGrowthTarget`, the function applying the reduction, **had no caller anywhere in
+`src`**. The milestone's one wonder did nothing at all. Caught by asking a question I
+now want asked every wave: *is every declared rule actually read by something?* Fixed
+as a threshold change only, with a regression guard proving a city without a
+growth-food building is bit-for-bit unaffected.
+
+This wave was also interrupted mid-flight by a harness restart after three of five
+agents had landed. Recovered by reading the disk and reproducing the claims myself
+rather than trusting the lost report — and the lost report's absence turned out to
+hide nothing, because the gate state was fully diagnosable from disk.
+
+### M4c findings worth keeping
+
+- **The goldens gate less than they look like they do.** A golden state is `newGame`
+  at turn 0, so it contains no city: `applyGrowth` never runs on it, and no M3/M4
+  mechanic — growth, production, maintenance, connection — is covered at hash level.
+  They do gate the schema, generation, pipeline determinism, and the harness's refusal
+  to auto-write. Breaking compound flooring and wonder uniqueness each turn the suite
+  red while `golden.test.ts` stays 9/9. **Action: add a played, city-bearing golden
+  world in M5**, which rehashes anyway.
+- The growth-food fix moved **no** hash. The agent reported that rather than inventing
+  a rehash to match my brief — my brief's premise was wrong, and the honest report was
+  worth more than a tidy-looking commit.
+- `production.ts` re-checks `mayStartBuilding` when a building completes but does not
+  re-check `resourceGate` for a queued unit. Proven unreachable (roads are only ever
+  added and cities are never destroyed, so connections only grow), but it is a
+  defensive asymmetry for hand-edited saves. A comment, not a behaviour change.
+- A bankruptcy-driven building loss emits **no event**, so it is a silent state change
+  the REPL can only show after the fact. A `BuildingLost` event is owed.
+
+## M5 — Technology — **NEXT**
+
+- [ ] a tech tree with prerequisites, costs and era progression
+- [ ] research accumulates beakers (inert since M4b) and completes techs
+- [ ] techs gate units, buildings, improvements and resources
+- [ ] a played, city-bearing golden world (see the M4c finding above)
 
 ## Later milestones
 
