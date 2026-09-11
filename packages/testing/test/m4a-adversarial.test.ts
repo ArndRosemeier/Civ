@@ -71,6 +71,18 @@
  * still the only place where `StartWork`/`CancelWork` completeness over played games
  * is checked, and the M2 keystone's new enumeration of those two families (M4b) does
  * not replace it — that one walks hand-built candidate lists, this one walks games.
+ *
+ * Migrated for M4c (docs/INTERFACES.md M4c) by the F6 rule, and the migration is
+ * **empty** — recorded because "nothing needed changing" is a claim a reviewer should
+ * be able to check rather than infer. M4c made `GameMap.resources` required and gave
+ * buildings `maintenance`/`effects`, so every hand-built map or building literal fell
+ * over at the typechecker; this file has neither (its boards come from `newGame` and
+ * from `createScenarioBuilder`, and it names buildings only through the shipped
+ * catalog), so it compiled unchanged. Its hash assertions are compared against the
+ * golden file rather than pinned as digits, and that file was regenerated for M4c, so
+ * they were already correct the moment the world moved. All 18 tests here passed
+ * against the M4c engine with no edit, which is the evidence: an empty migration is
+ * only interesting if it is verified rather than assumed.
  */
 
 import { spawnSync } from 'node:child_process';

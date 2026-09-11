@@ -32,12 +32,31 @@
  *   stored. Two cities cannot affect each other's growth rate in M3 (yields do
  *   not read other cities) but the order still decides the order of the events,
  *   which is part of what a caller sees.
+ * - **The threshold is the improvement-aware one (M4c).** The box is compared
+ *   against `cityGrowthTarget(...)` — `foodBoxSize(population)` reduced by the
+ *   city's own `growth-food` effects and floored at `MIN_GROWTH_FOOD` — and never
+ *   against the bare `foodBoxSize`. Before M4c's wiring the granary and the
+ *   Pyramids were inert: both declare `growth-food`, and nothing compared a food
+ *   box against the reduced requirement, so the shipped wonder did nothing at all.
+ *   The reduction is computed by `buildings.ts`' `cityGrowthTarget`, which is the
+ *   one place the sum-and-floor rule lives; this module composes it with its own
+ *   curve rather than re-reading `effects` (the M2 lesson about two writers of one
+ *   layer — see `buildings.ts`' module note). **Only the threshold changed**: the
+ *   multi-growth loop, the carry-over and the starvation rule below are M3's,
+ *   untouched.
  * - **Integer arithmetic only** (PLAN.md §5.3): food, the box and the thresholds
  *   are whole numbers, and nothing here reads the clock, the RNG or the
  *   environment.
  */
 
-import { autoAssignWorkedTiles, cityById, cityYields, type City } from './cities.js';
+import { cityGrowthTarget } from './buildings.js';
+import {
+  autoAssignWorkedTiles,
+  buildingCatalog,
+  cityById,
+  cityYields,
+  type City,
+} from './cities.js';
 import type { GameEvent } from './commands.js';
 import type { CityId } from './ids.js';
 import type { RulesetView } from './map.js';
@@ -63,11 +82,17 @@ export const FOOD_BOX_BASE = 10;
 export const FOOD_BOX_PER_CITIZEN = 5;
 
 /**
- * The food a city of `population` citizens must accumulate to gain one more.
+ * The food a city of `population` citizens must accumulate to gain one more,
+ * **before any building's `growth-food` reduction**.
  *
  * Linear in population — `FOOD_BOX_BASE + FOOD_BOX_PER_CITIZEN * (population - 1)`
  * — so it is a whole number for every input and cannot produce a fractional
  * threshold that no integer food total would ever reach.
+ *
+ * This is the *bare* curve: it is what a city with no `growth-food` building needs,
+ * and it is the input `cityGrowthTarget` (`buildings.ts`) reduces. `applyGrowth`
+ * never compares a food box against this number directly — doing so is exactly the
+ * M4c defect that left the granary and the Pyramids inert.
  *
  * Total for garbage input: a non-finite or fractional population is read as at
  * least one citizen (a city is never empty), so a hand-built state cannot make
@@ -100,11 +125,14 @@ const withCity = (state: GameState, city: City): GameState => ({
  * For each city, in the contract's terms:
  *
  * 1. `foodSurplus >= 0` — add it to the box. While the box holds enough for the
- *    next citizen, spend `foodBoxSize(population)`, add the citizen and carry the
- *    remainder over. A single turn can therefore add more than one citizen if the
- *    surplus is enormous (a hand-built state, or a future granary-like effect);
- *    the loop always terminates because each threshold is at least
- *    `FOOD_BOX_BASE` food and the box only decreases.
+ *    next citizen, spend that citizen's requirement
+ *    (`growthTarget` = `cityGrowthTarget(catalog, city, foodBoxSize(population))`,
+ *    the bare curve reduced by this city's own `growth-food` buildings and floored
+ *    at `MIN_GROWTH_FOOD`), add the citizen and carry the remainder over. A single
+ *    turn can therefore add more than one citizen if the surplus is enormous (a
+ *    hand-built state, or a city on a small threshold); the loop always terminates
+ *    because each threshold is at least `MIN_GROWTH_FOOD` food and the box only
+ *    decreases.
  * 2. `foodSurplus < 0` — subtract it. If the box would go below zero, the city
  *    loses a citizen (never below 1), its assignment is trimmed to the new
  *    population, the box restarts at 0, and a `CityStarved` event is emitted. A
@@ -123,11 +151,28 @@ export const applyGrowth = (state: GameState, ruleset: RulesetView): GrowthOutco
   let current = state;
   const events: GameEvent[] = [];
 
+  // Resolved once for the whole pass: the catalog does not change while cities
+  // grow, and `buildingCatalog` is the one place "a view with no buildings has
+  // none" is decided. Passed down rather than read per city, so every city in this
+  // pass is measured against the same content.
+  const catalog = buildingCatalog(ruleset);
+
   for (const cityId of cityIdsInOrder(state)) {
     const city = cityById(current, cityId);
     if (city === undefined) continue;
 
     const yields = cityYields(current, ruleset, cityId);
+
+    /**
+     * The food `population` citizens of **this** city need for one more citizen.
+     *
+     * The reduction is this city's own (`cityGrowthTarget` reads `city.buildings`,
+     * so a granary next door does not help) and it is floored inside
+     * `buildings.ts`, which is why this module cannot make the requirement zero —
+     * `MIN_GROWTH_FOOD` is the reason the loop below always makes progress.
+     */
+    const growthTarget = (population: number): number =>
+      cityGrowthTarget(catalog, city, foodBoxSize(population));
 
     // A surplus of exactly zero changes nothing at all: no growth, no
     // starvation, and the box keeps whatever it had (contract: "a surplus >= 0
@@ -139,8 +184,10 @@ export const applyGrowth = (state: GameState, ruleset: RulesetView): GrowthOutco
       let foodBox = city.foodBox + yields.foodSurplus;
       let gained = 0;
 
-      while (foodBox >= foodBoxSize(population)) {
-        foodBox -= foodBoxSize(population);
+      for (;;) {
+        const needed = growthTarget(population);
+        if (foodBox < needed) break;
+        foodBox -= needed;
         population += 1;
         gained += 1;
       }

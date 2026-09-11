@@ -49,6 +49,7 @@ import {
   asCityId,
   asImprovementId,
   asPlayerId,
+  asResourceId,
   asTerrainId,
   asUnitId,
   asUnitTypeId,
@@ -64,6 +65,7 @@ import {
   tileIndex,
   unitSupport,
   type BuildingDef,
+  type BuildingId,
   type City,
   type GameError,
   type GameEvent,
@@ -71,6 +73,7 @@ import {
   type Rates,
   type RulesetView,
   type TerrainId,
+  type TileIndex,
   type Unit,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
@@ -117,6 +120,14 @@ const terrainIds = (): TerrainId[] => {
  * **no** barbarian player here: the session is driven against a hand-built
  * board, so the transcript stays a fixture of the *REPL*, while the barbarian
  * player `newGame` appends is exercised by the real-CLI tests below.
+ *
+ * Migrated again for **M4c**, which made `GameMap.resources` a required field: the
+ * board carries `resources: []`. That is a migration and not a relaxation — the
+ * field is required, so a fixture that omitted it would only typecheck through a
+ * cast, which is exactly what this file refuses to do — and it is deliberately the
+ * *empty* list, so every landmark this file pins (the transcript, the hashes, the
+ * city view) stays a picture of a board with no resource on it. The resource
+ * surface has its own board below, where a resource is the point.
  */
 const syntheticState = (): GameState => ({
   schemaVersion: SCHEMA_VERSION,
@@ -125,7 +136,7 @@ const syntheticState = (): GameState => ({
   seed: 7,
   settings: { ...DEFAULT_SETTINGS, mapSize: 'tiny', civCount: 2, seed: 7 },
   rng: seedRng(7),
-  map: { width: WIDTH, height: HEIGHT, terrain: terrainIds(), huts: [] },
+  map: { width: WIDTH, height: HEIGHT, terrain: terrainIds(), huts: [], resources: [] },
   players: [
     {
       id: asPlayerId(0),
@@ -457,22 +468,32 @@ const cityOf = (state: GameState, id = 0): City => {
  * ------------------------------------------------------------------ */
 
 /**
- * A building row that declares a `maintenance`, which the shipped catalog's rows
- * do not: `BuildingDef` carries a shield `cost` and nothing else, and M4b adds no
- * effects (that is M4c). `economy.ts` reads the field *structurally* — a row that
- * carries an integer `maintenance > 0` is billed, one that carries nothing is
- * billed 0 — so a view like this one is exactly what that read is for, and M4c
- * filling the field in for real will not change this module's mind.
+ * A building row that bills a **large** maintenance: four gold a turn, where the
+ * dearest shipped row (the factory) charges three.
  *
- * Declared on the test's own type rather than cast: `readonly BilledBuildingDef[]`
- * *is* a `readonly BuildingDef[]`, so no `as` and no eslint escape is involved.
+ * M4b needed this row because no shipped building declared `maintenance` at all —
+ * `BuildingDef` carried a shield `cost` and nothing else, and `economy.ts` read a
+ * structurally-declared field so the money loop could be tested at all. **M4c made
+ * the field required and shipped rows that really bill** (the barracks charges 1,
+ * the factory 3), so this is no longer a stand-in for a missing field and the
+ * doc comment that said so is gone with it.
+ *
+ * It is kept for the fixture's *arithmetic*: `bankruptState` below needs a bill a
+ * three-commerce city cannot come close to paying, so that two disbanded units
+ * still leave a `TreasuryShortfall` in the same turn — and no shipped row costs
+ * enough to do that. The row is an ordinary `BuildingDef` (the engine's own shape,
+ * not a widened test-only one), with `effects: []` — legal, and the honest reading
+ * for a row that exists to be a bill — and `cost`, `maintenance` and `name` are
+ * placeholder numbers of this test's, not Civ 3's.
  */
-interface BilledBuildingDef extends BuildingDef {
-  readonly maintenance: number;
-}
-
-const TOLL_HOUSE: readonly BilledBuildingDef[] = [
-  { id: asBuildingId('toll-house'), name: 'Toll House', cost: 10, maintenance: 4 },
+const TOLL_HOUSE: readonly BuildingDef[] = [
+  {
+    id: asBuildingId('toll-house'),
+    name: 'Toll House',
+    cost: 10,
+    maintenance: 4,
+    effects: [],
+  },
 ];
 
 /** The shipped ruleset plus a building that actually bills its owner. */
@@ -575,6 +596,16 @@ const SCRIPT = ['units', 'move 0 1 1', 'move 0 2 2', 'move 0 9 9', 'wibble', 'en
  * lines per civilization *before* `TurnEnded` — the pipeline's new step 4. The
  * inertness sentence travels with both, because a "2 beakers" with no caveat would
  * imply a research system this build does not have.
+ *
+ * **M4c re-pinned nothing here, and that is the finding rather than an omission.**
+ * The map gained `resources`, `schemaVersion` went 5 -> 6 (so every hash moved —
+ * see the pin in the test that reads this fixture), and the city view gained two
+ * lines — but this board carries `resources: []`, the script never inspects a city,
+ * and no existing view line prints the schema version. The transcript is therefore
+ * byte-for-byte what M4b pinned, which is exactly what "a legend entry appears only
+ * when the glyph was drawn" is supposed to buy. What M4c *did* have to re-pin is the
+ * state-hash arithmetic elsewhere in this file (four pins on the synthetic board,
+ * plus the CLI's own) and the worker transcript's one `state` line.
  */
 const EXPECTED_TRANSCRIPT = [
   'CivTS play - seed 7, tiny map 4x4, 2 civs',
@@ -724,6 +755,18 @@ const WORKER_SCRIPT = [
   'quit',
 ];
 
+/**
+ * The same pinned session for the worker verbs (M4a), re-pinned for M4c in exactly
+ * two places, both of them facts about the *state shape* rather than about the
+ * rendering: the `state` view prints `schema=6` (was 5) and that view's `hash:` line
+ * moved because the map gained `resources` (`GameMap.resources` is inside the hashed
+ * state — see `state.ts`'s SCHEMA_VERSION 6 note). `0511ae245fa10624` ->
+ * `4815cda1972f9fd4`.
+ *
+ * Nothing else in it moved: no line of the picture, no `units` table cell, no city
+ * line — this board carries `resources: []`, and a resource-free view stays
+ * byte-identical by construction.
+ */
 const EXPECTED_WORKER_TRANSCRIPT = [
   'CivTS play - seed 7, tiny map 4x4, 2 civs',
   'you are Player 1 (p0); every view below is drawn from your fog of war',
@@ -785,7 +828,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'p0> state',
-  'state: seed=7 turn=1 revision=1 schema=5 map=tiny(4x4) civs=2',
+  'state: seed=7 turn=1 revision=1 schema=6 map=tiny(4x4) civs=2',
   'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, 0 luxuries',
   '  beakers and luxuries DO NOTHING yet: nothing reads them until M5 (tech) and M9 (happiness) - they only pile up, and nothing in this build spends or reads them.',
   '  gold is the only channel that acts today: it pays upkeep, and a treasury that cannot pay',
@@ -797,7 +840,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'jobs: 2 Worker@2,2 mining, 3 turns left',
   'civs: Player 1 (p0) <- you, Player 2 (p1)',
   'rng: a=-456573687 b=-84222363 c=801465066 d=1648156487',
-  'hash: 0511ae245fa10624',
+  'hash: 4815cda1972f9fd4',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -957,7 +1000,21 @@ describe('the REPL transcript', () => {
     // M3's rehash, this one *did* move the transcript, and deliberately: the
     // banner, every view and the `state` output now carry the economy (see the
     // pinned text below), which is the whole point of the milestone's UI half.
-    expect(hashValue(syntheticState())).toBe('c3eaac847e1f2b2a');
+    //
+    // Rehashed for M4c (SCHEMA_VERSION 5 -> 6): `GameMap` gained the sparse
+    // `resources` list, and `map` is *inside* the state, so a new map key moves
+    // every hash exactly as a new state key would — which is why `state.ts` bumped
+    // the version for it. c3eaac847e1f2b2a -> c8cee40ae7481c52. This board carries
+    // `resources: []`, and its transcript is again **unchanged**: a resource adds a
+    // glyph and a legend entry only where one was drawn, and this map has none. That
+    // byte-identity is the conditional-legend rule doing its job, not an untested
+    // path — the resource tests live in `packages/core/test/textview.test.ts`.
+    //
+    // This is a test-local pin, not a golden: it rehashes because the state *shape*
+    // moved, and it is updated in the same wave as the shape change. (The
+    // `packages/testing` goldens were regenerated once for M4c; nothing here
+    // regenerates or re-derives them.)
+    expect(hashValue(syntheticState())).toBe('c8cee40ae7481c52');
 
     const capture = open();
     runScript(capture.session, SCRIPT.join('\n'), capture.write);
@@ -993,7 +1050,11 @@ describe('the REPL transcript', () => {
     // treasury in the final state is 12 rather than the starting 10). 73edef6a26a57a1f
     // -> 849f619e646119bc. The transcript moved with it, for the first time in a
     // rehash: the money lines are in it (see `EXPECTED_TRANSCRIPT`).
-    expect(hashValue(capture.session.state)).toBe('849f619e646119bc');
+    //
+    // Rehashed for M4c (SCHEMA_VERSION 5 -> 6): `GameMap.resources`. 849f619e646119bc
+    // -> c2e1360531cae92c. The transcript is unchanged once more, for the reason the
+    // pin above states.
+    expect(hashValue(capture.session.state)).toBe('c2e1360531cae92c');
     // The `end` in this script banked a turn of a *cityless* economy: no city, so no
     // commerce and no income — the treasury is exactly the starting 10. A money loop
     // that invented income for a player with nothing built would move this.
@@ -1181,7 +1242,12 @@ describe('commands', () => {
     // ended on — the frozen fixture is never written to, which is the whole
     // assertion, and a money loop that mutated its input in place would move this
     // hash and fail right here.
-    expect(hashValue(state)).toBe('c3eaac847e1f2b2a');
+    //
+    // Rehashed for M4c, for the same reason as the pin above (`GameMap.resources`
+    // is part of the hashed state): c3eaac847e1f2b2a -> c8cee40ae7481c52. What the
+    // assertion *claims* is unchanged — the frozen state hashes to what it hashed
+    // to before the session ran.
+    expect(hashValue(state)).toBe('c8cee40ae7481c52');
 
     // Same input, same result: the session holds no hidden state of its own.
     const fresh = open();
@@ -1329,11 +1395,23 @@ describe('the city verbs', () => {
     // The two id spaces really are different (the note on `ProductionItem` says so),
     // so a bare id both catalogs hold cannot be resolved — and guessing would build
     // the wrong thing. The rule is refused with both spellings offered.
+    // M4c migration: a hand-built `BuildingDef` now carries `maintenance` and
+    // `effects`, both required. This row exists only to make the two id spaces
+    // collide, so it costs nothing to keep and does nothing — the empty effect list
+    // is legal and is the honest reading for a row that is not about effects. The
+    // claim below is unchanged and covers exactly what it covered before: a bare id
+    // both catalogs hold is refused with both spellings offered.
     const shared: RulesetView = {
       ...RULESET,
       buildings: [
         ...(RULESET.buildings ?? []),
-        { id: asBuildingId('scout'), name: 'Scout Lodge', cost: 5 },
+        {
+          id: asBuildingId('scout'),
+          name: 'Scout Lodge',
+          cost: 5,
+          maintenance: 0,
+          effects: [],
+        },
       ],
     };
     const capture = open({ ruleset: shared });
@@ -1524,6 +1602,390 @@ describe('the city verbs', () => {
     god.session.run('cities');
     expect(god.text()).toContain('cities: 0 for Player 2 (p1)');
     expect(god.text()).toContain('not yours, but visible to you:  0 City 1 p0 @0,0');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4c — the resource gate, the wonder rule and what a building costs
+ *
+ * The milestone's REPL half, on boards built for it. The *rules* are the engine's
+ * (`resources.ts`, `buildings.ts`, `commands.ts`); what is tested here is that a
+ * reader can see them: which resource a refused build is missing, what a city's
+ * buildings cost to keep, and which resources its owner has actually connected.
+ * ------------------------------------------------------------------ */
+
+/** The far corner of the synthetic board, where the fixture's Iron stands. */
+const IRON_TILE = tileIndex(WIDTH, 3, 3);
+
+/**
+ * A board with player 0's city at (0,0) and an **Iron** at (3,3), plus a road on
+ * every tile the caller names.
+ *
+ * The resource and the roads are both hand-built because the fixture is about the
+ * *gate*, not about generation or about a worker spending turns: `improvements` is
+ * the same array `WorkCompleted` appends to, so a road here is a road the engine
+ * genuinely reads. (3,3) is deliberately far from the city — a resource **adjacent**
+ * to a city centre counts as connected with no road at all ("endpoints inclusive",
+ * `resources.ts`), so a near resource could not express "not connected".
+ *
+ * Nothing is connected with no roads: the walk starts at the city centre and only
+ * expands through road tiles, so `roads: []` is the honest "no road reaches it".
+ * The Iron id is the shipped catalog's row (`requiresResource: iron` on the
+ * swordsman), and its name — "Iron" — is what the refusal below must print.
+ */
+const resourceState = (roadTiles: readonly TileIndex[]): GameState => {
+  const base = syntheticState();
+  return {
+    ...base,
+    nextCityId: 1,
+    map: {
+      ...base.map,
+      resources: [{ tile: IRON_TILE, resource: asResourceId('iron') }],
+    },
+    cities: [
+      {
+        id: asCityId(0),
+        owner: asPlayerId(0),
+        name: 'City 1',
+        tile: tileIndex(WIDTH, 0, 0),
+        population: 1,
+        foodBox: 0,
+        shields: 0,
+        queue: [],
+        buildings: [],
+        workedTiles: [],
+      },
+    ],
+    improvements: roadTiles.map((tile) => ({ tile, kind: asImprovementId('road') })),
+  };
+};
+
+/**
+ * The road chain from the city at (0,0) to the Iron at (3,3): (1,1) and (2,2) are
+ * road-improved, and (2,2) is 8-way adjacent to the resource — so the chain stops
+ * *beside* the Iron, which the contract's "endpoints inclusive" makes a connection.
+ */
+const ROAD_TO_IRON: readonly TileIndex[] = [tileIndex(WIDTH, 1, 1), tileIndex(WIDTH, 2, 2)];
+
+describe('the resource gate', () => {
+  it('names the missing resource when a build is refused for want of one', () => {
+    const capture = open({ state: resourceState([]) });
+    capture.clear();
+
+    const outcome = capture.session.run('build 0 unit:swordsman');
+    const error = refusal(outcome);
+    expect(error.kind).toBe('resource-not-connected');
+    if (error.kind !== 'resource-not-connected') {
+      throw new Error('expected the engine to refuse for a missing resource');
+    }
+    // The typed payload, which is the whole reason this is its own `GameError`
+    // member: the resource, the item that wanted it, and whose connection was
+    // missing.
+    expect(error.resource).toBe(asResourceId('iron'));
+    expect(error.item).toEqual({ kind: 'unit', id: asUnitTypeId('swordsman') });
+    expect(error.owner).toBe(asPlayerId(0));
+    expect(error.cityId).toBe(asCityId(0));
+
+    // …and the prose a reader gets. **It names the resource**: "it requires Iron"
+    // is the sentence the milestone's acceptance asks for, because "pick another
+    // item" is the wrong fix for a unit that is perfectly buildable once a road
+    // reaches the iron.
+    const text = capture.text();
+    expect(text).toContain('error: resource-not-connected');
+    expect(text).toContain('unit "Swordsman"');
+    expect(text).toContain('it requires Iron');
+    expect(text).toContain('Player 1 (p0) has no road connecting it');
+    // The rule itself, stated where the reader needs it, and stated as the *player's*
+    // connection rather than this city's.
+    expect(text).toContain('some city of that player reaches it');
+    expect(text).toContain('endpoints inclusive');
+
+    // The lesson is the engine's own option list (`planSetProduction`), so the gated
+    // unit is not advertised as buildable while the iron is out of reach — and the
+    // units that need nothing are.
+    expect(text).toContain('legal:');
+    expect(text).toContain('unit "Warrior" (cost 1 shield)');
+    expect(text).not.toContain('unit "Swordsman" (cost 3 shields)');
+
+    // Refused means nothing happened: no production was set and the game did not
+    // advance.
+    expect(cityOf(capture.session.state).production).toBeUndefined();
+    expect(capture.session.state.revision).toBe(0);
+  });
+
+  it('allows the build once a road reaches the resource, and shows the connection', () => {
+    // The negative half first, on the same board: with no road the city view says so.
+    const blocked = open({ state: resourceState([]) });
+    blocked.clear();
+    blocked.session.run('city 0');
+    expect(blocked.text()).toContain('resources: none connected');
+
+    // The positive half, with the one thing that changed being the road.
+    const capture = open({ state: resourceState(ROAD_TO_IRON) });
+    capture.clear();
+    capture.session.run('city 0');
+    // The city view names the resources its *owner* has connected, by name, because
+    // that is the fact the gate turns on.
+    expect(capture.text()).toContain('resources: connected for Player 1 (p0): Iron');
+
+    capture.clear();
+    const outcome = capture.session.run('build 0 unit:swordsman');
+    expect(outcome.kind).toBe('applied');
+    expect(cityOf(capture.session.state).production).toEqual({
+      kind: 'unit',
+      id: asUnitTypeId('swordsman'),
+    });
+    expect(capture.text()).toContain('production set to unit "Swordsman" (cost 3 shields)');
+
+    // Two facts about that line, both of them the rule rather than the rendering.
+    //
+    // (1) It reports the **owner's** connections even when somebody else is looking
+    // at the city: the line names the owner it is about, so a rival reading `city 0`
+    // is told about player 0's roads rather than being fed its own — or worse, being
+    // told the city is unbuildable when the engine says otherwise.
+    const rival = open({ state: resourceState(ROAD_TO_IRON), playerIndex: 1 });
+    rival.clear();
+    rival.session.run('city 0');
+    expect(rival.text()).toContain('resources: connected for Player 1 (p0): Iron');
+
+    // (2) Connection is per *player*, and it is *walked* rather than owned: the
+    // road-improved tiles on this board belong to nobody in the state shape, so what
+    // decides the answer is whether a city of the player in question can reach them.
+    // Player 1's city at (0,3) touches neither road tile (1,1) nor (2,2), so its own
+    // connection set is empty even though player 0's is not.
+    const base = resourceState(ROAD_TO_IRON);
+    const contested: GameState = {
+      ...base,
+      nextCityId: 2,
+      cities: [
+        ...base.cities,
+        {
+          id: asCityId(1),
+          owner: asPlayerId(1),
+          name: 'City 2',
+          tile: tileIndex(WIDTH, 0, 3),
+          population: 1,
+          foodBox: 0,
+          shields: 0,
+          queue: [],
+          buildings: [],
+          workedTiles: [],
+        },
+      ],
+    };
+    const second = open({ state: contested, playerIndex: 1 });
+    second.clear();
+    second.session.run('city 1');
+    expect(second.text()).toContain('resources: none connected');
+  });
+});
+
+describe('buildings and wonders, as the reader meets them', () => {
+  it('refuses a wonder another city already holds, and names the holder', () => {
+    const base = syntheticState();
+    /** A minimal city of player 0's: enough for `cityById`, `cityYields` and the view. */
+    const city = (
+      id: number,
+      name: string,
+      x: number,
+      y: number,
+      buildings: readonly BuildingId[],
+    ): City => ({
+      id: asCityId(id),
+      owner: asPlayerId(0),
+      name,
+      tile: tileIndex(WIDTH, x, y),
+      population: 1,
+      foodBox: 0,
+      shields: 0,
+      queue: [],
+      buildings,
+      workedTiles: [],
+    });
+    const state: GameState = {
+      ...base,
+      nextCityId: 2,
+      cities: [
+        // City 1 finished the Pyramids (the shipped catalog's one wonder).
+        city(0, 'City 1', 0, 0, [asBuildingId('pyramids')]),
+        city(1, 'City 2', 3, 3, []),
+      ],
+    };
+
+    const capture = open({ state });
+    capture.clear();
+    const outcome = capture.session.run('build 1 building:pyramids');
+    const error = refusal(outcome);
+    expect(error.kind).toBe('wonder-already-built');
+    if (error.kind !== 'wonder-already-built') {
+      throw new Error('expected the engine to refuse the duplicate wonder');
+    }
+    expect(error.holder).toBe(asCityId(0));
+    expect(error.building).toBe(asBuildingId('pyramids'));
+
+    const text = capture.text();
+    expect(text).toContain('error: wonder-already-built');
+    expect(text).toContain('building "Pyramids"');
+    // The refusal names *who* has it, which is the difference from `already-built`
+    // ("this city has it"): the fix is not "pick another item" but "someone else
+    // finished it first".
+    expect(text).toContain('city 0 "City 1"');
+    expect(text).toContain('already holds it');
+    expect(text).toContain('globally unique');
+    // …and the wonder is not in city 2's legal list while city 1 holds it.
+    expect(text).not.toContain('building "Pyramids" (cost');
+
+    // City 1 asking for its own wonder is the *other* refusal, and the engine
+    // distinguishes them — a reader told "someone else has it" about their own
+    // building would look for the wrong problem.
+    capture.clear();
+    expect(refusal(capture.session.run('build 0 building:pyramids')).kind).toBe('already-built');
+    expect(capture.text()).toContain('error: already-built');
+  });
+
+  it('shows every building with what it costs its owner, wonders marked', () => {
+    const base = syntheticState();
+    const state: GameState = {
+      ...base,
+      nextCityId: 1,
+      cities: [
+        {
+          id: asCityId(0),
+          owner: asPlayerId(0),
+          name: 'City 1',
+          tile: tileIndex(WIDTH, 0, 0),
+          population: 3,
+          foodBox: 0,
+          shields: 0,
+          queue: [],
+          // Granary is free, the barracks bills 1, the Pyramids bill 2 — the shipped
+          // catalog's own numbers, read through `maintenanceOf` rather than restated.
+          buildings: [asBuildingId('granary'), asBuildingId('barracks'), asBuildingId('pyramids')],
+          workedTiles: [tileIndex(WIDTH, 0, 1)],
+        },
+      ],
+    };
+
+    const capture = open({ state });
+    capture.clear();
+    capture.session.run('city 0');
+    const text = capture.text();
+
+    expect(text).toContain(
+      'buildings: Granary (0 gold/turn), Barracks (1 gold/turn), ' +
+        'Pyramids (wonder, 2 gold/turn); 3 gold/turn for this city',
+    );
+    // The number the reader is shown is the number the money loop charges: the same
+    // `maintenanceOf` sum, asked of `playerUpkeep` rather than re-added here.
+    const upkeep = playerUpkeep(state, RULESET, asPlayerId(0));
+    expect(upkeep.maintenance).toBeGreaterThan(0);
+    expect(text).toContain(`; ${String(upkeep.maintenance)} gold/turn for this city`);
+
+    // A city with none still says so, rather than leaving the reader to guess
+    // whether the view reports buildings at all.
+    const bare = open({ state: resourceState([]) });
+    bare.clear();
+    bare.session.run('city 0');
+    expect(bare.text()).toContain('buildings: (none)');
+  });
+
+  it('prints the growth threshold the engine will use, so a granary city reads 9 where a bare one reads 10', () => {
+    // The M4c growth-food wiring made this view a *statement about the engine*, and the
+    // statement has to be the engine's own: a city holding a granary grows on
+    // `foodBoxSize(population) - 1`, so every place the REPL prints the threshold it is
+    // filling toward — the city detail, the `cities` table, the one-line summary under
+    // every command, and the `CityGrew` line — must print the reduced one. Before the
+    // wiring this view printed the bare curve, which is exactly the "second answer to
+    // one question" the module's own notes forbid.
+    const base = syntheticState();
+    const withCity = (buildings: readonly BuildingId[]): GameState => ({
+      ...base,
+      nextCityId: 1,
+      cities: [
+        {
+          id: asCityId(0),
+          owner: asPlayerId(0),
+          name: 'City 1',
+          tile: tileIndex(WIDTH, 0, 0),
+          population: 1,
+          foodBox: 7,
+          shields: 0,
+          queue: [],
+          buildings,
+          // One worked grassland tile: 4 food against 2 eaten, a surplus of +2.
+          workedTiles: [tileIndex(WIDTH, 0, 1)],
+        },
+      ],
+    });
+
+    // The bare curve, unchanged: 10 at one citizen, 7 in the box, 3 to go.
+    expect(foodBoxSize(1)).toBe(10);
+    const plain = open({ state: withCity([]) });
+    plain.clear();
+    plain.session.run('city 0');
+    expect(plain.text()).toContain('food box 7/10 (3 more to grow)');
+    expect(plain.text()).toContain('0 City 1 p0 @0,0 pop 1 food 7/10 shields 0 (idle)');
+
+    // ... and the granary's city: 9, two to go. The number the reader sees is the
+    // number `applyGrowth` compares against, because it is asked of the engine
+    // (`cityGrowthTarget`) rather than restated here.
+    const granary = open({ state: withCity([asBuildingId('granary')]) });
+    granary.clear();
+    granary.session.run('city 0');
+    const text = granary.text();
+    expect(text).toContain('population 1; food box 7/9 (2 more to grow)');
+    expect(text).toContain('food 4 per turn, 2 eaten, surplus +2');
+    expect(text).toContain('0 City 1 p0 @0,0 pop 1 food 7/9 shields 0 (idle)');
+
+    // The `cities` table prints the same number, so the two views cannot disagree.
+    granary.clear();
+    granary.session.run('cities');
+    expect(granary.text()).toContain('7/9');
+
+    // And when the city grows, the denominator is the requirement for the *next*
+    // citizen at the new population: 7 + 2 = 9 spends the granary's 9 exactly and
+    // carries 0, and the view says the box is filling toward 14, not the bare 15.
+    granary.clear();
+    granary.session.run('end');
+    expect(granary.text()).toContain('grew to 2 citizen(s); food box 0/14 carried over');
+    expect(granary.text()).toContain('pop 2 food 0/14 shields 3 (idle)');
+    const grown = cityOf(granary.session.state);
+    expect(grown.population).toBe(2);
+    expect(grown.foodBox).toBe(0);
+    expect(foodBoxSize(grown.population)).toBe(15);
+  });
+
+  it('renders a building the catalog cannot read as costing nothing, never as undefined', () => {
+    // A hand-built city holding an id no catalog defines: the same "read what is
+    // there" the renderer applies to an unknown terrain id. The line still names it,
+    // and no line in the view may print `undefined`.
+    const base = syntheticState();
+    const state: GameState = {
+      ...base,
+      nextCityId: 1,
+      cities: [
+        {
+          id: asCityId(0),
+          owner: asPlayerId(0),
+          name: 'City 1',
+          tile: tileIndex(WIDTH, 0, 0),
+          population: 1,
+          foodBox: 0,
+          shields: 0,
+          queue: [],
+          buildings: [asBuildingId('ghost-house')],
+          workedTiles: [],
+        },
+      ],
+    };
+
+    const capture = open({ state });
+    capture.clear();
+    capture.session.run('city 0');
+    expect(capture.text()).toContain(
+      'buildings: ghost-house (0 gold/turn); 0 gold/turn for this city',
+    );
+    expect(capture.text()).not.toContain('undefined');
   });
 });
 
@@ -1833,6 +2295,20 @@ describe('event rendering', () => {
     expect(capture.session.state.players[1]?.treasury).toBe(10);
     expect(block[5]).toContain('ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries');
     expect(block[6]).toContain('ok: Player 2 (p1) paid 0 gold of upkeep');
+
+    // **M4c's other half of the bill**, asserted where a reader meets it: the
+    // building whose maintenance caused the shortfall is the building the player
+    // loses (`buildings.ts`' `disbandBuildings`, most recently completed first,
+    // until its maintenance covers what went unpaid). Four gold of Toll House
+    // against the `unpaid` remainder means the city is stripped of it — and the city
+    // view, which M4c taught to print maintenance, is where that shows.
+    expect(cityOf(capture.session.state).buildings).toEqual([]);
+    capture.clear();
+    capture.session.run('city 0');
+    expect(capture.text()).toContain('buildings: (none)');
+    // …and the *state* agrees with the number the upkeep event reported: nothing is
+    // billed for a building the player no longer holds.
+    expect(playerUpkeep(capture.session.state, BILLING_RULESET, asPlayerId(0)).maintenance).toBe(0);
   });
 });
 
@@ -2223,7 +2699,11 @@ describe('the worker verbs', () => {
     // session ends on a different state because the money loop now banks four
     // turns of income (and the fixture's players carry the four money fields).
     // 9dac80e9663b8231 -> 54f6d5c75de7e9d6.
-    expect(hashValue(first.session.state)).toBe('54f6d5c75de7e9d6');
+    //
+    // Rehashed for M4c (`GameMap.resources`; SCHEMA_VERSION 5 -> 6).
+    // 54f6d5c75de7e9d6 -> 3b83f6a9d4c11384. The transcript above moved with it only
+    // in its one `state` line — see `EXPECTED_WORKER_TRANSCRIPT`.
+    expect(hashValue(first.session.state)).toBe('3b83f6a9d4c11384');
   });
 
   it('documents the worker verbs in help and in the command summary', () => {
@@ -2742,6 +3222,15 @@ describe('the play command', () => {
       expect(first.stdout).toContain('production set to unit "Warrior" (cost 1 shield)');
       expect(first.stdout).toContain('population 1; food box');
       expect(first.stdout).toContain('works 1 of 1 citizen(s)');
+      // M4c's two city-view lines, on a **generated** world and in the transcript
+      // the CLI really prints. The city holds nothing yet and no road of its owns
+      // reaches a resource, so both say so out loud — a reader must be able to tell
+      // "nothing is connected" from "this view does not report connections".
+      expect(first.stdout).toContain('buildings: (none)');
+      expect(first.stdout).toContain(
+        'resources: none connected - a resource connects when a city of its owner reaches it ' +
+          'through road tiles',
+      );
       expect(first.stdout).toContain('ok: turn 2 begins');
       expect(first.stdout).toContain('p0> quit');
       expect(first.stdout).toContain('bye');
@@ -2787,7 +3276,16 @@ describe('the play command', () => {
       // more units and the city has a second worked tile to grow with), and three
       // `end`s now bank three turns of income into the treasury.
       // d7caab78d25b1473 -> 914715d7a9abfab2. The transcript moved with it.
-      expect(first.stdout).toContain('hash: 914715d7a9abfab2');
+      //
+      // Rehashed for M4c (SCHEMA_VERSION 5 -> 6): `GameMap.resources`, and on a
+      // *generated* world that is not an empty list — `generateWorld` places
+      // resources on tiles whose role allows them, so this pin moves both because the
+      // map carries a new key and because the key has contents. 914715d7a9abfab2 ->
+      // ba551db3aa29d33a. The transcript moved with it in three visible ways: the
+      // `schema=6` field, that hash, and the two new lines the `city 0` view prints
+      // (the buildings' maintenance and the owner's resource connections — see the
+      // pinned assertions above, which cover both).
+      expect(first.stdout).toContain('hash: ba551db3aa29d33a');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2980,7 +3478,7 @@ const printedRows = (printed: PrintedProvenance): readonly PrintedRow[] =>
   printed.sections.flatMap((section) => section.rows);
 
 describe('the provenance command', () => {
-  it('lists every row its totals count — terrain, unit, building and improvement alike', () => {
+  it('lists every row its totals count — terrain, unit, building, improvement and resource alike', () => {
     const run = runCli(['provenance'], '');
 
     expect(run.status).toBe(0);
@@ -3001,12 +3499,16 @@ describe('the provenance command', () => {
     // M4a added the fourth catalog (improvements), and the claim covers it the same
     // way: every row the totals count is a row this test read out of the catalog
     // itself, so a section the report forgot — or invented — fails here.
+    // M4c adds the fifth: the resource rows, whose numbers (yields, allowed terrain,
+    // which unit is gated on one) are the milestone's newest placeholder content and
+    // therefore exactly what this report has to account for.
     const rows = printedRows(printed);
     expect(rows.map((row) => row.id)).toEqual([
       ...CATALOG.terrains.map((t) => t.id),
       ...CATALOG.units.map((u) => u.id),
       ...CATALOG.buildings.map((b) => b.id),
       ...CATALOG.improvements.map((i) => i.id),
+      ...CATALOG.resources.map((r) => r.id),
     ]);
 
     // …which is what makes the table and the totals agree.
@@ -3019,11 +3521,15 @@ describe('the provenance command', () => {
     const stdout = runCli(['provenance'], '').stdout;
     const printed = parseProvenance(stdout);
 
+    // M4c adds `resources` as the fifth heading, after the four M2-M4a catalogs,
+    // because the report's sections *are* the catalog list rather than a selection
+    // from it.
     expect(printed.sections.map((section) => section.name)).toEqual([
       'terrains',
       'units',
       'buildings',
       'improvements',
+      'resources',
     ]);
 
     for (const section of printed.sections) {
@@ -3076,6 +3582,29 @@ describe('the provenance command', () => {
         expect(improvements?.rows[index]?.detail).toBe(spec.provenance.note);
         expect(spec.provenance.note).toContain('unsourced');
       }
+    }
+
+    // …and for M4c's resource rows, which is the newest place the honesty rule has
+    // to be readable: a resource's yields, the terrain it may stand on and — for the
+    // strategic one — the unit requirement it feeds are all numbers of ours. The
+    // printed detail is the catalog's own note, so the report cannot soften the
+    // claim, and at least the strategic row says outright that it is unsourced.
+    const resources = printed.sections.find((section) => section.name === 'resources');
+    expect(resources?.rows.map((row) => row.id)).toEqual(CATALOG.resources.map((r) => r.id));
+    for (const [index, spec] of CATALOG.resources.entries()) {
+      expect(spec.provenance.kind).toBe('placeholder');
+      if (spec.provenance.kind === 'placeholder') {
+        expect(resources?.rows[index]?.detail).toBe(spec.provenance.note);
+      }
+    }
+    // The one strategic resource the shipped swordsman is gated on carries the
+    // "unsourced, chosen to be playable" claim in its own row, which is what makes
+    // the *gate* a placeholder rule rather than a claimed Civ 3 one.
+    const strategic = CATALOG.resources.find((r) => r.id === 'iron');
+    expect(strategic?.provenance.kind).toBe('placeholder');
+    if (strategic?.provenance.kind === 'placeholder') {
+      expect(stdout).toContain(strategic.provenance.note);
+      expect(strategic.provenance.note).toContain('unsourced');
     }
   }, 120_000);
 });

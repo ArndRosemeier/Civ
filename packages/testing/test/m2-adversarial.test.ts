@@ -130,6 +130,27 @@
  * kept its strength exactly (the rehashed goldens, the moved event list) or was
  * replaced by a strictly wider one (the fog sweep, the map split, the rate space).
  *
+ * **Migrated to the M4c world** (docs/INTERFACES.md M4c). `GameMap` gained a
+ * required, sorted `resources` pair list, `generateWorld` places resources, and
+ * placement consumes RNG draws — so every generated world in this file moved, and
+ * with it the draw stream a goody hut reads its reward from. Two consequences,
+ * neither of them a relaxation:
+ *
+ * 1. The branch-coverage seed set for the hut rewards was **re-probed**. It is
+ *    picked by probing rather than by taste (the test asserts all three branches
+ *    occur), and on the M4c world seed 57's first hut entry draws `barbarians`
+ *    where it used to draw `nothing`; seed 13 is the new `nothing` provider. The
+ *    seed list grew by that one seed and the equality over `HUT_REWARD_KINDS` is
+ *    untouched — a branch that drifts away still fails loudly.
+ * 2. The map claims grew to the new field: a legal move must not change the map's
+ *    resources (a resource is placed terrain, not a pickup — unlike a hut, nothing
+ *    consumes it), so `conserveMove` pins the pair list byte-identical and the
+ *    purity test pins it against the input map.
+ *
+ * The keystone sweep, the money claims and the fog sweeps needed no change: the
+ * engine's action surface grew no member for M4c and the goldens compared here are
+ * the regenerated M4c file.
+ *
  * Findings that could NOT be turned into a test are reported in prose with the
  * review (cast/`any`/non-null audit, the `rehash:` commit note, the golden
  * harness's refusal to auto-write, CLI transcript hashes).
@@ -992,6 +1013,11 @@ describe('purity — a command never writes to what it was given', () => {
       expect(outcome.value.state.map.huts, cmdKey(cmd)).toEqual(
         mapRef.huts.filter((hut) => !entered.includes(Number(hut))),
       );
+      // M4c: the map's resource list is the third thing a move must leave exactly
+      // as it found it. Nothing consumes a resource — a resource is placed terrain
+      // (INTERFACES.md M4c), unlike the goody hut above — so "the map is the input
+      // map except for the hut" stays a claim about *every* field of `GameMap`.
+      expect(outcome.value.state.map.resources, cmdKey(cmd)).toEqual(mapRef.resources);
       expect(outcome.value.state.revision).toBe(state.revision + 1);
       expect(outcome.value.state.turn).toBe(cmd.type === 'EndTurn' ? state.turn + 1 : state.turn);
 
@@ -1274,6 +1300,16 @@ const conserveMove = (
     );
   }
 
+  // --- the map's M4c resources, which no move may touch ------------------
+  // Stated separately from the terrain comparison above so the claim names the
+  // field it is about: a resource is placed terrain, not a pickup, so unlike the
+  // hut below there is no legal move that removes one. A move that "gathered" a
+  // resource would show up here as a difference in the pair list.
+  check(
+    JSON.stringify(after.map.resources) === JSON.stringify(before.map.resources),
+    `${label}: a move changed the map's resources`,
+  );
+
   // --- the hut, and the draw it cost -------------------------------------
   const hutsAfter = after.map.huts.map(Number);
   if (hutsConsumed > 0) {
@@ -1509,8 +1545,16 @@ describe('conservation — a legal move moves one unit, and every unit that appe
  * the counts that test pins (`legalActions`, `enumerated`, `accepted` …) are part
  * of its evidence — quietly appending a seed there to reach the free-unit branch
  * would move another test's totals as a side effect.
+ *
+ * RE-PROBED for M4c: generation now places resources, and the draws that costs
+ * shift every later draw of the same seed — including the one a hut reward reads.
+ * On the M4c world seed 5 still draws `barbarians` and seed 3 still draws `unit`,
+ * while seed 57's first hut entry now draws `barbarians` where it used to be the
+ * `nothing` case; seed 13 is the probed `nothing` provider that replaces it. The
+ * set keeps its old members (so 57 still contributes a band) and gains one, rather
+ * than shrinking until the equality happens to hold.
  */
-const HUT_BRANCH_SEEDS: readonly number[] = [3, 5, 57];
+const HUT_BRANCH_SEEDS: readonly number[] = [3, 5, 13, 57];
 
 describe('hut rewards — conservation holds on every branch, not only where no hut is entered', () => {
   it('accounts for the units the free-unit branch adds, and for the band, and for nothing', () => {

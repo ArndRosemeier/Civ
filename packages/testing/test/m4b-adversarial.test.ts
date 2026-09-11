@@ -64,14 +64,20 @@
  *   `rateField`, and section 5 below pins the typed refusal so a regression is a test
  *   failure rather than a crash in a caller. Nothing that previously succeeded changed
  *   behaviour.
- * - **`TreasuryShortfall` is unreachable from a shipped game.** With the current
- *   catalog, building maintenance is 0, so a shortfall can never exceed what
- *   disbanding every billable unit saves — `unpaid` was 0 on every turn of every sweep
- *   here (450+ player-turns, 1000+ disbands). The branch is correct and is covered by
- *   `packages/core/test/economy.test.ts` against a hand-built maintenance-declaring
- *   ruleset view; what this file adds is the honest boundary, and the other half of it:
- *   the branch *is* reachable the moment a catalog declares maintenance, which is
- *   M4c's job. Asserted, not assumed.
+ * - **`TreasuryShortfall` was unreachable from a shipped game — and M4c closed
+ *   that.** When this file was written, building maintenance was 0 in the catalog,
+ *   so a shortfall could never exceed what disbanding every billable unit saved —
+ *   `unpaid` was 0 on every turn of every sweep here (450+ player-turns, 1000+
+ *   disbands). The branch was correct and covered
+ *   by `packages/core/test/economy.test.ts` against a hand-built
+ *   maintenance-declaring ruleset view; what this file added was the honest
+ *   boundary, and the other half of it: the branch *is* reachable the moment a
+ *   catalog declares maintenance. M4c's catalog does (`barracks`/`walls`/`temple`/
+ *   `library`/`marketplace` cost 1 gold, `factory` 3, the `pyramids` wonder 2, all
+ *   `placeholder` rows), so the boundary this file pinned has been crossed, and
+ *   section 2's zero-shortfall line is now pinned to the *narrower* reason that is
+ *   still true of this sweep — its cities hold no buildings — rather than to a
+ *   claim about the catalog that M4c made false.
  * - **"Changing rates affects future turns only" is an ambiguity the code resolves in
  *   one direction and this file pins.** A rate change does not recollect, refund or
  *   recompute anything, and there is no moment "after this turn's collection" for a
@@ -361,30 +367,34 @@ const contractSupport = (units: number, cities: number): number =>
 /**
  * What a building row declares as maintenance, read structurally — the same read
  * `economy.ts` makes, restated so the sum in the sweep is not the module agreeing with
- * itself. The shipped catalog declares none (effects are M4c's), which is why the
- * unpaid-shortfall branch is unreachable from a real game.
+ * itself.
  *
- * `UpkeepDef` is a test-local extension of `BuildingDef`, not a field added to the real
- * type — M4c owns that shape. It exists so a row can *declare* maintenance in this file
- * without a cast, which is what makes the "reachable only through a maintenance-declaring
- * catalog" half of the finding checkable.
+ * MIGRATED for M4c (docs/INTERFACES.md M4c, "Building maintenance and effects"):
+ * `maintenance` is now a **required** field of `BuildingDef` — with `effects`, and an
+ * optional `wonder: true` — so the test-local `UpkeepDef` extension that used to exist
+ * purely to *declare* the field is gone, and a row is written as a plain `BuildingDef`.
+ * The guard below stays deliberately: a view built in this file bypasses
+ * `validateRuleset`, so "a fractional or negative maintenance counts as nothing" is
+ * still worth reading here, and it is the reason `temple(2)` and `temple(3)` are the
+ * only maintenance numbers this file ever sums.
  */
-interface UpkeepDef extends BuildingDef {
-  readonly maintenance: number;
-}
+const declaredMaintenance = (def: BuildingDef): number =>
+  Number.isInteger(def.maintenance) && def.maintenance > 0 ? def.maintenance : 0;
 
-const declaredMaintenance = (def: BuildingDef): number => {
-  if (!('maintenance' in def)) return 0;
-  const declared: unknown = def.maintenance;
-  return typeof declared === 'number' && Number.isInteger(declared) && declared > 0 ? declared : 0;
-};
-
-/** A temple row for the tests that need the unpaid-shortfall branch to be reachable. */
-const temple = (maintenance: number): UpkeepDef => ({
+/**
+ * A temple row for the tests that need the unpaid-shortfall branch to be reachable.
+ *
+ * `effects: []` is the migration, not a weakening: M4c requires the field, and an
+ * empty list is how a row says "no multiplier, no growth bonus" — the number under
+ * test here is `maintenance`, and giving the row an effect would change the city's
+ * commerce, which is the income side this fixture deliberately keeps at zero.
+ */
+const temple = (maintenance: number): BuildingDef => ({
   id: asBuildingId('temple'),
   name: 'Temple',
   cost: 10,
   maintenance,
+  effects: [],
 });
 
 /* ------------------------------------------------------------------ *
@@ -1307,22 +1317,30 @@ describe('2. money conservation — income minus upkeep equals the delta, every 
     expect(totals.bankruptPlayerTurns).toBeGreaterThan(0);
     expect(totals.zeroTreasuryTurns).toBeGreaterThan(0);
     expect(totals.minTreasury).toBe(0);
-    // The finding in the header, asserted: with a catalog that declares no building
-    // maintenance, a shortfall can never exceed what disbanding every billable unit
-    // saves, so the unpaid branch is unreachable from a real game.
+    // The finding in the header, re-stated at its M4c width. The old reason ("the
+    // shipped catalog declares no maintenance") is now *false* — M4c's catalog declares
+    // 1-3 gold on seven buildings — so the zero below is pinned to the reason that is
+    // still true of this sweep: it queues units only (settlers, then military) and its
+    // cities are hand-built empty, so no city it plays ever holds a building to maintain
+    // and maintenance is 0 on every line. The assertion right below is what keeps that
+    // reason from decaying silently into "we stopped looking": if a future edit lets this
+    // sweep build something, this fails and a human restores the reachability claim.
     expect(totals.shortfalls).toBe(0);
 
     for (const state of finals) {
+      expect(state.cities.every((city) => city.buildings.length === 0)).toBe(true);
       expect(state.players.every((player) => player.treasury >= 0)).toBe(true);
       expect(isHashable(state)).toBe(true);
     }
   }, 300_000);
 
   it('reaches the unpaid branch only through a catalog that declares maintenance', () => {
-    // The other half of the finding: the branch is not dead code, it is M4c's. A foreign
-    // ruleset view that declares a temple's maintenance makes it reachable, with the
-    // shipped catalog's own content otherwise, and the numbers are pinned so the claim
-    // is checkable rather than argued.
+    // The other half of the finding, unchanged by M4c and still worth pinning *here*
+    // rather than only against shipped content: a view that declares a temple's
+    // maintenance makes the branch reachable, with the numbers pinned so the claim is
+    // checkable rather than argued. M4c closed the shipped-content half of the gap (its
+    // catalog declares maintenance, and its own acceptance sweep drives a real
+    // shortfall from it); this is the hand-built-view half, which stays this file's.
     const maintained: RulesetView = {
       ...RULESET,
       buildings: [temple(2)],
@@ -2472,6 +2490,12 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
     // (`SCHEMA_VERSION` 4 -> 5: four money fields on every player, plus M4b's starting
     // worker), through the harness's opt-in path and with a `rehash:` note; nothing else
     // may move them.
+    //
+    // M4c then moved them once more (`SCHEMA_VERSION` 5 -> 6: `GameMap.resources`, the
+    // sorted sparse resource pair list that generation now fills), again through the
+    // harness's opt-in path and again with a rehash note. So the pins below are the M4c
+    // values, and this assertion is unchanged in strength: the file must equal what this
+    // build computes, entry by entry, or the gate is red.
     expect(stored.entries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
       'tiny-civs2-seed1',
@@ -2482,7 +2506,9 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
 
     const state = goldenState(42);
     expect(state.schemaVersion).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(5);
+    // 6, not 5: M4c's `GameMap.resources`. Named rather than written as `> 5` so a
+    // future schema bump has to come here and say so.
+    expect(SCHEMA_VERSION).toBe(6);
 
     // The four new keys are inside the canonical JSON `hashValue` hashes, so a shape
     // change of any of them — added, renamed, removed — trips the gate. This is the check
@@ -2492,6 +2518,14 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
     expect(canonical).toContain('"rates":');
     expect(canonical).toContain('"beakers":0');
     expect(canonical).toContain('"luxuries":0');
+
+    // M4c's new hashed shape, by the same argument as the money keys: the map's resource
+    // pair list is inside the canonical JSON `hashValue` reads, so renaming the field or
+    // reordering the pairs trips the gate. Non-vacuous on purpose — generation places
+    // resources on the golden scenarios, so the list this asserts about is not empty (an
+    // empty list would make the containment check pass without hashing anything new).
+    expect(canonical).toContain('"resources":');
+    expect(state.map.resources.length).toBeGreaterThan(0);
 
     // Not vacuous: perturbing the money in memory moves the hash, and never to a stored
     // value. A golden that cannot fail is worthless.
@@ -2597,9 +2631,12 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
  *    refilled result against `advanceTurn`'s state and comparing the money event tail;
  * 3. the treasury-never-negative attack board (180 units, zero income, three simultaneous
  *    bankruptcies) and the corrupt-treasury/corrupt-rates totality;
- * 4. the *unreachability* of `TreasuryShortfall` under the shipped catalog, and its
- *    reachability through a maintenance-declaring ruleset view — the M4c boundary, pinned
- *    rather than argued;
+ * 4. the *unreachability* of `TreasuryShortfall` under a catalog that declares no
+ *    maintenance — the state M4b shipped — and its reachability through a
+ *    maintenance-declaring ruleset view. M4c's catalog declares maintenance, so the
+ *    unreachability half is now pinned at the narrower width that is still true here
+ *    (this sweep's cities hold no buildings at all, asserted), while the reachability
+ *    half — the M4c boundary — is pinned rather than argued;
  * 5. disband determinism across a JSON round trip and across a permuted presentation of
  *    the same state, and the barbarian checks (never charged, never disbanded, its units on
  *    nobody's bill, its city's commerce collected by nobody);

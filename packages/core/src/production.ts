@@ -35,6 +35,14 @@
  *   from a hand-built state or a queue that names the same building twice. The
  *   redundant entry is dropped and *nothing is charged*: no item was produced, so
  *   taking its cost would be silently burning shields on a no-op.
+ * - **M4c: a wonder is completed at most once in the world.** The same reading as
+ *   the bullet above, applied to a building *another* city holds: the queue entry
+ *   is dropped, nothing is charged, and no second copy can appear. Both refusals
+ *   are `buildings.ts`' `mayStartBuilding` asked with the state as it stands at the
+ *   moment of completion — one rule, asked twice (once by the planner that offers
+ *   the item, once here), rather than two rules that have to be kept in step. A
+ *   wonder lost to bankruptcy leaves `city.buildings` everywhere, so the same test
+ *   starts accepting it again, which is the whole of "buildable again".
  * - **Integers only** (PLAN.md §5.3), and no ambient state: costs come from the
  *   ruleset, yields from `cityYields`, and nothing here draws from the RNG or
  *   reads a clock.
@@ -48,7 +56,19 @@
  *   presented as a Civ 3 mechanic. Likewise "one completion per city per turn".
  */
 
-import { buildingDef, cityById, cityYields, type City, type ProductionItem } from './cities.js';
+import {
+  buildingCatalog,
+  buildingDef,
+  cityById,
+  cityYields,
+  type City,
+  type ProductionItem,
+} from './cities.js';
+// M4c: the wonder/uniqueness half of "may this city build this". A value import,
+// and a one-way edge — `buildings.ts` imports `City`/`BuildingDef` from `cities.ts`
+// type-only — so the production pass keeps one implementation of the rule instead
+// of a second copy of it here.
+import { mayStartBuilding } from './buildings.js';
 import type { GameEvent } from './commands.js';
 import type { CityId, TileIndex } from './ids.js';
 import { neighbors8, type RulesetView } from './map.js';
@@ -192,9 +212,21 @@ export const applyProduction = (state: GameState, ruleset: RulesetView): Product
     }
 
     if (item.kind === 'building') {
-      if (city.buildings.includes(item.id)) {
-        // Nothing was produced, so nothing is charged: the entry is dropped and
-        // the pool funds whatever comes next.
+      // M4c: `mayStartBuilding` is the one statement of "may this city have this
+      // building", and this is the second place that must agree with it — the
+      // planner that *offers* the item (`SetProduction`) and the pass that
+      // *completes* it. Two readings would be the M2 bug class again: a queue
+      // decided before a wonder was finished elsewhere, or a hand-built state, can
+      // hold an entry the rules no longer allow, and completing it would put a
+      // **second** copy of a globally unique wonder on the map.
+      //
+      // The refusals it covers are the two this module already documented — a
+      // building the city has (M3's typed `already-built`, unreachable here except
+      // from a hand-built state or a queue naming one row twice) and, since M4c, a
+      // **wonder any city anywhere already holds**. Either way nothing was
+      // produced, so nothing is charged: the entry is dropped and the pool funds
+      // whatever comes next.
+      if (!mayStartBuilding(current, buildingCatalog(ruleset), city, item.id)) {
         current = withCity(current, promote(city, { shields }));
         continue;
       }

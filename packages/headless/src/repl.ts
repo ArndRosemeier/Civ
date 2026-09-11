@@ -24,7 +24,7 @@
  *   builds exactly one `Command`, and hands it to `applyCommand`. Every refusal is
  *   the engine's own typed `GameError`, and every "legal:" line under it comes
  *   from an engine *evaluator* — `planFoundCity`, `planSetWorkedTiles`,
- *   `planSetProduction`, `itemCostOf`, `cityRadius`, `foodBoxSize` — the same
+ *   `planSetProduction`, `itemCostOf`, `cityRadius`, `cityGrowthTarget` — the same
  *   functions the applier decides with. So the REPL cannot advertise a city site,
  *   an assignment or a build order the engine would refuse, and there is no second
  *   copy of the city rules here to drift out of step with it.
@@ -100,9 +100,12 @@ import {
   buildingDef,
   citiesOf,
   cityById,
+  cityGrowthTarget,
+  cityMaintenance,
   cityRadius,
   cityYields,
   civPlayers,
+  connected,
   describe,
   err,
   foodBoxSize,
@@ -112,7 +115,9 @@ import {
   indexToX,
   indexToY,
   isExplored,
+  isWonder,
   itemCostOf,
+  maintenanceOf,
   ok,
   planFoundCity,
   planSetProduction,
@@ -121,6 +126,7 @@ import {
   planStartWork,
   playerIncome,
   playerUpkeep,
+  resourceDef,
   terrainAtIndex,
   tileIndex,
   unitById,
@@ -147,6 +153,7 @@ import {
   type PlayerState,
   type ProductionItem,
   type Rates,
+  type ResourceId,
   type Result,
   type RulesetView,
   type SetupError,
@@ -345,6 +352,20 @@ const improvementLabel = (ruleset: RulesetView, id: ImprovementId): string => {
     : `improvement "${def.name}" (${String(def.turns)} turn${def.turns === 1 ? '' : 's'})`;
 };
 
+/**
+ * A resource as prose: its catalog **name**, or the raw id when this ruleset cannot
+ * name it (M4c).
+ *
+ * The name is what a reader acts on — "it requires Iron" is the sentence that makes
+ * a refused build legible — and the raw id is the fallback for a hand-built view
+ * whose resource catalog does not describe what the state's map carries, the same
+ * "read what is there" rule `improvementLabel` and `buildingLabel` follow. Unlike
+ * those two there is no command argument to spell: nothing in the command language
+ * takes a resource id, so printing "Iron (iron)" would be noise rather than a hint.
+ */
+const resourceLabel = (ruleset: RulesetView, id: ResourceId): string =>
+  resourceDef(ruleset, id)?.name ?? id;
+
 /** `id (N turns)` for every improvement in the catalog — the catalogue, as data. */
 const improvementCatalogueHint = (ruleset: RulesetView): string => {
   const rows = improvementCatalog(ruleset).map(
@@ -447,8 +468,8 @@ const buildingLabel = (ruleset: RulesetView, id: BuildingId): string =>
  * Every list below is an answer the engine gives, not a restatement of
  * the city rules: `planFoundCity`, `planSetWorkedTiles` and
  * `planSetProduction` are the *same* evaluators `applyCommand` refuses
- * with, and `cityRadius`/`foodBoxSize`/`itemCostOf` are the engine's own
- * statements of the radius, the next-citizen threshold and an item's
+ * with, and `cityRadius`/`cityGrowthTarget`/`itemCostOf` are the engine's
+ * own statements of the radius, the next-citizen threshold and an item's
  * cost. That is the point: the prose under a refusal cannot drift from
  * the engine, because there is only one implementation of each rule.
  * ------------------------------------------------------------------ */
@@ -1093,6 +1114,48 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         ...legalBuildLines(context),
       ].join('\n');
 
+    /* ---------------- M4c: the resource gate and the wonder rule ---------------- */
+
+    case 'resource-not-connected':
+      // The refusal **names the missing resource**, which is the whole reason M4c
+      // gave this its own `GameError` member rather than reusing
+      // `unknown-production-item`: the item is real and settable in a city that has
+      // the resource, so the answer is "build a road to the Iron", not "pick
+      // something else". The connection rule is stated once, in `resources.ts`, and
+      // asked rather than restated: this line says what the *player* must do (the
+      // connection is the owner's, not this city's — M4c quantifies over "some city
+      // of that player").
+      return [
+        `error: resource-not-connected - ${cityLabel(context.state, error.cityId)} cannot build ` +
+          `${itemLabel(context.ruleset, error.item)}: it requires ${resourceLabel(
+            context.ruleset,
+            error.resource,
+          )}, and ${playerLabel(context.state, error.owner)} has no road connecting it.`,
+        '  a resource is connected for a player when some city of that player reaches it through',
+        '  a path of road-improved tiles (8-way, endpoints inclusive) - so a road from any of its',
+        '  cities will do, not only from this one.',
+        ...legalBuildLines(context),
+      ].join('\n');
+
+    case 'wonder-already-built': {
+      // `holder` is **absent** (never a key holding `undefined`) for a state the
+      // rule cannot produce, where the lookup found no holder at all. Saying "the
+      // city that holds it" there would be a claim about a city this state does not
+      // name, so the two cases are two sentences.
+      const held =
+        error.holder === undefined
+          ? 'a city already holds it, so another city may not start it'
+          : `${cityLabel(context.state, error.holder)} already holds it`;
+      return [
+        `error: wonder-already-built - ${cityLabel(context.state, error.cityId)} cannot start ` +
+          `${buildingLabel(context.ruleset, error.building)}: ${held}.`,
+        '  a wonder is globally unique - once any city anywhere holds it, no city may start it -',
+        '  and M4c has no destruction, so it is never rebuilt either. Bankruptcy is the one way a',
+        '  wonder is lost, and after that it is buildable again.',
+        ...legalBuildLines(context),
+      ].join('\n');
+    }
+
     case 'invalid-argument': {
       // `invalid-argument` is one error kind with many causes, so the lesson is
       // the one that fits the refused command: a refused `SetRates` gets the rate
@@ -1202,32 +1265,117 @@ export const formatSetupError = (error: SetupError): string => {
  * M3 - one city in full, and the list of them.
  *
  * Numbers here are read, never derived: the growth threshold comes from
- * `foodBoxSize`, an item's price from `itemCostOf`, the yields from
- * `cityYields`. "How much more food does this city need?" is a
- * subtraction of two numbers the engine published, not a second
- * statement of the growth rule.
+ * `cityGrowthTarget` (the bare `foodBoxSize` reduced by the city's own
+ * `growth-food` buildings — M4c, see `growthThresholdOf`), an item's
+ * price from `itemCostOf`, the yields from `cityYields`. "How much more
+ * food does this city need?" is a subtraction of two numbers the engine
+ * published, not a second statement of the growth rule.
  * ------------------------------------------------------------------ */
 
 /** `+2` / `-1` / `0`: a surplus with its sign, for a reader skimming the line. */
 const signed = (value: number): string => (value > 0 ? `+${String(value)}` : String(value));
+
+/**
+ * The food `city` needs for its next citizen: `foodBoxSize(population)` reduced by the
+ * city's own `growth-food` buildings and floored at `MIN_GROWTH_FOOD`. That is
+ * `cityGrowthTarget`, the engine's own read of the requirement — the one rule, asked
+ * rather than restated.
+ *
+ * **Migrated for the M4c growth-food wiring.** This module used to print the bare
+ * `foodBoxSize`, so a city holding a granary was shown `food 5/10 (5 more to grow)`
+ * while the engine grew it at 9: the view was a *second* answer to "what does this
+ * city need", and once the effect was wired it became the wrong one. Asking the engine
+ * is the discipline the rest of this file already follows for the price
+ * (`itemCostOf`), the yields (`cityYields`) and the maintenance bill
+ * (`maintenanceOf`), so the number a player reads is the number the growth pass will
+ * compare against and cannot drift from it.
+ */
+const growthThresholdOf = (ruleset: RulesetView, city: City): number =>
+  cityGrowthTarget(buildingCatalog(ruleset), city, foodBoxSize(city.population));
 
 /** The terrain under a tile, or `?` when the ruleset cannot name it. */
 const terrainNameAt = (state: GameState, ruleset: RulesetView, tile: TileIndex): string =>
   terrainDefAt(state, ruleset, tile)?.name ?? '?';
 
 /**
+ * One building as a reader needs it **since M4c**: what it is called, whether it
+ * is a wonder, and what it costs its owner per turn — `Granary (0 gold/turn)`,
+ * `Pyramids (wonder, 2 gold/turn)`.
+ *
+ * `maintenanceOf` is the engine's own read of the field (the one `economy.ts` sums
+ * for the bill), so the number a player sees beside a building cannot drift from
+ * the number they are charged for it. A row the catalog cannot describe — a
+ * hand-built city holding an id no catalog defines — costs nothing and is named by
+ * its id, the same "read what is there" `buildingLabel` follows.
+ *
+ * `wonder` is spelled out because it is the one property of a building that
+ * changes *other* cities' options: a wonder another city holds is not startable
+ * anywhere, so a reader who cannot see the mark cannot explain why the build menu
+ * changed.
+ */
+const buildingCostLabel = (ruleset: RulesetView, id: BuildingId): string => {
+  const def = buildingDef(ruleset, id);
+  if (def === undefined) return `${id} (0 gold/turn)`;
+  const kind = isWonder(def) ? 'wonder, ' : '';
+  return `${def.name} (${kind}${String(maintenanceOf(def))} gold/turn)`;
+};
+
+/**
+ * What a player has **connected**, for the city view (M4c): the resources its road
+ * network reaches, named.
+ *
+ * The list is `connected`'s own answer — the one implementation of the connection
+ * rule, the same one `planSetProduction` gates a unit on — so what this line says
+ * and what the engine will let the player build cannot disagree. It is the
+ * *player's* set and not this city's, which is why the line names the owner: M4c
+ * quantifies over "some city of that player", and a line that read as "this city's
+ * roads" would make a legal build look illegal.
+ *
+ * Read off `state.map.resources` (the map, in its `(tile, resource)` order) and
+ * filtered by membership, rather than off the catalog: a connection the catalog
+ * cannot name still exists in the state, and the id is then the honest label —
+ * exactly what `resourceLabel` does for the refusal in `formatGameError`.
+ *
+ * Nothing here consults the fog, and that is deliberate rather than an oversight: a
+ * connected resource is necessarily on a tile the player has explored (a road tile
+ * is a tile one of its units stood on), and the alternative — filtering the
+ * engine's answer through `isExplored` — would hide a connection the engine will
+ * still honour, which is a display that lies about the rule.
+ */
+const resourcesLine = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
+  const reached = connected(state, ruleset, playerId);
+  const names: string[] = [];
+  for (const pair of state.map.resources) {
+    if (!reached.has(pair.resource)) continue;
+    const name = resourceLabel(ruleset, pair.resource);
+    if (!names.includes(name)) names.push(name);
+  }
+
+  if (names.length === 0) {
+    return (
+      '  resources: none connected - a resource connects when a city of its owner reaches it ' +
+      'through road tiles'
+    );
+  }
+  return `  resources: connected for ${playerLabel(state, playerId)}: ${names.join(', ')}`;
+};
+
+/**
  * One city in full: population, the food box **and the threshold it is filling
  * toward**, the stored shields, the item being built **and what it costs**, the
- * queue behind that item, the buildings, and the tiles its citizens work.
+ * queue behind that item, the buildings with their maintenance, the resources the
+ * owner has connected, and the tiles its citizens work.
  *
  * The yields line states what `cityYields` computed — food, shields, commerce,
  * how much the citizens eat, and the surplus — because "why is this city not
  * growing?" is a question about integers the engine already has, and a reader
- * should not have to add them up.
+ * should not have to add them up. M4c's two new lines answer the two questions a
+ * city view gained with this wave: what is this city costing me to keep, and which
+ * resources can its owner actually build on.
  */
 const cityDetailText = (state: GameState, ruleset: RulesetView, city: City): string => {
   const yields: CityYields = cityYields(state, ruleset, city.id);
-  const box = foodBoxSize(city.population);
+  const box = growthThresholdOf(ruleset, city);
   const eaten = yields.food - yields.foodSurplus;
   const item = city.production;
 
@@ -1263,10 +1411,11 @@ const cityDetailText = (state: GameState, ruleset: RulesetView, city: City): str
   lines.push(
     city.buildings.length === 0
       ? '  buildings: (none)'
-      : `  buildings: ${city.buildings
-          .map((id) => buildingDef(ruleset, id)?.name ?? id)
-          .join(', ')}`,
+      : `  buildings: ${city.buildings.map((id) => buildingCostLabel(ruleset, id)).join(', ')}; ` +
+          `${String(cityMaintenance(buildingCatalog(ruleset), city))} gold/turn for this city`,
   );
+
+  lines.push(resourcesLine(state, ruleset, city.owner));
 
   lines.push(
     city.workedTiles.length === 0
@@ -1324,7 +1473,7 @@ const citiesTableText = (
           city.name,
           coordOf(state.map, city.tile),
           String(city.population),
-          `${String(city.foodBox)}/${String(foodBoxSize(city.population))}`,
+          `${String(city.foodBox)}/${String(growthThresholdOf(ruleset, city))}`,
           String(city.shields),
           item === undefined ? '(idle)' : itemLabel(ruleset, item),
         ]),
@@ -1356,7 +1505,7 @@ const citySummary = (state: GameState, ruleset: RulesetView, city: City, mine: b
   return (
     `${mine ? '*' : ' '}${String(city.id)} ${city.name} p${String(city.owner)} ` +
     `@${coordOf(state.map, city.tile)} pop ${String(city.population)} ` +
-    `food ${String(city.foodBox)}/${String(foodBoxSize(city.population))} ` +
+    `food ${String(city.foodBox)}/${String(growthThresholdOf(ruleset, city))} ` +
     `shields ${String(city.shields)} ` +
     (item === undefined ? '(idle)' : `building ${itemLabel(ruleset, item)}`)
   );
@@ -1564,12 +1713,21 @@ const outcomeText = (outcome: CommandOutcome, command: Command, ruleset: Ruleset
           'settler is consumed'
         );
 
-      case 'CityGrew':
+      case 'CityGrew': {
+        // The denominator is the requirement for the *next* citizen, so it is asked of
+        // the city as it stands after the growth (M4c: `growthThresholdOf`, which is
+        // the reduced requirement — a granary city at two citizens needs 14, not the
+        // bare 15). The fallback covers only a state the event contradicts (no city with
+        // that id), where there is nothing to ask.
+        const grown = cityById(outcome.state, event.cityId);
+        const next =
+          grown === undefined ? foodBoxSize(event.population) : growthThresholdOf(ruleset, grown);
         return (
           `ok: ${cityLabel(outcome.state, event.cityId)} grew to ` +
           `${String(event.population)} citizen(s); food box ${String(event.foodBox)}/` +
-          `${String(foodBoxSize(event.population))} carried over`
+          `${String(next)} carried over`
         );
+      }
 
       case 'CityStarved':
         return (

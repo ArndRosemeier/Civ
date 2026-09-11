@@ -21,47 +21,85 @@
  *   *write* an assignment (founding a city, or assigning a new citizen).
  * - **Yields are integers.** Every number here is a plain integer sum of the
  *   ruleset's integer terrain yields (PLAN.md §5.3): no fractions, no floats, no
- *   randomness, nothing that could differ between engines.
+ *   randomness, nothing that could differ between engines. M4c's building
+ *   multipliers keep that property: they are integer percentages applied with one
+ *   `Math.floor` (`buildings.ts`' `applyEffectPct`), never a float that reaches the
+ *   state.
+ * - **A tile's worth and a building's effect each have one owner elsewhere.**
+ *   What a *worked tile* produces is `tileYieldsWithResources` (terrain +
+ *   improvements + bonus resources), and what a city's *buildings* do to its output
+ *   is `cityBuildingEffects`/`applyEffectPct`. This module composes them into a
+ *   city's triple and re-implements neither: M2 lost a bug hunt to two writers of
+ *   one layer, and a second copy of either rule here would be that bug again with a
+ *   different name.
  * - **Every number is placeholder.** The radius shape, the centre's floor of
  *   1/1/1, the 2 food a citizen eats and the ordering `autoAssignWorkedTiles`
  *   uses are all chosen to be playable and are **not** sourced from Civ 3. Each
- *   one says so where it is declared.
+ *   one says so where it is declared. The M4c effect *magnitudes* are content
+ *   (`@civts/rules` rows, all `placeholder(...)`), not numbers this module owns.
  *
  * Nothing here reads ambient state: no RNG, no clock, no I/O. Every function is
  * a pure read of the state or the ruleset it is handed.
  */
 
 import type { BuildingId, CityId, PlayerId, TileIndex, UnitTypeId } from './ids.js';
-// The improvement-aware tile read. `terrainYields` below is the *terrain*-only
-// half, which the centre needs; a worked tile goes through `tileYields`, so how an
-// improvement changes a tile is stated once, in the module that owns
-// improvements (`improvements.ts`). The import is a value import, but
-// `improvements.ts` imports `GameState` from `state.ts` type-only and declares no
-// runtime dependency on this module, so there is no runtime cycle.
-import { tileYields } from './improvements.js';
+// The building-effect totals — the *only* place a building's effect on a city is
+// computed (M4c). A value import, and the one runtime edge between these two
+// modules: `buildings.ts` imports `BuildingDef` and `City` from here *type-only*,
+// so the edge runs one way and there is no cycle for `state.ts`' import order to
+// have to survive.
+import { applyEffectPct, buildingRow, cityBuildingEffects } from './buildings.js';
 import {
   inBounds,
   indexToX,
   indexToY,
   tileIndex,
+  type BuildingEffect,
   type RulesetView,
   type TerrainYields,
 } from './map.js';
+// The tile read a *worked* tile gets: terrain plus improvements plus bonus
+// resources. This module is the one that composes a city out of tiles, so it is
+// the place that asks for the whole of a tile's worth; `improvements.ts` owns the
+// terrain-plus-improvements half and `resources.ts` the composition, each stated
+// once. `cities.ts` deliberately does not re-walk either list itself.
+import { tileYieldsWithResources } from './resources.js';
 import type { GameState } from './state.js';
 
 /**
  * The engine's structural view of a *building* type, mirroring
  * `@civts/rules`' `BuildingSpec` (which carries this plus `provenance`, a field
  * the engine never reads). `core` cannot depend on the content package, so it
- * declares what it reads — the same arrangement as `TerrainDef`/`UnitDef`.
+ * declares what it reads — the same arrangement as `TerrainDef`/`UnitDef`, and the
+ * same fields: a row that could omit one of them would be a building the engine
+ * could not cost, keep or apply.
  *
- * M3 reads exactly one field: `cost`, the shields an item costs.
+ * M3 read exactly one field: `cost`, the shields an item costs. **M4c adds the
+ * three that make a building a building**, and each one has a single reader:
+ *
+ * - `maintenance` — gold per turn, read by `buildings.ts`' `maintenanceOf` and
+ *   summed into a player's upkeep by `economy.ts`. `0` is how a row says "free to
+ *   keep", which is a tuning choice; `validateRuleset` requires an integer `>= 0`.
+ * - `effects` — what it does for **its own city only**. Every effect is computed in
+ *   `buildings.ts` (`cityBuildingEffects`), which is the one place the
+ *   sum-first-floor-once rule for multipliers lives; `[]` is a legal, honest row
+ *   and means "this building currently does nothing but cost shields and gold".
+ * - `wonder` — present and `true` only for a wonder, and **absent** otherwise:
+ *   never a key holding `false`, which is the same trap as an explicit `undefined`
+ *   one step removed (a falsy key survives neither a JSON round trip nor a
+ *   reviewer's eye). The rules it turns on are stated once, in `buildings.ts`.
  */
 export interface BuildingDef {
   readonly id: BuildingId;
   readonly name: string;
   /** Production cost in shields. */
   readonly cost: number;
+  /** Gold per turn this building costs its owner; integer `>= 0`. */
+  readonly maintenance: number;
+  /** What it does for its own city; `[]` is "nothing yet", not "unknown". */
+  readonly effects: readonly BuildingEffect[];
+  /** Present (and `true`) only for a wonder. Absent means "ordinary building". */
+  readonly wonder?: true;
 }
 
 /**
@@ -167,13 +205,25 @@ export interface CityYields {
  * M2-era views that predate buildings are still valid views — they simply have
  * nothing to build, and this is the one place that decides what "no buildings"
  * means.
+ *
+ * Every reader below passes the result on rather than reading
+ * `ruleset.buildings` again, so "a view with no buildings has none" is stated once
+ * even though the callers live in three modules (`buildings.ts` takes the catalog
+ * as a parameter, for exactly that reason — see its module note).
  */
 export const buildingCatalog = (ruleset: RulesetView): readonly BuildingDef[] =>
   ruleset.buildings ?? [];
 
-/** The building type `id`, or `undefined` when the ruleset does not define it. */
+/**
+ * The building type `id`, or `undefined` when the ruleset does not define it.
+ *
+ * The lookup itself is `buildings.ts`' `buildingRow`, the engine's one "find the
+ * row with this id"; this function adds nothing but the step that resolves a
+ * *view* to a catalog, so a caller holding a ruleset and a caller holding rows
+ * cannot disagree about what a lookup means.
+ */
 export const buildingDef = (ruleset: RulesetView, id: BuildingId): BuildingDef | undefined =>
-  buildingCatalog(ruleset).find((def) => def.id === id);
+  buildingRow(buildingCatalog(ruleset), id);
 
 /**
  * The city with this id, or `undefined`.
@@ -236,15 +286,16 @@ export const cityRadius = (state: GameState, tile: TileIndex): readonly TileInde
 };
 
 /**
- * The terrain yields of one tile, **without improvements**, or `undefined` when
- * the tile is off the map or its terrain id is not in the ruleset.
+ * The terrain yields of one tile, **without improvements and without resources**,
+ * or `undefined` when the tile is off the map or its terrain id is not in the
+ * ruleset.
  *
  * This is the *terrain* read, and only the city centre uses it: the centre is not
  * a worked tile, so M4a's improvements do not touch it (INTERFACES.md M4a,
- * "Yields with improvements"). A worked tile asks `tileYields` in
- * `improvements.ts` instead, which is this same lookup plus the improvement
- * deltas — one statement of "what is this tile worth", in the module that owns
- * improvements.
+ * "Yields with improvements"). A worked tile asks `tileYieldsWithResources`
+ * (`resources.ts`, which composes `improvements.ts`' `tileYields`) instead — one
+ * statement of "what is this tile worth", in the modules that own improvements and
+ * resources.
  */
 const terrainYields = (
   state: GameState,
@@ -265,12 +316,25 @@ const terrainYields = (
  *   barren tile still produces something. **Improvements do not touch it**: the
  *   centre is not a worked tile, so a mine on a city's own tile changes nothing
  *   (M4a, "Yields with improvements"). Its floor is read from the *terrain*
- *   alone, which is why it uses `terrainYields` and not `tileYields`.
- * - Every other entry of `workedTiles` contributes its terrain's yields **plus
- *   every improvement's delta on that tile**, clamped at zero per component — an
- *   improvement may never make a worked tile yield a negative amount, and that
- *   clamp lives in `tileYields` (`improvements.ts`), the one place a tile's worth
- *   is computed. Integers only.
+ *   alone, which is why it uses `terrainYields` and not the tile read below.
+ * - Every other entry of `workedTiles` contributes what the tile is worth in this
+ *   state — its terrain's yields, plus every improvement's delta, plus every bonus
+ *   resource's delta — clamped at zero per component. That composition is
+ *   `tileYieldsWithResources` (`resources.ts`), which builds on `tileYields`
+ *   (`improvements.ts`); this function asks for it once and never re-walks either
+ *   list, so "what is this tile worth" has one implementation.
+ * - **A city's buildings then multiply what it produces** (M4c): the summed
+ *   `commerce-multiplier` percentage scales `commerce` and the summed
+ *   `shield-multiplier` percentage scales `shields`, each with **one** floor, via
+ *   `applyEffectPct`. The percentages of several buildings of the same kind are
+ *   summed *before* that single floor (`cityBuildingEffects`), never applied one
+ *   after another — flooring twice is a different number, and `buildings.ts`'
+ *   module note works the example through. Only buildings **this city holds**
+ *   contribute: a marketplace next door, or a barracks elsewhere in the same
+ *   empire, changes nothing here.
+ * - `food` is not multiplied by anything: M4c's union has no food multiplier, and
+ *   the granary's `growth-food` shrinks the *requirement* instead
+ *   (`cityGrowthTarget`), which is why it does not appear in this triple.
  * - At most `population` tiles are counted, in the stored order: one citizen
  *   works one tile. Entries a city could not legally work — its own centre, a
  *   repeated tile, a tile outside `cityRadius`, or one past the citizen count —
@@ -306,12 +370,18 @@ export const cityYields = (state: GameState, ruleset: RulesetView, cityId: CityI
     // The citizen is spent whether or not the tile's terrain is one this
     // ruleset describes: the tile is worked, it just yields nothing here.
     counted.add(index);
-    const yields = tileYields(state, ruleset, tile);
+    const yields = tileYieldsWithResources(state, ruleset, tile);
     if (yields === undefined) continue;
     food += yields.food;
     shields += yields.shields;
     commerce += yields.commerce;
   }
+
+  // M4c: this city's own buildings scale what it produces, with one floor each.
+  // `food` is deliberately not among them (see above).
+  const effects = cityBuildingEffects(buildingCatalog(ruleset), city);
+  shields = applyEffectPct(shields, effects.shieldPct);
+  commerce = applyEffectPct(commerce, effects.commercePct);
 
   return { food, shields, commerce, foodSurplus: food - FOOD_PER_CITIZEN * city.population };
 };
@@ -357,12 +427,14 @@ export const autoAssignWorkedTiles = (
 
   const candidates = cityRadius(state, city.tile).filter((tile) => !claimed.has(Number(tile)));
 
-  // Improvement-aware: a citizen values the tile as it *is*, so a mine already
-  // built inside the radius ranks above the bare hill it sits on. Ranking the
-  // bare terrain would make the assignment blind to everything a worker has done,
-  // which is exactly the state M4a adds.
+  // What the tile is actually worth in this state: terrain, improvements **and
+  // bonus resources**, so a citizen values a tile as it is — a mine already built
+  // inside the radius, or a bonus resource on it, ranks above the bare terrain it
+  // sits on. Ranking the bare terrain would make the assignment blind to
+  // everything a worker has done and to everything the map gave the tile, which is
+  // exactly the state M4a and M4c add.
   const rank = (tile: TileIndex): TerrainYields =>
-    tileYields(state, ruleset, tile) ?? { food: 0, shields: 0, commerce: 0 };
+    tileYieldsWithResources(state, ruleset, tile) ?? { food: 0, shields: 0, commerce: 0 };
 
   candidates.sort((a, b) => {
     const ya = rank(a);

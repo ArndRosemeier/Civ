@@ -138,8 +138,53 @@ const WITH_BUILDINGS: RulesetView = {
   terrains: TERRAINS,
   units: [],
   buildings: [
-    { id: asBuildingId('granary'), name: 'Granary', cost: 10 },
-    { id: asBuildingId('library'), name: 'Library', cost: 20 },
+    {
+      id: asBuildingId('granary'),
+      name: 'Granary',
+      cost: 10,
+      maintenance: 0,
+      effects: [{ kind: 'growth-food', amount: 1 }],
+    },
+    {
+      id: asBuildingId('library'),
+      name: 'Library',
+      cost: 20,
+      maintenance: 1,
+      effects: [{ kind: 'beaker-multiplier', pct: 50 }],
+    },
+  ],
+  improvements: [],
+  fidelity: 'tuned',
+};
+
+/**
+ * M4c's two city-output effects, in one view: a marketplace that scales commerce
+ * and a factory that scales shields. Kept separate from `WITH_BUILDINGS` so the
+ * lookup test above pins the catalog it was written for, and so the numbers below
+ * are the only buildings in play.
+ *
+ * The percentages and maintenances are this file's own stand-ins — the shipped
+ * catalog's values are pinned in `@civts/rules`' test and exercised end to end in
+ * `buildings.test.ts`. Nothing here is claimed to be Civ 3's.
+ */
+const YIELD_RULESET: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  buildings: [
+    {
+      id: asBuildingId('marketplace'),
+      name: 'Marketplace',
+      cost: 12,
+      maintenance: 1,
+      effects: [{ kind: 'commerce-multiplier', pct: 50 }],
+    },
+    {
+      id: asBuildingId('factory'),
+      name: 'Factory',
+      cost: 25,
+      maintenance: 3,
+      effects: [{ kind: 'shield-multiplier', pct: 50 }],
+    },
   ],
   improvements: [],
   fidelity: 'tuned',
@@ -243,7 +288,15 @@ const state = (
   seed: 7,
   settings: SETTINGS,
   rng: seedRng(7),
-  map: { width: WIDTH, height: HEIGHT, terrain: terrainIds(), huts: [] },
+  map: {
+    width: WIDTH,
+    height: HEIGHT,
+    terrain: terrainIds(),
+    huts: [],
+    // M4c: the map carries the resources `generateWorld` placed. Empty here, so a
+    // bonus resource cannot be the hidden reason a yield in this file moved.
+    resources: [],
+  },
   players: PLAYERS,
   nextUnitId: 0,
   units: [],
@@ -445,16 +498,73 @@ describe('cityYields', () => {
     expect(yields).toEqual({ food: 0, shields: 0, commerce: 0, foodSurplus: 0 });
   });
 
-  it('is unchanged by the building catalog: M3 buildings have no yield effect', () => {
-    // Pinned deliberately. M3 models exactly one property of a building — its
-    // shield cost — and `BuildingDef` has no yield field, so a ruleset that ships
-    // buildings must produce the same city output as one that ships none. If a
-    // later milestone gives a building an effect, this is where that shows up.
+  it('is unchanged by a catalog of buildings nobody has built', () => {
+    // M4c changed *why* this holds, and the change is the point: a building's
+    // effects apply only to the city that **holds** it, so a ruleset that ships
+    // buildings — a library with a beaker effect, a granary with a growth-food one —
+    // still produces exactly the output of a ruleset that ships none, as long as no
+    // city has built anything. The assertion is the same one M3 pinned (the two
+    // reads are equal); what moved is the reason it is true.
     const board = state([
       city(0, 0, CENTRE, { population: 2, workedTiles: [asTileIndex(at(3, 2))] }),
     ]);
     expect(cityYields(board, WITH_BUILDINGS, asCityId(0))).toEqual(
       cityYields(board, NO_BUILDINGS, asCityId(0)),
+    );
+    // Non-vacuity: the catalog really does carry effects, so the equality above is
+    // about *unbuilt* rows rather than about an empty catalog.
+    expect(WITH_BUILDINGS.buildings?.flatMap((def) => def.effects).length).toBeGreaterThan(0);
+  });
+
+  it('scales a city’s commerce and shields by the buildings that city holds', () => {
+    // A city of three citizens: the centre (mountains, so its 0/0/0 terrain is
+    // floored to 1/1/1) plus two worked grassland tiles (2/1/1 each) give
+    //   food 1 + 2 + 2 = 5, shields 1 + 1 + 1 = 3, commerce 1 + 1 + 1 = 3.
+    // Holding a marketplace (+50% commerce) and a factory (+50% shields):
+    //   commerce floor(3 * 150 / 100) = 4, shields floor(3 * 150 / 100) = 4,
+    //   food untouched (M4c's union has no food multiplier; the granary shrinks the
+    //   growth requirement instead — see `buildings.test.ts`).
+    const base = city(0, 0, CENTRE, {
+      population: 3,
+      workedTiles: [asTileIndex(at(3, 2)), asTileIndex(at(2, 1))],
+    });
+    const plain = state([base]);
+    const built = state([
+      { ...base, buildings: [asBuildingId('marketplace'), asBuildingId('factory')] },
+    ]);
+
+    expect(cityYields(plain, YIELD_RULESET, asCityId(0))).toEqual({
+      food: 5,
+      shields: 3,
+      commerce: 3,
+      foodSurplus: 5 - FOOD_PER_CITIZEN * 3,
+    });
+    expect(cityYields(built, YIELD_RULESET, asCityId(0))).toEqual({
+      food: 5,
+      shields: 4,
+      commerce: 4,
+      foodSurplus: 5 - FOOD_PER_CITIZEN * 3,
+    });
+  });
+
+  it('applies a building only to its own city, never to another city — even its owner’s', () => {
+    // The whole of "effects apply only to the city that holds the building": city 1
+    // is the same player's, four tiles away, and its yields are the untouched ones.
+    const bare = city(0, 0, CENTRE, { population: 2, workedTiles: [asTileIndex(at(3, 2))] });
+    const other = city(1, 0, at(0, 0), { population: 2, workedTiles: [asTileIndex(at(1, 0))] });
+    const stateWithout = state([bare, other]);
+    const stateWith = state([
+      { ...bare, buildings: [asBuildingId('marketplace'), asBuildingId('factory')] },
+      other,
+    ]);
+
+    expect(cityYields(stateWith, YIELD_RULESET, asCityId(1))).toEqual(
+      cityYields(stateWithout, YIELD_RULESET, asCityId(1)),
+    );
+    // …and the holding city really did change, so the equality is about the
+    // *other* city rather than about a multiplier that does nothing.
+    expect(cityYields(stateWith, YIELD_RULESET, asCityId(0))).not.toEqual(
+      cityYields(stateWithout, YIELD_RULESET, asCityId(0)),
     );
   });
 

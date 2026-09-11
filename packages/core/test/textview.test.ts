@@ -37,12 +37,35 @@
  * `NaN`), and god mode's header is asserted to gain nothing at all. Beakers and
  * luxuries are deliberately **not** in the header: they do nothing until M5 and M9,
  * and a bare number there would imply otherwise.
+ *
+ * **M4c.** `GameMap` gained `resources`, so the hand-built maps below carry
+ * `resources: []` — a migration, not a relaxation: the field is required, and a
+ * fixture that omitted it would only typecheck through a cast. A resource is drawn
+ * as `$` with a legend entry naming every resource actually drawn, under **exactly
+ * the hut's fog rule**: a resource on a tile the viewer has not explored is not
+ * revealed — no glyph, no legend entry, and the whole view is byte-identical to the
+ * same board with that resource removed. The legend entry is conditional in the
+ * same way, which is why a resource-free map renders exactly as it did before this
+ * wave. Every resource id in these fixtures is a stand-in for a catalog row; none
+ * of them is presented as Civ 3 content.
  */
 
 import { describe, expect, it } from 'vitest';
-import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
+import {
+  asPlayerId,
+  asResourceId,
+  asTerrainId,
+  asTileIndex,
+  asUnitId,
+  asUnitTypeId,
+} from '../src/ids.js';
 import { asImprovementId, type ImprovementDef } from '../src/improvements.js';
-import type { RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
+import {
+  compareTileResources,
+  type RulesetView,
+  type TerrainDef,
+  type TerrainRole,
+} from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import {
   civPlayers,
@@ -238,7 +261,13 @@ const syntheticState = (
   seed: 7,
   settings: SETTINGS,
   rng: { a: 1, b: 2, c: 3, d: 4 },
-  map: { width: 4, height: 4, terrain: GRID_4x4.map((role) => asTerrainId(role)), huts: [] },
+  map: {
+    width: 4,
+    height: 4,
+    terrain: GRID_4x4.map((role) => asTerrainId(role)),
+    huts: [],
+    resources: [],
+  },
   players,
   nextUnitId: players.length,
   units: startingUnits(players),
@@ -262,6 +291,31 @@ const STATE_4x4: GameState = syntheticState([player(0, 5), player(1, 10)]);
 const withHuts = (state: GameState, huts: readonly number[]): GameState => ({
   ...state,
   map: { ...state.map, huts: huts.map((tile) => asTileIndex(tile)) },
+});
+
+/**
+ * `state` with resources on the map (M4c: `GameMap.resources`, the sparse
+ * `(tile, resource)` list `map.ts` keeps sorted by `(tile, resource)`).
+ *
+ * The pairs are written in whatever order a test finds readable and **sorted with
+ * the engine's own `compareTileResources`**: the order is part of the map's shape, so
+ * a fixture that relied on an order of its own would be testing a state no builder
+ * can produce, and a second copy of the comparison here would be a second statement
+ * of a rule `map.ts` already states. The glyph they are drawn as, `$`, is pinned in
+ * the tests below rather than imported — like `%` for a hut, it is part of the
+ * picture a reader sees.
+ */
+const withResources = (
+  state: GameState,
+  pairs: readonly (readonly [number, string])[],
+): GameState => ({
+  ...state,
+  map: {
+    ...state.map,
+    resources: pairs
+      .map(([tile, resource]) => ({ tile: asTileIndex(tile), resource: asResourceId(resource) }))
+      .sort(compareTileResources),
+  },
 });
 
 /**
@@ -298,6 +352,13 @@ const glyphRows = (view: string): readonly string[] =>
 
 /** How many goody huts a rendered grid draws, counted as the picture shows them. */
 const hutGlyphs = (grid: string): number => grid.split('%').length - 1;
+
+/** How many resource glyphs a rendered grid draws, counted as the picture shows them. */
+const resourceGlyphs = (grid: string): number => grid.split('$').length - 1;
+
+/** The legend line of a rendered view, as a reader sees it. */
+const legendOf = (view: string): string =>
+  view.split('\n').find((line) => line.startsWith('legend: ')) ?? '';
 
 /**
  * The players the `starts:` line names, as `marker=Name@x,y` entries — read off
@@ -396,6 +457,7 @@ describe('describe', () => {
         height: 1,
         terrain: many.map(() => asTerrainId('grassland')),
         huts: [],
+        resources: [],
       },
     };
 
@@ -413,6 +475,7 @@ describe('describe', () => {
         height: 1,
         terrain: [asTerrainId('grassland'), asTerrainId('volcano')],
         huts: [],
+        resources: [],
       },
     };
 
@@ -568,6 +631,108 @@ describe('describe', () => {
     expect(view).not.toContain('starts:');
     expect(glyphRows(view)).toEqual(['~~::', '~,,-', ':%h^', '--h^']);
     expect(view).toContain('% hut');
+  });
+
+  it('draws a resource as $, with a legend field naming it, over the terrain it sits on', () => {
+    // Tile 13 is (1,3), the west tile of the bottom row. The resource replaces the
+    // `-` it sat on rather than being drawn beside it, and `$` is not a terrain
+    // glyph (`GRID_4x4[13]` is plains, and the hills tile at 14 is untouched).
+    const view = describeState(withResources(STATE_4x4, [[13, 'silk']]), RULESET);
+
+    expect(glyphRows(view)).toEqual(['~~::', '~0,-', ':,1^', '-$h^']);
+    expect(legendOf(view)).toContain('$ silk');
+    // The legend entry is a claim about the picture, so it says nothing about the
+    // glyph beyond the resource that is there: no `$` appears anywhere but the
+    // legend and the one tile it marks.
+    expect(resourceGlyphs(glyphRows(view).join(''))).toBe(1);
+
+    // A map with no resource adds no legend field and never draws the glyph — the
+    // rule that keeps every pre-M4c picture byte-identical.
+    const bare = describeState(STATE_4x4, RULESET);
+    expect(glyphRows(bare).join('')).not.toContain('$');
+    expect(legendOf(bare)).not.toContain('$');
+  });
+
+  it('names every resource the grid drew, in draw order and once each', () => {
+    // Three pairs, two of them the same resource on two tiles: the legend lists
+    // what is *on the board*, in the order the grid draws it (row by row), and a
+    // resource standing on two tiles is one entry rather than two.
+    const view = describeState(
+      withResources(STATE_4x4, [
+        [13, 'silk'],
+        [9, 'iron'],
+        [6, 'iron'],
+      ]),
+      RULESET,
+    );
+
+    expect(glyphRows(view)).toEqual(['~~::', '~0$-', ':$1^', '-$h^']);
+    expect(resourceGlyphs(glyphRows(view).join(''))).toBe(3);
+    expect(legendOf(view)).toContain('$ iron, silk');
+    // Draw order, not catalog order and not alphabetical: `silk` is drawn last
+    // because its tile is the last one the grid reaches.
+    expect(legendOf(view).indexOf('iron')).toBeLessThan(legendOf(view).indexOf('silk'));
+
+    // A viewport that crops the silk away lists only what it still draws, so the
+    // legend is a picture of the window rather than of the map.
+    const cropped = describeState(
+      withResources(STATE_4x4, [
+        [13, 'silk'],
+        [9, 'iron'],
+        [6, 'iron'],
+      ]),
+      RULESET,
+      { viewport: { x: 0, y: 0, width: 4, height: 3 } },
+    );
+    expect(legendOf(cropped)).toContain('$ iron');
+    expect(legendOf(cropped)).not.toContain('silk');
+  });
+
+  it('draws a resource whose id no catalog can name, rather than dropping it', () => {
+    // `describe` reads resources off the *map*; the ruleset's catalog is not
+    // consulted, exactly as it is not consulted for terrain. An id nothing defines
+    // is the id a reader can still act on (it is what `build`'s `requiresResource`
+    // spelling uses), so it is printed as itself rather than vanishing — the same
+    // reading an unknown terrain id gets, which is drawn as `?` rather than
+    // silently skipped.
+    const view = describeState(withResources(STATE_4x4, [[13, 'mithril']]), RULESET);
+
+    expect(glyphRows(view)[3]).toBe('-$h^');
+    expect(legendOf(view)).toContain('$ mithril');
+    // `RULESET` ships no resource catalog at all, which is a view the engine still
+    // runs: it is *not* a reason to hide what is painted on the map.
+    expect(RULESET.resources).toBeUndefined();
+  });
+
+  it('lets a start marker, and a hut, win over a resource on the same tile', () => {
+    // Neither collision is reachable from `generateWorld` (it places resources on
+    // neither a start tile nor a hut), so both are hand-built. The marker and the
+    // hut are the drawing order `describe` documents — a hut over a resource, a
+    // marker over both — and a glyph that was never drawn is claimed by no legend.
+    const view = describeState(
+      withResources(withHuts(STATE_4x4, [9]), [
+        [5, 'iron'],
+        [9, 'iron'],
+      ]),
+      RULESET,
+    );
+
+    expect(glyphRows(view)).toEqual(['~~::', '~0,-', ':%1^', '--h^']);
+    expect(view).toContain('% hut');
+    expect(legendOf(view)).not.toContain('$');
+    expect(legendOf(view)).not.toContain('iron');
+  });
+
+  it('still draws resources when the start legend is switched off', () => {
+    // `showStarts` gates the start *markers* and their `starts:` line, nothing
+    // else: a resource is map data, like a hut.
+    const view = describeState(withResources(STATE_4x4, [[9, 'iron']]), RULESET, {
+      showStarts: false,
+    });
+
+    expect(view).not.toContain('starts:');
+    expect(glyphRows(view)).toEqual(['~~::', '~,,-', ':$h^', '--h^']);
+    expect(legendOf(view)).toContain('$ iron');
   });
 
   it('accepts a start tile outside the map without crashing', () => {
@@ -824,6 +989,7 @@ describe('describe with a viewer', () => {
           asTerrainId([4, 5, 6, 9].includes(tile) ? role : 'mountains'),
         ),
         huts: [],
+        resources: [],
       },
     };
 
@@ -845,6 +1011,7 @@ describe('describe with a viewer', () => {
         height: 1,
         terrain: [asTerrainId('volcano'), asTerrainId('grassland')],
         huts: [],
+        resources: [],
       },
     };
 
@@ -1005,6 +1172,77 @@ describe('describe with a viewer', () => {
     expect(view).toBe(describeState(FOGGED, RULESET, { viewer: asPlayerId(0) }));
     // …while god mode, which is allowed to know, shows it.
     expect(glyphRows(describeState(hutInTheFog, RULESET))[3]).toBe('-%h^');
+  });
+
+  it('draws a resource the viewer has explored, and adds its legend field', () => {
+    // Tile 9 is one of the four player 0 has explored (4, 5, 6, 9) — the positive
+    // half of the fog rule below, so that test cannot pass by nothing ever being
+    // drawn.
+    const view = describeState(withResources(FOGGED, [[9, 'iron']]), RULESET, {
+      viewer: asPlayerId(0),
+    });
+
+    expect(glyphRows(view)[2]).toBe('?$??');
+    expect(legendOf(view)).toContain('$ iron');
+    expect(resourceGlyphs(glyphRows(view).join(''))).toBe(1);
+  });
+
+  it('does not reveal a resource on a tile the viewer has not explored, in the grid or the legend', () => {
+    // M4c's resource glyph is drawn under *exactly* the hut's fog rule: a resource
+    // is map data with a strategic consequence, so a tile the player has not
+    // explored contributes neither a glyph nor a legend entry. Tile 13 is
+    // unexplored and tile 9 is not, so this board has one of each and the test
+    // proves both halves in one view.
+    const partlyInTheFog = withResources(FOGGED, [
+      [13, 'silk'],
+      [9, 'iron'],
+    ]);
+    const view = describeState(partlyInTheFog, RULESET, { viewer: asPlayerId(0) });
+
+    expect(glyphRows(view)[3]).toBe('????');
+    expect(glyphRows(view)[2]).toBe('?$??');
+    // The silk is nowhere in the output — not as a glyph, not as a legend entry,
+    // and not as the id itself.
+    expect(view).not.toContain('$ silk');
+    expect(view).not.toContain('silk');
+
+    // The strongest form of "does not leak", the same one the hut test makes: the
+    // whole view is byte-identical to the same board with the hidden resource
+    // removed altogether.
+    expect(view).toBe(
+      describeState(withResources(FOGGED, [[9, 'iron']]), RULESET, { viewer: asPlayerId(0) }),
+    );
+
+    // …and two *different* resources on two different unexplored tiles render the
+    // same bytes, so nothing about a resource the viewer cannot see can influence
+    // the output at all — not its id, not its kind, not which tile it is on.
+    const other = withResources(FOGGED, [
+      [12, 'gems'],
+      [9, 'iron'],
+    ]);
+    expect(describeState(other, RULESET, { viewer: asPlayerId(0) })).toBe(view);
+
+    // …while god mode, which is allowed to know, draws the silk and names it.
+    const god = describeState(partlyInTheFog, RULESET);
+    expect(glyphRows(god)[3]).toBe('-$h^');
+    expect(legendOf(god)).toContain('$ iron, silk');
+  });
+
+  it('adds no resource legend entry when every resource on the map is in the fog', () => {
+    // The conditional-legend rule, stated on its own: a board whose *only*
+    // resources are unexplored has no `$` in its legend at all, because the legend
+    // entry is a claim that the glyph is on the pictured map. (The hut-free views
+    // of M2 and M3 stay byte-identical for exactly this reason.)
+    const hidden = withResources(FOGGED, [
+      [13, 'silk'],
+      [10, 'gems'],
+    ]);
+    const view = describeState(hidden, RULESET, { viewer: asPlayerId(0) });
+
+    expect(view).not.toContain('$');
+    expect(glyphRows(view)).toEqual(['????', '~0,?', '?,??', '????']);
+    // The picture is exactly the board with no resources on it, byte for byte.
+    expect(view).toBe(describeState(FOGGED, RULESET, { viewer: asPlayerId(0) }));
   });
 
   it('never presents the barbarians as a start, in god mode or through the fog', () => {

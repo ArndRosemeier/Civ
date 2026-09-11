@@ -89,7 +89,19 @@ export interface UnitDef {
   /** Production cost in shields. Unused in M2: production arrives in M3+. */
   readonly cost: number;
   readonly domain: UnitDomain;
-  /** M4; omitted by every M2 row. */
+  /**
+   * The resource this unit type needs (M4c). Absent on every row that needs
+   * nothing — the key is **omitted**, never present and `undefined`, for the
+   * reason every optional field in this project is: a present-but-`undefined` key
+   * cannot survive a JSON round trip.
+   *
+   * What the field *means* is stated once, in `resources.ts`: a unit whose row
+   * declares one may be produced only by a city whose owner has that resource
+   * connected by road (`resourceGate`, read by `planSetProduction` in
+   * `commands.ts`). This module owns the field's shape and nothing else — it does
+   * not decide gating, and `requiredResourceOf` is the engine's only read of it.
+   * `validateRuleset` rejects a value naming a resource no catalog row defines.
+   */
   readonly requiresResource?: ResourceId;
 }
 

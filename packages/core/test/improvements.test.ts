@@ -279,7 +279,17 @@ const state = (
   seed: 7,
   settings: SETTINGS,
   rng: seedRng(7),
-  map: { width: WIDTH, height: HEIGHT, terrain: terrainIds(), huts: [] },
+  map: {
+    width: WIDTH,
+    height: HEIGHT,
+    terrain: terrainIds(),
+    huts: [],
+    // M4c: the map carries the resources `generateWorld` placed, as sparse
+    // `(tile, resource)` pairs. Empty here — an improvement's own rules read no
+    // resource — and spelled out rather than omitted, because the key is part of
+    // `GameMap` and therefore of every state hash.
+    resources: [],
+  },
   players: PLAYERS,
   nextUnitId: 0,
   units: [],
@@ -308,13 +318,16 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
  * ------------------------------------------------------------------ */
 
 describe('GameState.improvements at setup', () => {
-  it('starts empty, as an array, at schema version 5', () => {
-    // A fourth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b): the field is
-    // empty here, and the version moved with it, so a save from the previous shape
-    // is recognisable rather than silently misread. M4b moved it because
+  it('starts empty, as an array, at schema version 6', () => {
+    // A fifth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b -> M4c): the field
+    // is empty here, and the version moved with it, so a save from the previous
+    // shape is recognisable rather than silently misread. M4b moved it because
     // `PlayerState` gained `treasury`/`rates`/`beakers`/`luxuries` and `newGame`
     // now also places a worker — both of which change every existing hash
-    // (INTERFACES.md M4b, "Migration owners").
+    // (INTERFACES.md M4b, "Migration owners"). M4c moved it again because `GameMap`
+    // gained `resources`: no `GameState` key is new this time, but `map` is inside
+    // the state and is hashed with it, so a new map key moves every hash exactly as
+    // a new state key would (INTERFACES.md M4c, "Resources", "Migration owners").
     const game = newGame(42, SETTINGS, RULESET);
     expect(game.ok).toBe(true);
     if (!game.ok) return;
@@ -322,7 +335,21 @@ describe('GameState.improvements at setup', () => {
     expect(game.value.improvements).toEqual([]);
     expect(Array.isArray(game.value.improvements)).toBe(true);
     expect(game.value.schemaVersion).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(5);
+    expect(SCHEMA_VERSION).toBe(6);
+
+    // M4c's map key, read the same way and for the same reason: a fresh game's map
+    // always *carries* `resources`, and this stand-in catalog ships no resource row,
+    // so the honest reading is present-and-empty. Absent would be a state that
+    // predates M4c — a different shape wearing the same version number.
+    expect(Array.isArray(game.value.map.resources)).toBe(true);
+    expect(game.value.map.resources).toEqual([]);
+    expect(Object.keys(game.value.map).sort()).toEqual([
+      'height',
+      'huts',
+      'resources',
+      'terrain',
+      'width',
+    ]);
 
     // The new keys are readable straight off a fresh game, on *every* player:
     // civilizations hold the starting treasury, barbarians hold nothing, and every

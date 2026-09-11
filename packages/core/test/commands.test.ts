@@ -24,7 +24,13 @@
 
 import { describe, expect, it } from 'vitest';
 import { canonicalize, hashValue } from '@civts/testing';
-import { MIN_CITY_DISTANCE, cityById, type City, type ProductionItem } from '../src/cities.js';
+import {
+  MIN_CITY_DISTANCE,
+  cityById,
+  type BuildingDef,
+  type City,
+  type ProductionItem,
+} from '../src/cities.js';
 import {
   applyCommand,
   planCancelWork,
@@ -45,6 +51,7 @@ import {
   asBuildingId,
   asCityId,
   asPlayerId,
+  asResourceId,
   asTerrainId,
   asTileIndex,
   asUnitId,
@@ -59,7 +66,7 @@ import {
   type ImprovementDef,
   type ImprovementId,
 } from '../src/improvements.js';
-import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
+import type { GameMap, ResourceDef, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { applyProduction, itemCost, itemCostOf } from '../src/production.js';
 import { isOk, type Result } from '../src/result.js';
 import { nextBelow, seedRng } from '../src/rng.js';
@@ -169,6 +176,10 @@ const MAP: GameMap = {
   // M3: the map carries its goody huts; this fixture has none, so no move below
   // can be affected by one (hut rewards are another workstream's).
   huts: [],
+  // M4c: the map also carries its resources, as sparse `(tile, resource)` pairs.
+  // This shared fixture holds none — the resource-gate section below is where a
+  // board gains an iron — so no earlier assertion on this board changes meaning.
+  resources: [],
 };
 
 const makeDef = (id: string, role: UnitRole, movement: number, cost: number): UnitDef => ({
@@ -188,13 +199,62 @@ const WARRIOR = makeDef('warrior', 'military', 2, 2);
 /** Movement 1: enough to start a job or take one step, never both. */
 const WORKER = makeDef('worker', 'worker', 1, 2);
 
+/** The three resource ids this fixture's catalog defines, named once. */
+const IRON = asResourceId('iron');
+const GEMS = asResourceId('gems');
+const WHEAT = asResourceId('wheat');
+
+/**
+ * M4c's gated row: the one unit type in this fixture that declares
+ * `requiresResource`, appended **after** the warrior so anything that takes "the
+ * first `military` land unit in catalog order" (hut rewards, `hut.ts`) still gets
+ * the warrior. Its requirement is the whole subject of the gate section below.
+ */
+const SWORDSMAN: UnitDef = { ...makeDef('swordsman', 'military', 1, 3), requiresResource: IRON };
+
+/**
+ * The resource catalog, one row per kind, as **placeholder** rows of ours: iron
+ * is what a unit row may demand, gems are placed and counted and read by nothing
+ * (M4c: "no happiness effect until M9"), and wheat adds `+2 food` to its tile.
+ */
+const RESOURCES: readonly ResourceDef[] = [
+  {
+    id: IRON,
+    name: 'Iron',
+    kind: 'strategic',
+    yields: { food: 0, shields: 0, commerce: 0 },
+    allowedRoles: ['grassland', 'plains', 'hills', 'mountains'],
+  },
+  {
+    id: GEMS,
+    name: 'Gems',
+    kind: 'luxury',
+    yields: { food: 0, shields: 0, commerce: 0 },
+    allowedRoles: ['grassland', 'plains', 'hills', 'mountains'],
+  },
+  {
+    id: WHEAT,
+    name: 'Wheat',
+    kind: 'bonus',
+    yields: { food: 2, shields: 0, commerce: 0 },
+    allowedRoles: ['grassland', 'plains'],
+  },
+];
+
 /** Building costs (shields), as placeholder rows of ours. */
 const GRANARY_COST = 10;
 const LIBRARY_COST = 20;
 
-const BUILDINGS = [
-  { id: asBuildingId('granary'), name: 'Granary', cost: GRANARY_COST },
-  { id: asBuildingId('library'), name: 'Library', cost: LIBRARY_COST },
+/**
+ * Building rows, with M4c's three fields spelled out: `maintenance` **0** ("free to
+ * keep" — the money-loop assertions in this file are measured against M4b's
+ * unit-support formula and must not move) and `effects: []` ("costs shields and
+ * nothing else"). Both are legal rows; upkeep-declaring and effect-declaring
+ * buildings are pinned in the files that own those systems.
+ */
+const BUILDINGS: readonly BuildingDef[] = [
+  { id: asBuildingId('granary'), name: 'Granary', cost: GRANARY_COST, maintenance: 0, effects: [] },
+  { id: asBuildingId('library'), name: 'Library', cost: LIBRARY_COST, maintenance: 0, effects: [] },
 ];
 
 /**
@@ -241,12 +301,17 @@ const IRRIGATION: ImprovementDef = {
 
 const IMPROVEMENTS: readonly ImprovementDef[] = [ROAD, MINE, IRRIGATION];
 
-/** The engine's view of a ruleset: terrain, a unit catalog, buildings, improvements. */
+/**
+ * The engine's view of a ruleset: terrain, a unit catalog, buildings, improvements
+ * and — M4c — a resource catalog. `SWORDSMAN` is the one gated row and is
+ * **appended**, so catalog order for everything before it is unchanged.
+ */
 const RULESET: RulesetView = {
   terrains: TERRAINS,
-  units: [SETTLER, SCOUT, WARRIOR, WORKER],
+  units: [SETTLER, SCOUT, WARRIOR, WORKER, SWORDSMAN],
   buildings: BUILDINGS,
   improvements: IMPROVEMENTS,
+  resources: RESOURCES,
   fidelity: 'tuned',
 };
 
@@ -1417,6 +1482,281 @@ describe('applyCommand — SetProduction', () => {
     expect(apply(frozen, P0, setProduction(0, unitItem('warrior'))).ok).toBe(true);
     expect(apply(frozen, P0, setProduction(0, unitItem('spaceship'))).ok).toBe(false);
     expect(frozen).toEqual(snapshot);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4c — the resource gate on production
+ * ------------------------------------------------------------------ */
+
+/**
+ * The two boards the gate section differs by: player 0's city on 13 (the M3
+ * fixture) on a map carrying **iron on 15**, and the same board with a **road on
+ * 14**. Tile 13 is `(1,3)` and tile 15 is `(3,3)`, so 14 is the one tile between
+ * them: with the road the city centre reaches the iron, without it nothing does.
+ *
+ * Iron on a mountain is deliberate — the connection rule is a path of *road*
+ * tiles and asks nothing about terrain (M4c names no terrain rule), so a
+ * mountain resource is the case that would break if someone "improved" the walk
+ * with a passability check.
+ */
+const IRON_TILE = 15;
+const ROAD_TO_IRON = 14;
+const IRON_MAP: GameMap = {
+  ...MAP,
+  resources: [{ tile: asTileIndex(IRON_TILE), resource: IRON }],
+};
+
+/** Player 0's city with iron on the map and no road: the gate is shut. */
+const GATED_STATE: GameState = withCities({ ...STATE, map: IRON_MAP }, [CITY]);
+
+/** The same board with the one road that connects the iron: the gate is open. */
+const CONNECTED_STATE: GameState = {
+  ...GATED_STATE,
+  improvements: [{ tile: asTileIndex(ROAD_TO_IRON), kind: ROAD.id }],
+};
+
+const swordsman = unitItem('swordsman');
+
+/**
+ * A **wonder** row (M4c): `wonder: true` is what turns on global uniqueness, and
+ * the key is present-and-`true`, never present-and-`false` (which
+ * `validateRuleset` rejects). It lives in its own ruleset below, so the shared
+ * `RULESET` — and every count asserted against it earlier in this file — is
+ * unchanged by it.
+ */
+const PYRAMIDS: BuildingDef = {
+  id: asBuildingId('pyramids'),
+  name: 'Pyramids',
+  cost: 40,
+  maintenance: 0,
+  effects: [],
+  wonder: true,
+};
+
+const WONDER_RULESET: RulesetView = { ...RULESET, buildings: [...BUILDINGS, PYRAMIDS] };
+
+const pyramids = buildingItem('pyramids');
+
+describe('applyCommand — SetProduction resource gating (M4c)', () => {
+  it('accepts the gated unit once the owner has the resource connected', () => {
+    const outcome = mustOk(apply(CONNECTED_STATE, P0, setProduction(0, swordsman)));
+
+    expect(cityOf(outcome.state, 0).production).toEqual(swordsman);
+    expect(outcome.state.revision).toBe(CONNECTED_STATE.revision + 1);
+    // A setter emits no event, on M3's precedent: the payload is the record.
+    expect(outcome.events).toEqual([]);
+  });
+
+  it('lays the road and the very same command becomes legal — nothing else differs', () => {
+    // The two boards differ by exactly one `(tile, kind)` pair, so this is a test
+    // of the gate rather than of a board that happens to be different.
+    expect(GATED_STATE.improvements).toEqual([]);
+    expect(CONNECTED_STATE.improvements).toEqual([
+      { tile: asTileIndex(ROAD_TO_IRON), kind: ROAD.id },
+    ]);
+    expect(planSetProduction(GATED_STATE, RULESET, P0, asCityId(0), swordsman).ok).toBe(false);
+    expect(planSetProduction(CONNECTED_STATE, RULESET, P0, asCityId(0), swordsman).ok).toBe(true);
+  });
+
+  it('refuses it with the typed error while the road is missing', () => {
+    const expected: GameError = {
+      kind: 'resource-not-connected',
+      cityId: asCityId(0),
+      owner: P0,
+      item: swordsman,
+      resource: IRON,
+    };
+
+    expect(
+      refusedAs(apply(GATED_STATE, P0, setProduction(0, swordsman)), 'resource-not-connected'),
+    ).toStrictEqual(expected);
+
+    // The plan evaluator — the applier's *own* decision, and the one `actions.ts`'
+    // production options are filtered through — refuses identically, field for
+    // field. A generator and an applier that disagreed here is the bug the
+    // keystone invariant exists to catch.
+    const plan = planSetProduction(GATED_STATE, RULESET, P0, asCityId(0), swordsman);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) throw new Error('unreachable: the gate is shut on this board');
+    expect(plan.error).toStrictEqual(expected);
+  });
+
+  it('refuses a requirement naming a resource no catalog row defines', () => {
+    // `validateRuleset` rejects such a unit row outright, so this is reachable only
+    // through a foreign or hand-built view. The gate is total on it: the id is not
+    // connected, so the item is refused with the same typed error that names it.
+    const champion: UnitDef = {
+      ...SWORDSMAN,
+      id: asUnitTypeId('champion'),
+      requiresResource: asResourceId('mithril'),
+    };
+    const ruleset: RulesetView = { ...RULESET, units: [...RULESET.units, champion] };
+    const item: ProductionItem = { kind: 'unit', id: champion.id };
+
+    expect(planSetProduction(CONNECTED_STATE, ruleset, P0, asCityId(0), item).ok).toBe(false);
+    expect(
+      refusedAs(
+        apply(CONNECTED_STATE, P0, setProduction(0, item), ruleset),
+        'resource-not-connected',
+      ),
+    ).toStrictEqual({
+      kind: 'resource-not-connected',
+      cityId: asCityId(0),
+      owner: P0,
+      item,
+      resource: asResourceId('mithril'),
+    });
+  });
+
+  it('gates nothing that demands nothing, on the very same disconnected board', () => {
+    // The check is the gate, not "units are suspicious": a warrior, a settler and a
+    // building are all fine with iron unconconnected and no road anywhere.
+    expect(apply(GATED_STATE, P0, setProduction(0, unitItem('warrior'))).ok).toBe(true);
+    expect(apply(GATED_STATE, P0, setProduction(0, unitItem('settler'))).ok).toBe(true);
+    expect(apply(GATED_STATE, P0, setProduction(0, buildingItem('granary'))).ok).toBe(true);
+  });
+
+  it('is the player’s connection, not the building city’s own road', () => {
+    // M4c connects a resource for a *player* when "some city of that player" reaches
+    // it, so a second city far from the road network may still build the swordsman…
+    const twoCities = withCities(CONNECTED_STATE, [CITY, city(1, 0, 4)]);
+    expect(cityOf(twoCities, 1).tile).toBe(asTileIndex(4));
+
+    const outcome = mustOk(apply(twoCities, P0, setProduction(1, swordsman)));
+    expect(cityOf(outcome.state, 1).production).toEqual(swordsman);
+
+    // …while that same city, alone with no city of its owner reaching any iron,
+    // is refused. The connection is the player's, not a property of the city.
+    const lonely = withCities(GATED_STATE, [city(1, 0, 4)]);
+    expect(
+      refusedAs(apply(lonely, P0, setProduction(1, swordsman)), 'resource-not-connected').kind,
+    ).toBe('resource-not-connected');
+  });
+
+  it('refuses a barbarian owner even with a road right up to the resource', () => {
+    // A board that connects for a civilization — same roads, same iron, same city
+    // tile — owned by the barbarians: "no economy and therefore no connections".
+    const barbarianCity = city(0, 1, 13, { population: 2, workedTiles: [asTileIndex(4)] });
+    const barbarians = withCities(
+      { ...CONNECTED_STATE, players: [player(0, 5), player(1, 6, 'barbarian')] },
+      [barbarianCity],
+    );
+
+    expect(barbarians.cities[0]?.owner).toBe(P1);
+    expect(
+      refusedAs(apply(barbarians, P1, setProduction(0, swordsman)), 'resource-not-connected'),
+    ).toStrictEqual({
+      kind: 'resource-not-connected',
+      cityId: asCityId(0),
+      owner: P1,
+      item: swordsman,
+      resource: IRON,
+    });
+  });
+
+  it('leaves the state, the city and the revision untouched when the gate refuses', () => {
+    const frozen: GameState = structuredClone(GATED_STATE);
+    const snapshot = structuredClone(frozen);
+    deepFreeze(frozen);
+
+    expect(apply(frozen, P0, setProduction(0, swordsman)).ok).toBe(false);
+    expect(frozen).toEqual(snapshot);
+    // The city is still building *nothing* — and by absence, not by a key holding
+    // `undefined`, which is the spelling that cannot survive a JSON round trip.
+    expect(cityOf(frozen, 0).production).toBeUndefined();
+    expect('production' in cityOf(frozen, 0)).toBe(false);
+    expect(frozen.revision).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4c — wonders are globally unique (the building half of the same decision)
+ * ------------------------------------------------------------------ */
+
+describe('applyCommand — SetProduction and the wonder rule (M4c)', () => {
+  /** Player 0's city 0 on 13 holds the wonder; its city 1 on 4 does not. */
+  const oneHolder = (): GameState =>
+    withCities({ ...GATED_STATE, players: [player(0, 5), player(1, 6)] }, [
+      city(0, 0, 13, { population: 2, buildings: [PYRAMIDS.id] }),
+      city(1, 0, 4),
+    ]);
+
+  it('refuses a wonder another city holds, naming the holder', () => {
+    const state = oneHolder();
+
+    expect(
+      refusedAs(
+        apply(state, P0, setProduction(1, pyramids), WONDER_RULESET),
+        'wonder-already-built',
+      ),
+    ).toStrictEqual({
+      kind: 'wonder-already-built',
+      cityId: asCityId(1),
+      building: PYRAMIDS.id,
+      holder: asCityId(0),
+    });
+
+    // The holder itself gets the *other* refusal, because its situation is
+    // different: it has the wonder, so `already-built` is the honest reason.
+    expect(
+      refusedAs(apply(state, P0, setProduction(0, pyramids), WONDER_RULESET), 'already-built'),
+    ).toStrictEqual({ kind: 'already-built', cityId: asCityId(0), building: PYRAMIDS.id });
+
+    // …and the plan evaluator, which `actions.ts`' option list filters through,
+    // refuses for the same two reasons. One rule, asked here and by
+    // `production.ts`' completion pass (`buildings.ts`' `mayStartBuilding`).
+    const plan = planSetProduction(state, WONDER_RULESET, P0, asCityId(1), pyramids);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) throw new Error('unreachable: another city holds the wonder');
+    expect(plan.error).toStrictEqual({
+      kind: 'wonder-already-built',
+      cityId: asCityId(1),
+      building: PYRAMIDS.id,
+      holder: asCityId(0),
+    });
+  });
+
+  it('accepts an unheld wonder, and accepts it again once the holder loses it', () => {
+    const unheld = withCities({ ...GATED_STATE, players: [player(0, 5), player(1, 6)] }, [
+      city(0, 0, 13, { population: 2 }),
+      city(1, 0, 4),
+    ]);
+
+    const built = mustOk(apply(unheld, P0, setProduction(1, pyramids), WONDER_RULESET));
+    expect(cityOf(built.state, 1).production).toEqual(pyramids);
+
+    // Bankruptcy takes the buildings a player can no longer pay for (`economy.ts`),
+    // leaving `city.buildings` everywhere — which is what makes the wonder startable
+    // again. `disbandBuildings` is not called here because this test is about the
+    // *rule*, not about the money loop; dropping the building is exactly the state
+    // that loop produces.
+    const state = oneHolder();
+    expect(cityOf(state, 0).buildings).toEqual([PYRAMIDS.id]);
+    const lost: GameState = {
+      ...state,
+      cities: state.cities.map((existing) =>
+        existing.id === asCityId(0) ? { ...existing, buildings: [] } : existing,
+      ),
+    };
+
+    expect(cityOf(lost, 0).buildings).toEqual([]);
+    const again = mustOk(apply(lost, P0, setProduction(1, pyramids), WONDER_RULESET));
+    expect(cityOf(again.state, 1).production).toEqual(pyramids);
+  });
+
+  it('leaves the ordinary buildings untouched by the wonder rule', () => {
+    // The rule is about `wonder: true` rows only: two cities may each build a
+    // granary, and the second city's granary is not "already built" because the
+    // first city has one.
+    const state = oneHolder();
+
+    expect(apply(state, P0, setProduction(1, buildingItem('granary')), WONDER_RULESET).ok).toBe(
+      true,
+    );
+    expect(
+      planSetProduction(state, WONDER_RULESET, P0, asCityId(1), buildingItem('granary')).ok,
+    ).toBe(true);
   });
 });
 

@@ -51,6 +51,17 @@
  *   enumeration is the whole space, not a sample of it. `CancelWork` is a single
  *   question about the unit's own state, and it is legal exactly when the unit is
  *   working.
+ * - **M4c's resource gate is mirrored here, through the applier's own evaluator.**
+ *   `cityProductionOptions` lists what a city may be set to build by filtering the
+ *   catalog through `planSetProduction` — the same function `applyCommand` refuses
+ *   with, resource gate included — so a unit whose `requiresResource` the owner has
+ *   not connected is **not offered**, and (the other direction) everything offered
+ *   is something the applier accepts. That is the mirror the keystone invariant
+ *   asks for, and it is a *query* rather than a `legalActions` yield for the reason
+ *   the setters are: `SetProduction` emits no event, and the committed adversarial
+ *   sweeps treat "an advertised action with no observable effect" as a generator
+ *   that has drifted. `actions.test.ts` sweeps the options against `applyCommand`
+ *   in both directions.
  * - **`SetRates` (M4b) is a query too, and the sixth generator is its evaluator.**
  *   `planSetRates` is the applier's own decision — "this actor exists, and this
  *   triple is three integers `>= 0` summing to `RATE_TOTAL`" — and `applyCommand`
@@ -104,18 +115,20 @@
  *   never materialises the whole space (PLAN.md §5.2).
  */
 
+import { buildingCatalog, cityById, type ProductionItem } from './cities.js';
 import {
   planCancelWork,
   planFoundCity,
   planMove,
+  planSetProduction,
   planStartWork,
   type Command,
 } from './commands.js';
 import { improvementCatalog, type ImprovementId } from './improvements.js';
-import type { PlayerId, TileIndex, UnitId } from './ids.js';
+import type { CityId, PlayerId, TileIndex, UnitId } from './ids.js';
 import { neighbors8, type RulesetView } from './map.js';
 import type { GameState } from './state.js';
-import { unitById } from './units.js';
+import { unitById, unitCatalog } from './units.js';
 
 /**
  * Every adjacent tile `unitId` may legally step onto, in ascending tile-index
@@ -214,6 +227,66 @@ export const unitActions = (
   }));
 
   return [...found, ...started, ...cancelled, ...moves];
+};
+
+/**
+ * Every production item `cityId` may legally be set to build, in catalog order:
+ * the unit catalog first, then the building catalog, each with duplicate ids
+ * collapsed, filtered through `planSetProduction` — the evaluator `applyCommand`
+ * refuses with.
+ *
+ * **This is the mirror `SetProduction`'s legality needs.** The applier refuses an
+ * item this ruleset cannot price, a building the city already has, and — M4c — a
+ * unit whose `requiresResource` the city's owner has not connected. A UI that
+ * built its menu from `unitCatalog` alone would offer exactly that unit, so the
+ * enumeration has to be made of the applier's own verdicts rather than of the
+ * catalog, and the resource-gated unit simply does not appear. The other direction
+ * holds too: every item this yields is one `applyCommand` accepts out of the same
+ * catalog, which `actions.test.ts` asserts on boards with and without a connected
+ * resource.
+ *
+ * A `cityId` the state does not hold yields `[]` — asking about a city that is not
+ * there is a question a UI asks every frame, and "nothing" is the honest answer.
+ * The acting player is the city's own owner, exactly as `unitMoveOptions` acts for
+ * the unit's owner: a per-city query has no separate actor, and a state whose
+ * owner is missing from `players` offers nothing, which is what `applyCommand`
+ * says about such an actor too.
+ *
+ * Deliberately **not** yielded by `legalActions`, on the precedent M3 set for the
+ * two setters and M4b's amendment recorded: a production choice is a search space
+ * over content, not an action list, and `SetProduction` emits no event — so
+ * advertising it would put a no-op-looking command in the event-driven sweeps.
+ * Legality is still stated once, in `planSetProduction`; this function is how the
+ * gate reaches the UI and the AI.
+ */
+export const cityProductionOptions = (
+  state: GameState,
+  ruleset: RulesetView,
+  cityId: CityId,
+): readonly ProductionItem[] => {
+  const city = cityById(state, cityId);
+  if (city === undefined) return [];
+
+  const candidates: readonly ProductionItem[] = [
+    ...unitCatalog(ruleset).map((def): ProductionItem => ({ kind: 'unit', id: def.id })),
+    ...buildingCatalog(ruleset).map((def): ProductionItem => ({ kind: 'building', id: def.id })),
+  ];
+
+  const seen = new Set<string>();
+  const options: ProductionItem[] = [];
+  for (const item of candidates) {
+    // Duplicate ids in a foreign catalog are collapsed, because the applier's
+    // accepted set has one entry per *distinct* item and a generator that listed
+    // the same item twice would be advertising a choice that is not there — the
+    // same reading `unitActions` applies to improvement kinds.
+    const key = `${item.kind}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!planSetProduction(state, ruleset, city.owner, cityId, item).ok) continue;
+    options.push(item);
+  }
+
+  return options;
 };
 
 /**

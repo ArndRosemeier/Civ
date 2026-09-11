@@ -145,6 +145,86 @@
  * (`treasury`, `rates`, `beakers`, `luxuries`) whether or not a scenario mentions
  * them, so `PlayerState` has one shape and the state stays hashable.
  *
+ * M4c extends the builder for the fourth time, additively, for the same reason as
+ * always — three of the wave's five acceptance scenarios are not writable without
+ * it. Three methods, one per fact of the world the DSL could not state:
+ *
+ * - **`addResource(x, y, id)` places a resource on a tile.** `GameMap.resources` is
+ *   what generation put on the terrain, and the builder assembled its map with no
+ *   `resources` field at all — so no scenario could start from a world where a
+ *   strategic resource was reachable, and the resource gate (the M4c rule that a
+ *   unit demanding a resource may only be built where its owner has that resource
+ *   *connected*) had no hand-built world to be asserted against. Like
+ *   `addImprovement`, the cheap half of the rule is checked at the call (the
+ *   coordinates are on the map, the ruleset defines the id, the same *pair* is not
+ *   asked for twice) and the half that needs the finished map is checked in
+ *   `build()` (the terrain under the tile must be in that row's `allowedRoles`, and
+ *   the tile must not carry a goody hut — two of the three placement guarantees
+ *   `gen.ts` gives).
+ *
+ *   **Two of the generator's guarantees are deliberately not enforced**, and the
+ *   reasons are stated rather than left to a reader to discover:
+ *
+ *   1. *A start tile may carry a resource.* `gen.ts` never places one on a start
+ *      tile, but a hand-built world has no generation and no pre-history: a
+ *      player's `startingTile` here is simply where its first unit stands, and
+ *      `FoundCity` founds exactly where the settler stands — so the most natural
+ *      way to write "a resource on the city tile itself", which M4c's acceptance
+ *      evidence asks for, would be refused if the rule were imposed.
+ *   2. *Two resources may share one tile.* `gen.ts` places at most one per tile;
+ *      `map.ts`' `TileResource` list is a `(tile, resource)` pair list, so a
+ *      hand-built map can state two, and `resources.ts` sums a tile's bonus
+ *      deltas precisely because "a hand-built map is not bound by the generator's
+ *      rule". The acceptance evidence names this world outright, so the builder
+ *      must be able to write it — and it does reject the same *pair* twice, which
+ *      is an authoring mistake rather than a second resource.
+ *
+ *   The list is folded through the engine's own comparator (`compareTileResources`)
+ *   rather than sorted here: `(tile, resource)` ascending is `GameMap.resources`'
+ *   contract because the list is hashed, and the module that states the order is
+ *   the module that imposes it.
+ * - **`addBuilding(cityIndex, building)` gives a city a building.** `addCity`'s
+ *   `buildings` option already states one at the moment the city is created, and
+ *   that is unchanged; what was missing is the world in which a building stands in
+ *   a city the scenario has already finished describing — which is what the wonder
+ *   rules need ("once ANY city anywhere holds it, no city may start it"), and what
+ *   the maintenance scenario needs to state a city whose buildings outrun its
+ *   income. The catalog check is `addCity`'s; on top of it this refuses a building
+ *   the city already holds (the engine's typed `already-built`, which is a refusal
+ *   and not a silent no-op) and a **wonder** another city already holds (the
+ *   engine's global-uniqueness rule, which no legal game can produce two copies
+ *   of). Calls append, so a city's `buildings` order is the order the scenario
+ *   wrote them in — the order `production.ts` appends on completion, and therefore
+ *   the order `disbandBuildings` reads backwards when a bankruptcy takes the most
+ *   recently completed first.
+ * - **`connectRoad(from, to)` connects two tiles by road.** A resource is connected
+ *   for a player when some city of that player reaches it through a path of
+ *   road-improved tiles, so "a city connected by road to a strategic resource" is
+ *   the *world* the acceptance evidence needs, and writing it as a chain of
+ *   `addImprovement` calls is a fact about the shipped catalog's road id and about
+ *   the 8-way geometry, restated by every scenario. This method reads the road
+ *   **kind** off the catalog (exactly as `resources.ts` does, so a ruleset that
+ *   calls its road `highway` still works and no scenario depends on the id), walks
+ *   a deterministic 8-way line from `from` to `to` inclusive, and records the road
+ *   on every tile of it — skipping the tiles that already carry that improvement,
+ *   because a road is a road and two roads meeting is not a second road. It is
+ *   *not* a statement of the connection rule: the rule has one implementation
+ *   (`resources.ts`' `connected`), and this only writes the world it reads.
+ *
+ * The `Scenario` interface itself is untouched for the fourth time (no new field,
+ * no changed signature), the runner is unchanged, and `addResource`/`addBuilding`/
+ * `connectRoad` are the only new names on the builder's surface — so a scenario
+ * written against M2, M3, M4a or M4b keeps compiling. Said out loud because the
+ * assignment asked: what M4c extends here is the **builder**, not the frozen
+ * `Scenario` interface.
+ *
+ * The one other edit is a *migration*, not an extension: `describeGameError`'s
+ * message table gained the two error members M4c added to `GameError`
+ * (`resource-not-connected` and `wonder-already-built`). Without those case labels
+ * a scenario that hits the new refusals — which is exactly what the resource
+ * evidence does — reports `unrecognised error` and throws away the one thing that
+ * makes the refusal useful, so the table follows the union it describes.
+ *
  * Failure channels — the frozen signature is narrower than the builder's needs,
  * so the split is stated here rather than discovered by a caller:
  *
@@ -216,6 +296,7 @@ import {
   autoAssignWorkedTiles,
   buildingDef,
   cityRadius,
+  compareTileResources,
   distance8,
   err,
   improvementCatalog,
@@ -223,10 +304,13 @@ import {
   inBounds,
   indexToX,
   indexToY,
+  isWonder,
   itemCostOf,
   loadSettings,
   ok,
   ratesProblem,
+  resourceCatalog,
+  resourceDef,
   seedRng,
   tileIndex,
   unitCatalog,
@@ -246,6 +330,7 @@ import {
   type PlayerState,
   type ProductionItem,
   type Rates,
+  type ResourceId,
   type Result,
   type RulesetView,
   type Settings,
@@ -254,6 +339,7 @@ import {
   type TerrainId,
   type TerrainRole,
   type TileIndex,
+  type TileResource,
   type Unit,
   type UnitDef,
   type UnitTypeId,
@@ -336,6 +422,33 @@ export interface ScenarioBuilder {
    * terrain role throws at `build()`, where the terrain is final.
    */
   addImprovement(x: number, y: number, kind: ImprovementId): ScenarioBuilder;
+  /**
+   * Place a resource on a tile (M4c) — a *map* fact, like a hut, and the only way
+   * a scenario can give a player something to connect. Coordinates off the map, an
+   * id this ruleset does not define, and the same `(tile, resource)` pair twice
+   * throw here; a tile whose terrain role is not in that row's `allowedRoles`, and
+   * a tile that carries a goody hut, throw at `build()`, where the terrain and the
+   * huts are final. Two **different** resources on one tile are allowed (see the
+   * module note: `gen.ts` places at most one, and a hand-built map may state two).
+   */
+  addResource(x: number, y: number, resource: ResourceId): ScenarioBuilder;
+  /**
+   * Give the city `addCity` created at `cityIndex` a building (M4c). Appends, so a
+   * city's `buildings` list is the order the scenario wrote them in. A building
+   * this ruleset does not define, a building the city already holds (the engine's
+   * own `already-built`), and a **wonder** another city already holds (its
+   * global-uniqueness rule) throw here, at the call that named them.
+   */
+  addBuilding(cityIndex: number, building: BuildingId): ScenarioBuilder;
+  /**
+   * Connect two tiles by road (M4c): the road improvement every tile on a
+   * deterministic 8-way line between them carries, endpoints included. The road is
+   * found by `kind` in this ruleset's improvement catalog, so no scenario depends
+   * on the shipped id; a ruleset with no road row throws here. This writes a world
+   * — it does not decide whether anything is *connected* (`resources.ts` owns that
+   * rule, and it is the only implementation of it).
+   */
+  connectRoad(from: readonly [number, number], to: readonly [number, number]): ScenarioBuilder;
   addUnit(playerIndex: number, type: UnitTypeId, at: readonly [number, number]): ScenarioBuilder;
   /** State a city outright (M3) — the only way a scenario can have a queue at all. */
   addCity(playerIndex: number, at: readonly [number, number], options?: CitySetup): ScenarioBuilder;
@@ -568,6 +681,23 @@ const describeGameError = (error: GameError): string => {
       return `unknown-production-item (${describeItem(error.item)} is not buildable)`;
     case 'already-built':
       return `already-built (city ${String(error.cityId)} already has "${error.building}")`;
+    // M4c's two production refusals. Each names the fix, because the two are
+    // genuinely different answers: "build a road (or a city nearer)" versus
+    // "someone else finished the wonder first" — and a message that said only
+    // "refused" would leave a scenario author re-deriving which of the two their
+    // world produced. `resource-not-connected` names the resource and whose
+    // connection was missing (they are two facts: connection is the *player's*),
+    // and `wonder-already-built` names the holder when the state knows one.
+    case 'resource-not-connected':
+      return (
+        `resource-not-connected (${describeItem(error.item)} requires "${error.resource}", which ` +
+        `player ${String(error.owner)} has not connected to city ${String(error.cityId)})`
+      );
+    case 'wonder-already-built':
+      return (
+        `wonder-already-built (city ${String(error.cityId)} may not start "${error.building}"` +
+        `${error.holder === undefined ? '' : `, which city ${String(error.holder)} already holds`})`
+      );
     // M4a's worker refusals. Each names the improvement and the tile or role that
     // decided it, because "why can this worker not dig here?" is the question a
     // scenario author is asking.
@@ -662,6 +792,21 @@ interface ImprovementPlacement {
 }
 
 /**
+ * A resource the scenario asked for (M4c), in the coordinates it was written in —
+ * the same reason `HutPlacement`/`ImprovementPlacement` keep coordinates: the
+ * terrain under the tile is only final in `build()`.
+ *
+ * Two entries with the same `(x, y)` and different `resource` are two resources on
+ * one tile, which a hand-built map may state (see the module note) and which M4c's
+ * acceptance evidence names; the same pair twice is refused at the call.
+ */
+interface ResourcePlacement {
+  readonly x: number;
+  readonly y: number;
+  readonly resource: ResourceId;
+}
+
+/**
  * A city the scenario asked for, with every option resolved to the value the
  * state will carry. `workedTiles` keeps "the author named them" distinct from
  * "the builder assigns them": `undefined` means the latter, and an explicitly
@@ -694,6 +839,8 @@ interface BuilderWorld {
   readonly huts: HutPlacement[];
   /** M4a: the improvements the scenario asked for, in the order it asked. */
   readonly improvements: ImprovementPlacement[];
+  /** M4c: the resources the scenario asked for, in the order it asked. */
+  readonly resources: ResourcePlacement[];
   readonly cities: CityPlacement[];
 }
 
@@ -780,6 +927,34 @@ const checkedWorkedTiles = (
 };
 
 /**
+ * Every tile on the deterministic 8-way line from `from` to `to`, both endpoints
+ * included — the shape `connectRoad` writes.
+ *
+ * One step per tile: the x and y coordinates each move one tile toward the target
+ * (so a diagonal target is walked diagonally), which makes consecutive tiles
+ * 8-adjacent and therefore a path the connection walk in `resources.ts` can
+ * actually cross. Deterministic by construction — no RNG, no search, no tie to
+ * break — and it terminates because every step strictly reduces the distance to the
+ * target in at least one axis. Both endpoints are checked to be on the map by the
+ * caller, and a coordinate that is not a number is off the map (`inBounds` says so),
+ * so no `NaN` can be walked.
+ */
+const roadPath = (
+  from: readonly [number, number],
+  to: readonly [number, number],
+): readonly (readonly [number, number])[] => {
+  const path: (readonly [number, number])[] = [[from[0], from[1]]];
+  let x = from[0];
+  let y = from[1];
+  while (x !== to[0] || y !== to[1]) {
+    x += Math.sign(to[0] - x);
+    y += Math.sign(to[1] - y);
+    path.push([x, y]);
+  }
+  return path;
+};
+
+/**
  * Turn the recorded world into a `GameState`, or into the one `SetupError` a
  * hand-built map can produce.
  *
@@ -859,6 +1034,48 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
   }
   huts.sort((a, b) => Number(a) - Number(b));
 
+  // M4c resources, in the order `GameMap.resources`' contract fixes: `(tile,
+  // resource)` ascending. The sort is the engine's own comparator rather than a
+  // comparison written here, because the order is part of a hashed field's contract
+  // and the module that states it is the module that imposes it.
+  //
+  // Two of the three placement guarantees `gen.ts` gives are checked here, and only
+  // because they are knowable now: the tile's role must be one the row lists, and
+  // the tile must not carry a goody hut. The third — "never on a start tile" — is
+  // deliberately *not* enforced; see the module note (a hand-built world has no
+  // pre-history, a player's start tile is where its first unit stands, and M4c's
+  // acceptance evidence asks for a resource on a city tile).
+  const resources: TileResource[] = [];
+  for (const placed of world.resources) {
+    const index = tileIndex(world.width, placed.x, placed.y);
+    const role = world.roles[index] ?? DEFAULT_FILL_ROLE;
+    const def = resourceDef(world.ruleset, placed.resource);
+    if (def === undefined) {
+      throw new Error(
+        `scenario builder: addResource(${String(placed.x)}, ${String(placed.y)}, ` +
+          `"${placed.resource}") names a resource this ruleset does not define, so nothing could ` +
+          'connect to it; add the row to the ruleset or drop the call',
+      );
+    }
+    if (!def.allowedRoles.includes(role)) {
+      throw new Error(
+        `scenario builder: addResource(${String(placed.x)}, ${String(placed.y)}, ` +
+          `"${placed.resource}") puts it on "${role}", which is not in its allowedRoles ` +
+          `(${def.allowedRoles.join(', ')}) — gen.ts would never place it there, so the world is ` +
+          'one generation cannot produce',
+      );
+    }
+    if (huts.some((hut) => Number(hut) === index)) {
+      throw new Error(
+        `scenario builder: addResource(${String(placed.x)}, ${String(placed.y)}, ` +
+          `"${placed.resource}") puts it on a goody hut — generateWorld never places a resource ` +
+          'and a hut on one tile',
+      );
+    }
+    resources.push({ tile: asTileIndex(index), resource: placed.resource });
+  }
+  resources.sort(compareTileResources);
+
   // Creation order is id order (dense ids, sorted array — the `newGame`
   // invariant), and a player's first placement is the tile it "started" on.
   const units: Unit[] = [];
@@ -934,7 +1151,7 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
     seed: resolved.value.seed,
     settings: resolved.value,
     rng: seedRng(resolved.value.seed),
-    map: { width: world.width, height: world.height, terrain, huts },
+    map: { width: world.width, height: world.height, terrain, huts, resources },
     players,
     nextUnitId: units.length,
     units,
@@ -977,8 +1194,9 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
     }
     if (!def.allowedRoles.includes(role)) {
       throw new Error(
-        `scenario builder: addImprovement(${String(placed.x)}, ${String(placed.y)}, ` +
-          `"${placed.kind}") puts it on "${role}", which is not in its allowedRoles ` +
+        `scenario builder: the improvement "${placed.kind}" at (${String(placed.x)}, ` +
+          `${String(placed.y)}) — placed by addImprovement or connectRoad — is on "${role}", ` +
+          `which is not in its allowedRoles ` +
           `(${def.allowedRoles.join(', ')}) — StartWork would refuse this tile, so the world is ` +
           'one the command layer cannot produce',
       );
@@ -1056,6 +1274,7 @@ export const createScenarioBuilder = (
     placements: [],
     huts: [],
     improvements: [],
+    resources: [],
     cities: [],
   };
 
@@ -1086,6 +1305,23 @@ export const createScenarioBuilder = (
     if (!Number.isInteger(value) || value < min) {
       throw new Error(
         `scenario builder: ${method} needs an integer ${field} >= ${String(min)} (got ${String(value)})`,
+      );
+    }
+  };
+
+  /**
+   * A *city* index, checked the way `checkPlayerIndex` checks a player's: a city
+   * index is the position of an `addCity` call, which is also the city's own
+   * `CityId` (`build()` hands ids out in creation order), so the two spellings name
+   * the same city and this is the one place the range is decided.
+   */
+  const checkCityIndex = (method: string, cityIndex: number): void => {
+    const known = world.cities.length;
+    if (!Number.isInteger(cityIndex) || cityIndex < 0 || cityIndex >= known) {
+      throw new Error(
+        `scenario builder: ${method}(${String(cityIndex)}, ...) needs the index of a city that has ` +
+          `been added with addCity, in [0, ${String(known - 1)}]; ${String(known)} city/cities ` +
+          'have been added so far',
       );
     }
   };
@@ -1267,6 +1503,125 @@ export const createScenarioBuilder = (
       // The terrain role is checked in `build()`: a later `setTile` can still
       // change what this tile is, so the answer is not known yet.
       world.improvements.push({ x, y, kind });
+      return builder;
+    },
+
+    addResource(x, y, resource) {
+      checkTile(x, y);
+
+      // An id this ruleset does not describe would be a pair nothing can connect
+      // to: `connected` reads the map's pairs against the catalog, so a scenario
+      // asserting "the iron gated the swordsman" would be asserting about a
+      // resource the engine cannot see. Reported here, where the author wrote the
+      // id, exactly as `addImprovement` reports an unknown kind.
+      if (resourceDef(world.ruleset, resource) === undefined) {
+        const known = resourceCatalog(world.ruleset)
+          .map((def) => def.id)
+          .join(', ');
+        throw new Error(
+          `scenario builder: the ruleset defines no resource "${resource}"` +
+            (known === '' ? ' (it defines no resources)' : ` (it defines: ${known})`),
+        );
+      }
+
+      // The same *pair* twice is an authoring mistake: `GameMap.resources` is a
+      // pair list, and a second identical pair would be one resource written twice
+      // rather than a second resource. Two *different* resources on one tile are a
+      // world a hand-built map may state (see the module note), so they are allowed.
+      if (
+        world.resources.some(
+          (placed) => placed.x === x && placed.y === y && placed.resource === resource,
+        )
+      ) {
+        throw new Error(
+          `scenario builder: addResource(${String(x)}, ${String(y)}, "${resource}") is called twice ` +
+            'for one tile; a tile holds a given resource once (a *different* resource may share ' +
+            'the tile, as `map.ts` says a hand-built map may)',
+        );
+      }
+
+      // The terrain role and the huts under this tile are checked in `build()`: a
+      // later `setTile`/`addHut` can still change the answer, so it is not known yet.
+      world.resources.push({ x, y, resource });
+      return builder;
+    },
+
+    addBuilding(cityIndex, building) {
+      checkCityIndex('addBuilding', cityIndex);
+      const placed = world.cities[cityIndex];
+      if (placed === undefined) {
+        // Unreachable: `checkCityIndex` has already proved the index is in range.
+        throw new Error('scenario builder: addBuilding needs an index that names a city');
+      }
+
+      const def = buildingDef(world.ruleset, building);
+      if (def === undefined) {
+        throw new Error(
+          `scenario builder: the ruleset defines no building "${building}", so no city can hold it`,
+        );
+      }
+
+      // The engine's own `already-built` refusal, stated at the call: M3 made
+      // "build it twice" a typed error rather than a silent no-op, so a hand-built
+      // city holding two copies would be a city the command layer cannot produce.
+      if (placed.buildings.includes(building)) {
+        throw new Error(
+          `scenario builder: addBuilding(${String(cityIndex)}, "${building}") is called for a city ` +
+            'that already holds it; building one twice is refused by the engine, not a silent no-op',
+        );
+      }
+
+      // M4c's wonder rule, at the call: a wonder is globally unique — "once ANY
+      // city anywhere holds it, no city may start it" — so a hand-built world with
+      // two copies is a world no legal game can reach.
+      if (
+        isWonder(def) &&
+        world.cities.some((city, index) => index !== cityIndex && city.buildings.includes(building))
+      ) {
+        throw new Error(
+          `scenario builder: addBuilding(${String(cityIndex)}, "${building}") would be a second copy ` +
+            `of a wonder — a wonder is globally unique, and no city may start one another city holds`,
+        );
+      }
+
+      // Appended, so a city's `buildings` order is the order this scenario wrote
+      // them in: the order `production.ts` appends on completion, and therefore the
+      // order `disbandBuildings` reads backwards (most recently completed first).
+      world.cities[cityIndex] = { ...placed, buildings: [...placed.buildings, building] };
+      return builder;
+    },
+
+    connectRoad(from, to) {
+      const [fromX, fromY] = from;
+      const [toX, toY] = to;
+      checkTile(fromX, fromY);
+      checkTile(toX, toY);
+
+      // The road is a *kind*, not an id: `resources.ts`' connection walk reads its
+      // roads off the catalog the same way, so renaming the shipped row cannot
+      // disconnect a civilization and no scenario has to know the shipped id.
+      const road = improvementCatalog(world.ruleset).find((def) => def.kind === 'road');
+      if (road === undefined) {
+        throw new Error(
+          'scenario builder: connectRoad needs a road improvement in this ruleset — a ruleset that ' +
+            'defines no row of kind "road" has no tile a connection walk could cross',
+        );
+      }
+
+      for (const [x, y] of roadPath(from, to)) {
+        // A road is a road: two segments meeting is not a second road, so a tile
+        // that already carries this improvement is skipped rather than reported the
+        // way `addImprovement` reports the same call twice (that refusal is for an
+        // author who wrote one call twice, which is a different mistake).
+        if (
+          world.improvements.some(
+            (placed) => placed.x === x && placed.y === y && placed.kind === road.id,
+          )
+        ) {
+          continue;
+        }
+        world.improvements.push({ x, y, kind: road.id });
+      }
       return builder;
     },
 

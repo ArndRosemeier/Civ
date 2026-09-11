@@ -359,6 +359,13 @@ describe('hashValue', () => {
  * differently, so `canonicalize` refuses it outright rather than letting an
  * unhashable save exist. That bug class cost M2's `Settings.ruleset` and M3's
  * `City.production` a hunt each; this is the loud version of it.
+ *
+ * M4c: the same answer, for the same reason. `GameMap` gained a required `resources`
+ * pair list and `SCHEMA_VERSION` went 5 -> 6, and neither can reach anything here —
+ * this file hashes plain JSON, not `GameState`, so no hand-built literal needs the new
+ * field and no assertion moves. Where the schema's hashes *are* pinned is where the
+ * states are: `golden.test.ts`, and the `m3`/`m4b` adversarial files, which re-pinned
+ * their digits to the M4c values.
  * ------------------------------------------------------------------ */
 
 describe('an optional field, absent versus undefined', () => {

@@ -111,6 +111,12 @@ const MAP: GameMap = {
   // has seen, and a hut is not a fog rule; the generated-game cases below do
   // carry the real, hut-bearing map.
   huts: [],
+  // M4c: so do resources, as the same sparse `(tile, resource)` pair list
+  // `generateWorld` writes. None here for the same reason: `describe` renders a
+  // resource glyph, and this board exists so that a fog assertion cannot be moved
+  // by a resource nobody mentioned. The key is present and empty rather than
+  // absent — it is part of `GameMap`, and therefore of every state hash.
+  resources: [],
 };
 
 /**

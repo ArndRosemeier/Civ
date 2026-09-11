@@ -17,13 +17,14 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { asTerrainId, asUnitId, asUnitTypeId } from '../src/ids.js';
+import { asResourceId, asTerrainId, asUnitId, asUnitTypeId } from '../src/ids.js';
 import {
   TERRAIN_BY_ROLE,
   TERRAIN_ROLES,
   distance8,
   terrainAtIndex,
   type GameMap,
+  type ResourceDef,
   type RulesetView,
   type TerrainDef,
   type TerrainRole,
@@ -96,6 +97,38 @@ const NO_UNITS: RulesetView = {
   improvements: [],
   fidelity: 'tuned',
 };
+
+/**
+ * A stand-in resource catalog (M4c) for the cases that need a world which really
+ * has resources in it. One row per kind, on roles this stand-in terrain set
+ * provides, so placement has somewhere to go on every seed.
+ */
+const RESOURCE_ROWS: readonly ResourceDef[] = [
+  {
+    id: asResourceId('iron'),
+    name: 'Iron',
+    kind: 'strategic',
+    yields: { food: 0, shields: 0, commerce: 0 },
+    allowedRoles: ['hills', 'mountains'],
+  },
+  {
+    id: asResourceId('gems'),
+    name: 'Gems',
+    kind: 'luxury',
+    yields: { food: 0, shields: 0, commerce: 0 },
+    allowedRoles: ['hills', 'mountains'],
+  },
+  {
+    id: asResourceId('wheat'),
+    name: 'Wheat',
+    kind: 'bonus',
+    yields: { food: 1, shields: 0, commerce: 0 },
+    allowedRoles: ['grassland', 'plains'],
+  },
+];
+
+/** The ruleset view that ships those rows — the M4c half of the engine's view. */
+const RESOURCED: RulesetView = { ...RULESET, resources: RESOURCE_ROWS };
 
 /** A duel map (40x40) with two civilizations: small, fast, and enough land. */
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
@@ -233,6 +266,67 @@ describe('newGame', () => {
 
     expect(game.improvements).toEqual([]);
     expect(JSON.parse(JSON.stringify(game))).toEqual(game);
+  });
+
+  it('carries the generated resources on the map, and stores the map verbatim', () => {
+    // M4c: resources ride on `GameMap`, which setup stores exactly as generation
+    // returned it — there is no second list on the state and nothing to re-derive.
+    // With a ruleset that ships no resource catalog the honest answer is an empty
+    // list, and the *key* is still there: `map` is hashed wholesale, so "no
+    // resources" must be an empty array rather than an absent field.
+    const game = mustGame(42, SETTINGS, RULESET);
+    expect(game.map.resources).toEqual([]);
+    expect('resources' in game.map).toBe(true);
+    // …and the map has exactly these five keys: the shape is pinned so a field
+    // added without a schema bump — the thing the bump exists to record — cannot
+    // slip into the hashed JSON unnoticed.
+    expect(Object.keys(game.map).sort()).toEqual([
+      'height',
+      'huts',
+      'resources',
+      'terrain',
+      'width',
+    ]);
+    expect(JSON.parse(JSON.stringify(game))).toEqual(game);
+  });
+
+  it('places resources on a real game without ever touching a start or a hut', () => {
+    // The placement contract, reached through `newGame` rather than through
+    // `generateWorld` directly: what setup hands the game is what the generator
+    // produced, so the exclusions have to hold in the state a player actually
+    // gets. `gen.test.ts` owns the full placement contract; this is the state-level
+    // half — the map is not re-worked on the way through setup.
+    for (const seed of [1, 42, 1337]) {
+      const game = mustGame(seed, SETTINGS, RESOURCED);
+
+      expect(game.map.resources.length).toBeGreaterThan(0);
+      expect(game.map.huts.length).toBeGreaterThan(0);
+
+      for (const pair of game.map.resources) {
+        const row = RESOURCE_ROWS.find((r) => r.id === pair.resource);
+        expect(row).toBeDefined();
+        // `allowedRoles` is a placement rule: whatever row the pair names must
+        // allow the role of the tile it sits on.
+        expect(row === undefined ? [] : [...row.allowedRoles]).toContain(
+          roleAt(game.map, pair.tile),
+        );
+
+        expect(game.map.huts).not.toContain(pair.tile);
+        expect(civPlayers(game).map((p) => p.startingTile)).not.toContain(pair.tile);
+      }
+    }
+  });
+
+  it('is deterministic with resources in play: the same seed reproduces the pairs', () => {
+    const first = mustGame(1337, SETTINGS, RESOURCED);
+    const second = mustGame(1337, SETTINGS, RESOURCED);
+
+    expect(second.map.resources).toEqual(first.map.resources);
+    expect(second).toEqual(first);
+    // Two seeds do not have to differ, but a placement that never moved would be
+    // indistinguishable from a hard-coded one.
+    const other = mustGame(1338, SETTINGS, RESOURCED);
+    expect(other.map.resources).not.toEqual(first.map.resources);
   });
 
   it('places every civilization on a passable land tile inside the map', () => {
@@ -698,5 +792,26 @@ describe('starting fog', () => {
       );
       expect(outside).toEqual([]);
     }
+  });
+});
+
+/**
+ * The persisted shape itself, asserted rather than assumed.
+ *
+ * `schemaVersion` sits *inside* the hashed state, so the number is not decoration:
+ * it is the contract a save file and a golden file are read under. M4c moved it
+ * 5 → 6 because `GameMap` gained the sparse resource list, which changes every
+ * state hash exactly as a new `GameState` key would (INTERFACES.md M4c,
+ * "Resources" and "Migration owners").
+ */
+describe('the persisted state shape', () => {
+  it('is schema version 6 — M4c put the resource list on the map', () => {
+    // Pinned by *value*, not by `toBe(SCHEMA_VERSION)`. A test that agrees with
+    // whatever the constant says cannot notice a shape change that was never
+    // recorded, and recording it is the whole point of the number: the comment
+    // above `SCHEMA_VERSION` is where the history is written down, this is where it
+    // is enforced. When the shape moves again, this line moves with it — in the
+    // same commit as the golden regeneration, which is what a rehash is.
+    expect(SCHEMA_VERSION).toBe(6);
   });
 });

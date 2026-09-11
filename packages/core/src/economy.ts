@@ -25,7 +25,18 @@
  *   no unit remains that can pay. Each removal emits `UnitDisbanded`. The
  *   treasury NEVER goes negative; if the shortfall survives every disband, the
  *   unpaid amount is reported in a `TreasuryShortfall` event rather than
- *   invented as a debt field.
+ *   invented as a debt field. **M4c adds the other half of the bill**: a player
+ *   whose buildings outrun its income loses the buildings it could not pay for
+ *   (`buildings.ts`' `disbandBuildings`, most recently completed first, until
+ *   their maintenance covers what went unpaid) — a wonder included, since a wonder
+ *   is a building that bills gold like any other. That loss is a *consequence* of
+ *   the unpaid bill, not a payment against it: see the ledger identity below.
+ * - **A city's building effects are its own** (M4c): the summed
+ *   `commerce-multiplier` of the buildings it holds is already inside the commerce
+ *   `cityYields` reports (so the rates split multiplied commerce), and this module
+ *   applies the summed `beaker-multiplier` to that city's beaker channel, with one
+ *   floor, through `buildings.ts`' `applyEffectPct`. No effect of one city reaches
+ *   another, and no effect is computed here: `buildings.ts` owns that rule.
  *
  * Design notes:
  *
@@ -61,6 +72,18 @@
  *   `TreasuryShortfall.unpaid`. `treasuryAfter` is `max(0, …)` of that sum, so the
  *   treasury can never be negative (asserted as an invariant by the tests) and the
  *   floor is exactly the bankruptcy branch.
+ * - **A building lost to bankruptcy buys no gold, and the identity above is why.**
+ *   M4c's `disbandBuildings` removes buildings from a broke player's cities, but
+ *   their maintenance is **not** added to `covered`: the player did not pay with
+ *   them, it *lost* them, and the gold it failed to pay is still reported unpaid.
+ *   Crediting the demolition instead would make every shortfall coverable by
+ *   tearing down the very buildings that caused it — `shortfall <= maintenance +
+ *   unitSupport` always holds — so `TreasuryShortfall` would become unreachable
+ *   from **any** content, which is precisely the M4b debt the contract says M4c
+ *   exists to close. What the loss buys is the *next* turn: the maintenance is gone
+ *   from `buildingMaintenance`, so a player that sheds its unaffordable buildings
+ *   stops bleeding. The ledger identity is therefore unchanged by M4c, and the
+ *   tests can keep checking it to the gold.
  * - **Everything read is read totally.** A player whose `treasury` is missing or
  *   is not a whole number — a hand-built state, a save from before M4b, a JSON
  *   round trip — is read as 0 rather than allowed to put a `NaN` or a fraction
@@ -78,7 +101,17 @@
  *   approximation, NOT that rule.
  */
 
-import { buildingDef, cityYields, type BuildingDef } from './cities.js';
+import { buildingCatalog, cityYields } from './cities.js';
+// M4c: what a building costs to keep, what its beaker effect does to a city's
+// science, and the one way a building is lost. A value import, and a one-way edge
+// (`buildings.ts` imports `BuildingDef`/`City` from `cities.ts` type-only and
+// nothing from here), so the money loop's own import graph stays acyclic.
+import {
+  applyEffectPct,
+  cityBuildingEffects,
+  disbandBuildings,
+  playerMaintenance,
+} from './buildings.js';
 // Type-only: this module produces events and never calls into the command layer,
 // so the edge is erased and `commands.ts` (which imports `ratesProblem` from here
 // as a *value*) cannot form a runtime cycle.
@@ -354,53 +387,28 @@ export const unitSupport = (state: GameState, playerId: PlayerId): UnitSupport =
 };
 
 /**
- * How much a single building costs its owner each turn.
- *
- * M4b **adds no buildings' effects**: the contract says it "sums whatever
- * `maintenance` the catalog already declares", and the catalog declares none —
- * buildings carry a `cost` in shields and nothing else (see `BuildingDef`), because
- * effects are M4c's "buildings & wonders v1". The field is therefore read
- * *structurally*: a row that carries an integer `maintenance > 0` is billed, and a
- * row that carries nothing is billed 0, so M4c can fill the field in without this
- * module changing its mind about what a building costs.
- *
- * The read is total on a foreign row: a missing field, a fraction, a negative
- * number or a string all mean "this row declares no maintenance", never a
- * fractional bill.
- */
-const maintenanceOf = (def: BuildingDef): number => {
-  if (!('maintenance' in def)) return 0;
-  const declared: unknown = def.maintenance;
-  return typeof declared === 'number' && Number.isInteger(declared) && declared > 0 ? declared : 0;
-};
-
-/**
  * What `playerId`'s buildings cost each turn: the sum of every owned city's
  * buildings' maintenance, in city-id order (the order of `state.cities`).
  *
- * A building id the ruleset does not describe costs nothing — the same
- * reading `production.ts` gives an item it cannot price. Nothing is charged twice
- * for the same row in the same city: a city's `buildings` list is its own set
- * (M3 refuses to build one twice), and a hand-built duplicate is billed twice
- * because it *is* two entries; saying so is cheaper than inventing a de-duplication
- * rule the state shape does not have.
+ * The sum itself is `buildings.ts`' `playerMaintenance` — the module that owns what
+ * a building costs — and this function is the money loop's thin, named entry point
+ * to it, so `UpkeepPaid`'s `maintenance` and the buildings `disbandBuildings`
+ * reasons about are the same number computed once. The catalog is resolved here
+ * through `buildingCatalog`, the one place "a view with no buildings has none" is
+ * decided.
+ *
+ * A building id the ruleset does not describe costs nothing — the same reading
+ * `production.ts` gives an item it cannot price. Nothing is charged twice for the
+ * same row in the same city: a city's `buildings` list is its own set (M3 refuses
+ * to build one twice), and a hand-built duplicate is billed twice because it *is*
+ * two entries; saying so is cheaper than inventing a de-duplication rule the state
+ * shape does not have.
  */
 export const buildingMaintenance = (
   state: GameState,
   ruleset: RulesetView,
   playerId: PlayerId,
-): number => {
-  let total = 0;
-  for (const city of state.cities) {
-    if (city.owner !== playerId) continue;
-    for (const building of city.buildings) {
-      const def = buildingDef(ruleset, building);
-      if (def === undefined) continue;
-      total += maintenanceOf(def);
-    }
-  }
-  return total;
-};
+): number => playerMaintenance(state, buildingCatalog(ruleset), playerId);
 
 /** What one player owes this turn: the two halves, and their sum. */
 export interface Upkeep {
@@ -439,9 +447,20 @@ export const playerUpkeep = (
  * - **`gold` is this turn's income.** `beakers` and `luxuries` are the same split's
  *   other two channels: they accumulate into the player's pools and do nothing
  *   until M5 and M9 respectively.
- * - **No building or improvement gold effects exist yet.** The contract's income
- *   line mentions them; `BuildingDef` carries no `gold` field and M4c owns effects,
- *   so today this term is exactly the cities' gold share. Stated here rather than
+ * - **M4c: the city's own library scales its beakers.** After the split, this
+ *   city's summed `beaker-multiplier` percentage is applied to its **beaker
+ *   channel** with one floor (`applyEffectPct`), so the library of a city raises
+ *   that city's science and nothing else's — not the player's other cities, and not
+ *   its gold or its luxuries. Beakers still do nothing until M5; a library makes an
+ *   inert pool fill faster, which is stated rather than implied.
+ * - **The commerce those beakers came from is already multiplied.** A
+ *   `commerce-multiplier` (marketplace) is applied inside `cityYields`, because it
+ *   scales *commerce* — which the rates then divide — rather than one channel. So a
+ *   city with both a marketplace and a library multiplies twice on purpose, once
+ *   per effect, each with its own single floor.
+ * - **No building adds gold directly.** The contract's income line allows for
+ *   "building/improvement gold effects"; M4c's effect union has none, so today this
+ *   term is exactly the cities' gold share plus nothing. Stated here rather than
  *   left to be discovered.
  * - An unknown `playerId` collects nothing, and a player with no cities collects
  *   nothing: both are the honest answer for a read that has no failure channel.
@@ -454,6 +473,7 @@ export const playerIncome = (
   const player = playerById(state, playerId);
   if (player === undefined) return NO_COMMERCE;
   const rates = ratesOf(player);
+  const catalog = buildingCatalog(ruleset);
 
   let gold = 0;
   let beakers = 0;
@@ -462,8 +482,11 @@ export const playerIncome = (
   for (const city of state.cities) {
     if (city.owner !== playerId) continue;
     const split = splitCommerce(cityYields(state, ruleset, city.id).commerce, rates);
+    // This city's own buildings, and only this city's: `cityBuildingEffects` reads
+    // `city.buildings`.
+    const effects = cityBuildingEffects(catalog, city);
     gold += split.gold;
-    beakers += split.beakers;
+    beakers += applyEffectPct(split.beakers, effects.beakerPct);
     luxuries += split.luxuries;
   }
 
@@ -544,7 +567,22 @@ const withoutUnit = (state: GameState, unitId: Unit['id']): GameState => ({
  *    `UNIT_SUPPORT_COST`, the last capped at what remains), emitting
  *    `UnitDisbanded` per removal and `TreasuryShortfall` for whatever could not be
  *    covered. The treasury is exactly 0 afterwards — never negative — and the
- *    ledger identity in the module note holds to the gold.
+ *    ledger identity in the module note holds to the gold. Whatever is still unpaid
+ *    then costs the player **buildings** (M4c): `disbandBuildings` takes the most
+ *    recently completed ones, a wonder included, until their maintenance covers the
+ *    unpaid amount. That loss changes the state without a ledger line of its own —
+ *    see the *known gap* below.
+ *
+ * **Known gap, stated rather than implied.** Losing buildings is visible in the
+ * state (`city.buildings` shrinks) and in the next turn's `UpkeepPaid.maintenance`,
+ * but it emits **no event of its own**: `GameEvent` is declared in `commands.ts`
+ * and has no building-loss member, and adding one is a change to a frozen union
+ * this module does not own. The contract's own words for the branch are
+ * `UnitDisbanded` plus `TreasuryShortfall`, both of which are emitted exactly as
+ * before, so nothing here is *mis*-reported; what is missing is a line a reader of
+ * the stream alone could use. Recorded as M4c debt in the report rather than
+ * papered over, and the `BuildingLoss` list `disbandBuildings` returns is the shape
+ * such an event would carry.
  *
  * **Barbarians are skipped entirely.** They are a player (M3) so their units are
  * ordinary units, but the contract is explicit — "barbarians have no economy" — so
@@ -641,6 +679,22 @@ export const applyEconomy = (state: GameState, ruleset: RulesetView): EconomyOut
     const unpaid = shortfall - covered;
     if (unpaid > 0) {
       events.push({ type: 'TreasuryShortfall', playerId: player.id, unpaid });
+
+      // M4c: the bill it could not pay also costs it the buildings that ran it up.
+      // A building that bills gold every turn is a building a broke civilization
+      // cannot keep, and this is the *only* place anything is ever destroyed in
+      // M4c — which is what makes INTERFACES.md's "a bankrupted wonder becomes
+      // buildable again" reachable at all, since nothing else removes a building
+      // from `city.buildings`.
+      //
+      // `buildings.ts`' `disbandBuildings` owns *which* buildings go (most recently
+      // completed first, zero-maintenance rows skipped, until their combined
+      // maintenance covers `unpaid`) and why. The gold is deliberately **not**
+      // credited to `covered`: see the module note's ledger identity, and
+      // `disbandBuildings`' own note for why crediting it would make
+      // `TreasuryShortfall` — the branch M4c exists to make reachable —
+      // unreachable again.
+      current = disbandBuildings(current, buildingCatalog(ruleset), player.id, unpaid).state;
     }
   }
 

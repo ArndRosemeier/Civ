@@ -101,9 +101,61 @@
  *    `newGame` places a starting worker per civilization), regenerated through the
  *    harness's own opt-in path and recorded in the milestone's `rehash:` note.
  *
+ * Migrated for M4c (docs/INTERFACES.md M4c), once more by the F6 rule. M4c changed
+ * what a turn may *do* rather than adding a step to it, so the changes are all in the
+ * conservation sweep's transcription of that turn (`checkTurn`, whose doc comment
+ * names each one and why the replacement is stronger):
+ *
+ * 1. The three pinned golden hashes were re-pinned to the M4c values
+ *    (`SCHEMA_VERSION` 5 -> 6: `GameMap.resources`, the sorted sparse pair list
+ *    `generateWorld` now fills — a new hashed key *and* a board change, since
+ *    placement consumes RNG draws). The assertion still compares the digits written
+ *    here against both the file on disk and this build's hashes.
+ * 2. A queued item the rules no longer allow — above all a **wonder another city has
+ *    finished** — is dropped by the completion pass: shields banked, nothing charged,
+ *    no event, entry consumed. That one branch was previously three separate
+ *    "problems" on the failing seeds.
+ * 3. A unit produced this turn can be **disbanded by the same turn's money step**
+ *    (bankruptcy takes a broke player's highest-id unit, and M4c's maintenance makes
+ *    that reachable), so "units that appeared === units `CityProduced` names" became
+ *    the conservation equation `appeared + disbanded-this-turn === produced`.
+ * 4. The sweep's planner keeps the wonder in its item menu, so it asserts the one
+ *    legal refusal (`wonder-already-built`, with the row really a wonder held
+ *    elsewhere) instead of asserting `ok` and failing on the rules working.
+ *
+ * Each of the two new branches is counted (`TurnWitness`) and the sweep asserts the
+ * counts are non-zero on its seeds, so the migration cannot quietly become a branch
+ * no run ever enters — the same non-vacuity discipline the rest of this file uses.
+ *
  * Nothing was relaxed to reach green: the conservation sweeps kept every claim they
  * had and gained the two above, and the golden pin still compares the digits this
  * file writes down against both the file on disk and this build's hashes.
+ *
+ * Migrated once more for the M4c **growth-food wiring** (the fix to M4c's contract
+ * violation: `growth-food` was declared by the granary and the Pyramids and applied
+ * to nothing, so `applyGrowth` grew every city on the bare curve). Exactly two
+ * assertions in this file encoded the old timing, and both are now **stronger**, not
+ * weaker:
+ *
+ * 1. `checkTurn`'s transcription of the growth rule spent `foodBoxSize(population)`
+ *    per citizen. It now spends `growthRequirement(city, population)` — that same
+ *    curve reduced by the `growth-food` effects of the *rows this city holds* and
+ *    floored at `MIN_GROWTH_FOOD`, re-derived here from `CATALOG.buildings` rather
+ *    than asked of the engine's own `cityGrowthTarget` (which would make the oracle
+ *    circular). The sweep really does reach this: its cities build granaries, and with
+ *    the old transcription in place the wiring fix alone (the wiring reverted by hand,
+ *    Z2's mutation check) makes the long-run conservation case fail with **182
+ *    distinct problems** — 59 on seed 1, 79 on seed 42, 44 on seed 1337, of which 103
+ *    are the "food bookkeeping" line. The old text agreed with the bug; the new text is
+ *    the contract.
+ * 2. The shape invariant "`foodBox` is in `[0, foodBoxSize(population))`" is now
+ *    "`foodBox` is in `[0, growthRequirement(city, population))`". Since the reduced
+ *    requirement is never larger than the bare one, this is strictly stronger: it
+ *    still fails a box at or above the bare curve, and it additionally fails a
+ *    granary city sitting one food short of a citizen it should have gained.
+ *
+ * Nothing was deleted: the food half is still transcribed independently of
+ * `applyGrowth`, the pipeline composition still holds, and no sweep was narrowed.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -118,6 +170,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
   HUT_REWARD_KINDS,
+  MIN_GROWTH_FOOD,
   applyCommand,
   applyEconomy,
   applyGrowth,
@@ -148,6 +201,8 @@ import {
   unitDef,
   unitMoveOptions,
   visibleTiles,
+  type BuildingId,
+  type City,
   type Command,
   type GameEvent,
   type GameState,
@@ -301,6 +356,46 @@ const citiesFoundedOf = (
   events: readonly GameEvent[],
 ): readonly Extract<GameEvent, { type: 'CityFounded' }>[] =>
   events.flatMap((event) => (event.type === 'CityFounded' ? [event] : []));
+
+/**
+ * The `UnitDisbanded` events of a turn (M4b's money step, M4c's maintenance makes it
+ * reachable). Read here because it is the *other* half of "what happened to the unit
+ * this turn's production produced": bankruptcy disbands a player's highest-id unit,
+ * which can be the one `applyProduction` spawned moments earlier in the same turn.
+ */
+const disbandedUnitsOf = (
+  events: readonly GameEvent[],
+): readonly Extract<GameEvent, { type: 'UnitDisbanded' }>[] =>
+  events.flatMap((event) => (event.type === 'UnitDisbanded' ? [event] : []));
+
+/**
+ * The `TreasuryShortfall` events of a turn: the gold a broke player could not pay even
+ * after every unit it could disband was gone. M4c demolishes buildings only on that
+ * remainder, so this is the event that says "this player's cities lost buildings this
+ * turn" — the read a sweep needs when a building completed moments earlier is not in
+ * its city at the end of the turn.
+ */
+const treasuryShortfallsOf = (
+  events: readonly GameEvent[],
+): readonly Extract<GameEvent, { type: 'TreasuryShortfall' }>[] =>
+  events.flatMap((event) => (event.type === 'TreasuryShortfall' ? [event] : []));
+
+/**
+ * Is this building row a **wonder** (M4c, "Wonders v1")?
+ *
+ * Read off the row structurally rather than by importing `buildings.ts`'
+ * `isWonder`: this file is an adversarial reviewer of the engine's rules, and the
+ * rule it is checking here — "a wonder is globally unique" — has to be stated from
+ * the catalog's own data, or the check would be the module agreeing with itself.
+ * The contract's spelling is an optional `wonder: true` ("a `false` is not how this
+ * project spells 'not a wonder'"), so anything that is not exactly `true` is not one.
+ */
+const wonderRow = (id: BuildingId): boolean =>
+  (RULESET.buildings ?? []).some((def) => def.id === id && def.wonder === true);
+
+/** Every city anywhere that holds `id` — the whole-map read the wonder rule is about. */
+const citiesHolding = (state: GameState, id: BuildingId): readonly number[] =>
+  state.cities.filter((city) => city.buildings.includes(id)).map((city) => Number(city.id));
 
 /** The neighbour of `unitId` that steps toward the nearest hut, or `undefined`. */
 const greedyTowardHut = (state: GameState, unitId: number): TileIndex | undefined => {
@@ -1435,16 +1530,78 @@ interface RunTotals {
   readonly maxPopulation: number;
   readonly maxCities: number;
   readonly unitsAtEnd: number;
+  /** M4c branches, counted so the sweep can prove it took them (see `TurnWitness`). */
+  readonly droppedUnstartable: number;
+  readonly producedThenDisbanded: number;
   readonly hash: string;
 }
+
+/**
+ * What one checked turn witnessed about M4c's two new branches, so the sweep can
+ * assert they were really taken on its seeds: a migration that replaces an assertion
+ * with a branch no run ever enters is indistinguishable from one that deleted it.
+ */
+interface TurnWitness {
+  /** Entries a city could afford but the rules no longer allowed (M4c's drop path). */
+  readonly droppedUnstartable: number;
+  /** Units produced and then disbanded within the same turn (M4c's reachable bankruptcy). */
+  readonly producedThenDisbanded: number;
+}
+
+/**
+ * The food `city`'s own buildings shave off its growth requirement, **re-derived
+ * here from the shipped catalog rows** rather than asked of `cityGrowthTarget`.
+ *
+ * That independence is the whole point: the transcription below is the oracle the
+ * engine's growth pass is measured against, so asking the engine's own reduction
+ * function what the reduction is would make the check circular — a `growth-food`
+ * summed twice, summed per kind instead of per building, or dropped entirely would
+ * still agree with itself. This reads `CATALOG.buildings`, matches the rows the city
+ * holds by id, and adds the `amount` of every `growth-food` effect, which is the
+ * contract's rule stated in one line (docs/INTERFACES.md M4c: "`growth-food` reduces
+ * the food a city needs to grow"; "effects apply only to its own city").
+ *
+ * A row the catalog does not describe contributes nothing, the same reading the
+ * engine takes of it.
+ */
+const growthFoodOf = (city: City): number => {
+  let total = 0;
+  for (const id of city.buildings) {
+    const row = CATALOG.buildings.find((def) => def.id === id);
+    if (row === undefined) continue;
+    for (const effect of row.effects) {
+      if (effect.kind === 'growth-food') total += effect.amount;
+    }
+  }
+  return total;
+};
+
+/**
+ * The food `population` citizens of **this** city must reach to gain another one:
+ * the bare curve `foodBoxSize(population)` reduced by the city's own `growth-food`
+ * buildings and floored at `MIN_GROWTH_FOOD`.
+ *
+ * Migrated for the M4c wiring (see the file's header note): before it, `applyGrowth`
+ * compared the box against `foodBoxSize` alone, so this transcription — which copied
+ * that comparison — agreed with the bug. It now states the contract's threshold
+ * instead, and the floor is asserted against the constant rather than repeated as a
+ * literal.
+ */
+const growthRequirement = (city: City, population: number): number =>
+  Math.max(MIN_GROWTH_FOOD, foodBoxSize(population) - growthFoodOf(city));
 
 /**
  * Check one `EndTurn` against the contract, from the state before it and the
  * state after it.
  *
- * The food half is transcribed from INTERFACES.md M3 ("Growth (food box)") — add
- * the surplus, spend `foodBoxSize` per citizen born and carry the remainder,
- * draw down a deficit and starve only below zero — and compared with the state.
+ * The food half is transcribed from INTERFACES.md M3 ("Growth (food box)") **as M4c
+ * amended it** — add the surplus, spend `growthRequirement(city, population)` per
+ * citizen born (the bare curve reduced by the city's own `growth-food` buildings,
+ * floored at `MIN_GROWTH_FOOD`, and re-asked after every citizen) and carry the
+ * remainder, draw down a deficit and starve only below zero — and compared with the
+ * state. The reason stays the same as it was in M3: the requirement is restated here
+ * from the catalog rows rather than read back out of `applyGrowth`, so a growth bug
+ * has to fool an independent transcription before it can pass.
  * The shields half is transcribed from "Production": add `cityYields(...).shields`,
  * complete when the pool covers the item, subtract its cost, carry the
  * remainder, promote the next queue entry.
@@ -1470,6 +1627,37 @@ interface RunTotals {
  * it. What is checked here instead is what a pipeline test can check — the events
  * appear in exactly that order, and `after` carries the money the economy step
  * computed, un-clamped by anything downstream.
+ *
+ * **Migrated to the M4c content rules** (docs/INTERFACES.md M4c). Three of this
+ * function's assertions changed shape, because M4c changed what a turn can legally
+ * do rather than adding a step to it, and each replacement is at least as strong as
+ * what it replaced:
+ *
+ * - **A queue entry the rules no longer allow is dropped, not completed.** A wonder
+ *   is globally unique, so a city that had one queued when another city finished it
+ *   must not build a second: `production.ts` banks the shields, charges nothing,
+ *   emits nothing and consumes the entry. The old reading called that "carried
+ *   shields through a completion", "completed without an event" and "a completed
+ *   building did not join the city". The branch is now explicit — when the pool
+ *   covers the price, *either* the item was charged exactly once and joined the
+ *   city/state, *or* the whole pool is untouched, nothing is charged and the entry
+ *   is gone because the item is not startable (the city holds it, or a wonder
+ *   another city holds does).
+ * - **A unit produced this turn may be disbanded by the same turn's money step.**
+ *   The old equality "units that appeared === units a `CityProduced` event names"
+ *   assumed every produced unit survives the turn. M4b's bankruptcy disbands a
+ *   broke player's highest-id unit and M4c's maintenance makes that reachable in a
+ *   shipped game, so the claim is now the conservation equation
+ *   `appeared + disbanded-same-turn === produced`, with each vanished unit required
+ *   to be named by a `UnitDisbanded` event — strictly stronger, since a produced
+ *   unit that no event accounts for is still a failure.
+ * - **The wonder rule is checked on the world, every turn**: no two cities anywhere
+ *   hold the same wonder.
+ *
+ * The return value is a witness: the two M4c branches above are counted so the
+ * sweep can assert they were really taken on these seeds. A migration that leaves a
+ * branch no run ever enters would otherwise be indistinguishable from one that
+ * deleted the assertion.
  */
 const checkTurn = (
   rec: Recorder,
@@ -1477,7 +1665,9 @@ const checkTurn = (
   after: GameState,
   events: readonly GameEvent[],
   label: string,
-): void => {
+): TurnWitness => {
+  let droppedUnstartable = 0;
+  let producedThenDisbanded = 0;
   rec.check(after.turn === before.turn + 1, `${label}: turn did not advance by one`);
   rec.check(
     after.revision === before.revision + 1,
@@ -1555,17 +1745,38 @@ const checkTurn = (
   const claimedUnitIds = new Set(
     completions.flatMap((event) => (event.unitId === undefined ? [] : [Number(event.unitId)])),
   );
+  const disbandedUnitIds = new Set(disbandedUnitsOf(events).map((event) => Number(event.unitId)));
+  const survivingIds = new Set(after.units.map((unit) => Number(unit.id)));
   const appeared = after.units.filter((unit) => !beforeById.has(Number(unit.id)));
-  rec.check(
-    appeared.length === claimedUnitIds.size,
-    `${label}: ${String(appeared.length)} units appeared but ${String(claimedUnitIds.size)} production events name one`,
-  );
   for (const unit of appeared) {
     rec.check(
       claimedUnitIds.has(Number(unit.id)),
       `${label}: unit ${String(unit.id)} appeared during a turn without a CityProduced event`,
     );
   }
+  // MIGRATED for M4c: the old equality was `appeared.length === claimedUnitIds.size`,
+  // which assumed every unit a `CityProduced` event names is still in the state when
+  // the turn ends. M4b's money step disbands a player's **highest-id** unit to cover a
+  // shortfall, and M4c's maintenance makes that reachable in a shipped game — so the
+  // unit `applyProduction` spawned in this very turn can be the one bankruptcy
+  // disbands, and the event that names it is `UnitDisbanded`, not a missing unit. The
+  // claim is now an equation rather than a count: every unit a production event names
+  // either survives the turn or is named by a disband event **of the same turn**, and
+  // never simply vanishes. That is at least as strong as what it replaced — it still
+  // fails on a produced unit no event accounts for, and it additionally fails on a
+  // `CityProduced` whose unit was quietly dropped.
+  const vanished = [...claimedUnitIds].filter((id) => !survivingIds.has(id));
+  for (const id of vanished) {
+    rec.check(
+      disbandedUnitIds.has(id),
+      `${label}: produced unit ${String(id)} is in neither the state nor a UnitDisbanded event`,
+    );
+  }
+  rec.check(
+    appeared.length + vanished.length === claimedUnitIds.size,
+    `${label}: ${String(appeared.length)} units appeared and ${String(vanished.length)} were ` +
+      `disbanded, but ${String(claimedUnitIds.size)} production events name one`,
+  );
 
   const citiesSeen = new Set<number>();
   const tilesClaimed = new Map<number, number>();
@@ -1586,8 +1797,12 @@ const checkTurn = (
     let starved = false;
     if (yields.foodSurplus > 0) {
       foodBox += yields.foodSurplus;
-      while (foodBox >= foodBoxSize(population)) {
-        foodBox -= foodBoxSize(population);
+      // The *reduced* requirement, re-derived from the catalog by `growthRequirement`
+      // and never the bare `foodBoxSize`: the box is re-asked after every citizen, so
+      // a multi-citizen spurt spends each new citizen's own reduced requirement, which
+      // is what makes this transcription the contract's rule rather than the old bug.
+      while (foodBox >= growthRequirement(cityBefore, population)) {
+        foodBox -= growthRequirement(cityBefore, population);
         population += 1;
       }
     } else if (yields.foodSurplus < 0) {
@@ -1640,12 +1855,18 @@ const checkTurn = (
       Number.isInteger(cityAfter.population) && cityAfter.population >= 1,
       `${label}: city ${String(id)} has population ${String(cityAfter.population)}`,
     );
+    // Migrated for the M4c wiring: the bound is the city's **own** requirement
+    // (`growthRequirement`), not the bare curve. That is strictly stronger — the
+    // reduced requirement never exceeds the bare one — and it is the bound a granary
+    // city really has: it grows at 9, so a box of 9 would be a city that should have
+    // grown and did not.
     rec.check(
       Number.isInteger(cityAfter.foodBox) &&
         cityAfter.foodBox >= 0 &&
-        cityAfter.foodBox < foodBoxSize(cityAfter.population),
+        cityAfter.foodBox < growthRequirement(cityAfter, cityAfter.population),
       `${label}: city ${String(id)} foodBox ${String(cityAfter.foodBox)} is outside ` +
-        `[0, ${String(foodBoxSize(cityAfter.population))}) for population ${String(cityAfter.population)}`,
+        `[0, ${String(growthRequirement(cityAfter, cityAfter.population))}) for population ` +
+        `${String(cityAfter.population)} (buildings: ${cityAfter.buildings.join(', ') || 'none'})`,
     );
     rec.check(
       Number.isInteger(cityAfter.shields) && cityAfter.shields >= 0,
@@ -1709,27 +1930,68 @@ const checkTurn = (
 
     const cost = itemCost(RULESET, item);
     const redundant = item.kind === 'building' && grownCity.buildings.includes(item.id);
+    // M4c (INTERFACES.md, "Wonders v1"): a wonder is **globally unique**, so a queued
+    // wonder that some other city has finished is no longer startable and the completion
+    // pass *drops* the entry — banking the shields, charging nothing and emitting no
+    // event — rather than building a second copy. "Some other city holds it" is read
+    // from all three places it can be true, because each covers a case the others miss:
+    //
+    // - the **grown** state (before production): the ordinary case, a wonder finished on
+    //   an earlier turn — and the one case the final state can hide, because the money
+    //   step of this very turn can demolish the wonder its holder just paid for;
+    // - the **final** state: a lower-id city that finished it *during* this pass, which
+    //   the grown state cannot show;
+    // - this turn's **`CityProduced` events**, for a wonder finished by another city in
+    //   this pass and demolished again before the turn ended.
+    //
+    // All three are whole-map reads of "who holds it", never a second reading of the
+    // completion rule: this city is excluded, so a city that legally completes the wonder
+    // itself still counts as startable.
+    const wonderHeldByAnother =
+      item.kind === 'building' &&
+      wonderRow(item.id) &&
+      [
+        ...citiesHolding(grown.state, item.id),
+        ...citiesHolding(after, item.id),
+        ...completions.flatMap((event) =>
+          event.item.kind === 'building' && event.item.id === item.id ? [Number(event.cityId)] : [],
+        ),
+      ].some((holder) => holder !== Number(id));
+    const startable = !redundant && !wonderHeldByAnother;
+    // M4c's other demolition path: a broke player's buildings are torn down by the money
+    // step, most recently completed first, and M4c has no other way for a building to
+    // leave a city. So a building that completed *this turn* may legitimately not be in
+    // the city when the turn ends — and only when its owner really was bankrupt, which
+    // `TreasuryShortfall` is the event for (economy.ts demolishes only what the unpaid
+    // remainder could not cover).
+    const ownerWasBankrupt = treasuryShortfallsOf(events).some(
+      (event) => Number(event.playerId) === Number(cityAfter.owner),
+    );
     rec.check(cost > 0, `${label}: city ${String(id)} is building an item with no price`);
 
     if (pool >= cost) {
-      // Completion: one per turn, cost subtracted, remainder carried over.
-      if (!redundant) pool -= cost;
-      rec.check(
-        cityAfter.shields === pool,
-        `${label}: city ${String(id)} carried ${String(cityAfter.shields)} shields through a ` +
-          `completion, expected ${String(pool)}`,
-      );
+      // The pool covers the price, so exactly one of two things happened, and both are
+      // pinned: the item completed and was charged exactly once, or nothing was charged
+      // and the entry was dropped *because* it is not startable. MIGRATED for M4c —
+      // before this, the second case was read as "carried shields through a completion",
+      // "completed without an event" and "a completed building did not join the city".
       rec.check(
         sameJson(cityAfter.production, grownCity.queue[0]),
         `${label}: city ${String(id)} did not promote the next queue entry`,
       );
       rec.check(
         sameJson(cityAfter.queue, grownCity.queue.slice(1)),
-        `${label}: city ${String(id)} did not consume the completed entry from its queue`,
+        `${label}: city ${String(id)} did not consume the settled entry from its queue`,
       );
-      if (redundant) {
-        rec.check(completion === undefined, `${label}: a redundant building was charged`);
-      } else {
+
+      if (startable) {
+        // Completion: one per turn, cost subtracted, remainder carried over.
+        pool -= cost;
+        rec.check(
+          cityAfter.shields === pool,
+          `${label}: city ${String(id)} carried ${String(cityAfter.shields)} shields through a ` +
+            `completion, expected ${String(pool)}`,
+        );
         rec.check(
           completion !== undefined,
           `${label}: city ${String(id)} completed without an event`,
@@ -1744,28 +2006,72 @@ const checkTurn = (
         );
         if (item.kind === 'building') {
           rec.check(
-            cityAfter.buildings.includes(item.id),
-            `${label}: a completed building did not join the city`,
+            cityAfter.buildings.includes(item.id) || ownerWasBankrupt,
+            `${label}: a completed building did not join the city and its owner was not bankrupt`,
           );
         } else {
           const unitId = completion?.unitId;
           rec.check(unitId !== undefined, `${label}: a produced unit has no unitId in its event`);
           const spawned = unitId === undefined ? undefined : unitById(after, unitId);
-          rec.check(spawned !== undefined, `${label}: the produced unit is not in the state`);
-          rec.check(
-            spawned !== undefined && Number(spawned.owner) === Number(cityAfter.owner),
-            `${label}: the produced unit belongs to somebody else`,
-          );
-          rec.check(
-            spawned !== undefined && Number(spawned.tile) === Number(completion?.tile),
-            `${label}: the produced unit is not on the tile its event names`,
-          );
-          const def = spawned === undefined ? undefined : unitDef(RULESET, spawned.type);
-          rec.check(
-            def === undefined || spawned?.movementLeft === def.movement,
-            `${label}: the produced unit does not start at full movement`,
-          );
+          // M4c: the money step of this same turn disbands a broke player's **highest-id**
+          // unit, which can be the one production just spawned — so a produced unit may
+          // legitimately be absent from the final state, but only when a `UnitDisbanded`
+          // event of this turn names it. Stated as a disjunction with the claim that the
+          // event agrees with the completion, rather than as "it must be there".
+          const disbanded =
+            unitId === undefined
+              ? undefined
+              : disbandedUnitsOf(events).find((event) => Number(event.unitId) === Number(unitId));
+          if (spawned === undefined) {
+            if (disbanded !== undefined) producedThenDisbanded += 1;
+            rec.check(
+              disbanded !== undefined,
+              `${label}: the produced unit is in neither the state nor a UnitDisbanded event`,
+            );
+            rec.check(
+              disbanded === undefined || Number(disbanded.playerId) === Number(cityAfter.owner),
+              `${label}: the disbanded produced unit belonged to somebody else`,
+            );
+            rec.check(
+              disbanded === undefined || Number(disbanded.tile) === Number(completion?.tile),
+              `${label}: the disbanded produced unit is not on the tile its event names`,
+            );
+            rec.check(
+              disbanded === undefined || disbanded.unitType === item.id,
+              `${label}: the disbanded produced unit is not the type the city built`,
+            );
+          } else {
+            rec.check(
+              Number(spawned.owner) === Number(cityAfter.owner),
+              `${label}: the produced unit belongs to somebody else`,
+            );
+            rec.check(
+              Number(spawned.tile) === Number(completion?.tile),
+              `${label}: the produced unit is not on the tile its event names`,
+            );
+            const def = unitDef(RULESET, spawned.type);
+            rec.check(
+              def === undefined || spawned.movementLeft === def.movement,
+              `${label}: the produced unit does not start at full movement`,
+            );
+          }
         }
+      } else {
+        // Dropped, and nothing charged: the shields stay banked (the pool is untouched,
+        // so `cityAfter.shields === pool` — the whole price is still there, which is the
+        // assertion the old code wrote as "expected 0" only because it assumed a charge
+        // had happened), no event names this city, and the dead entry is gone from the
+        // queue, which the promotion checks above already pinned. The reason is named in
+        // the message rather than asserted, because this branch *is* the two reasons:
+        // asserting them here would be restating the branch condition.
+        const why = redundant ? 'the city already holds it' : 'a wonder another city holds';
+        droppedUnstartable += 1;
+        rec.check(
+          cityAfter.shields === pool,
+          `${label}: city ${String(id)} banked ${String(cityAfter.shields)} shields while ` +
+            `${why} (the whole pool of ${String(pool)} must be untouched)`,
+        );
+        rec.check(completion === undefined, `${label}: an unstartable building was charged`);
       }
     } else {
       rec.check(
@@ -1791,6 +2097,22 @@ const checkTurn = (
       `${label}: city ${String(city.id)} exists after the turn but not before`,
     );
   }
+
+  // M4c's wonder rule as a property of the *world* rather than of one city's branch:
+  // at most one city anywhere holds a given wonder. This is the invariant a second copy
+  // would break, so it is checked on every turn of every run, not only where the sweep
+  // happened to notice a dropped queue entry.
+  for (const def of RULESET.buildings ?? []) {
+    if (def.wonder !== true) continue;
+    const holders = citiesHolding(after, def.id);
+    rec.check(
+      holders.length <= 1,
+      `${label}: wonder ${String(def.id)} is held by ${String(holders.length)} cities ` +
+        `[${holders.join(',')}]`,
+    );
+  }
+
+  return { droppedUnstartable, producedThenDisbanded };
 };
 
 /**
@@ -1813,6 +2135,8 @@ const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
     maxPopulation: 1,
     maxCities: 0,
     unitsAtEnd: 0,
+    droppedUnstartable: 0,
+    producedThenDisbanded: 0,
     hash: '',
   };
 
@@ -1898,13 +2222,28 @@ const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
           { type: 'SetProduction', cityId: current.id, item },
           RULESET,
         );
-        rec.check(
-          queued.ok,
-          `seed ${String(seed)}: queuing ${JSON.stringify(item)} was refused: ${
-            queued.ok ? '' : JSON.stringify(queued.error)
-          }`,
-        );
-        if (queued.ok) state = queued.value.state;
+        if (queued.ok) {
+          state = queued.value.state;
+        } else {
+          // MIGRATED for M4c. The sweep deliberately keeps the wonder in its menu — the
+          // rules it exercises are the point — so the one *legal* refusal it can now meet
+          // is `wonder-already-built`: M4c's global uniqueness means no city may start a
+          // wonder any city anywhere already holds (INTERFACES.md, "Wonders v1"). The
+          // blanket `queued.ok` this replaces was the pre-M4c spelling of "nothing else
+          // may refuse this", and the replacement is the same claim with the rule's own
+          // exception named, asserted two ways: the kind is exactly that one, and the
+          // item really is a wonder another city holds. Any other refusal — a resource
+          // gate, a malformed row, a phantom `already-built` — still fails here.
+          const heldByAnother =
+            item.kind === 'building' &&
+            wonderRow(item.id) &&
+            citiesHolding(state, item.id).some((holder) => holder !== Number(current.id));
+          rec.check(
+            queued.error.kind === 'wonder-already-built' && heldByAnother,
+            `seed ${String(seed)}: queuing ${JSON.stringify(item)} was refused: ` +
+              `${JSON.stringify(queued.error)} (wonder held elsewhere: ${String(heldByAnother)})`,
+          );
+        }
       }
 
       // Walk units on some turns so huts get entered and the barbarian player
@@ -1943,13 +2282,15 @@ const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
       totals.starved += citiesStarvedOf(ended.value.events).length;
       totals.produced += completionsOf(ended.value.events).length;
 
-      checkTurn(
+      const witness = checkTurn(
         rec,
         before,
         ended.value.state,
         ended.value.events,
         `seed ${String(seed)} turn ${String(turn)}`,
       );
+      totals.droppedUnstartable += witness.droppedUnstartable;
+      totals.producedThenDisbanded += witness.producedThenDisbanded;
       state = ended.value.state;
     }
   }
@@ -1989,6 +2330,13 @@ describe('economy conservation — 110 turns, real cities, real starvation', () 
       expect(sum((run) => run.produced)).toBeGreaterThan(10);
       expect(sum((run) => run.huts)).toBeGreaterThan(0);
       expect(sum((run) => run.barbarianUnits)).toBeGreaterThan(0);
+      // The two M4c branches the conservation sweep now transcribes (a queue entry
+      // dropped because a wonder was finished elsewhere, and a produced unit disbanded
+      // by the same turn's money step) must really be taken on these seeds — otherwise
+      // the migration would have replaced a claim with a branch nobody enters. Both
+      // counts are deterministic: they are a function of the seeds above.
+      expect(sum((run) => run.droppedUnstartable)).toBeGreaterThan(0);
+      expect(sum((run) => run.producedThenDisbanded)).toBeGreaterThan(0);
       expect(Math.max(...runs.map((run) => run.maxPopulation))).toBeGreaterThan(1);
       expect(Math.max(...runs.map((run) => run.maxCities))).toBeGreaterThan(1);
       for (const run of runs) expect(run.hash).toMatch(/^[0-9a-f]{16}$/);
@@ -2344,22 +2692,24 @@ const runGoldenHarness = (corrupt: boolean): GoldenHarnessRun => {
  * They moved once per persisted-shape change, never for any other reason: M3's
  * foundation commit took `SCHEMA_VERSION` 2 -> 3 (`nextCityId`, `cities`,
  * `PlayerState.kind`, the barbarian player, `GameMap.huts`), M4a's took it
- * 3 -> 4 (`GameState.improvements`), and M4b's takes it 4 -> 5 — every player
+ * 3 -> 4 (`GameState.improvements`), M4b's took it 4 -> 5 — every player
  * gains the four money fields (`treasury`, `rates`, `beakers`, `luxuries`) and
  * `newGame` starts each civilization with a worker as well as a settler, which is
  * a persisted-shape change *and* a board change, so every hash moves for two
- * independent reasons. All three were deliberate, contract-mandated rehashes
- * regenerated through the harness's own opt-in path; the M4b values below are the
- * ones `packages/testing/goldens/state.json` now stores.
+ * independent reasons — and M4c's takes it 5 -> 6: `GameMap.resources`, the sorted
+ * sparse resource pair list `generateWorld` now fills, which is both a new hashed
+ * key and a board change (placement consumes RNG draws). All four were deliberate,
+ * contract-mandated rehashes regenerated through the harness's own opt-in path; the
+ * M4c values below are the ones `packages/testing/goldens/state.json` now stores.
  *
  * A hash that moves *without* a shape change is a semantic bug and must not be
  * re-pinned — that is the whole point of writing the digits down rather than
  * comparing the file against itself.
  */
 const PINNED_GOLDENS: readonly { readonly name: string; readonly hash: string }[] = [
-  { name: 'tiny-civs2-seed1', hash: '6f2e1f2a9adb3a2a' },
-  { name: 'tiny-civs2-seed42', hash: '93a436cc99000580' },
-  { name: 'tiny-civs2-seed1337', hash: 'ed23a69cd84d5ab4' },
+  { name: 'tiny-civs2-seed1', hash: 'b348542b99463975' },
+  { name: 'tiny-civs2-seed42', hash: '282dc8ea55459c0f' },
+  { name: 'tiny-civs2-seed1337', hash: '549641adc3c31b67' },
 ];
 
 describe('goldens — still a gate, still refusing to auto-write', () => {
@@ -2372,11 +2722,12 @@ describe('goldens — still a gate, still refusing to auto-write', () => {
     const computed = states.map((state) => hashValue(state));
     console.log('m3 golden hashes:', computed.join(' '));
 
-    // M3 changed the persisted shape once, at its foundation commit, and M4a
-    // changed it once more (`improvements`, SCHEMA_VERSION 4); M4b changes it again
-    // (the four money fields plus M4b's starting worker, SCHEMA_VERSION 5). All
-    // three moved every hash deliberately, through the harness's opt-in path, and
-    // each is recorded in its milestone's `rehash:` note. Nothing else may move them.
+    // M3 changed the persisted shape once, at its foundation commit, M4a changed it
+    // once more (`improvements`, SCHEMA_VERSION 4), M4b changed it again (the four
+    // money fields plus M4b's starting worker, SCHEMA_VERSION 5), and M4c changed it
+    // a fourth time (`GameMap.resources`, SCHEMA_VERSION 6). All four moved every hash
+    // deliberately, through the harness's opt-in path, and each is recorded in its
+    // milestone's `rehash:` note. Nothing else may move them.
     expect(computed).toEqual(PINNED_GOLDENS.map((entry) => entry.hash));
     // Named as well as positional: a pin is only meaningful if the hash is the one
     // the scenario the name describes produces.

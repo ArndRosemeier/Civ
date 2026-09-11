@@ -28,6 +28,15 @@
  *   the game and the money loop needs no side table. Barbarians carry them too,
  *   inert, for the same reason they carry an `explored` row: one shape for every
  *   player, and `PlayerId` stays an index into `players`.
+ * - **Resources ride on the map, not on the state (M4c).** `newGame` stores the
+ *   generated `GameMap` verbatim, so the resources `generateWorld` placed come
+ *   with it — there is no second list here and nothing for setup to re-derive.
+ *   That is the same boundary M4a drew the other way round for improvements:
+ *   terrain, huts and resources are what the *world* is (generation decides them
+ *   once), while improvements, units and cities are what a civilization *did*
+ *   (gameplay decides them afterwards). Putting resources on the state would make
+ *   `{ ...state, map: generateWorld(...) }` — regenerate the world, keep the
+ *   resources — a state nobody could explain.
  */
 
 import { generateWorld, type GeneratedWorld } from './gen.js';
@@ -84,8 +93,18 @@ import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js'
  *   and every player's `explored` row, on top of the four new keys. Regenerated
  *   intentionally, through the harness's documented path, in the same commit, with
  *   a `rehash:` line in the commit message (INTERFACES.md M4b, "State shape").
+ * - 6 — M4c: `GameMap` gains `resources`, the sparse `(tile, resource)` list
+ *   generation places. The state's *own* fields are unchanged this time — no new
+ *   `GameState` key, no new `PlayerState` key — but `map` is inside the state and
+ *   is hashed with it, so a new map key moves every hash exactly as a new state
+ *   key would, and the version records that deliberately rather than leaving the
+ *   change implicit. Additive, a fourth time in a row (the field is a fresh array
+ *   of pairs, and an empty-or-not map key is still a new key in the hashed JSON),
+ *   so the goldens were regenerated through the harness's documented path
+ *   (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a `rehash:` line
+ *   (INTERFACES.md M4c, "Resources" and "Migration owners").
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /** What a player *is*: a civilization, or the barbarians. */
 export type PlayerKind = 'civ' | 'barbarian';

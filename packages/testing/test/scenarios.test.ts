@@ -40,21 +40,31 @@ import {
   asCityId,
   asImprovementId,
   asPlayerId,
+  asResourceId,
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  buildingCatalog,
+  buildingHolder,
   cityAt,
   cityById,
+  cityMaintenance,
+  cityProductionOptions,
   cityYields,
   civPlayers,
+  connected,
   foodBoxSize,
   hasImprovement,
   hutAt,
   improvementDef,
   improvementsAt,
+  isConnected,
   isExplored,
   isPlaceholder,
+  isWonder,
   loadSettings,
+  maintenanceOf,
+  mayStartBuilding,
   neighbors8,
   newGame,
   nextBelow,
@@ -70,8 +80,10 @@ import {
   unitsOnTile,
   visibleTiles,
   type City,
+  type CityId,
   type Command,
   type CommandOutcome,
+  type BuildingId,
   type GameError,
   type GameEvent,
   type GameState,
@@ -83,6 +95,7 @@ import {
   type Result,
   type RulesetView,
   type TileIndex,
+  type UnitTypeId,
   type UnitWork,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
@@ -5241,5 +5254,1641 @@ describe('the scenario builder states M4b money', () => {
     expect(() =>
       build((b) => withRome(b).addBarbarianPlayer().setRates(2, { tax: 1, science: 1, luxury: 8 })),
     ).toThrow(/the barbarian player .* has no economy/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4c acceptance evidence — building effects, wonders, resources, maintenance
+ * ------------------------------------------------------------------ */
+
+/**
+ * M4c's content, named the way `@civts/rules` names it, with the magnitudes these
+ * scenarios assert spelled out beside each id.
+ *
+ * **Every magnitude below is a placeholder.** The rows are `placeholder(...)` in
+ * the shipped catalog; the percentages, maintenance costs, wonder flag and the
+ * swordsman's iron requirement are ours, chosen to be playable, and none of them is
+ * presented as Civ 3's (PLAN.md §6.2 — the provenance rule the M3 warning states
+ * verbatim). What the scenarios pin is that the *engine* reads the row the catalog
+ * declares: the rule under test is M4c's (sum-then-floor, global uniqueness, the
+ * connection walk, maintenance reachability), not the tuning. Where a number of
+ * ours is asserted as a number, it is asserted *as* a placeholder — the maintenance
+ * scenario checks the provenance outright.
+ */
+const MARKETPLACE = asBuildingId('marketplace'); // commerce-multiplier 50%, maintenance 1, cost 12
+const LIBRARY = asBuildingId('library'); // beaker-multiplier 50%, maintenance 1, cost 20
+const BARRACKS = asBuildingId('barracks'); // shield-multiplier 25%, maintenance 1, cost 12
+const WALLS = asBuildingId('walls'); // shield-multiplier 25%, maintenance 1, cost 15
+const FACTORY = asBuildingId('factory'); // shield-multiplier 50%, maintenance 3, cost 25
+const PYRAMIDS = asBuildingId('pyramids'); // wonder: growth-food 1, maintenance 2, cost 30
+const IRON = asResourceId('iron'); // strategic: what the swordsman requires
+const GEMS = asResourceId('gems'); // luxury: placed, connected, read by nothing until M9
+const WHEAT = asResourceId('wheat'); // bonus: +1 food on its tile
+const WINES = asResourceId('wines'); // luxury: inert until M9
+const SWORDSMAN = asUnitTypeId('swordsman'); // cost 3 shields, `requiresResource: iron`
+
+const buildingItem = (id: BuildingId): ProductionItem => ({ kind: 'building', id });
+const unitItem = (id: UnitTypeId): ProductionItem => ({ kind: 'unit', id });
+
+/** The city `cityId`, or a loud failure: every scenario world below has it. */
+const cityOf = (state: GameState, cityId: CityId): City => {
+  const city = cityById(state, cityId);
+  if (city === undefined) throw new Error(`city ${String(cityId)} is not in the state`);
+  return city;
+};
+
+/** The building row `id`, or a loud failure — a content bug rather than a test bug. */
+const buildingRowOf = (ruleset: RulesetView, id: BuildingId) => {
+  const def = buildingCatalog(ruleset).find((row) => row.id === id);
+  if (def === undefined) throw new Error(`the ruleset defines no building "${id}"`);
+  return def;
+};
+
+/**
+ * `state` with city `cityId`'s `buildings` list replaced **wholesale** — the world
+ * an assertion uses to ask "what would this same city have produced with *these*
+ * buildings?".
+ *
+ * This is not a shortcut around the engine: a building's effect is a pure read of
+ * `city.buildings` (`buildings.ts`' `cityBuildingEffects`), so the same city with a
+ * shorter list *is* the same city earlier in its own completion order — same
+ * terrain, same worked tiles, same citizens, same rates. Assertions that read the
+ * earlier stage off the final state through this helper are therefore asserting
+ * about the engine's own earlier world rather than about a hand-recomputed number.
+ * The stages are taken from the city's **actual** final list (`slice`), not from a
+ * list the test believes in, so a scenario whose timeline silently completed a
+ * different set of buildings fails the assertions that follow instead of grading
+ * itself against its own intention.
+ */
+const withBuildings = (
+  state: GameState,
+  cityId: CityId,
+  buildings: readonly BuildingId[],
+): GameState => ({
+  ...state,
+  cities: state.cities.map((city) => (city.id === cityId ? { ...city, buildings } : city)),
+});
+
+/** The production options a city shows, as `kind:id` strings a test can compare. */
+const optionIds = (state: GameState, ruleset: RulesetView, cityId: CityId): readonly string[] =>
+  cityProductionOptions(state, ruleset, cityId).map((item) => `${item.kind}:${item.id}`);
+
+/** Every resource `playerId` has connected, sorted — a comparable list. */
+const connectedIds = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): readonly string[] => [...connected(state, ruleset, playerId)].sort();
+
+/** Build a fixture world directly (outside `runScenario`) for the hand-walked tests. */
+const buildWorld = (setup: (b: ScenarioBuilder) => ScenarioBuilder): GameState => {
+  const built = setup(createScenarioBuilder(RULESET, DUEL_SETTINGS)).build();
+  if (!built.ok) throw new Error(`the fixture must build: ${JSON.stringify(built.error)}`);
+  return built.value;
+};
+
+/**
+ * Walking a scripted turn sequence by hand, asserting each step — the same
+ * technique the conservation scenario's second test uses, and the reason it is here
+ * rather than only in the scenario's `assert`: the *before* and *after* of a
+ * building's completion are states the runner's final state no longer has.
+ */
+const walk = (
+  state: GameState,
+  commands: readonly Command[],
+): { readonly state: GameState; readonly events: readonly GameEvent[] } => {
+  let current = state;
+  const events: GameEvent[] = [];
+  for (const command of commands) {
+    const outcome = applyFor(current, ROME, command, RULESET);
+    current = outcome.state;
+    events.push(...outcome.events);
+  }
+  return { state: current, events };
+};
+
+/* ---- 12. Building effects ----------------------------------------- */
+
+/**
+ * The building-effect world. One Roman city, three citizens, a worked radius whose
+ * yields are whole and stated, no food surplus (so nothing grows and every stage
+ * below is about the *buildings*), and a scripted completion order.
+ *
+ * The arithmetic, all of it from the shipped rows:
+ *
+ * - centre grassland 2 food / 1 shield / 1 commerce (floored at 1 per component);
+ *   worked grassland 2/1/1; two worked plains 1/2/1 each.
+ * - So **6 food** (2+2+1+1) with three citizens eating 6 — a surplus of exactly 0,
+ *   which is what keeps the world from growing out from under the assertions — and
+ *   **6 shields** (1+1+2+2) and **4 commerce** (1+1+1+1).
+ * - Rome's rates are **5/5/0** rather than the default 6/4/0, chosen so the two
+ *   channels are equal and the library's 50% lands on a number that moves: at 6/4/0
+ *   four commerce is 2 gold and 1 beaker, and a 50% beaker multiplier on 1 beaker
+ *   would be invisible (floor(1.5) = 1). PLACEHOLDER rates either way — `RATE_TOTAL`
+ *   is 10 in both.
+ * - 34 stored shields and 100 gold are stated outright, so the scripted completions
+ *   land on the turns the comments below name and the treasury never hits zero (a
+ *   shortfall here would take the buildings the scenario is measuring).
+ */
+const EFFECT_CITY = asCityId(0);
+const EFFECT_GRASSLAND = at(4, 5);
+const EFFECT_PLAINS_A = at(6, 5);
+const EFFECT_PLAINS_B = at(5, 6);
+const EFFECT_RATES: Rates = { tax: 5, science: 5, luxury: 0 };
+const EFFECT_STORED_SHIELDS = 34;
+const EFFECT_TREASURY = 100;
+
+const effectSetup = (b: ScenarioBuilder): ScenarioBuilder =>
+  b
+    .addPlayer('Rome')
+    .addPlayer('Carthage')
+    .fillTerrain('grassland')
+    .setTile(6, 5, 'plains')
+    .setTile(5, 6, 'plains')
+    .setRates(0, EFFECT_RATES)
+    .setTreasury(0, EFFECT_TREASURY)
+    .addUnit(0, WARRIOR, [35, 35])
+    .addUnit(1, WARRIOR, [20, 20])
+    .addCity(0, [5, 5], {
+      name: 'Roma',
+      population: 3,
+      foodBox: 0,
+      shields: EFFECT_STORED_SHIELDS,
+      workedTiles: [EFFECT_GRASSLAND, EFFECT_PLAINS_A, EFFECT_PLAINS_B],
+    });
+
+/** The completion order the scenario scripts: one building at a time, in this order. */
+const EFFECT_COMPLETIONS: readonly BuildingId[] = [MARKETPLACE, LIBRARY, BARRACKS, WALLS, FACTORY];
+
+/**
+ * The script: `SetProduction` then enough `EndTurn`s for that item to finish.
+ *
+ * The factory needs **three** turns at the 9 shields a turn the two 25% multipliers
+ * give (9, 18, 27 >= its cost 25), which is why it is the one entry with extra
+ * `EndTurn`s. The earlier items all complete on the first turn because 34 stored
+ * shields pay for them (40 - 12 = 28, 34 - 20 = 14, 20 - 12 = 8, 8 + 7 = 15 >= 15).
+ */
+const effectRun = (completed: readonly BuildingId[]): readonly Command[] => {
+  const commands: Command[] = [];
+  for (const id of completed) {
+    commands.push(setProduction(0, buildingItem(id)));
+    commands.push(endTurn());
+    if (id === FACTORY) commands.push(endTurn(), endTurn());
+  }
+  return commands;
+};
+
+const EFFECT_RUN: readonly Command[] = effectRun(EFFECT_COMPLETIONS);
+
+/** What the final state of the scripted world has to look like, stage by stage. */
+const EFFECT_STAGES: readonly {
+  readonly completed: number;
+  readonly shows: string;
+  readonly shields: number;
+  readonly commerce: number;
+  readonly food: number;
+  readonly gold: number;
+  readonly beakers: number;
+}[] = [
+  { completed: 0, shows: 'nothing', shields: 6, commerce: 4, food: 6, gold: 2, beakers: 2 },
+  { completed: 1, shows: 'marketplace', shields: 6, commerce: 6, food: 6, gold: 3, beakers: 3 },
+  { completed: 2, shows: 'library', shields: 6, commerce: 6, food: 6, gold: 3, beakers: 4 },
+  { completed: 3, shows: 'barracks', shields: 7, commerce: 6, food: 6, gold: 3, beakers: 4 },
+  { completed: 4, shows: 'walls', shields: 9, commerce: 6, food: 6, gold: 3, beakers: 4 },
+  { completed: 5, shows: 'factory', shields: 12, commerce: 6, food: 6, gold: 3, beakers: 4 },
+];
+
+/**
+ * BUILDING EFFECTS. What one city's buildings do to *its own* output, with the
+ * exact gold, beakers and shields before and after each of the three multipliers
+ * M4c ships — and the compound-flooring rule, which is the whole reason the effect
+ * union is summed before it is applied.
+ *
+ * Reading the table above (all of it hand-computed from the shipped rows, and all of
+ * it asserted below):
+ *
+ * - **before any building** — 6 shields, 4 commerce, so 2 gold and 2 beakers at
+ *   5/5/0;
+ * - **marketplace** (commerce +50%) — `floor(4 * 150 / 100) = 6` commerce, hence
+ *   3 gold and 3 beakers. It changes *commerce*, which the rates then divide, so
+ *   both channels move;
+ * - **library** (beakers +50%) — the city's 3 beakers become
+ *   `floor(3 * 150 / 100) = 4`; gold is untouched at 3. It scales one *channel*, and
+ *   only this city's (M4c: effects apply only to their own city);
+ * - **barracks** (shields +25%) — `floor(6 * 125 / 100) = 7`;
+ * - **walls** (shields +25%) — the two percentages **sum before one floor**:
+ *   `floor(6 * 150 / 100) = 9`. Flooring each separately would give
+ *   `floor(floor(6 * 1.25) * 1.25) = 8`, which is the reading this engine does NOT
+ *   implement, and the assertion below checks both numbers so that the case is
+ *   discriminating rather than merely satisfied;
+ * - **factory** (shields +50%) — the three percentages now sum to 100%:
+ *   `floor(6 * 200 / 100) = 12`, not the 13 a per-building floor gives.
+ *
+ * Food is 6 at every stage: M4c's union has no food multiplier, and the granary's
+ * `growth-food` shrinks the *requirement* instead, which is not part of this triple.
+ */
+const buildingEffectsScenario = defineScenario({
+  name: 'building-effects-multiply-one-city-and-floor-once',
+  settings: DUEL_SETTINGS,
+  setup: effectSetup,
+  run: EFFECT_RUN,
+  assert: (after, ruleset) => {
+    const city = cityOf(after, EFFECT_CITY);
+    const stage = (completed: number): GameState =>
+      withBuildings(after, EFFECT_CITY, city.buildings.slice(0, completed));
+    const yieldsAt = (completed: number) => cityYields(stage(completed), ruleset, EFFECT_CITY);
+    const incomeAt = (completed: number) => playerIncome(stage(completed), ruleset, ROME);
+
+    const observed = EFFECT_STAGES.map((entry) => ({
+      entry,
+      yields: yieldsAt(entry.completed),
+      income: incomeAt(entry.completed),
+    }));
+    const [none, market, library, barracks, walls, all] = observed;
+
+    // The alternative reading of the compound rule, computed here so the assertion
+    // can name it: apply each building's percentage in turn, flooring every time.
+    const floorEach = (value: number, pcts: readonly number[]): number =>
+      pcts.reduce((running, pct) => Math.floor((running * (100 + pct)) / 100), value);
+    const wallsFloorEach = floorEach(6, [25, 25]);
+    const factoryFloorEach = floorEach(6, [50, 25, 25]);
+
+    const exact = (entry: (typeof observed)[number]): string =>
+      `${entry.entry.shows}: ${String(entry.yields.shields)} shields, ` +
+      `${String(entry.yields.commerce)} commerce, ${String(entry.yields.food)} food, ` +
+      `${String(entry.income.gold)} gold, ${String(entry.income.beakers)} beakers`;
+
+    return [
+      check(
+        city.buildings.length === EFFECT_COMPLETIONS.length &&
+          EFFECT_COMPLETIONS.every((id, index) => city.buildings[index] === id),
+        'the city completed its five buildings in the scripted order (marketplace, library, ' +
+          `barracks, walls, factory); it actually holds [${city.buildings.join(', ')}]`,
+      ),
+      check(
+        none !== undefined &&
+          none.yields.shields === 6 &&
+          none.yields.commerce === 4 &&
+          none.yields.food === 6 &&
+          none.income.gold === 2 &&
+          none.income.beakers === 2,
+        'before any building the city produces 6 shields and 4 commerce (grassland centre 2/1/1, ' +
+          'worked grassland 2/1/1, two worked plains 1/2/1 each) and 6 food with no surplus, so at ' +
+          `5/5/0 that commerce is 2 gold and 2 beakers; got ${none === undefined ? 'nothing' : exact(none)}`,
+      ),
+      check(
+        market !== undefined &&
+          market.yields.commerce === 6 &&
+          market.yields.shields === 6 &&
+          market.income.gold === 3 &&
+          market.income.beakers === 3,
+        'after the marketplace the commerce multiplier applies to commerce alone: ' +
+          `floor(4 * 150 / 100) = 6, so 3 gold and 3 beakers and shields unchanged at 6; got ` +
+          (market === undefined ? 'nothing' : exact(market)),
+      ),
+      check(
+        library !== undefined &&
+          library.income.beakers === 4 &&
+          library.income.gold === 3 &&
+          library.yields.commerce === 6,
+        "after the library the beaker multiplier applies to this city's own beaker channel: " +
+          `floor(3 * 150 / 100) = 4, with gold untouched at 3 and commerce still 6; got ` +
+          (library === undefined ? 'nothing' : exact(library)),
+      ),
+      check(
+        barracks !== undefined && barracks.yields.shields === 7,
+        'after the barracks the single 25% shield multiplier gives floor(6 * 125 / 100) = 7; got ' +
+          `${String(barracks?.yields.shields)} shields`,
+      ),
+      check(
+        walls !== undefined && walls.yields.shields === 9 && wallsFloorEach === 8,
+        'two 25% shield multipliers SUM before one floor: floor(6 * 150 / 100) = 9, and flooring ' +
+          `each separately would give ${String(wallsFloorEach)} (the reading this engine does NOT ` +
+          `implement, so this case discriminates); got ${String(walls?.yields.shields)} shields`,
+      ),
+      check(
+        all !== undefined && all.yields.shields === 12 && all.yields.commerce === 6,
+        'after the factory the three shield percentages sum to 100% before the floor: ' +
+          `floor(6 * 200 / 100) = 12, not the ${String(factoryFloorEach)} a per-building floor ` +
+          `gives; got ${String(all?.yields.shields)} shields`,
+      ),
+      check(
+        observed.every((entry) => entry.yields.food === 6),
+        "food is not multiplied by any building (M4c's effect union has no food multiplier; the " +
+          `granary reduces the growth requirement instead): 6 food at every stage; got ` +
+          observed.map((entry) => String(entry.yields.food)).join(', '),
+      ),
+      check(
+        moneyOf(after, ROME).treasury === 96,
+        'gold is accounted for to the piece: 100 + (3-1) + (3-2) + (3-3) + (3-4) + (3-4) + (3-4) ' +
+          `+ (3-7) = 96 — seven turns of 3 gold of income against the maintenance of the buildings ` +
+          `standing at the time; got ${String(moneyOf(after, ROME).treasury)}`,
+      ),
+    ];
+  },
+});
+
+describe('M4c scenario: building effects (gold, beakers, shields, compound flooring)', () => {
+  it('agrees with the scenario assertions and pins every stage from the engine’s own turns', () => {
+    const result = runScenario(buildingEffectsScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The same timeline again, walked one command at a time, so each stage is read
+    // off the *state the engine produced* rather than off a reconstruction of it.
+    let state = buildWorld(effectSetup);
+    expect(cityYields(state, RULESET, EFFECT_CITY)).toEqual({
+      food: 6,
+      shields: 6,
+      commerce: 4,
+      foodSurplus: 0,
+    });
+
+    for (const entry of EFFECT_STAGES.slice(1)) {
+      const id = EFFECT_COMPLETIONS[entry.completed - 1];
+      if (id === undefined) throw new Error('every stage after the first completes one building');
+      const steps: Command[] = [setProduction(0, buildingItem(id)), endTurn()];
+      if (id === FACTORY) steps.push(endTurn(), endTurn());
+      const walked = walk(state, steps);
+      state = walked.state;
+
+      const yields = cityYields(state, RULESET, EFFECT_CITY);
+      const income = playerIncome(state, RULESET, ROME);
+      expect({
+        shields: yields.shields,
+        commerce: yields.commerce,
+        food: yields.food,
+        gold: income.gold,
+        beakers: income.beakers,
+      }).toEqual({
+        shields: entry.shields,
+        commerce: entry.commerce,
+        food: entry.food,
+        gold: entry.gold,
+        beakers: entry.beakers,
+      });
+      // The building really is standing, and it is the one this stage is named for.
+      expect(cityOf(state, EFFECT_CITY).buildings.at(-1)).toBe(id);
+    }
+
+    expect(cityOf(state, EFFECT_CITY).buildings).toEqual([...EFFECT_COMPLETIONS]);
+    expect(moneyOf(state, ROME)).toEqual({ treasury: 96, beakers: 27, luxuries: 0 });
+    expect(hashValue(state)).toBe(hashValue(result.finalState));
+  });
+
+  it('collects the last turn’s gold and beakers in the engine’s own event stream', () => {
+    // The runner's final state is one thing; the *ledger* is another, and M4c's
+    // effects have to be visible in both. The final turn is the factory's: its
+    // 3 gold and 4 beakers are what the commerce multiplier, the rates and the
+    // beaker multiplier produced together.
+    const state = buildWorld(effectSetup);
+    const walked = walk(state, EFFECT_RUN);
+    const lastTurn = incomeLines(walked.events, ROME).at(-1);
+
+    expect(lastTurn).toEqual({
+      type: 'IncomeCollected',
+      playerId: ROME,
+      gold: 3,
+      beakers: 4,
+      luxuries: 0,
+    });
+    // ...and the bill that turn, which is every building's maintenance summed.
+    expect(upkeepLines(walked.events, ROME).at(-1)).toEqual({
+      type: 'UpkeepPaid',
+      playerId: ROME,
+      gold: 7,
+      maintenance: 7,
+      unitSupport: 0,
+      units: 1,
+      freeUnits: FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE,
+    });
+  });
+});
+
+/* ---- 12b. Growth food: the granary --------------------------------- */
+
+/**
+ * M4c's `growth-food` effect: the granary reduces the food a city needs to grow,
+ * and in this world the reduction is worth **exactly one turn**.
+ *
+ * The arithmetic, all of it the shipped rows' (every one of them a placeholder)
+ * plus one bonus resource the map places:
+ *
+ * - Rome's capital stands on grassland (2 food / 1 shield / 1 commerce) and works
+ *   one grassland tile carrying **wheat** — a bonus resource worth +1 food, so 3
+ *   food on that tile. Five food in total, one citizen eating 2, so the surplus is
+ *   exactly **3**.
+ * - `foodBoxSize(1)` is `FOOD_BOX_BASE` = 10, and the granary declares
+ *   `growth-food: 1`, so the reduced requirement is **9**.
+ * - The box therefore reaches 9 on the **third** turn of the run and 10 on the
+ *   fourth: the granary city grows on turn 3 carrying `9 - 9 = 0` over, and the
+ *   identical city without one grows a turn later carrying `12 - 10 = 2`. A surplus
+ *   of 2 would be no evidence at all — 9 and 10 both land on the fifth turn — which
+ *   is why the fixture is tuned to 3.
+ *
+ * Carthage's capital is the **control in the same world**: same terrain, the same
+ * wheat on the tile it works, the same citizen count and the same box, so the
+ * granary is the only difference between the two cities and the one-turn gap cannot
+ * be explained by two different maps.
+ */
+const GRANARY_CITY = asCityId(0); // Rome's capital: the holder
+const GRANARY_CONTROL = asCityId(1); // Carthage's capital: identical but for the granary
+const GRANARY_TILE_A = at(6, 5); // grassland + wheat: 2 + 1 = 3 food
+const GRANARY_TILE_B = at(11, 10); // the same tile, in Carthage's radius
+
+const granaryGrowthSetup =
+  (holdsGranary: boolean) =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    const world = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addResource(6, 5, WHEAT)
+      .addResource(11, 10, WHEAT)
+      .addUnit(0, WARRIOR, [35, 35])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], {
+        name: 'Roma',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [GRANARY_TILE_A],
+      })
+      .addCity(1, [10, 10], {
+        name: 'Carthago',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [GRANARY_TILE_B],
+      });
+    // The single difference between the scenario and its falsification variant.
+    return holdsGranary ? world.addBuilding(0, GRANARY) : world;
+  };
+
+const granaryGrowthScenario = defineScenario({
+  name: 'granary-grows-its-city-one-turn-earlier',
+  settings: DUEL_SETTINGS,
+  setup: granaryGrowthSetup(true),
+  // Three turns: the third is the granary city's growth turn, and the state the
+  // scenario stops at is the moment the control city is one food short.
+  run: endTurns(3),
+  assert: (after, ruleset) => {
+    const holder = cityOf(after, GRANARY_CITY);
+    const control = cityOf(after, GRANARY_CONTROL);
+    const controlYields = cityYields(after, ruleset, GRANARY_CONTROL);
+
+    // The control's fourth turn, probed forward from the state the run stopped at.
+    const fourth = romeApply(after, ruleset, endTurn())?.state;
+    const controlGrown = fourth === undefined ? undefined : cityOf(fourth, GRANARY_CONTROL);
+
+    return [
+      check(
+        holder.buildings.includes(GRANARY) && !control.buildings.includes(GRANARY),
+        "the granary stands in Rome's capital and in no other city, so the two cities " +
+          'differ in nothing but the building: Rome holds ' +
+          `[${holder.buildings.join(', ')}], Carthage holds [${control.buildings.join(', ')}]`,
+      ),
+      check(
+        controlYields.food === 5 && controlYields.foodSurplus === 3 && foodBoxSize(1) === 10,
+        'the arithmetic both turns come from: a grassland centre plus a wheat grassland tile is ' +
+          '5 food, one citizen eats 2, so the surplus is 3 against the 10 food a second citizen ' +
+          `costs — got food ${String(controlYields.food)}, surplus ` +
+          `${String(controlYields.foodSurplus)}, box size ${String(foodBoxSize(1))}`,
+      ),
+      check(
+        after.turn === 4 && holder.population === 2 && holder.foodBox === 0,
+        'the granary city grew on the THIRD turn of the run (the state is at turn 4), carrying ' +
+          `9 - 9 = 0 over — got turn ${String(after.turn)}, population ` +
+          `${String(holder.population)}, box ${String(holder.foodBox)}`,
+      ),
+      check(
+        control.population === 1 && control.foodBox === 9,
+        'at that same moment the city without a granary has NOT grown: its box holds 9 of the 10 ' +
+          "a second citizen costs, because the reduction is the holder's alone — got population " +
+          `${String(control.population)}, box ${String(control.foodBox)}`,
+      ),
+      check(
+        controlGrown !== undefined && controlGrown.population === 2 && controlGrown.foodBox === 2,
+        'the very next turn the control city grows too — 12 - 10 = 2 carried over — so the ' +
+          'granary bought exactly one turn and not two, and the remainder differs (0 against 2) ' +
+          `because the threshold did — got population ${String(controlGrown?.population)}, box ` +
+          `${String(controlGrown?.foodBox)} (the fourth turn was ` +
+          `${fourth === undefined ? 'refused' : 'applied'})`,
+      ),
+    ];
+  },
+});
+
+describe('M4c scenario: the granary grows its city one turn earlier', () => {
+  it('agrees with the scenario assertions, and shows the gap in the engine’s own turn stream', () => {
+    const result = runScenario(granaryGrowthScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The same world again, walked one turn at a time: the two growths are then read
+    // off the *engine's* events rather than off the states they left behind, which is
+    // what makes "on the third turn, with this box" a statement about the pipeline.
+    const third = walk(buildWorld(granaryGrowthSetup(true)), endTurns(3));
+    expect(third.state.turn).toBe(4);
+    expect(third.events.filter((event) => event.type === 'CityGrew')).toEqual([
+      { type: 'CityGrew', cityId: GRANARY_CITY, owner: ROME, population: 2, foodBox: 0 },
+    ]);
+    expect(cityOf(third.state, GRANARY_CONTROL)).toMatchObject({ population: 1, foodBox: 9 });
+
+    const fourth = walk(third.state, [endTurn()]);
+    expect(fourth.state.turn).toBe(5);
+    expect(fourth.events.filter((event) => event.type === 'CityGrew')).toEqual([
+      { type: 'CityGrew', cityId: GRANARY_CONTROL, owner: CARTHAGE, population: 2, foodBox: 2 },
+    ]);
+
+    // And the scripted run's final state is exactly the state the walk reached: the
+    // scenario is measuring the same world the events above come from.
+    expect(result.finalState).toBeDefined();
+    if (result.finalState !== undefined) {
+      expect(hashValue(third.state)).toBe(hashValue(result.finalState));
+    }
+  });
+});
+
+/* ---- 13. Wonders -------------------------------------------------- */
+
+const WONDER_CITY_A = asCityId(0); // Rome's city
+const WONDER_CITY_B = asCityId(1); // Carthage's city, five tiles away
+const WONDER_HILLS = at(5, 6); // worked by A: 0 food, 2 shields, 0 commerce
+const WONDER_FARM = at(10, 11); // worked by B: 2 food, 1 shield, 1 commerce
+
+/**
+ * The wonder world, parameterised by the two things the two scenarios below differ
+ * in: Rome's starting treasury (which decides whether it can pay the wonder's
+ * maintenance) and whether the wonder is there at all (which is what the
+ * discrimination tests take away).
+ *
+ * Rome's city A works one hill, so its output is deliberately tiny: the centre
+ * (grassland, floored at 1/1/1) plus the hill is **2 food, 3 shields, 1 commerce**,
+ * a food surplus of exactly 0 (no growth to move the numbers), and at the default
+ * 6/4/0 that one commerce is `floor(0.6) = 0` gold, `floor(0.4) = 0` beakers and the
+ * leftover 1 to gold — **1 gold a turn**. The Pyramids cost **2 gold a turn**
+ * (PLACEHOLDER: the row's own `maintenance`), so from a treasury of 0 the very first
+ * `EndTurn` cannot pay for them.
+ *
+ * Carthage's city B is there for the opposite reason: it is the *other* player's
+ * production options, and M4c's wonder rule is about every city anywhere.
+ */
+const wonderSetup =
+  (treasury: number, holdsWonder: boolean) =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    const world = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(5, 6, 'hills')
+      .setTreasury(0, treasury)
+      .addUnit(0, WARRIOR, [35, 35])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], {
+        name: 'Roma',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [WONDER_HILLS],
+      })
+      .addCity(1, [10, 10], {
+        name: 'Carthago',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [WONDER_FARM],
+      });
+    return holdsWonder ? world.addBuilding(0, PYRAMIDS) : world;
+  };
+
+/** Rome can pay: the wonder stands, and stays standing through the scenario. */
+const wonderHeldScenario = defineScenario({
+  name: 'wonder-held-by-one-civilization-leaves-every-other-option',
+  settings: DUEL_SETTINGS,
+  setup: wonderSetup(EFFECT_TREASURY, true),
+  assert: (after, ruleset) => {
+    const catalog = buildingCatalog(ruleset);
+    const cityA = cityOf(after, WONDER_CITY_A);
+    const cityB = cityOf(after, WONDER_CITY_B);
+    const holder = buildingHolder(after, PYRAMIDS);
+
+    // The other player's city, and *starting* the wonder there.
+    const bRefusal = errorOf(
+      applyCommand(after, CARTHAGE, setProduction(1, buildingItem(PYRAMIDS)), ruleset),
+    );
+    const bHeld = bRefusal?.kind === 'wonder-already-built' ? bRefusal : undefined;
+    // The holder's own city: a different refusal, with a different fix.
+    const ownRefusal = errorOf(
+      applyCommand(after, ROME, setProduction(0, buildingItem(PYRAMIDS)), ruleset),
+    );
+    // The control: B may still start an *ordinary* building, so the refusal above
+    // is about the wonder's uniqueness and not about B's city being unusable.
+    const granaryRefusal = errorOf(
+      applyCommand(after, CARTHAGE, setProduction(1, buildingItem(GRANARY)), ruleset),
+    );
+
+    const row = buildingRowOf(ruleset, PYRAMIDS);
+
+    return [
+      check(
+        holder?.id === WONDER_CITY_A,
+        `city ${String(Number(WONDER_CITY_A))} ("Roma") holds the Pyramids — the world is the one ` +
+          'the scenario describes, and every assertion below is about a wonder that is really standing',
+      ),
+      check(
+        !optionIds(after, ruleset, WONDER_CITY_B).includes(`building:${PYRAMIDS}`) &&
+          !mayStartBuilding(after, catalog, cityB, PYRAMIDS),
+        "a wonder one city holds is offered by NO other city: Carthage's production options are " +
+          `[${optionIds(after, ruleset, WONDER_CITY_B).join(', ')}]`,
+      ),
+      check(
+        bHeld !== undefined && bHeld.building === PYRAMIDS && bHeld.holder === WONDER_CITY_A,
+        'and asking to start it anyway is refused with the typed `wonder-already-built`, naming the ' +
+          `city that holds it — got ${bRefusal === undefined ? 'no refusal at all' : JSON.stringify(bRefusal)}`,
+      ),
+      check(
+        ownRefusal?.kind === 'already-built' && ownRefusal.building === PYRAMIDS,
+        "the holder's own attempt is refused with `already-built` instead (a different refusal, " +
+          `because the fix is different) — got ${JSON.stringify(ownRefusal)}`,
+      ),
+      check(
+        granaryRefusal === undefined &&
+          optionIds(after, ruleset, WONDER_CITY_B).includes(`building:${GRANARY}`),
+        'the uniqueness refusal is about the wonder and not about Carthage: the same city may still ' +
+          'start an ordinary building, and the granary is refused with nothing',
+      ),
+      check(
+        isWonder(row) &&
+          maintenanceOf(row) === 2 &&
+          cityMaintenance(catalog, cityA) === 2 &&
+          cityMaintenance(catalog, cityB) === 0,
+        'a wonder is a building like any other in every other respect: it declares `wonder: true`, ' +
+          'it costs its owner 2 gold a turn, and that bill falls only on the city holding it ' +
+          `(B owes ${String(cityMaintenance(catalog, cityB))})`,
+      ),
+    ];
+  },
+});
+
+/** Rome cannot pay: the wonder's maintenance bankrupts it, and the wonder is lost. */
+const wonderBankruptcyScenario = defineScenario({
+  name: 'a-bankrupted-wonder-is-buildable-again',
+  settings: DUEL_SETTINGS,
+  setup: wonderSetup(0, true),
+  run: [endTurn()],
+  assert: (after, ruleset) => {
+    const catalog = buildingCatalog(ruleset);
+    const cityA = cityOf(after, WONDER_CITY_A);
+    const restored = withBuildings(after, WONDER_CITY_A, [PYRAMIDS]);
+    const income = playerIncome(after, ruleset, ROME);
+    const next = applyFor(after, ROME, endTurn(), ruleset);
+    const restartedRefusal = errorOf(
+      applyCommand(after, ROME, setProduction(0, buildingItem(PYRAMIDS)), ruleset),
+    );
+    const otherRefusal = errorOf(
+      applyCommand(after, CARTHAGE, setProduction(1, buildingItem(PYRAMIDS)), ruleset),
+    );
+
+    return [
+      check(
+        cityA.buildings.length === 0 && buildingHolder(after, PYRAMIDS) === undefined,
+        'the bankruptcy took the wonder: city 0 holds nothing and no city anywhere holds the ' +
+          `Pyramids (its buildings are [${cityA.buildings.join(', ')}])`,
+      ),
+      check(
+        moneyOf(after, ROME).treasury === 0 && income.gold === 1,
+        'the bill was 2 gold of maintenance against 1 gold of income (one commerce at 6/4/0), so ' +
+          'the treasury floored at exactly 0 and reported a shortfall rather than going negative — ' +
+          `got ${String(moneyOf(after, ROME).treasury)} gold and ${String(income.gold)} of income`,
+      ),
+      check(
+        cityMaintenance(catalog, cityOf(restored, WONDER_CITY_A)) === 2 &&
+          !mayStartBuilding(restored, catalog, cityOf(restored, WONDER_CITY_A), PYRAMIDS) &&
+          !optionIds(restored, ruleset, WONDER_CITY_B).includes(`building:${PYRAMIDS}`),
+        'the same world with the wonder put back is exactly the world where nobody may start it: ' +
+          "its maintenance is 2, city 0 may not restart it and it is in no other city's options — " +
+          'so what the loss changed is the holder, and nothing else',
+      ),
+      check(
+        mayStartBuilding(after, catalog, cityA, PYRAMIDS) &&
+          optionIds(after, ruleset, WONDER_CITY_A).includes(`building:${PYRAMIDS}`) &&
+          restartedRefusal === undefined,
+        'a wonder lost to bankruptcy is buildable again: the city that lost it may start it once ' +
+          `more — got ${restartedRefusal === undefined ? 'accepted' : JSON.stringify(restartedRefusal)}`,
+      ),
+      check(
+        optionIds(after, ruleset, WONDER_CITY_B).includes(`building:${PYRAMIDS}`) &&
+          otherRefusal === undefined,
+        'and it is back in the OTHER player\'s options too, which is the whole of "unique but never ' +
+          'rebuilt" coming apart: with no holder anywhere, the wonder is startable by anyone',
+      ),
+      check(
+        moneyOf(next.state, ROME).treasury === 1 &&
+          !next.events.some((event) => event.type === 'TreasuryShortfall'),
+        'what the loss buys is the next turn: with no maintenance left, 1 gold of income is 1 gold ' +
+          'of treasury and no shortfall',
+      ),
+    ];
+  },
+});
+
+describe('M4c scenario: wonders are globally unique', () => {
+  it('keeps a held wonder out of every other city’s options, and names the holder in the refusal', () => {
+    const result = runScenario(wonderHeldScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The world the setup really built: if the wonder were not standing, the
+    // scenario's assertions would be about nothing, so the fixture is pinned here.
+    const state = buildWorld(wonderSetup(EFFECT_TREASURY, true));
+    expect(buildingHolder(state, PYRAMIDS)?.id).toBe(WONDER_CITY_A);
+    expect(cityOf(state, WONDER_CITY_A).buildings).toEqual([PYRAMIDS]);
+    expect(cityYields(state, RULESET, WONDER_CITY_A)).toEqual({
+      food: 2,
+      shields: 3,
+      commerce: 1,
+      foodSurplus: 0,
+    });
+    expect(playerIncome(state, RULESET, ROME)).toEqual({ gold: 1, beakers: 0, luxuries: 0 });
+
+    // The option list is the *engine's* own (`planSetProduction`), which is why the
+    // assertion above is not just a menu the test painted.
+    expect(optionIds(state, RULESET, WONDER_CITY_B)).not.toContain(`building:${PYRAMIDS}`);
+    expect(optionIds(state, RULESET, WONDER_CITY_B)).toContain(`building:${GRANARY}`);
+  });
+
+  it('records the bankruptcy that takes it: a real shortfall out of the wonder’s own maintenance', () => {
+    const result = runScenario(wonderBankruptcyScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const state = buildWorld(wonderSetup(0, true));
+    expect(buildingHolder(state, PYRAMIDS)?.id).toBe(WONDER_CITY_A);
+
+    // One `EndTurn`: income 1, upkeep 2 (the wonder alone), treasury 0 — so the
+    // shortfall is 1, and no unit can pay it (Rome's single warrior is inside the
+    // six-unit free allowance, so `applyEconomy` disbands nothing).
+    const walked = walk(state, [endTurn()]);
+    expect(moneyOf(walked.state, ROME).treasury).toBe(0);
+    expect(shortfallLines(walked.events, ROME)).toEqual([
+      { type: 'TreasuryShortfall', playerId: ROME, unpaid: 1 },
+    ]);
+    expect(disbandLines(walked.events, ROME)).toEqual([]);
+    expect(upkeepLines(walked.events, ROME).at(0)?.maintenance).toBe(2);
+    // The wonder is gone, which is what makes `mayStartBuilding` say yes again.
+    expect(buildingHolder(walked.state, PYRAMIDS)).toBeUndefined();
+  });
+});
+
+/* ---- 14. Resources ------------------------------------------------ */
+
+const RESOURCE_CITY = asCityId(0); // Rome's city, road-connected to the iron
+const RESOURCE_REMOTE = asCityId(1); // Rome's second city, no road anywhere near it
+const RESOURCE_OTHER = asCityId(2); // Carthage's city, with iron on its own tile
+const RESOURCE_WORKED = at(4, 5);
+const RESOURCE_SHARED = at(6, 5); // wheat (bonus) and wines (luxury), same tile
+const RESOURCE_IRON = at(5, 9); // hills, carrying iron and gems
+const RESOURCE_ROAD_NEAR = at(5, 8); // the last roaded tile before the resource
+const RESOURCE_ROAD_GAP = at(5, 7); // the middle tile the broken road omits
+const RESOURCE_REMOTE_FARM = at(15, 16);
+const RESOURCE_OTHER_TILE = at(20, 20);
+const RESOURCE_OTHER_FARM = at(21, 20);
+
+/**
+ * The resource world, with one switch: whether the road from Rome's capital to the
+ * iron is whole or broken **at its middle tile** (`(5, 7)`).
+ *
+ * What the world states, and why each piece is there:
+ *
+ * - a **hills tile at (5, 9) carrying iron AND gems**, four tiles south of Rome's
+ *   capital. Iron is strategic (it gates the swordsman); gems is a luxury, inert
+ *   until M9. Two resources on one tile is a world `gen.ts` would not place — and
+ *   M4c's acceptance evidence asks for it, because `resources.ts` sums a tile's
+ *   bonus deltas and must not assume the generator's at-most-one-per-tile rule;
+ * - a **wheat (bonus, +1 food) and a wines (luxury) on the same worked tile**
+ *   `(6, 5)`: the bonus delta is the only one of the four that touches the tile, so
+ *   the city's food is 7 rather than 6 and the wines contribute nothing;
+ * - the **road**: `connectRoad` writes the whole chain (5,5)..(5,8) when it is
+ *   whole, and (5,5),(5,6) plus (5,8) alone when it is broken. The broken variant
+ *   therefore has the resource tile's *neighbour* roaded and still connects
+ *   nothing, which is what makes "a path from a city" the rule rather than "a road
+ *   near the resource";
+ * - the **resource tile itself carries no road** in either variant: endpoints are
+ *   inclusive, so a chain that stops *next to* the iron connects it;
+ * - a **second Roman city at (15, 15) with no roads and no nearby resources**, and
+ *   **Carthage's city at (20, 20) standing on its own iron with no roads at all**.
+ *   The first is the engine's per-*player* reading of connection ("a resource is
+ *   connected for a player if SOME city of that player reaches it", `resources.ts`);
+ *   the second is the city-centre-is-a-node half of "endpoints inclusive". Both are
+ *   asserted, in both directions.
+ */
+const resourceSetup =
+  (roadBroken: boolean) =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    const world = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(5, 9, 'hills')
+      .setTile(20, 20, 'hills')
+      .addResource(6, 5, WHEAT)
+      .addResource(6, 5, WINES)
+      .addResource(5, 9, GEMS)
+      .addResource(5, 9, IRON)
+      .addResource(20, 20, IRON)
+      .addUnit(0, WARRIOR, [35, 35])
+      .addUnit(1, WARRIOR, [36, 35])
+      .addCity(0, [5, 5], {
+        name: 'Roma',
+        population: 2,
+        foodBox: 0,
+        shields: 4,
+        workedTiles: [RESOURCE_WORKED, RESOURCE_SHARED],
+      })
+      .addCity(0, [15, 15], {
+        name: 'Ostia',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [RESOURCE_REMOTE_FARM],
+      })
+      .addCity(1, [20, 20], {
+        name: 'Carthago',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [RESOURCE_OTHER_FARM],
+      });
+    return roadBroken
+      ? world.connectRoad([5, 5], [5, 6]).connectRoad([5, 8], [5, 8])
+      : world.connectRoad([5, 5], [5, 8]);
+  };
+
+/**
+ * RESOURCES, the positive half: a city road-connected to a strategic resource can
+ * build the unit that requires it, and the two extra worlds the evidence names —
+ * a resource on a city tile with no road at all, and two resources sharing a tile —
+ * behave as the contract says.
+ *
+ * The script is the proof of legality: `SetProduction` on the swordsman is applied,
+ * so the applier accepted it. Everything the assertion adds is the *reason* (the
+ * connection walk's exact answer), the mirror (`planSetProduction` is also what the
+ * option list is made of, so the swordsman is *offered*) and the three other worlds.
+ */
+const resourceConnectedScenario = defineScenario({
+  name: 'road-connected-resource-allows-the-gated-unit',
+  settings: DUEL_SETTINGS,
+  setup: resourceSetup(false),
+  run: [setProduction(0, unitItem(SWORDSMAN))],
+  assert: (after, ruleset) => {
+    const cityA = cityOf(after, RESOURCE_CITY);
+    const otherRefusal = errorOf(
+      applyCommand(after, CARTHAGE, setProduction(2, unitItem(SWORDSMAN)), ruleset),
+    );
+    const shared = after.map.resources.filter((entry) => entry.tile === RESOURCE_SHARED);
+    const onIron = after.map.resources.filter((entry) => entry.tile === RESOURCE_IRON);
+    const production = cityA.production;
+    const gated =
+      production?.kind === 'unit' && production.id === SWORDSMAN ? production : undefined;
+    const yieldsA = cityYields(after, ruleset, RESOURCE_CITY);
+    // A rendering of the probe for the message, computed once: reading `otherRefusal`
+    // inside the message would be reading a variable the condition above has already
+    // narrowed, which is a lint error and a worse message.
+    const otherText =
+      otherRefusal === undefined ? 'an accepted order' : JSON.stringify(otherRefusal);
+
+    return [
+      check(
+        connectedIds(after, ruleset, ROME).join(',') === 'gems,iron,wheat,wines' &&
+          isConnected(after, ruleset, ROME, IRON),
+        'Rome is connected to exactly the four resources its network reaches — the road chain down ' +
+          'to (5, 8) buys the iron and the gems, and the two on the worked tile next to the capital ' +
+          'need no road at all — got ' +
+          `[${connectedIds(after, ruleset, ROME).join(', ')}]`,
+      ),
+      check(
+        gated !== undefined &&
+          optionIds(after, ruleset, RESOURCE_CITY).includes(`unit:${SWORDSMAN}`),
+        'the connected city may build the gated unit: the scripted `SetProduction(swordsman)` was ' +
+          'applied (the applier accepted it, and the city is set to it), and the swordsman is in the ' +
+          `city's production options — production is ${JSON.stringify(production)}`,
+      ),
+      check(
+        optionIds(after, ruleset, RESOURCE_REMOTE).includes(`unit:${SWORDSMAN}`),
+        'connection is the PLAYER\'s, as `resources.ts` states it ("some city of that player"): ' +
+          "Rome's second city at (15, 15) has no road and no resource anywhere near it, and may " +
+          'still build the swordsman because Rome has iron connected',
+      ),
+      check(
+        connectedIds(after, ruleset, CARTHAGE).join(',') === 'iron' &&
+          optionIds(after, ruleset, RESOURCE_OTHER).includes(`unit:${SWORDSMAN}`) &&
+          otherRefusal === undefined,
+        'a resource on the CITY TILE is connected with no road at all (endpoints inclusive, and a ' +
+          "city centre is a node of the network): Carthage's city stands on its own iron, and may " +
+          `build the swordsman — got [${connectedIds(after, ruleset, CARTHAGE).join(', ')}] and ` +
+          otherText,
+      ),
+      check(
+        shared.length === 2 &&
+          shared[0]?.resource === WHEAT &&
+          shared[1]?.resource === WINES &&
+          onIron.length === 2 &&
+          onIron[0]?.resource === GEMS &&
+          onIron[1]?.resource === IRON,
+        'two resources may share one tile, and the sparse list stays sorted by (tile, resource): ' +
+          `(6, 5) carries [${shared.map((entry) => entry.resource).join(', ')}] and (5, 9) carries ` +
+          `[${onIron.map((entry) => entry.resource).join(', ')}]`,
+      ),
+      check(
+        hasImprovement(after, RESOURCE_ROAD_NEAR, ROAD) &&
+          !hasImprovement(after, RESOURCE_IRON, ROAD),
+        'the chain stops NEXT TO the iron: (5, 8) is roaded and the resource tile is not, which is ' +
+          'what "endpoints inclusive" means on the resource end',
+      ),
+      check(
+        yieldsA.food === 7 &&
+          yieldsA.shields === 3 &&
+          yieldsA.commerce === 3 &&
+          yieldsA.foodSurplus === 3,
+        "the tile's worth is terrain plus improvements plus BONUS resources: the wheat adds its " +
+          '+1 food to (6, 5) (grassland 2/1/1 -> 3/1/1) and the wines on the same tile add nothing, ' +
+          'since only a bonus row has a delta — got ' +
+          `${String(yieldsA.food)} food, ${String(yieldsA.shields)} shields, ` +
+          `${String(yieldsA.commerce)} commerce`,
+      ),
+    ];
+  },
+});
+
+/**
+ * RESOURCES, the negative half: with the road broken **at its middle tile** the same
+ * order is refused with the typed error, and the mirror holds — the unit is no longer
+ * *offered*, because the option list is made of the same `planSetProduction` verdicts.
+ *
+ * The run is empty on purpose: this scenario is about a refusal, and a refusal is
+ * not a state transition, so the assertion probes the applier instead of scripting a
+ * command the runner would refuse (a refused command in `run` fails the scenario for
+ * a different reason — the script, not the rule).
+ */
+const resourceBrokenScenario = defineScenario({
+  name: 'broken-road-refuses-the-gated-unit-with-resource-not-connected',
+  settings: DUEL_SETTINGS,
+  setup: resourceSetup(true),
+  assert: (after, ruleset) => {
+    const refusal = errorOf(
+      applyCommand(after, ROME, setProduction(0, unitItem(SWORDSMAN)), ruleset),
+    );
+    const typed = refusal?.kind === 'resource-not-connected' ? refusal : undefined;
+    const otherRefusal = errorOf(
+      applyCommand(after, CARTHAGE, setProduction(2, unitItem(SWORDSMAN)), ruleset),
+    );
+
+    return [
+      check(
+        !isConnected(after, ruleset, ROME, IRON) &&
+          connectedIds(after, ruleset, ROME).join(',') === 'wheat,wines',
+        'the broken chain connects the iron to nothing: (5, 6) is roaded, the middle tile (5, 7) is ' +
+          'not, and (5, 8) is roaded but unreachable — so the walk reaches only the two resources ' +
+          `beside the capital, got [${connectedIds(after, ruleset, ROME).join(', ')}]`,
+      ),
+      check(
+        hasImprovement(after, at(5, 6), ROAD) &&
+          !hasImprovement(after, RESOURCE_ROAD_GAP, ROAD) &&
+          hasImprovement(after, RESOURCE_ROAD_NEAR, ROAD),
+        'the gap is the middle tile of the chain, and the far segment is roaded: (5, 6) roaded, ' +
+          '(5, 7) not, (5, 8) roaded — a road near the iron is not a connection to it',
+      ),
+      check(
+        typed !== undefined &&
+          typed.cityId === RESOURCE_CITY &&
+          typed.owner === ROME &&
+          typed.resource === IRON &&
+          typed.item.kind === 'unit' &&
+          typed.item.id === SWORDSMAN,
+        'the build is refused with the typed `resource-not-connected`, naming the city, the owner, ' +
+          `the item and the resource — got ${JSON.stringify(refusal)}`,
+      ),
+      check(
+        !optionIds(after, ruleset, RESOURCE_CITY).includes(`unit:${SWORDSMAN}`) &&
+          optionIds(after, ruleset, RESOURCE_CITY).includes(`unit:${WARRIOR}`),
+        'and the unit is not OFFERED either, because the option list is filtered through the same ' +
+          "evaluator: the swordsman is gone from the city's options while the warrior (which " +
+          'demands nothing) is still there',
+      ),
+      check(
+        otherRefusal === undefined &&
+          optionIds(after, ruleset, RESOURCE_OTHER).includes(`unit:${SWORDSMAN}`),
+        "the refusal is about Rome's chain and not about the unit row: Carthage, whose own city " +
+          'tile carries iron, still may build the swordsman',
+      ),
+    ];
+  },
+});
+
+describe('M4c scenario: road-connected resources gate production', () => {
+  it('lets the connected city build the swordsman and pins the shared-tile and city-tile worlds', () => {
+    const result = runScenario(resourceConnectedScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const state = buildWorld(resourceSetup(false));
+    // The map the setup really built: sparse, sorted pairs, two of them on one tile.
+    expect(state.map.resources).toEqual([
+      { tile: RESOURCE_SHARED, resource: WHEAT },
+      { tile: RESOURCE_SHARED, resource: WINES },
+      { tile: RESOURCE_IRON, resource: GEMS },
+      { tile: RESOURCE_IRON, resource: IRON },
+      { tile: RESOURCE_OTHER_TILE, resource: IRON },
+    ]);
+    // A map fact has to survive serialisation like every other map fact.
+    const roundTripped: unknown = JSON.parse(JSON.stringify(state));
+    expect(hashValue(roundTripped)).toBe(hashValue(state));
+  });
+
+  it('refuses it with resource-not-connected, changes nothing, and still offers everything else', () => {
+    const result = runScenario(resourceBrokenScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    const state = buildWorld(resourceSetup(true));
+    const attempt = applyCommand(state, ROME, setProduction(0, unitItem(SWORDSMAN)), RULESET);
+
+    // A refusal is not a transition: the typed error, and no new state at all.
+    expect(attempt.ok).toBe(false);
+    expect(errorOf(attempt)).toEqual({
+      kind: 'resource-not-connected',
+      cityId: RESOURCE_CITY,
+      owner: ROME,
+      item: { kind: 'unit', id: SWORDSMAN },
+      resource: IRON,
+    });
+    // Nothing about the world moved: the same hash before and after the attempt,
+    // and the same hash as the scenario's final state.
+    const finalState = result.finalState;
+    if (finalState === undefined) throw new Error('the broken-road scenario must build a state');
+    expect(hashValue(state)).toBe(hashValue(finalState));
+    const roundTripped: unknown = JSON.parse(JSON.stringify(state));
+    expect(hashValue(roundTripped)).toBe(hashValue(state));
+  });
+});
+
+/* ---- 15. Maintenance ---------------------------------------------- */
+
+const MAINTENANCE_CITY = asCityId(0);
+const MAINTENANCE_HILLS = at(5, 6);
+
+/**
+ * The five buildings, in the order the scenario gives them to the city.
+ *
+ * The order is load-bearing: `addBuilding` appends, `production.ts` appends on
+ * completion, and `disbandBuildings` reads the list **backwards** (most recently
+ * completed first) — so "the last four of these five" is exactly "the four a
+ * bankruptcy takes when 6 gold go unpaid". Their maintenance is 1, 1, 1, 1 and 3
+ * (PLACEHOLDER, from the shipped rows).
+ */
+const MAINTENANCE_BUILDINGS: readonly BuildingId[] = [
+  MARKETPLACE,
+  LIBRARY,
+  BARRACKS,
+  WALLS,
+  FACTORY,
+];
+
+/** What the city could not pay: 7 gold of maintenance against 1 gold of income. */
+const MAINTENANCE_UNPAID = 6;
+
+/**
+ * The maintenance world, at a treasury the caller chooses.
+ *
+ * Rome's city works one hill from a grassland centre, so its output is 2 food (a
+ * surplus of 0: the city never grows), 3 shields and **1 commerce**, which at the
+ * default 6/4/0 is `floor(0.6) = 0` gold plus the leftover 1 — **1 gold a turn**.
+ * Five buildings cost **7 gold a turn**. Rome's single worker is well inside the
+ * `FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE = 6` free allowance, so there is no
+ * unit to disband: the shortfall reaches `TreasuryShortfall`, and what pays is the
+ * buildings themselves.
+ */
+const maintenanceSetup =
+  (treasury: number) =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    let world = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .setTile(5, 6, 'hills')
+      .setTreasury(0, treasury)
+      .addUnit(0, WORKER, [35, 35])
+      .addUnit(1, WARRIOR, [20, 20])
+      .addCity(0, [5, 5], {
+        name: 'Roma',
+        population: 1,
+        foodBox: 0,
+        workedTiles: [MAINTENANCE_HILLS],
+      });
+    for (const id of MAINTENANCE_BUILDINGS) world = world.addBuilding(0, id);
+    return world;
+  };
+
+/**
+ * MAINTENANCE, and the debt M4b left open: its `TreasuryShortfall` branch was
+ * unreachable from shipped content, because every shipped `maintenance` was zero
+ * and only a hand-built ruleset could state one. This scenario runs through
+ * `runScenario`, which validates `CATALOG` and nothing else — no test view, no
+ * hand-written ruleset — and asserts that the shortfall is *reached*, that the gold
+ * it reports is the arithmetic of the shipped rows, that the buildings which ran it
+ * up are the ones taken, and that the treasury never goes negative.
+ *
+ * The test below adds the other half of the claim by pinning the provenance of the
+ * five rows: every one of them is `placeholder(...)`, so the numbers are ours and
+ * unsourced rather than borrowed from Civ 3.
+ */
+const maintenanceScenario = defineScenario({
+  name: 'building-maintenance-outruns-income-and-drives-a-shortfall',
+  settings: DUEL_SETTINGS,
+  setup: maintenanceSetup(0),
+  run: [endTurn()],
+  assert: (after, ruleset) => {
+    const catalog = buildingCatalog(ruleset);
+    const city = cityOf(after, MAINTENANCE_CITY);
+    const before = withBuildings(after, MAINTENANCE_CITY, MAINTENANCE_BUILDINGS);
+    const owed = cityMaintenance(catalog, cityOf(before, MAINTENANCE_CITY));
+    const income = playerIncome(after, ruleset, ROME);
+    const support = unitSupport(after, ROME);
+    const next = applyFor(after, ROME, endTurn(), ruleset);
+    const rows = MAINTENANCE_BUILDINGS.map((id) => buildingRowOf(ruleset, id));
+    const specs = CATALOG.buildings.filter((spec) => MAINTENANCE_BUILDINGS.includes(spec.id));
+
+    return [
+      check(
+        owed === 7 && income.gold === 1 && owed - income.gold === MAINTENANCE_UNPAID,
+        `the city's buildings cost ${String(owed)} gold a turn (1+1+1+1+3) against ` +
+          `${String(income.gold)} gold of income (one commerce at 6/4/0), so ` +
+          `${String(MAINTENANCE_UNPAID)} gold of the bill cannot be paid — and no unit can pay it ` +
+          `either, because the whole army is inside the free allowance (${String(support.units)} ` +
+          `unit(s), ${String(support.free)} free, ${String(support.gold)} owed)`,
+      ),
+      check(
+        specs.length === 5 &&
+          specs.every((spec) => spec.maintenance > 0) &&
+          specs.every((spec) => isPlaceholder(spec.provenance)),
+        'this shortfall comes from SHIPPED content and from nothing a test wrote: all five rows are ' +
+          "`@civts/rules`' own, each declares a maintenance > 0, and each says outright that its " +
+          'numbers are placeholders of ours (unsourced, chosen to be playable) — that is the M4b ' +
+          'debt closed',
+      ),
+      check(
+        city.buildings.length === 1 && city.buildings[0] === MARKETPLACE,
+        'the buildings that ran it up paid: `disbandBuildings` took the four most recently completed ' +
+          '— factory (3), walls (1), barracks (1), library (1) — until their 6 gold covered the 6 ' +
+          'unpaid, leaving the marketplace it can afford; the city holds ' +
+          `[${city.buildings.join(', ')}]`,
+      ),
+      check(
+        moneyOf(after, ROME).treasury === 0,
+        'the treasury floored at exactly 0: a shortfall is reported, never a negative balance and ' +
+          `never an invented debt field — got ${String(moneyOf(after, ROME).treasury)}`,
+      ),
+      check(
+        !next.events.some((event) => event.type === 'TreasuryShortfall') &&
+          moneyOf(next.state, ROME).treasury === 0,
+        'what the loss buys is the next turn: with only the marketplace left, 1 gold of income and ' +
+          '1 gold of maintenance meet exactly, and no shortfall is reported again',
+      ),
+      check(
+        rows.every((row) => maintenanceOf(row) > 0) && rows.every((row) => row.effects.length > 0),
+        "and the rows the assertion above reads are the engine's own view of the catalog: every one " +
+          'declares a maintenance and at least one effect, so no building here is a free shield sink',
+      ),
+    ];
+  },
+});
+
+describe('M4c scenario: maintenance drives a real TreasuryShortfall from shipped content', () => {
+  it('closes M4b’s debt: the shortfall is reachable with no hand-built ruleset at all', () => {
+    const result = runScenario(maintenanceScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The fixture, and the three numbers that make it a shipped-content shortfall.
+    const state = buildWorld(maintenanceSetup(0));
+    const city = cityOf(state, MAINTENANCE_CITY);
+    expect(city.buildings).toEqual([...MAINTENANCE_BUILDINGS]);
+    expect(cityMaintenance(buildingCatalog(RULESET), city)).toBe(7);
+    expect(playerIncome(state, RULESET, ROME).gold).toBe(1);
+
+    // Every row involved is the shipped catalog's own, declares its own maintenance,
+    // and says outright that the number is a placeholder of ours.
+    expect(MAINTENANCE_BUILDINGS.map((id) => maintenanceOf(buildingRowOf(RULESET, id)))).toEqual([
+      1, 1, 1, 1, 3,
+    ]);
+    const specs = CATALOG.buildings.filter((spec) => MAINTENANCE_BUILDINGS.includes(spec.id));
+    expect(specs).toHaveLength(5);
+    expect(specs.reduce((total, spec) => total + spec.maintenance, 0)).toBe(7);
+    expect(specs.every((spec) => isPlaceholder(spec.provenance))).toBe(true);
+
+    // And the same scenario against the same (shipped) catalog, explicitly — the
+    // point being that `runScenario` never had a hand-built view to begin with.
+    expect(runScenarioAgainst(maintenanceScenario, RULESET).passed).toBe(true);
+
+    // The ledger, from the events alone: the shortfall is real, nothing was
+    // disbanded, and the upkeep line names the 7 gold the rows declare.
+    const walked = walk(state, [endTurn()]);
+    expect(shortfallLines(walked.events, ROME)).toEqual([
+      { type: 'TreasuryShortfall', playerId: ROME, unpaid: MAINTENANCE_UNPAID },
+    ]);
+    expect(disbandLines(walked.events, ROME)).toEqual([]);
+    expect(upkeepLines(walked.events, ROME).at(0)).toEqual({
+      type: 'UpkeepPaid',
+      playerId: ROME,
+      gold: 7,
+      maintenance: 7,
+      unitSupport: 0,
+      units: 1,
+      freeUnits: FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE,
+    });
+    expect(cityOf(walked.state, MAINTENANCE_CITY).buildings).toEqual([MARKETPLACE]);
+    expect(moneyOf(walked.state, ROME).treasury).toBe(0);
+  });
+
+  it('buys the next turn with the loss, and takes no unit instead of a building', () => {
+    const state = buildWorld(maintenanceSetup(0));
+    const first = walk(state, [endTurn()]);
+    const second = walk(first.state, [endTurn()]);
+
+    expect(shortfallLines(first.events, ROME)).toHaveLength(1);
+    expect(shortfallLines(second.events, ROME)).toEqual([]);
+    expect(disbandLines(second.events, ROME)).toEqual([]);
+    expect(moneyOf(second.state, ROME).treasury).toBe(0);
+    expect(cityOf(second.state, MAINTENANCE_CITY).buildings).toEqual([MARKETPLACE]);
+    // The army is untouched: a building was taken, not a unit, because there was no
+    // supported unit to take.
+    expect(second.state.units.filter((unit) => unit.owner === ROME)).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The DSL's own M4c surface: `addResource`, `addBuilding`, `connectRoad`
+ * ------------------------------------------------------------------ */
+
+describe('the scenario builder states M4c worlds', () => {
+  const withRome = (b: ScenarioBuilder): ScenarioBuilder =>
+    b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, WORKER, [5, 5]) // Rome's start tile: where its first unit stands
+      .addUnit(1, WARRIOR, [20, 20]);
+
+  const build = (
+    setup: (builder: ScenarioBuilder) => ScenarioBuilder,
+    ruleset: RulesetView = RULESET,
+  ) => setup(createScenarioBuilder(ruleset, DUEL_SETTINGS)).build();
+
+  const builtState = (
+    setup: (builder: ScenarioBuilder) => ScenarioBuilder,
+    ruleset: RulesetView = RULESET,
+  ): GameState => {
+    const built = build(setup, ruleset);
+    if (!built.ok) throw new Error(`the fixture must build: ${JSON.stringify(built.error)}`);
+    return built.value;
+  };
+
+  it('places resources as sorted (tile, resource) pairs, and lets two share a tile', () => {
+    const state = builtState((b) =>
+      withRome(b)
+        .setTile(4, 4, 'hills')
+        // Asked out of order on purpose: the builder folds them, it does not keep
+        // the order the calls came in, because `GameMap.resources` is a sorted list
+        // and every state hash reads it as one.
+        .addResource(6, 5, WINES)
+        .addResource(6, 5, WHEAT)
+        .addResource(4, 4, IRON)
+        .addResource(4, 4, GEMS),
+    );
+
+    expect(state.map.resources).toEqual([
+      { tile: at(4, 4), resource: GEMS },
+      { tile: at(4, 4), resource: IRON },
+      { tile: at(6, 5), resource: WHEAT },
+      { tile: at(6, 5), resource: WINES },
+    ]);
+    // Two on one tile is a world `gen.ts` would not place and a hand-built map may
+    // state (the module note says so): `resources.ts` sums a tile's deltas rather
+    // than reading a single row, and M4c's acceptance evidence names this world.
+    expect(state.map.resources.filter((entry) => entry.tile === at(4, 4))).toHaveLength(2);
+    // And it survives the round trip every other map fact does.
+    const roundTripped: unknown = JSON.parse(JSON.stringify(state));
+    expect(hashValue(roundTripped)).toBe(hashValue(state));
+  });
+
+  it('refuses a resource it cannot place, and states the two generator rules it deliberately does not impose', () => {
+    expect(() => build((b) => withRome(b).addResource(DUEL.width, 0, IRON))).toThrow(
+      /outside this world's 40x40 map/,
+    );
+    expect(() => build((b) => withRome(b).addResource(6, 5, asResourceId('unobtainium')))).toThrow(
+      /defines no resource "unobtainium"/,
+    );
+    expect(() =>
+      build((b) => withRome(b).addResource(6, 5, WHEAT).addResource(6, 5, WHEAT)),
+    ).toThrow(/called twice for one tile/);
+
+    // The terrain under the tile, and the huts on it, are only final at build() —
+    // the same split `addImprovement` uses.
+    expect(() => build((b) => withRome(b).addResource(6, 5, IRON))).toThrow(
+      /not in its allowedRoles \(hills, mountains\)/,
+    );
+    expect(() => build((b) => withRome(b).addHut(6, 5).addResource(6, 5, WHEAT))).toThrow(
+      /goody hut/,
+    );
+    // A later setTile rescues an earlier addResource, exactly as it does for an
+    // improvement: the check is at build().
+    expect(build((b) => withRome(b).addResource(6, 5, IRON).setTile(6, 5, 'hills')).ok).toBe(true);
+
+    // The two placement guarantees `gen.ts` gives that a *hand-built* world is
+    // deliberately not bound by (the module note argues both):
+    // 1. a resource on a player's own start tile — which is where `FoundCity`
+    //    founds, and where M4c's evidence wants a resource;
+    expect(build((b) => withRome(b).addResource(5, 5, WHEAT)).ok).toBe(true);
+    // 2. two resources sharing a tile.
+    expect(build((b) => withRome(b).addResource(9, 9, WHEAT).addResource(9, 9, WINES)).ok).toBe(
+      true,
+    );
+  });
+
+  it('gives a city a building in the order it is stated, and refuses what the engine refuses', () => {
+    const state = builtState((b) =>
+      withRome(b)
+        .addCity(0, [10, 10], { name: 'Roma', population: 1 })
+        .addBuilding(0, MARKETPLACE)
+        .addBuilding(0, BARRACKS),
+    );
+    expect(cityOf(state, asCityId(0)).buildings).toEqual([MARKETPLACE, BARRACKS]);
+
+    // The engine's own two refusals, raised where the author wrote the call.
+    expect(() =>
+      build((b) =>
+        withRome(b)
+          .addCity(0, [10, 10], { population: 1 })
+          .addBuilding(0, MARKETPLACE)
+          .addBuilding(0, MARKETPLACE),
+      ),
+    ).toThrow(/already holds it/);
+    expect(() =>
+      build((b) =>
+        withRome(b)
+          .addCity(0, [10, 10], { population: 1 })
+          .addCity(1, [20, 20], { population: 1 })
+          .addBuilding(0, PYRAMIDS)
+          .addBuilding(1, PYRAMIDS),
+      ),
+    ).toThrow(/second copy of a wonder/);
+    expect(() =>
+      build((b) =>
+        withRome(b).addCity(0, [10, 10], { population: 1 }).addBuilding(0, asBuildingId('nope')),
+      ),
+    ).toThrow(/defines no building "nope"/);
+    expect(() => build((b) => withRome(b).addBuilding(0, MARKETPLACE))).toThrow(
+      /needs the index of a city/,
+    );
+
+    // The control: two cities may hold the same *ordinary* building, and one may
+    // hold a wonder — which is what makes the two refusals about the rules they
+    // name and not about the call being impossible.
+    const shared = builtState((b) =>
+      withRome(b)
+        .addCity(0, [10, 10], { population: 1 })
+        .addCity(1, [20, 20], { population: 1 })
+        .addBuilding(0, MARKETPLACE)
+        .addBuilding(1, MARKETPLACE)
+        .addBuilding(0, PYRAMIDS),
+    );
+    expect(cityOf(shared, asCityId(0)).buildings).toEqual([MARKETPLACE, PYRAMIDS]);
+    expect(cityOf(shared, asCityId(1)).buildings).toEqual([MARKETPLACE]);
+  });
+
+  it('connects two tiles by road, reading the road KIND off the catalog rather than an id', () => {
+    const straight = builtState((b) => withRome(b).connectRoad([5, 5], [8, 5]));
+    expect(straight.improvements).toEqual([
+      { tile: at(5, 5), kind: ROAD },
+      { tile: at(6, 5), kind: ROAD },
+      { tile: at(7, 5), kind: ROAD },
+      { tile: at(8, 5), kind: ROAD },
+    ]);
+
+    // 8-way: a diagonal target is walked diagonally, which is what makes the chain
+    // a path `resources.ts`' 8-way connection walk can cross.
+    const diagonal = builtState((b) => withRome(b).connectRoad([5, 5], [7, 7]));
+    expect(diagonal.improvements.map((entry) => Number(entry.tile))).toEqual(
+      [at(5, 5), at(6, 6), at(7, 7)].map(Number),
+    );
+
+    // Overlapping segments: a road is a road, so a tile already carrying one is not
+    // a second road (that refusal belongs to `addImprovement`, where writing one call
+    // twice is the mistake being reported).
+    const overlapping = builtState((b) =>
+      withRome(b).connectRoad([5, 5], [8, 5]).connectRoad([7, 5], [9, 5]),
+    );
+    expect(overlapping.improvements.map((entry) => Number(entry.tile))).toEqual(
+      [at(5, 5), at(6, 5), at(7, 5), at(8, 5), at(9, 5)].map(Number),
+    );
+
+    // The same world with the road row renamed: the connection layer reads the row's
+    // *kind*, so nothing in the DSL depended on the shipped id.
+    const renamedRoads: RulesetView = {
+      ...RULESET,
+      improvements: RULESET.improvements.map((def) =>
+        def.kind === 'road' ? { ...def, id: asImprovementId('highway') } : def,
+      ),
+    };
+    const renamed = builtState((b) => withRome(b).connectRoad([5, 5], [7, 5]), renamedRoads);
+    expect(renamed.improvements).toEqual([
+      { tile: at(5, 5), kind: asImprovementId('highway') },
+      { tile: at(6, 5), kind: asImprovementId('highway') },
+      { tile: at(7, 5), kind: asImprovementId('highway') },
+    ]);
+
+    // The refusals: off the map, no road row at all, and terrain the road may not
+    // take (checked at build(), where the terrain under the path is final).
+    expect(() => build((b) => withRome(b).connectRoad([5, 5], [DUEL.width, 5]))).toThrow(
+      /outside this world's 40x40 map/,
+    );
+    const noRoads: RulesetView = {
+      ...RULESET,
+      improvements: RULESET.improvements.filter((def) => def.kind !== 'road'),
+    };
+    expect(() => build((b) => withRome(b).connectRoad([5, 5], [7, 5]), noRoads)).toThrow(
+      /needs a road improvement/,
+    );
+    expect(() =>
+      build((b) => withRome(b).setTile(6, 5, 'ocean').connectRoad([5, 5], [7, 5])),
+    ).toThrow(/not in its allowedRoles/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The M4c assertions discriminate
+ * ------------------------------------------------------------------ */
+
+describe('the M4c scenario assertions discriminate (they are not decoration)', () => {
+  it('the compound-flooring assertion fails when the city holds only one 25% shield multiplier', () => {
+    // The same world and the same assertions, minus the walls: the shield count at
+    // the "two 25% multipliers" stage is then a single 25% (7 rather than 9), so the
+    // sum-before-floor assertion has to notice.
+    const variant: Scenario = {
+      name: 'building-effects-without-the-walls',
+      settings: DUEL_SETTINGS,
+      setup: effectSetup,
+      run: effectRun(EFFECT_COMPLETIONS.filter((id) => id !== WALLS)),
+      assert: assertOf(buildingEffectsScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(
+      /two 25% shield multipliers SUM before one floor/,
+    );
+  });
+
+  it('the building-effect assertions fail when Rome splits its commerce at the default rates', () => {
+    // 6/4/0 rather than 5/5/0: the same commerce splits into different channels, so
+    // the library's 50% lands on 2 beakers rather than 3 and the exact numbers the
+    // scenario pins must break. (The world, the buildings and the timeline are
+    // otherwise identical, which is what makes the failure about the gold/beaker
+    // assertions specifically.)
+    const variant: Scenario = {
+      name: 'building-effects-at-the-default-rates',
+      settings: DUEL_SETTINGS,
+      setup: (b) => effectSetup(b).setRates(0, DEFAULT_RATES),
+      run: EFFECT_RUN,
+      assert: assertOf(buildingEffectsScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(
+      /after the library the beaker multiplier applies to this city.s own beaker/,
+    );
+    expect(text).toMatch(/after the marketplace the commerce multiplier applies to commerce alone/);
+  });
+
+  it('the granary assertions fail when the granary is taken away', () => {
+    // The same world and the same assertions with the granary removed from Rome's
+    // capital: the holder's reduced requirement of 9 is gone, so its box reaches 9 on
+    // the third turn and does NOT grow — and it grows on the fourth turn instead,
+    // carrying 2 over where the scenario pins 0. That one turn IS the effect, so the
+    // assertions have to notice its absence.
+    const variant: Scenario = {
+      name: 'granary-growth-with-no-granary',
+      settings: DUEL_SETTINGS,
+      setup: granaryGrowthSetup(false),
+      run: endTurns(3),
+      assert: assertOf(granaryGrowthScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/stands in Rome's capital and in no other city/);
+    expect(text).toMatch(/the granary city grew on the THIRD turn of the run/);
+    // ...and the failure is about the holder, not about a world that never ran: the
+    // control city's own assertions still hold, exactly as they do in the real one.
+    expect(text).not.toMatch(/the city without a granary has NOT grown/);
+  });
+
+  it('the wonder-held assertions fail when nobody holds the wonder', () => {
+    const variant: Scenario = {
+      name: 'wonder-held-by-nobody',
+      settings: DUEL_SETTINGS,
+      setup: wonderSetup(EFFECT_TREASURY, false),
+      assert: assertOf(wonderHeldScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    // Both halves have to break: the world is not the one the scenario describes,
+    // and the other player *may* start the wonder.
+    expect(text).toMatch(/holds the Pyramids/);
+    expect(text).toMatch(/is offered by NO other city/);
+  });
+
+  it('the bankruptcy assertions fail when there was no wonder to take', () => {
+    // No wonder, and a treasury of 0: Rome's 1 gold of income is unspent, so the
+    // treasury ends at 1 rather than floored at 0 — which is exactly the statement
+    // that the wonder's 2 gold of maintenance was what drove the shortfall.
+    const variant: Scenario = {
+      name: 'bankruptcy-with-no-wonder',
+      settings: DUEL_SETTINGS,
+      setup: wonderSetup(0, false),
+      run: [endTurn()],
+      assert: assertOf(wonderBankruptcyScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/the bill was 2 gold of maintenance against 1 gold of income/);
+  });
+
+  it('the connection assertions fail against the broken road, and the refusal assertions against the whole one', () => {
+    const connected = runScenario({
+      name: 'connection-assertions-against-a-broken-road',
+      settings: DUEL_SETTINGS,
+      setup: resourceSetup(true),
+      run: [setProduction(0, unitItem(SWORDSMAN))],
+      assert: assertOf(resourceConnectedScenario),
+    });
+
+    expect(connected.passed).toBe(false);
+    const connectedText = failures(connected.assertions).join('\n');
+    // The scripted order itself is refused — which is the negative half of the same
+    // rule, reported by the runner rather than by the assertion.
+    expect(connectedText).toMatch(/run\[0\].*was refused: resource-not-connected/);
+    expect(connectedText).toMatch(/Rome is connected to exactly the four resources/);
+
+    const broken = runScenario({
+      name: 'refusal-assertions-against-a-whole-road',
+      settings: DUEL_SETTINGS,
+      setup: resourceSetup(false),
+      assert: assertOf(resourceBrokenScenario),
+    });
+
+    expect(broken.passed).toBe(false);
+    const brokenText = failures(broken.assertions).join('\n');
+    expect(brokenText).toMatch(/the build is refused with the typed `resource-not-connected`/);
+    expect(brokenText).toMatch(/the broken chain connects the iron to nothing/);
+    // ...but the scenario's other half still holds, which is what makes the failure
+    // about the connection rather than about a world that never ran: Carthage's own
+    // city-tile iron is still buildable in both worlds.
+    expect(brokenText).not.toMatch(/Carthage, whose own city tile carries iron/);
+  });
+
+  it('the maintenance assertions fail when the city can pay for its buildings', () => {
+    // A treasury of 100: the same buildings, the same income, and no shortfall — so
+    // nothing is disbanded and the exact list of survivors the scenario pins must
+    // break. This is the assertion that would otherwise pass on a world where
+    // maintenance was simply ignored.
+    const variant: Scenario = {
+      name: 'maintenance-with-a-solvent-treasury',
+      settings: DUEL_SETTINGS,
+      setup: maintenanceSetup(100),
+      run: [endTurn()],
+      assert: assertOf(maintenanceScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/the buildings that ran it up paid/);
+    expect(text).toMatch(/the treasury floored at exactly 0/);
   });
 });

@@ -20,6 +20,16 @@
  *   exactly when it is drawn, the way `? unknown` and `? unexplored` do. A hut on
  *   a tile the viewer has not explored is not drawn and adds no legend entry:
  *   fog hides the feature, not just the terrain under it.
+ * - **Resources are drawn the same way, and under the same fog rule** (M4c,
+ *   "Resources"). A resource is map data with a *strategic* consequence — a city
+ *   whose owner has one connected may build the units that require it — so an
+ *   agent that could not see where one stands could not play the rule. `$` is the
+ *   glyph: not a terrain role's, not `%`, not `?`, and not a start marker
+ *   (`0`-`9`/`*`). The legend names **every resource actually drawn**, by catalog
+ *   id, because the id is the engine's vocabulary and the one token both the
+ *   ruleset and the command layer spell resource rows with; a tile the viewer has
+ *   not explored contributes neither a glyph nor a legend entry, which is the
+ *   letter of the hut rule above. See `RESOURCE_GLYPH` and `legendLine`.
  * - **Player start markers** number the *civilizations* by player index (`0`-`9`,
  *   then `*`), which is the same numbering used by `PlayerState.id`. Barbarians
  *   are a player but have no homeland (see `startsLine`).
@@ -54,7 +64,7 @@
  *   can afford the sentence, is where the inertness is spelled out.
  */
 
-import type { PlayerId, TerrainId, UnitTypeId } from './ids.js';
+import type { PlayerId, ResourceId, TerrainId, UnitTypeId } from './ids.js';
 import { improvementDef, type ImprovementId } from './improvements.js';
 import {
   indexToX,
@@ -115,6 +125,48 @@ const UNEXPLORED_GLYPH = '?';
  * appears in none of those sets and stands out in a field of `,`/`-`/`~`.
  */
 const HUT_GLYPH = '%';
+
+/**
+ * Glyph for a resource (M4c, "Resources"). Like `HUT_GLYPH` it must be readable
+ * *as itself*: not one of `ROLE_GLYPHS`' terrain glyphs, not `?` (unknown or
+ * unexplored), and not a start marker (`0`-`9` or `*`, which `startMarker` also
+ * spends on `*` past the tenth player). `$` appears in none of those sets and
+ * stands out in a field of `,`/`-`/`~`, and it reads as "worth something", which
+ * is what a resource is: the strategic ones gate units, the bonus ones add yields
+ * to the tile, and the luxuries are counted until M9.
+ *
+ * One glyph for every resource kind, and the legend carries the names: a
+ * per-resource glyph table would be a second naming scheme that could drift from
+ * the catalog's ids, and the id is what the ruleset and the command layer use.
+ */
+const RESOURCE_GLYPH = '$';
+
+/**
+ * Which resource stands on each tile, for the glyph lookup.
+ *
+ * The *first* pair on a tile wins, and `GameMap.resources` is ordered by
+ * `(tile, resource)` (`map.ts`), so a hand-built map carrying two resources on
+ * one tile — the generator never places two — is drawn as the alphabetically
+ * first of them rather than as whichever one a rebuilt map happened to list
+ * first. That is the same "first entry wins" reading `describe` takes of two
+ * start markers on one tile.
+ *
+ * Read the way `HUT_GLYPH`'s set is read from `map.huts` below — straight off the
+ * map, no guard and no second shape check. `GameMap.resources` is a *required*
+ * field since M4c, exactly as `huts` has been since M3, so a map without it is a
+ * map this build cannot construct and no fixture can write: a `describe` that grew
+ * its own private "is this a `(tile, resource)` pair?" test would be a second
+ * answer to a question `map.ts` and `resources.ts` already answer, which is the
+ * mistake M2 taught this codebase to stop making.
+ */
+const resourceTiles = (map: GameMap): ReadonlyMap<number, ResourceId> => {
+  const byTile = new Map<number, ResourceId>();
+  for (const pair of map.resources) {
+    const index = Number(pair.tile);
+    if (!byTile.has(index)) byTile.set(index, pair.resource);
+  }
+  return byTile;
+};
 
 /**
  * The row a viewer sees when the state has no explored row for it — a player id
@@ -226,17 +278,44 @@ const unitsRuler = (view: Window): string => {
   return out;
 };
 
-const legendLine = (sawUnknown: boolean, sawUnexplored: boolean, sawHut: boolean): string => {
+/**
+ * What the grid actually drew, besides terrain: the three special glyphs and the
+ * resources they mark. A struct rather than four positional arguments because the
+ * legend's fields are decided one by one and a caller that swapped two booleans
+ * would still compile — and because the resource list is of a different type from
+ * the three flags, so a mis-ordered call is a compile error rather than a wrong
+ * legend.
+ */
+interface LegendFacts {
+  readonly unknown: boolean;
+  readonly unexplored: boolean;
+  readonly hut: boolean;
+  /**
+   * Every resource the grid drew, **in the order it was drawn** (row by row,
+   * left to right) with duplicates removed. Empty when none was drawn, which is
+   * also the case for every resource that exists only on an unexplored tile.
+   */
+  readonly resources: readonly ResourceId[];
+}
+
+const legendLine = (facts: LegendFacts): string => {
   const parts = TERRAIN_ROLES.map((role) => `${ROLE_GLYPHS[role]} ${role}`);
   // Only when one was drawn, like `? unknown` below: a legend entry is a claim
   // that the glyph is on the map. In viewer mode this also keeps a hut the viewer
   // has not explored out of the legend entirely, which is what "nothing about an
   // unexplored tile leaks" means for a feature that is not terrain.
-  if (sawHut) parts.push(`${HUT_GLYPH} hut`);
-  if (sawUnknown) parts.push(`${UNKNOWN_GLYPH} unknown`);
+  if (facts.hut) parts.push(`${HUT_GLYPH} hut`);
+  // M4c: one entry for the shared resource glyph, naming every resource that is
+  // actually on the pictured map — the same "only what was drawn" rule, and the
+  // same fog rule, since the list is built inside the drawing loop. The ids are
+  // the catalog's (the vocabulary the ruleset and `build`'s `requiresResource`
+  // spelling share); an id no catalog row defines is printed as itself rather than
+  // dropped, the way an unknown terrain id is drawn as `?` instead of vanishing.
+  if (facts.resources.length > 0) parts.push(`${RESOURCE_GLYPH} ${facts.resources.join(', ')}`);
+  if (facts.unknown) parts.push(`${UNKNOWN_GLYPH} unknown`);
   // Only in viewer mode, and only when a `?` actually came from fog: god mode
   // must keep the legend it has always printed.
-  if (sawUnexplored) parts.push(`${UNEXPLORED_GLYPH} unexplored`);
+  if (facts.unexplored) parts.push(`${UNEXPLORED_GLYPH} unexplored`);
   return `legend: ${parts.join('  ')}`;
 };
 
@@ -466,6 +545,11 @@ export const describe = (
   // not a scan of `map.huts` per rendered tile.
   const hutTiles = new Set<number>(map.huts.map(Number));
 
+  // Resources, keyed by flat tile index (M4c). Built once per call for the same
+  // reason as `hutTiles`, and read only *after* the fog check below — so a resource
+  // on an unexplored tile is never drawn and never joins the legend.
+  const resourceByTile = resourceTiles(map);
+
   // Start markers keyed by flat tile index; the first *civilization* on a tile
   // wins, so a (malformed) shared start does not make the output order-dependent.
   // `civPlayers`, never `players`: a digit means "a civilization begins here", and
@@ -487,12 +571,19 @@ export const describe = (
   let sawUnknown = false;
   let sawUnexplored = false;
   let sawHut = false;
+  // Every resource actually drawn, in draw order, deduplicated. A `Set` for the
+  // membership test and an array for the order, because the legend is a picture of
+  // what is on the board and re-sorting the ids (or taking them from the catalog)
+  // would list a resource the pictured window does not show.
+  const drawnResources: ResourceId[] = [];
+  const drawnResourceSet = new Set<ResourceId>();
   const glyphAt = (x: number, y: number): string => {
     const slot = y * map.width + x;
-    // Fog first: an unexplored tile's terrain — and any hut on it — is not read
-    // at all, so it cannot influence the output even indirectly (via `sawUnknown`
-    // or `sawHut`, say). `?` is returned before the hut check below, which is what
-    // "a hut on an unexplored tile must not be revealed" means in code.
+    // Fog first: an unexplored tile's terrain — and any hut or resource on it — is
+    // not read at all, so it cannot influence the output even indirectly (via
+    // `sawUnknown`, `sawHut` or `drawnResources`, say). `?` is returned before the
+    // hut and resource checks below, which is what "a hut (or a resource) on an
+    // unexplored tile must not be revealed" means in code.
     if (viewerRow !== undefined && viewerRow[slot] !== true) {
       sawUnexplored = true;
       return UNEXPLORED_GLYPH;
@@ -503,6 +594,21 @@ export const describe = (
     if (hutTiles.has(slot)) {
       sawHut = true;
       return HUT_GLYPH;
+    }
+    // M4c: a resource stands over the terrain too, and *under* a hut — the
+    // generator places neither on a hut and never two resources on one tile, so
+    // this order is only ever read on a hand-built map, where the consumable
+    // (a hut) is the more transient fact and the durable one (a resource) is on
+    // the tiles around it anyway. The glyph is drawn before the terrain id is
+    // resolved, so a resource on a tile whose terrain the ruleset cannot name is
+    // still visible rather than collapsing into `?`.
+    const resource = resourceByTile.get(slot);
+    if (resource !== undefined) {
+      if (!drawnResourceSet.has(resource)) {
+        drawnResourceSet.add(resource);
+        drawnResources.push(resource);
+      }
+      return RESOURCE_GLYPH;
     }
     const id = map.terrain[slot];
     if (id === undefined) {
@@ -536,7 +642,14 @@ export const describe = (
     lines.push(stripEnd(`${String(y).padStart(labelWidth)} |${row}`));
   }
 
-  lines.push(legendLine(sawUnknown, sawUnexplored, sawHut));
+  lines.push(
+    legendLine({
+      unknown: sawUnknown,
+      unexplored: sawUnexplored,
+      hut: sawHut,
+      resources: drawnResources,
+    }),
+  );
   // Any *civilization* with a start tile gets a `starts:` line, so the digits on
   // the map always have a legend (see `startsLine` on why this is `civPlayers`,
   // exactly like the `civs=` count in the header).

@@ -220,6 +220,12 @@ const board = (options: BoardOptions = {}): GameState => {
       height: HEIGHT,
       terrain: GRID.map((role) => asTerrainId(role)),
       huts: huts.map((tile) => asTileIndex(tile)),
+      // M4c: the map also carries the resources `generateWorld` placed, as sparse
+      // `(tile, resource)` pairs. Empty here: a hut's reward is drawn from the
+      // state RNG and reads no map field, so a resource on this board could only
+      // be a hidden reason a reward changed. Present and empty, never absent —
+      // the key is hashed with the state.
+      resources: [],
     },
     players,
     nextUnitId: units.reduce((next, candidate) => Math.max(next, Number(candidate.id) + 1), 0),

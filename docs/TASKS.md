@@ -157,14 +157,54 @@ back): civilizations start with a **settler only**, so a worker must be produced
 city before any improvement can be built. Real Civ 3 starts with settler + worker, and
 it makes the improvement system immediately exercisable.
 
-## M4b — The economy — **NEXT**
+## M4b — The money loop — **DONE** (commit `8ee69ef`)
 
-- [ ] tax / science / luxury sliders; commerce split into gold, beakers, luxuries
-- [ ] a treasury per player: income, maintenance, and **unit support**
-- [ ] buildings & wonders v1 (effects, not just costs)
-- [ ] road-connected luxury and strategic resources
-- [ ] starting worker per civilization (see the M4a gap above) — bundles the rehash
-- [ ] a **bankruptcy** scenario, and a treasury/conservation scenario
+- [x] rates (placeholder 10-slot split, default 6/4/0) and the commerce split, remainder to gold
+- [x] treasury, income, upkeep, unit support (placeholder free-unit formula)
+- [x] deterministic bankruptcy: highest unit id first, treasury floors at 0 and never goes negative
+- [x] `advanceTurn` order: work → growth → production → **money** → refill → turn++
+- [x] `SetRates`; six money events; REPL shows the economy on every view
+- [x] starting worker per civilization (closes the M4a gap) — rehash SCHEMA_VERSION 4 → 5
+- [x] bankruptcy, 120-turn conservation, rates-split and starting-units scenarios with meta-tests
+
+**Defect found by adversarial review and fixed at the source:** `SetRates` with a
+null or absent `rates` payload threw a `TypeError` where every other malformed
+payload returns a typed `GameError` — contradicting its own doc comment. Now read
+through a total field reader (widens to `unknown`, narrows by a type predicate, no
+cast). The verifier also mutation-checked the gate itself: removing the
+remainder-to-gold and reversing the disband order produced 17 failures, then both
+mutations were reverted and the file hash confirmed identical.
+
+**My own error, worth remembering:** the M4b draft required `legalActions` to yield
+`SetRates`. The implementing agent declined; I verified the deciding fact myself —
+the module yields no `SetWorkedTiles` and no `SetProduction` either, because
+setters have been planner-only since M3. The draft line contradicted established
+design, so the agent was right and the contract was wrong. Amendment recorded in
+`INTERFACES.md`. **Lesson: when an agent pushes back on my contract, check the
+precedent before defending the wording.**
+
+### M4b accepted debt
+
+- `TreasuryShortfall.unpaid` is **unreachable from shipped content** because no
+  catalog building declares a maintenance; only a foreign ruleset view can produce
+  it. M4c adds maintenance-declaring buildings, which makes it reachable.
+- **Beakers and luxuries accumulate but do nothing** until M5 (tech) and M9
+  (happiness). The REPL states this from one shared constant, so the caveat cannot
+  drift between views.
+- An unknown command discriminant still throws rather than returning a typed error;
+  the exhaustive switch is the compile-time guard against that shape.
+- The M4b adversarial file is the slowest in the repo (~36s of a ~40s gate). The
+  cost is the keystone's ~1.0M-call candidate universe; judged worth it, trimmable
+  on request.
+
+## M4c — Buildings, wonders & resources — **NEXT**
+
+- [ ] building `maintenance` (makes `TreasuryShortfall` reachable from real content)
+- [ ] building effects v1: commerce/beaker/shield multipliers, growth food
+- [ ] wonders v1: globally unique, never rebuilt
+- [ ] strategic / luxury / bonus resources placed on the map
+- [ ] road connection from a city to a resource, and unit gating on strategic resources
+- [ ] bonus resources add tile yields
 
 ## Later milestones
 

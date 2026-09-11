@@ -978,3 +978,110 @@ Named up front: `packages/testing/src/scenario.ts`, `packages/headless/src/repl.
 `packages/core/test/*.test.ts`, `packages/testing/test/*.test.ts` and
 `packages/headless/test/repl.test.ts` — all gain `treasury`/`rates`/`beakers`/`luxuries`
 on `PlayerState`, which changes every state hash again (SCHEMA_VERSION 4 → 5).
+
+---
+
+# M4c contracts — FROZEN (buildings, wonders, resources)
+
+Last wave of M4. Provenance rule unchanged: every new row is `placeholder`, and no
+number is presented as Civ 3's.
+
+## Building maintenance and effects
+
+`BuildingSpec` gains required `maintenance: number` (>= 0, integer) and
+`effects: readonly BuildingEffect[]`, plus optional `wonder: true`.
+
+```ts
+export type BuildingEffect =
+  | { readonly kind: 'commerce-multiplier'; readonly pct: number }   // marketplace
+  | { readonly kind: 'beaker-multiplier';   readonly pct: number }   // library
+  | { readonly kind: 'shield-multiplier';   readonly pct: number }   // factory
+  | { readonly kind: 'growth-food';         readonly amount: number }; // granary
+```
+
+Multipliers are **integer percentages applied with a floor**, and a building's
+effects apply only to its own city. `pct` must be `>= 0` and `amount` must be a
+non-negative integer; `validateRuleset` rejects a negative, fractional or unknown
+effect. Multiple multipliers of the same kind in one city compound by summing the
+percentages first and flooring **once** — stated explicitly because flooring twice
+gives a different number, and someone will otherwise "simplify" it.
+
+`growth-food` reduces the food a city needs to grow (it is the granary), floored at
+a minimum of 1 so a city can always eventually grow and cannot be made to divide by
+zero.
+
+**Maintenance must actually be reachable.** At least one shipped building declares
+`maintenance > 0` in every city that can build it, so `TreasuryShortfall` becomes
+reachable from real content rather than only from a hand-built ruleset view. That
+gap is M4b's accepted debt and this wave closes it.
+
+## Wonders v1
+
+A wonder is a building with `wonder: true`. Rules, all testable:
+
+- **Globally unique**: once ANY city anywhere holds it, no city may start it, and
+  it appears in no other city's production options.
+- **Never rebuilt**: there is no destruction in M4c, so "unique" and "never
+  rebuilt" collapse into the same rule — say so rather than pretending otherwise.
+- A wonder costs maintenance like any other building, so bankruptcy can disband it;
+  if that happens it becomes buildable again. That is the one way a wonder is lost,
+  so pin it.
+
+## Resources
+
+```ts
+export interface ResourceSpec {
+  readonly id: ResourceId;
+  readonly name: string;
+  readonly kind: 'strategic' | 'luxury' | 'bonus';
+  readonly yields: TerrainYields;              // bonus only; zeros otherwise
+  readonly allowedRoles: readonly TerrainRole[];
+  readonly provenance: Provenance;
+}
+```
+
+Placement: `GameMap` gains `resources: readonly TileResource[]` — the same **sparse
+`(tile, resource)` pair** convention as improvements, sorted by `(tile, resource)`,
+placed at generation on tiles whose role is allowed, never on a start tile, never on
+a hut.
+
+Connection: a resource is connected for a player if some **city of that player**
+reaches the resource tile through a path of road-improved tiles (8-way, endpoints
+inclusive). Deterministic BFS; no path length limit. Barbarians have no economy and
+therefore no connections. State the rule once and reuse it — availability must not
+be computed two different ways in two places, which is exactly the M2 bug about two
+writers of the explored layer.
+
+Gating:
+- A unit whose `UnitSpec` declares `requiresResource` may only be produced by a city
+  whose owner has that resource **connected**. `validateRuleset` must reject a
+  `requiresResource` naming an unknown resource.
+- Bonus resources add their `yields` to the tile, on top of terrain and
+  improvements, and are **not** gated or connected — they are just terrain.
+
+Luxury resources have **no happiness effect until M9**. They are placed, connected
+and counted, and nothing reads them for contentment yet; say that plainly rather
+than implying happiness is modelled.
+
+## Acceptance evidence for M4c
+
+- A building-effect scenario: exact gold/beakers/shields before and after a
+  marketplace/library/factory, including the compound-flooring rule.
+- A wonder scenario: a wonder started by one player disappears from every other
+  city's options; a bankrupted wonder becomes buildable again.
+- A resource scenario: a city connected by road to a strategic resource can build
+  the unit that requires it; breaking the road (or never building it) makes the
+  build illegal, with the typed error.
+- A maintenance scenario: a city whose buildings outrun its income drives a real
+  `TreasuryShortfall` from SHIPPED content.
+- The keystone sweep green with the resource-gated production path.
+
+## Migration owners (F6 rule)
+
+`GameMap` gains `resources` and `BuildingSpec` gains required fields, so every
+hand-built map/building literal moves, and `packages/testing/goldens/state.json`
+is regenerated once more (SCHEMA_VERSION 5 → 6). Named owners:
+`packages/testing/src/scenario.ts`, `packages/headless/src/repl.ts`,
+`packages/core/src/textview.ts`, `packages/rules/src/index.ts`, and the hand-built
+literals in `packages/core/test/*.test.ts`, `packages/testing/test/*.test.ts` and
+`packages/headless/test/repl.test.ts`.

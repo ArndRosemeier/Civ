@@ -28,8 +28,16 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { hashValue } from '@civts/testing';
-import type { BuildingDef, City } from '../src/cities.js';
+// SHIPPED content, read by one test below (`M4c: a TreasuryShortfall reachable from
+// shipped content`): M4c's acceptance criterion is about shipped content
+// specifically, and `@civts/core`' own reads never touch this package.
+import { CATALOG, validateRuleset } from '@civts/rules';
+import { canonicalize, hashValue } from '@civts/testing';
+// `cityYields` is the city read the money loop multiplies: `playerIncome` splits a
+// city's commerce, so "what a city yields" is a number this file has to be able to
+// state rather than infer.
+import { cityYields, type BuildingDef, type City } from '../src/cities.js';
+import type { GameEvent } from '../src/commands.js';
 // The module under test. Every name it exports and this file uses is imported, so
 // a rename fails here rather than in another package.
 import {
@@ -49,12 +57,16 @@ import {
   asBuildingId,
   asCityId,
   asPlayerId,
+  asResourceId,
   asTerrainId,
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  type BuildingId,
+  type TileIndex,
 } from '../src/ids.js';
-import type { GameMap, RulesetView, TerrainDef } from '../src/map.js';
+import { asImprovementId, type ImprovementDef, type TileImprovement } from '../src/improvements.js';
+import type { GameMap, ResourceDef, RulesetView, TerrainDef, TileResource } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import {
   DEFAULT_RATES,
@@ -89,7 +101,17 @@ const MAP: GameMap = {
   height: 4,
   terrain: Array.from({ length: 16 }, () => GRASSLAND),
   huts: [],
+  // M4c: the map carries the resources `generateWorld` placed. Empty here, so no
+  // bonus resource can be the hidden reason a number in this file moved; the one
+  // test that *wants* a resource builds its own map with `mapWith` below.
+  resources: [],
 };
+
+/**
+ * The same board with the given (tile, resource) pairs on it — the map half of
+ * M4c's shape, spelled out where a test asks for it rather than baked into `MAP`.
+ */
+const mapWith = (resources: readonly TileResource[]): GameMap => ({ ...MAP, resources });
 
 const makeUnitDef = (id: string, role: UnitDef['role'], movement: number): UnitDef => ({
   id: asUnitTypeId(id),
@@ -105,45 +127,70 @@ const makeUnitDef = (id: string, role: UnitDef['role'], movement: number): UnitD
 const WARRIOR = makeUnitDef('warrior', 'military', 1);
 const WORKER = makeUnitDef('worker', 'worker', 1);
 
-/** A building with no declared upkeep — the only shape the M4b catalog has. */
-const GRANARY: BuildingDef = { id: asBuildingId('granary'), name: 'Granary', cost: 10 };
+/**
+ * A building with nothing declared but its cost: free to keep, and doing nothing
+ * for its city. M4c's `BuildingDef` carries `maintenance` and `effects` as
+ * required fields, and `0` / `[]` are how a row says "neither" — a legal row, not
+ * an unknown one.
+ */
+const GRANARY: BuildingDef = {
+  id: asBuildingId('granary'),
+  name: 'Granary',
+  cost: 10,
+  maintenance: 0,
+  effects: [],
+};
 
 /**
- * A building that *does* declare upkeep. M4c's buildings arrive with effects; this
- * row is what proves the maintenance term is summed rather than hard-coded to
- * zero. It is a test-local type rather than a field added to `BuildingDef` (which
- * is not this workstream's file), which is also why `economy.ts` reads the field
- * structurally.
+ * A building that bills gold. `effects: []` because the money loop reads no
+ * effect: what this row is for is the `maintenance` term, and the *effects*
+ * (commerce, beakers, shields, growth food) are exercised in `buildings.test.ts`
+ * and `cities.test.ts`.
  */
-interface UpkeepDef extends BuildingDef {
-  readonly maintenance: number;
-}
-
-const TEMPLE: UpkeepDef = {
+const TEMPLE: BuildingDef = {
   id: asBuildingId('temple'),
   name: 'Temple',
   cost: 20,
   maintenance: 2,
+  effects: [],
+};
+
+/**
+ * A library: one gold of maintenance and a +50% beaker effect, the shape
+ * `@civts/rules` ships. This is the row that makes the beaker half of M4c
+ * observable in the money loop, and the numbers are this file's stand-in — the
+ * shipped values are pinned in `@civts/rules`' test and used end to end in
+ * `buildings.test.ts`. Not claimed to be Civ 3's.
+ */
+const LIBRARY: BuildingDef = {
+  id: asBuildingId('library'),
+  name: 'Library',
+  cost: 20,
+  maintenance: 1,
+  effects: [{ kind: 'beaker-multiplier', pct: 50 }],
 };
 
 /** Rows whose declared upkeep is not a usable count: billed as nothing, not as a fraction. */
-const ZERO_UPKEEP: UpkeepDef = {
+const ZERO_UPKEEP: BuildingDef = {
   id: asBuildingId('zero'),
   name: 'Zero',
   cost: 1,
   maintenance: 0,
+  effects: [],
 };
-const NEGATIVE_UPKEEP: UpkeepDef = {
+const NEGATIVE_UPKEEP: BuildingDef = {
   id: asBuildingId('negative'),
   name: 'Negative',
   cost: 1,
   maintenance: -3,
+  effects: [],
 };
-const FRACTIONAL_UPKEEP: UpkeepDef = {
+const FRACTIONAL_UPKEEP: BuildingDef = {
   id: asBuildingId('fractional'),
   name: 'Fractional',
   cost: 1,
   maintenance: 0.5,
+  effects: [],
 };
 
 const RULESET: RulesetView = {
@@ -157,10 +204,87 @@ const RULESET: RulesetView = {
 /** The same view with the upkept building, and one with nonsense upkeep rows. */
 const UPKEEP_RULESET: RulesetView = { ...RULESET, buildings: [GRANARY, TEMPLE] };
 
+/** The same view with a library, for M4c's beaker effect. */
+const LIBRARY_RULESET: RulesetView = { ...RULESET, buildings: [GRANARY, LIBRARY] };
+
 const NONSENSE_RULESET: RulesetView = {
   ...RULESET,
   buildings: [ZERO_UPKEEP, NEGATIVE_UPKEEP, FRACTIONAL_UPKEEP],
 };
+
+/**
+ * One improvement and three resource rows for M4c's tile composition, all
+ * stand-ins of this file's own with plain numbers, so a delta is the difference
+ * between two readings rather than a value the reader has to trust: the mine adds
+ * one shield, the bonus wheat adds one food **and** one commerce. The shipped
+ * catalog's values are pinned in `@civts/rules`' test and exercised against the
+ * engine in `resources.test.ts`; none of these is claimed to be Civ 3's.
+ *
+ * The three resource rows exist together so the *kind* is observable in the money
+ * loop: only `bonus` reaches a tile, while a `strategic` row is a gate and a
+ * `luxury` row a count (M4c, "Resources").
+ */
+const MINE: ImprovementDef = {
+  id: asImprovementId('mine'),
+  kind: 'mine',
+  name: 'Mine',
+  turns: 3,
+  yields: { food: 0, shields: 1, commerce: 0 },
+  allowedRoles: ['grassland'],
+};
+
+const WHEAT: ResourceDef = {
+  id: asResourceId('wheat'),
+  name: 'Wheat',
+  kind: 'bonus',
+  yields: { food: 1, shields: 0, commerce: 1 },
+  allowedRoles: ['grassland'],
+};
+
+const IRON: ResourceDef = {
+  id: asResourceId('iron'),
+  name: 'Iron',
+  kind: 'strategic',
+  yields: { food: 0, shields: 0, commerce: 0 },
+  allowedRoles: ['grassland'],
+};
+
+const GEMS: ResourceDef = {
+  id: asResourceId('gems'),
+  name: 'Gems',
+  kind: 'luxury',
+  yields: { food: 0, shields: 0, commerce: 0 },
+  allowedRoles: ['grassland'],
+};
+
+/**
+ * The views above plus an improvement catalog and a resource catalog. `resources`
+ * is the optional half of the M4c map shape (`improvements` on a view is required,
+ * resources are not), and this view is used by the M4c tests at the end of the
+ * income section and by nothing else — no number in any other test moves because
+ * this catalog exists.
+ */
+const RESOURCE_RULESET: RulesetView = {
+  ...RULESET,
+  improvements: [MINE],
+  resources: [WHEAT, IRON, GEMS],
+};
+
+/**
+ * The **shipped** content, validated the way the CLI validates it — a validated
+ * `Ruleset` is structurally a `RulesetView`, so no adapter is needed. Read by the
+ * M4c acceptance test at the bottom of this file and by nothing else here; the
+ * engine's own modules never reach for content.
+ */
+const SHIPPED: RulesetView = (() => {
+  const validated = validateRuleset(CATALOG, 'tuned');
+  if (!validated.ok) {
+    throw new Error(
+      `the shipped catalog must validate at fidelity "tuned": ${JSON.stringify(validated.error)}`,
+    );
+  }
+  return validated.value;
+})();
 
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
@@ -248,6 +372,15 @@ const BARBARIAN = asPlayerId(2);
 const unitStack = (count: number, owner: number): readonly Unit[] =>
   Array.from({ length: count }, (_unused, index) => unit(index, WARRIOR, owner));
 
+/**
+ * The two tiles city 0 (centre tile 5, i.e. (1,1)) works, and the two city 1
+ * (centre tile 10, i.e. (2,2)) works. Every tile on this board is grassland with
+ * 1 commerce, so each city's commerce is `1 + 2 = 3` and the arithmetic below can
+ * be done in the reader's head.
+ */
+const WORKED_0: readonly TileIndex[] = [asTileIndex(4), asTileIndex(6)];
+const WORKED_1: readonly TileIndex[] = [asTileIndex(9), asTileIndex(11)];
+
 /** Every rates triple of non-negative integers summing to `RATE_TOTAL`. */
 const everyRates = (): readonly Rates[] => {
   const out: Rates[] = [];
@@ -273,6 +406,16 @@ const pluck = <T>(
   take: (event: T) => boolean,
   value: (event: T) => number,
 ): readonly number[] => events.flatMap((event) => (take(event) ? [value(event)] : []));
+
+/**
+ * Every event of one type, narrowed by the predicate rather than by a cast — the
+ * same shape `commands.ts` uses to read a payload it cannot trust.
+ */
+const eventsOfType = <T extends GameEvent['type']>(
+  events: readonly GameEvent[],
+  type: T,
+): readonly Extract<GameEvent, { readonly type: T }>[] =>
+  events.filter((event): event is Extract<GameEvent, { readonly type: T }> => event.type === type);
 
 /* ------------------------------------------------------------------ *
  * The split
@@ -458,6 +601,157 @@ describe('playerIncome — the split is per city, not once for the player', () =
     });
     expect(playerIncome(state, RULESET, P0)).toEqual({ gold: 1, beakers: 0, luxuries: 0 });
   });
+
+  it('scales the beaker channel by the library the city holds, and by no other city’s', () => {
+    // M4c's beaker effect, in the money loop. One city of three citizens works two
+    // grassland tiles: 3 commerce, all of it science at 0/10/0, so 3 beakers — and
+    // `floor(3 * 150 / 100) = 4` with a +50% library. The other city is the same
+    // player's and holds nothing, so it still splits to its own unmultiplied
+    // channels: an effect is a *city's*, never a player's.
+    const rates: Rates = { tax: 0, science: RATE_TOTAL, luxury: 0 };
+    const bareCity = city(0, 0, 5, { population: 3, workedTiles: WORKED_0 });
+    const libraryCity: City = { ...bareCity, buildings: [asBuildingId('library')] };
+    const neighbours: readonly City[] = [city(1, 0, 10, { population: 3, workedTiles: WORKED_1 })];
+
+    const plain = board({ players: [player(0, { rates })], cities: [bareCity, ...neighbours] });
+    const built = board({ players: [player(0, { rates })], cities: [libraryCity, ...neighbours] });
+
+    // The library's city went from 3 beakers to 4; the other city contributed its
+    // own 3, untouched.
+    expect(playerIncome(plain, LIBRARY_RULESET, P0)).toEqual({ gold: 0, beakers: 6, luxuries: 0 });
+    expect(playerIncome(built, LIBRARY_RULESET, P0)).toEqual({ gold: 0, beakers: 7, luxuries: 0 });
+
+    // …and the same library is on the same player's *bill* in the same turn: the two
+    // halves of M4c — an effect and a maintenance — are read from one row.
+    expect(playerUpkeep(built, LIBRARY_RULESET, P0).maintenance).toBe(LIBRARY.maintenance);
+    expect(playerUpkeep(plain, LIBRARY_RULESET, P0).maintenance).toBe(0);
+  });
+});
+
+describe('bonus resources — a tile’s worth reaches the city, and then the money loop', () => {
+  /**
+   * The two tiles the city works, and the first of them — where every pair below
+   * goes. A tuple, so `WORKED[0]` is a `TileIndex` and not `TileIndex | undefined`.
+   */
+  const WORKED: readonly [TileIndex, TileIndex] = [asTileIndex(4), asTileIndex(6)];
+  const TILE = WORKED[0];
+
+  /**
+   * One city of three citizens on tile 5, working tiles 4 and 6 (M4c's
+   * `cityYields` composition, on this file's all-grassland board: terrain is
+   * 2 food / 1 shield / 1 commerce per tile, and the centre is floored, not added).
+   */
+  const CITY = city(0, 0, 5, { population: 3, workedTiles: WORKED });
+
+  /** The board with whatever the test puts on the map and on the city's tiles. */
+  const boardWith = (
+    resources: readonly TileResource[],
+    improvements: readonly TileImprovement[] = [],
+  ): GameState =>
+    board({
+      map: mapWith(resources),
+      players: [player(0)],
+      cities: [CITY],
+      improvements,
+    });
+
+  it('stacks terrain, the improvement and the bonus resource, and nothing else', () => {
+    // Three contributions on one tile, in the order M4c fixes them: the terrain's
+    // own yields, the improvement's delta, then the bonus resource's delta — read
+    // through `cityYields`, which is the composition the money loop multiplies.
+    const bare = boardWith([]);
+    const mined = boardWith([], [{ tile: TILE, kind: MINE.id }]);
+    const wheat = boardWith([{ tile: TILE, resource: WHEAT.id }], [{ tile: TILE, kind: MINE.id }]);
+
+    // Grassland everywhere: centre 2/1/1 plus two worked tiles at 2/1/1.
+    expect(cityYields(bare, RESOURCE_RULESET, CITY.id)).toEqual({
+      food: 6,
+      shields: 3,
+      commerce: 3,
+      foodSurplus: 0,
+    });
+    // …plus the mine's +1 shield on the worked tile.
+    expect(cityYields(mined, RESOURCE_RULESET, CITY.id)).toEqual({
+      food: 6,
+      shields: 4,
+      commerce: 3,
+      foodSurplus: 0,
+    });
+    // …plus the wheat's +1 food and +1 commerce, on top of both of the above.
+    expect(cityYields(wheat, RESOURCE_RULESET, CITY.id)).toEqual({
+      food: 7,
+      shields: 4,
+      commerce: 4,
+      foodSurplus: 1,
+    });
+
+    // The deltas are the *catalog rows'* declared yields, not numbers this test
+    // happens to agree with: a retuned wheat row moves the expectation with it, and
+    // a row silently ignored by the engine cannot pass.
+    const bareYields = cityYields(bare, RESOURCE_RULESET, CITY.id);
+    const wheatYields = cityYields(wheat, RESOURCE_RULESET, CITY.id);
+    expect(wheatYields.food - bareYields.food).toBe(WHEAT.yields.food);
+    expect(wheatYields.shields - bareYields.shields).toBe(MINE.yields.shields);
+    expect(wheatYields.commerce - bareYields.commerce).toBe(WHEAT.yields.commerce);
+
+    // A resource on a tile no citizen works contributes nothing: a bonus resource
+    // is not connected (it needs no road) but it is also not a per-*player* number —
+    // it feeds the city that works the tile it sits on, and nothing else.
+    const elsewhere = boardWith([{ tile: asTileIndex(9), resource: WHEAT.id }]);
+    expect(cityYields(elsewhere, RESOURCE_RULESET, CITY.id)).toEqual(bareYields);
+
+    // And the centre is not a worked tile, so a resource on the city's own tile is
+    // worth nothing either — the same rule M4a states for improvements, applied by
+    // the same composition (`cities.ts`: the centre reads its *terrain* alone).
+    const onCentre = boardWith([{ tile: CITY.tile, resource: WHEAT.id }]);
+    expect(cityYields(onCentre, RESOURCE_RULESET, CITY.id)).toEqual(bareYields);
+  });
+
+  it('adds nothing for a strategic or a luxury row, whose yields are zeros by contract', () => {
+    // M4c: `yields` is "bonus only; zeros otherwise". A strategic row's effect is the
+    // production gate and a luxury row's is its connection count, and neither is a
+    // number on a tile — stated here so a later change that made iron feed a city
+    // would have to change this test on purpose. Which rows reach the engine *when*
+    // they do carry yields is a rule about the kind, and `resources.test.ts` pins it
+    // directly; what this file checks is the consequence one layer up.
+    const bare = boardWith([]);
+    for (const row of [IRON, GEMS]) {
+      const placed = boardWith([{ tile: TILE, resource: row.id }]);
+
+      // The premise this test rests on, asserted rather than assumed: these two rows
+      // declare no delta, so "nothing changed" cannot be explained by zeros that
+      // were never meant to be added. Editing a row above therefore has to edit this
+      // line too, instead of quietly turning the case into a different one.
+      expect(row.yields).toEqual({ food: 0, shields: 0, commerce: 0 });
+      expect(cityYields(placed, RESOURCE_RULESET, CITY.id)).toEqual(
+        cityYields(bare, RESOURCE_RULESET, CITY.id),
+      );
+    }
+  });
+
+  it('splits the extra commerce through the rates, so the gold and beakers move', () => {
+    // The tile's worth is not the end of the chain: commerce is what `playerIncome`
+    // divides. At 5/4/1, 3 commerce is 2 gold / 1 beaker (the remainder-to-gold
+    // example), and the wheat's extra commerce makes it 4 — `floor(4*5/10) = 2` gold
+    // plus the remainder, and `floor(4*4/10) = 1` beaker. One more commerce is one
+    // more gold here, which is the only reason a bonus resource is visible at all.
+    const rates: Rates = { tax: 5, science: 4, luxury: 1 };
+    const bare = board({
+      map: mapWith([]),
+      players: [player(0, { rates })],
+      cities: [CITY],
+    });
+    const wheat = board({
+      map: mapWith([{ tile: TILE, resource: WHEAT.id }]),
+      players: [player(0, { rates })],
+      cities: [CITY],
+    });
+
+    expect(cityYields(bare, RESOURCE_RULESET, CITY.id).commerce).toBe(3);
+    expect(playerIncome(bare, RESOURCE_RULESET, P0)).toEqual({ gold: 2, beakers: 1, luxuries: 0 });
+    expect(cityYields(wheat, RESOURCE_RULESET, CITY.id).commerce).toBe(4);
+    expect(playerIncome(wheat, RESOURCE_RULESET, P0)).toEqual({ gold: 3, beakers: 1, luxuries: 0 });
+  });
 });
 
 describe('unit support — the free allowance and the cost beyond it', () => {
@@ -566,6 +860,98 @@ describe('playerUpkeep — the two halves, and their sum', () => {
       unitSupport: 3 * UNIT_SUPPORT_COST,
       gold: TEMPLE.maintenance + 3 * UNIT_SUPPORT_COST,
     });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M4c: the shipped catalog's maintenance, and the shortfall it makes real
+ * ------------------------------------------------------------------ */
+
+describe('M4c: a TreasuryShortfall reachable from shipped content', () => {
+  /**
+   * This is the **one** test in this file that reads `@civts/rules` instead of a
+   * local stand-in, and it does so deliberately: M4c's acceptance evidence names "a
+   * city whose buildings outrun its income drives a real `TreasuryShortfall` from
+   * SHIPPED content", and M4b's accepted debt was that only a hand-built view could
+   * reach the branch. Every read in `packages/core/src` stays content-agnostic —
+   * this is evidence about the catalog, not a dependency of the engine on it.
+   *
+   * The expectations are **derived from the catalog**, never written down: a retune
+   * of a row's maintenance changes the number this test expects instead of turning
+   * it red, and what it pins is the rule (the sum is billed, the unpaid remainder is
+   * reported, the buildings that caused it are lost) rather than today's tuning.
+   */
+  const billing = CATALOG.buildings.filter((row) => row.maintenance > 0);
+
+  const maintenanceOfIds = (ids: readonly BuildingId[]): number => {
+    const byId = new Map(billing.map((row) => [String(row.id), row.maintenance]));
+    return ids.reduce((total, id) => total + (byId.get(String(id)) ?? 0), 0);
+  };
+
+  it('bills the shipped maintenance, reports what the city cannot pay, and takes the buildings', () => {
+    // Non-vacuity first: the shipped catalog really does bill for something, so
+    // nothing below is an assertion about zero.
+    expect(billing.length).toBeGreaterThan(0);
+    const billed = billing.reduce((total, row) => total + row.maintenance, 0);
+
+    // One city holding every building the catalog charges for, one commerce of
+    // income (the centre's, at 6/4/0 -> 1 gold), no units, an empty treasury.
+    const state = board({
+      players: [player(0, { treasury: 0 })],
+      cities: [city(0, 0, 5, { buildings: billing.map((row) => row.id) })],
+    });
+
+    const outcome = applyEconomy(state, SHIPPED);
+    const income = eventsOfType(outcome.events, 'IncomeCollected')[0];
+    const upkeep = eventsOfType(outcome.events, 'UpkeepPaid')[0];
+    const shortfalls = eventsOfType(outcome.events, 'TreasuryShortfall');
+    const disbands = eventsOfType(outcome.events, 'UnitDisbanded');
+
+    // The bill *is* the catalog's own sum of maintenances, to the gold — read
+    // through the money loop and through the read it delegates to.
+    expect(buildingMaintenance(state, SHIPPED, P0)).toBe(billed);
+    expect(upkeep?.maintenance).toBe(billed);
+    expect(upkeep?.gold).toBe(billed);
+
+    // Nothing could pay it: no unit is billable, so no unit is disbanded, the unpaid
+    // remainder is *reported* (this is the branch M4c makes reachable), and the
+    // treasury floors at 0.
+    expect(disbands).toEqual([]);
+    expect(shortfalls).toHaveLength(1);
+    expect(shortfalls[0]?.unpaid).toBe(billed - (income?.gold ?? 0));
+    expect(shortfalls[0]?.unpaid).toBeGreaterThan(0);
+    expect(outcome.state.players[0]?.treasury).toBe(0);
+
+    // M4c's other half: the player also loses the buildings it could not pay for —
+    // most recently completed first, until their maintenance covers the unpaid
+    // amount, and no further.
+    const before = billing.map((row) => row.id);
+    const after = outcome.state.cities[0]?.buildings ?? [];
+    const shed = before.slice(after.length);
+    const kept = before.slice(0, after.length);
+    const unpaid = shortfalls[0]?.unpaid ?? 0;
+
+    expect(shed.length).toBeGreaterThan(0);
+    expect(maintenanceOfIds(shed)).toBeGreaterThanOrEqual(unpaid);
+    expect(maintenanceOfIds(kept)).toBeLessThan(unpaid);
+    // And the state stays hashable: a loss is a smaller `buildings` array, never an
+    // `undefined` written into one.
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+  });
+
+  it('emits no shortfall at all for the same city once it holds nothing that bills', () => {
+    // The falsification of the test above: the shortfall has to come from the
+    // buildings, not from the city or the pass. Same board, same rates, no
+    // buildings — and the money loop is silent.
+    const state = board({
+      players: [player(0, { treasury: 0 })],
+      cities: [city(0, 0, 5, { buildings: [asBuildingId('granary')] })],
+    });
+    const outcome = applyEconomy(state, SHIPPED);
+
+    expect(buildingMaintenance(state, SHIPPED, P0)).toBe(0);
+    expect(eventsOfType(outcome.events, 'TreasuryShortfall')).toEqual([]);
+    expect(outcome.state.cities[0]?.buildings.map(String)).toEqual(['granary']);
   });
 });
 
@@ -773,13 +1159,23 @@ describe('applyEconomy — income, upkeep and bankruptcy', () => {
   });
 
   it('keeps the treasury non-negative and the ledger exact over a long run', () => {
-    // 200 turns of two cities that earn 1 gold each and a temple each, with nine
-    // units (one billable). The treasury drains, goes bankrupt once, disbands the
-    // one unit it can, and then runs at a permanent 2-gold shortfall — which is
-    // never a negative treasury, and is reported every turn it happens.
+    // 200 turns of two cities that earn 1 gold each and a temple each (2 gold of
+    // maintenance apiece), with nine units — one of them billable. The treasury
+    // drains and the player goes bankrupt on turn 4.
+    //
+    // **M4c changes what happens next, and this is where that is pinned.** M4b
+    // disbanded the one billable unit and then ran a permanent 2-gold shortfall for
+    // the rest of the run. A building that bills gold is now a building a broke
+    // player cannot keep, so the same turn also costs it the temple it could not pay
+    // for (`disbandBuildings`, most recently completed first) — and once those are
+    // gone the player is *solvent*: income 2, upkeep 2, and no further shortfall.
+    // The M4b reading was a civilization permanently in arrears with its buildings
+    // intact, which is not a state the contract asks the money loop to sustain.
     //
     // On *every* turn the identity in the module note holds to the gold:
     //   after - before === income - upkeep + sum(disbanded.saved) + shortfall.unpaid
+    // — unchanged by M4c, because a lost building buys no gold (see the module note:
+    // crediting the demolition would make `TreasuryShortfall` unreachable).
     let state = board({
       players: [player(0, { treasury: STARTING_TREASURY })],
       cities: [
@@ -837,14 +1233,26 @@ describe('applyEconomy — income, upkeep and bankruptcy', () => {
     }
 
     expect(turns).toBe(200);
-    // The run really did go bankrupt and stay short, rather than idling:
-    // income 2 a turn, upkeep 5 (four of maintenance, one of support) — so the
-    // first three turns are paid from the starting treasury, the fourth disbands
-    // unit 8, and every turn after that reports the same 2 gold it cannot pay.
+    // The run really did go bankrupt rather than idling: income 2 a turn, upkeep 5
+    // (four of maintenance, one of support) — so the first three turns are paid from
+    // the starting treasury and the fourth cannot be.
     expect(disbands).toBe(1);
-    expect(shortfalls).toBe(197);
+    expect(shortfalls).toBe(1);
+    // What bankruptcy cost it: unit 8 (the highest id, and the only billable one) and
+    // the two-gold temple it could not pay for. The *most recently completed*
+    // building went, which on this fixture is city 1's — city 0 keeps its temple, and
+    // the run then sits at income 2 against upkeep 2 for the remaining 196 turns.
     expect(state.units.map((kept) => Number(kept.id))).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(state.cities.map((each) => each.buildings.map(String))).toEqual([['temple'], []]);
     expect(state.players[0]?.treasury).toBe(0);
+    // And it stays solvent: a further turn collects 2 against the 2 it still owes,
+    // so nothing is unpaid and no building is lost. This is the falsification of the
+    // M4b reading — the shortfall is not a permanent condition once M4c can take the
+    // buildings that caused it.
+    const next = applyEconomy(state, UPKEEP_RULESET);
+    expect(next.events.filter((event) => event.type === 'TreasuryShortfall')).toEqual([]);
+    expect(next.state.cities.map((each) => each.buildings.map(String))).toEqual([['temple'], []]);
+    expect(next.state.players[0]?.treasury).toBe(0);
   });
 });
 

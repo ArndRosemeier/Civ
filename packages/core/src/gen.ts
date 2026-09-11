@@ -22,12 +22,15 @@
 import { asTileIndex, type TerrainId, type TileIndex } from './ids.js';
 import {
   TERRAIN_BY_ROLE,
+  compareTileResources,
   distance8,
   neighbors8,
+  resourceCatalog,
   type GameMap,
   type RulesetView,
   type TerrainRole,
   type TerrainYields,
+  type TileResource,
 } from './map.js';
 import { nextBelow, seedRng, type RngState } from './rng.js';
 
@@ -68,6 +71,22 @@ const MIN_START_DISTANCE = 2;
  * without turning the map into confetti — and it is not a sourced Civ 3 figure.
  */
 const HUT_TILES_PER_HUT = 128;
+/**
+ * One resource placement per this many map tiles, per catalog row (M4c,
+ * "Resources"). 120 is a **placeholder** — it is unsourced and chosen to be
+ * playable: on a duel map of 1600 tiles it puts one copy of every shipped
+ * resource somewhere in the world, and on a huge map it scales to a copy per
+ * region rather than turning the terrain into confetti — and it is **not** a
+ * sourced Civ 3 figure. Because the count is derived from the tile count, the
+ * *density* is the same on every map size; what changes is how many copies the
+ * world holds.
+ *
+ * A resource is never a thing a player collects by standing on it in M4c: a
+ * strategic resource gates production only once it is connected by road from a
+ * city, so its value is that it sits somewhere a civilization can plausibly
+ * claim rather than everywhere at once.
+ */
+const RESOURCE_TILES_PER_RESOURCE = 120;
 /** How many of the best-scoring tiles the RNG may draw the first start from. */
 const START_POOL = 24;
 /**
@@ -252,9 +271,11 @@ const landComponentSizes = (map: GameMap, isWater: readonly boolean[]): number[]
  * generation needs, or when the map cannot host `civCount` spread-out starts
  * (W3 converts both into typed `SetupError`s).
  *
- * The returned map carries its goody huts (`map.huts`, ascending) and the
- * returned RNG state is the one *after* those placement draws, so a caller that
- * stores it (W3 does) has a stream that no future caller can replay by accident.
+ * The returned map carries its goody huts (`map.huts`, ascending) and its
+ * resources (`map.resources`, sorted by `(tile, resource)`) — both placed after
+ * the starts, so neither can disturb a start position — and the returned RNG
+ * state is the one *after* both placement steps, so a caller that stores it (W3
+ * does) has a stream that no future caller can replay by accident.
  */
 export const generateWorld = (opts: GenOptions, ruleset: RulesetView): GeneratedWorld => {
   const { width, height, seed, civCount } = opts;
@@ -355,8 +376,10 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
   for (const role of roleByIndex) terrain.push(roleIds[role]);
   // Huts are placed at the very end (step 7), once the starts are known, so this
   // intermediate map carries an empty list; the returned map is this map plus the
-  // huts. Everything before step 7 reads terrain only.
-  const map: GameMap = { width, height, terrain, huts: [] };
+  // huts. Everything before step 7 reads terrain only. Resources (step 8) are
+  // placed after the huts for the same reason: both are "what the world holds",
+  // and both avoid the starts.
+  const map: GameMap = { width, height, terrain, huts: [], resources: [] };
 
   // 5. Second pass: water touching land (8-way) becomes coast, the rest ocean.
   for (let i = 0; i < count; i++) {
@@ -367,11 +390,18 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
 
   // 6. Starts: distinct passable land tiles, spread out by greedy max-min
   //    distance, preferring better yields, ties broken by index.
+  //
+  //    The per-terrain lookups generation needs are built here, once: `startScore`
+  //    reads yields, the start and hut pools read passability, and step 8 reads the
+  //    *role* a tile carries (which is data, not something derivable from the id —
+  //    see `TerrainDef.role`).
   const impassableById = new Map<TerrainId, boolean>();
   const yieldsById = new Map<TerrainId, TerrainYields>();
+  const roleById = new Map<TerrainId, TerrainRole>();
   for (const def of ruleset.terrains) {
     impassableById.set(def.id, def.impassable);
     yieldsById.set(def.id, def.yields);
+    roleById.set(def.id, def.role);
   }
 
   const candidates: { readonly index: number; readonly score: number }[] = [];
@@ -484,5 +514,77 @@ export const generateWorld = (opts: GenOptions, ruleset: RulesetView): Generated
   const huts: TileIndex[] = hutPool.slice(0, wanted).map((index) => asTileIndex(index));
   huts.sort((a, b) => a - b); // ascending, as M3 requires
 
-  return { map: { ...map, huts }, rng, starts };
+  // 8. Resources (M4c, "Resources"): a sparse `(tile, resource)` list, drawn from
+  //    the map RNG after the huts, so terrain and starts — which never use the
+  //    stream — are exactly what they were and only the returned RNG state moves
+  //    on. The rules, all of them placement rules rather than economics:
+  //
+  //    * a resource goes on a tile whose role its row allows (`allowedRoles`);
+  //    * never on a start tile — a civilization must begin the game with its
+  //      capital tile free, exactly as with a hut;
+  //    * never on a hut: the two would fight over one tile, and a hut is entered
+  //      while a resource is connected, so a shared tile would be a rule nobody
+  //      could state cleanly;
+  //    * **at most one resource per tile**, which is why `used` grows as rows are
+  //      placed and why every later row's pool is filtered against it. Civ 3 also
+  //      puts one resource on a tile, and the pair list would otherwise have to
+  //      answer what two resources on one tile mean;
+  //    * every catalog row gets `max(1, …)` copies where its terrain allows, so a
+  //      shipped resource is a resource that exists in the world rather than a
+  //      row only a hand-built map can produce;
+  //    * the draw per copy removes one tile from that row's pool (the same partial
+  //      Fisher-Yates the huts use), so two copies of one resource never share a
+  //      tile and the result depends only on the RNG state and the ascending pool
+  //      order — never on sort stability.
+  //
+  //    A view with no resource catalog places nothing: `resourceCatalog` is the
+  //    one place that decides what "no catalog" means, and an M2-era structural
+  //    stand-in is precisely a world with no resources in it.
+  const resourceRows = resourceCatalog(ruleset);
+  const resources: TileResource[] = [];
+
+  if (resourceRows.length > 0) {
+    const huted = new Set<number>(huts.map(Number));
+    const used = new Set<number>();
+    const perRow = Math.max(
+      1,
+      Math.floor(count / (RESOURCE_TILES_PER_RESOURCE * resourceRows.length)),
+    );
+
+    for (const row of resourceRows) {
+      const pool: number[] = [];
+      for (let i = 0; i < count; i++) {
+        if (isStart[i] === true) continue; // never on a start tile
+        if (huted.has(i)) continue; // never on a hut
+        if (used.has(i)) continue; // at most one resource per tile
+        const id = terrain[i];
+        if (id === undefined) continue;
+        const role = roleById.get(id);
+        if (role === undefined) continue; // undescribed terrain hosts nothing
+        if (!row.allowedRoles.includes(role)) continue;
+        pool.push(i);
+      }
+
+      const copies = Math.min(pool.length, perRow);
+      for (let n = 0; n < copies; n++) {
+        const draw = nextBelow(rng, pool.length - n);
+        rng = draw[1];
+        const j = n + draw[0];
+        const swap = at(pool, n);
+        pool[n] = at(pool, j);
+        pool[j] = swap;
+
+        const tile = at(pool, n);
+        used.add(tile);
+        resources.push({ tile: asTileIndex(tile), resource: row.id });
+      }
+    }
+
+    // Stored in the contract's order — tile, then resource id — via the one
+    // comparison that states it (`compareTileResources`), so the list is sorted
+    // however the rows happened to be visited.
+    resources.sort(compareTileResources);
+  }
+
+  return { map: { ...map, huts, resources }, rng, starts };
 };

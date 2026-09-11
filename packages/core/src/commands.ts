@@ -133,16 +133,59 @@
  *   `planSetRates` decide, each shared with `applyCommand` so a generator cannot
  *   advertise what the applier refuses. `actions.ts` yields **no** `SetRates` and
  *   says why (a 66-triple choice space is a query, like M3's two setters).
+ *
+ * M4c adds the resource gate, and it is a *refusal inside an existing evaluator*
+ * rather than a new command:
+ *
+ * - **`planSetProduction` is where production legality is decided, so the gate
+ *   lives there.** A unit whose row declares `requiresResource` may only be built
+ *   by a city whose owner has that resource connected (INTERFACES.md M4c,
+ *   "Gating"), and "may only be built" is exactly what `planSetProduction` already
+ *   answers — the function `applyCommand` refuses with and that `actions.ts`'
+ *   production-options generator filters with. Putting the check anywhere else
+ *   (a guard in the applier, a second predicate in the generator) is how a
+ *   generator and an applier come to disagree, which is the keystone invariant's
+ *   whole subject.
+ * - **The rule itself is `resources.ts`' `resourceGate`, not a walk here.** This
+ *   layer asks "is it connected?" and never looks at a road: M4c's connection rule
+ *   has one implementation, and a second one in the command layer is the M2
+ *   two-writers bug wearing a new hat.
+ * - **The building half of the same decision is `buildings.ts`' `mayStartBuilding`,
+ *   asked here.** A building item may not be set when the catalog cannot read the
+ *   row, when the city already holds it (`already-built`, M3's typed refusal) or —
+ *   M4c's wonder rule — when any city anywhere holds it. That last one is stated
+ *   once, in `buildings.ts`, and asked from this file, `actions.ts`'
+ *   `cityProductionOptions` (which filters through this function) and
+ *   `production.ts`' completion pass, so the planner cannot offer a wonder another
+ *   city has finished and the completion pass cannot create a second copy of one.
+ * - **Refusing the *order* is the whole enforcement point in M4c.** Nothing in
+ *   `production.ts`'s completion pass re-checks the gate, so a city that legally
+ *   queued a swordsman and then lost the road completes it: the gate is a rule
+ *   about what may be *set*, and M4c's contract states it in exactly that place
+ *   ("a unit ... may only be produced by a city whose owner has that resource
+ *   connected"). Widening it to completion would need a decision the contract does
+ *   not make — whether a half-built unit's shields are lost, kept or refunded —
+ *   and inventing one here would be worse than the gap.
  */
 
+// `buildingCatalog` here, with `buildings.ts`' rule, because `planSetProduction` is
+// where "may this city build this" is decided for *both* kinds of item.
 import {
   autoAssignWorkedTiles,
+  buildingCatalog,
   cityById,
   cityRadius,
   MIN_CITY_DISTANCE,
   type City,
   type ProductionItem,
 } from './cities.js';
+// M4c: the *building* half of production legality, asked of the module that states
+// it. `buildings.ts` says outright that its `mayStartBuilding` is the one rule the
+// planner, the option list and `production.ts`' completion path all apply; the
+// planner is this file, so the rule is asked here rather than restated — a second
+// copy would be free to disagree with the pass that completes the item, which is
+// exactly how a wonder comes to exist twice.
+import { buildingHolder, mayStartBuilding } from './buildings.js';
 // Runtime import of the rate *rule*, not of the money loop: `SetRates` must refuse
 // a triple the split cannot use with the same reason a slider UI would show, and
 // `economy.ts` is where that rule is written down once. `economy.ts` imports this
@@ -164,6 +207,7 @@ import {
   type BuildingId,
   type CityId,
   type PlayerId,
+  type ResourceId,
   type TileIndex,
   type UnitId,
   type UnitTypeId,
@@ -179,6 +223,12 @@ import {
   type TerrainRole,
 } from './map.js';
 import { itemCostOf } from './production.js';
+// Runtime import of the resource *rule*, not of a second copy of it: `SetProduction`
+// must ask the one implementation of "is this resource connected for this player?"
+// (`resources.ts`) and refuse with the answer. A connection walk written here
+// instead would be a second statement of M4c's rule, free to drift from the one
+// the generator and any future consumer read.
+import { resourceGate } from './resources.js';
 import { err, ok, type Result } from './result.js';
 import type { GameState, PlayerState, Rates } from './state.js';
 import { advanceTurn } from './turn.js';
@@ -303,6 +353,51 @@ export type GameError =
   | { readonly kind: 'unknown-production-item'; readonly item: ProductionItem }
   /** The city already has this building; building it twice is not a no-op. */
   | { readonly kind: 'already-built'; readonly cityId: CityId; readonly building: BuildingId }
+  /**
+   * M4c: the item is a unit whose row declares `requiresResource`, and the city's
+   * owner does not have that resource **connected** — no path of road-improved
+   * tiles from any of that player's cities reaches it (`resources.ts`' `connected`
+   * is the one implementation of that rule, and `resourceGate` the verdict).
+   *
+   * A distinct member rather than an `invalid-argument` or a reuse of
+   * `unknown-production-item`, because the *fix* is distinct and a caller must be
+   * able to say it: the item is perfectly real and settable in a city that has the
+   * resource, so the answer is "build a road" (or "found a city nearer"),
+   * not "pick another item". `resource` names what is missing so the UI can render
+   * "requires iron" from the refusal alone, and `owner` names whose connection was
+   * missing — with connection being the *player's* (M4c: "some city of that
+   * player"), which is why the refusing city and the missing connection are two
+   * facts and not one.
+   */
+  | {
+      readonly kind: 'resource-not-connected';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      readonly item: ProductionItem;
+      readonly resource: ResourceId;
+    }
+  /**
+   * M4c: the item is a **wonder** another city already holds. Wonders are globally
+   * unique — "once any city anywhere holds it, no other city may start it" — so the
+   * `SetProduction` that would queue one is refused rather than left to be dropped
+   * silently when it completes (`production.ts` applies the same rule at the moment
+   * of completion, so a queue that predates the other city's wonder cannot
+   * duplicate it either).
+   *
+   * Distinct from `already-built`, which means *this* city has it: the fixes differ
+   * ("pick something else" versus "someone else finished it first"), and a refusal
+   * that named the wrong one would be a lie about the state. And distinct from
+   * `unknown-production-item` because the item is real and buildable — just not by
+   * this city while the wonder stands. `holder` names the city that has it, so a UI
+   * can say who; it is **absent** (never a key holding `undefined`) for a state the
+   * rule cannot produce, where the lookup found no holder at all.
+   */
+  | {
+      readonly kind: 'wonder-already-built';
+      readonly cityId: CityId;
+      readonly building: BuildingId;
+      readonly holder?: CityId;
+    }
   /**
    * `StartWork` was asked of a unit that is not a worker — including a unit whose
    * type the ruleset does not describe, because the engine cannot see a worker
@@ -1060,14 +1155,27 @@ export interface SetProductionPlan {
  * Decide whether `cityId` may be set to build `item` — the one place
  * `SetProduction`'s legality is stated.
  *
- * Two refusals, as the contract fixes them: an item this ruleset cannot build
+ * Four refusals, as the contract fixes them: an item this ruleset cannot build
  * (`unknown-production-item`, which includes a row whose cost is not a usable
- * number of shields — see `itemCostOf`), and a building the city already has
- * (`already-built`; building it twice is a typed refusal, never a silent no-op).
- * Queueing a building the city does **not** yet have is legal, and so is setting
- * the item a city is already building — the applier accepts exactly what this
- * function accepts, and an applier that refused a redundant-but-legal command
- * would make the two disagree.
+ * number of shields — see `itemCostOf`), a unit whose row demands a resource the
+ * owner has not connected (`resource-not-connected`, M4c's gate), a building the
+ * city already has (`already-built`; building it twice is a typed refusal, never a
+ * silent no-op), and a **wonder** any city anywhere already holds
+ * (`wonder-already-built`, M4c's global uniqueness). Queueing a building the city
+ * does **not** yet have is legal, and so is setting the item a city is already
+ * building — the applier accepts exactly what this function accepts, and an
+ * applier that refused a redundant-but-legal command would make the two disagree.
+ *
+ * The order of the checks is the order of the reasons, most fundamental first: an
+ * item nothing can price is not an item, then whether it may be built *here at
+ * all* (the resource gate is about the item's own requirement, and the building
+ * rule about who holds it, not about this city's history), then whether this city
+ * already has it. Each rule is asked of the module that owns it: the gate through
+ * `resources.ts`' `resourceGate`, and the building rule through `buildings.ts`'
+ * `mayStartBuilding`. The gate is asked of the *owner*, because M4c's connection is
+ * the player's — a swordsman is buildable in every city of a player who has iron
+ * connected anywhere — while the wonder rule is asked of the **world**, because
+ * uniqueness is global.
  */
 export const planSetProduction = (
   state: GameState,
@@ -1087,8 +1195,48 @@ export const planSetProduction = (
   const cost = itemCostOf(ruleset, item);
   if (cost === undefined) return err({ kind: 'unknown-production-item', item });
 
-  if (item.kind === 'building' && city.buildings.includes(item.id)) {
-    return err({ kind: 'already-built', cityId, building: item.id });
+  // M4c's gate. `resourceGate` answers `open` for every item that demands nothing
+  // (every building, and every unit whose row omits `requiresResource`), so this
+  // is not a check that only applies to some items — it is the gate, read for all
+  // of them.
+  const gate = resourceGate(state, ruleset, city.owner, item);
+  if (gate.kind === 'blocked') {
+    return err({
+      kind: 'resource-not-connected',
+      cityId,
+      owner: city.owner,
+      item,
+      resource: gate.resource,
+    });
+  }
+
+  // M4c's building rule, asked of `buildings.ts` rather than restated: a row this
+  // catalog cannot read, a building *this* city already holds, or a wonder held by
+  // any city anywhere. The two refusals below name the cause, because the caller's
+  // fix differs — build something else, versus see who finished the wonder first.
+  //
+  // Reachable only for a `building` item: the gate above never closes on one (M4c's
+  // `BuildingEffect` union has no resource member), so a unit's path through this
+  // function is unaffected by the branch.
+  if (
+    item.kind === 'building' &&
+    !mayStartBuilding(state, buildingCatalog(ruleset), city, item.id)
+  ) {
+    if (city.buildings.includes(item.id)) {
+      return err({ kind: 'already-built', cityId, building: item.id });
+    }
+    // Everything `mayStartBuilding` can be false for has now been ruled out except
+    // another city's wonder: the row exists, because `itemCostOf` priced it through
+    // the same catalog a few lines above. The holder is read for the *message*, and
+    // its key is omitted rather than written `undefined` when there is none — the
+    // rule cannot produce that state, but a hand-built city list is not the rule.
+    const holder = buildingHolder(state, item.id);
+    return err({
+      kind: 'wonder-already-built',
+      cityId,
+      building: item.id,
+      ...(holder === undefined ? {} : { holder: holder.id }),
+    });
   }
 
   return ok({ city, item, cost });

@@ -23,7 +23,14 @@
 
 import { describe, expect, it } from 'vitest';
 import { canonicalize, hashValue } from '@civts/testing';
-import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
+import {
+  asPlayerId,
+  asResourceId,
+  asTerrainId,
+  asTileIndex,
+  asUnitId,
+  asUnitTypeId,
+} from '../src/ids.js';
 import { asImprovementId } from '../src/improvements.js';
 import type { GameMap, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
@@ -119,6 +126,10 @@ const MAP: GameMap = {
   height: 4,
   terrain: Array.from({ length: 16 }, () => asTerrainId('grassland')),
   huts: [],
+  // M4c: a map carries its resources as a sparse `(tile, resource)` list. These
+  // tests are about unit lookups, so the honest value is "this world holds none" —
+  // stated as an empty list rather than omitted, which the type would reject.
+  resources: [],
 };
 
 const player = (index: number, tile: number): PlayerState => ({
@@ -242,6 +253,31 @@ describe('unitDef', () => {
   it('does not answer with a unit of the wrong role', () => {
     const def = unitDef(RULESET, asUnitTypeId('warrior'));
     expect(def?.role).toBe('military');
+  });
+
+  it('carries requiresResource as an absent key, never a key holding undefined (M4c)', () => {
+    // The field is optional by *absence*: a row that demands nothing has no key at
+    // all, because a present-but-`undefined` key cannot survive a JSON round trip
+    // (the trap that has cost this project three bug hunts). Whether a requirement
+    // *gates* anything is `resources.ts`' business and is tested there; this pins
+    // the shape of the field this module declares.
+    const gated: UnitDef = {
+      ...WARRIOR,
+      // A distinct id, so the row is a *new* catalog entry rather than a second
+      // `warrior`; `unitDef` finds the first row with an id, as it should.
+      id: asUnitTypeId('swordsman'),
+      requiresResource: asResourceId('iron'),
+    };
+    const withGated: RulesetView = { ...RULESET, units: [...DEFS, gated] };
+
+    for (const def of DEFS) expect('requiresResource' in def).toBe(false);
+    expect(unitDef(RULESET, WARRIOR.id)?.requiresResource).toBeUndefined();
+    expect(unitDef(withGated, gated.id)?.requiresResource).toBe(asResourceId('iron'));
+    // The catalog is data handed to the engine, not state: a row carrying the field
+    // is JSON-safe because the value is a string, and a row without it is safe
+    // because the key is genuinely absent.
+    expect(JSON.parse(JSON.stringify(gated))).toEqual(gated);
+    expect('requiresResource' in JSON.parse(JSON.stringify(WARRIOR))).toBe(false);
   });
 });
 

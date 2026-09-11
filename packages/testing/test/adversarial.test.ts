@@ -64,6 +64,20 @@
  * catalog with a settler but **no worker** still starts a game, because the two
  * absences are not the same failure and every pre-M4b structural view in the tree is
  * exactly that — which is a claim about M4b's contract rather than about this file.
+ *
+ * **Migrated to M4c's catalogs** (docs/INTERFACES.md M4c). `RulesetView` gained an
+ * optional `resources` catalog and `GameMap` gained a **required** `resources` list,
+ * and `SCHEMA_VERSION` went 5 -> 6 for it, so every state hash moved a fourth time.
+ * Two consequences land here, both fixture-shaped: the structural view below now
+ * carries the shipped building and resource catalogs (a view that omits resources
+ * generates a *different* world, since placement consumes RNG draws — so the
+ * pinned-hash tests would fail against a golden file the harness wrote from the
+ * real catalog), and every state this file hashes is built by `newGame` — the one
+ * map it edits (the width-perturbation case) is a spread of a generated one, so no
+ * hand-built literal needed the new field at all. No claim was
+ * dropped or weakened: the hash-sensitivity sweep, the fog sweeps, the terrain
+ * sweep and "the golden can actually fail" suites are the same
+ * assertions, re-pinned to the M4c hashes through the same stored file.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -152,6 +166,18 @@ const RULESET: RulesetView = {
   // improvement on a tile, so the shipped rows change nothing they assert — but a
   // view that omitted the field would not typecheck at all.
   improvements: CATALOG.improvements,
+  // M4c: the building and resource catalogs. Both are *optional* on `RulesetView`,
+  // so this fixture compiled without them — which is exactly why they are here
+  // rather than left off. The resource catalog is not inert the way an unused
+  // building row is: `generateWorld` places resources, placement consumes RNG
+  // draws, and `GameMap.resources` is hashed, so a view without it generates a
+  // *different world* from the one `packages/testing/test/golden.test.ts` stores a
+  // hash for (that harness runs the shipped `CATALOG` through `validateRuleset`).
+  // A fixture that disagreed with the golden harness would make the pinned-hash
+  // tests below fail for a reason that has nothing to do with the hasher, so the
+  // two views carry the same catalogs.
+  buildings: CATALOG.buildings,
+  resources: CATALOG.resources,
   fidelity: 'tuned',
 };
 const ROLE_BY_ID: ReadonlyMap<TerrainId, TerrainRole> = new Map(
@@ -364,6 +390,15 @@ const inProcessHashes = (): ReadonlyMap<string, string> =>
  * does: `newGame` places a settler per player, so a view without `units` comes
  * back as `missing-unit-role` and every case would print `SETUP-ERROR` — which
  * would look like a determinism failure while actually being a stale fixture.
+ *
+ * M4c: it carries the **resource** catalog too, and that one is load-bearing
+ * rather than structural. `generateWorld` places resources on the map and
+ * placement consumes RNG draws, so a child that generated without a resource
+ * catalog would build a *different world* from the in-process one and print a
+ * different hash — a determinism failure that is really a fixture disagreement.
+ * `buildings` and `improvements` change nothing at `newGame` (no city exists at
+ * turn 1), and are here so the child derives the same four catalogs from the same
+ * shipped source as the in-process fixture instead of hand-picking fields.
  */
 const freshProcessScript = (cases: readonly HashCase[]): string => `
 (async () => {
@@ -377,6 +412,9 @@ const freshProcessScript = (cases: readonly HashCase[]): string => `
       defenseBonusPct: t.defenseBonusPct, yields: t.yields, impassable: t.impassable,
     })),
     units: CATALOG.units,
+    buildings: CATALOG.buildings,
+    improvements: CATALOG.improvements,
+    resources: CATALOG.resources,
     fidelity: 'tuned',
   };
   console.log('pid ' + String(process.pid));

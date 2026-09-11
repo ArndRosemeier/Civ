@@ -76,6 +76,11 @@ const MAP: GameMap = {
   height: 4,
   terrain: Array.from({ length: 16 }, () => GRASSLAND),
   huts: [],
+  // M4c: the map carries the resources `generateWorld` placed, as sparse
+  // `(tile, resource)` pairs. Empty here, so no bonus resource can quietly change
+  // a city's shields or commerce and move the numbers this file pins. The key is
+  // present and empty — it is part of `GameMap`, and therefore of every state hash.
+  resources: [],
 };
 
 const makeUnitDef = (
@@ -107,16 +112,21 @@ const MINE: ImprovementDef = {
   allowedRoles: ['grassland'],
 };
 
-/** A building that declares upkeep, so "billed the turn it completes" is visible. */
-interface UpkeepDef extends BuildingDef {
-  readonly maintenance: number;
-}
-
-const TEMPLE: UpkeepDef = {
+/**
+ * A building that bills gold, so "billed the turn it completes" is visible.
+ *
+ * M4c made `maintenance` a **required** field of `BuildingDef` (and added
+ * `effects`), so the local `UpkeepDef` interface this fixture used to declare — a
+ * `BuildingDef` plus an upkeep the engine could read — is gone: the contract now
+ * says what it was saying. `effects: []` is the honest way to write "this row does
+ * nothing but cost shields and gold"; it is a legal row, not an unknown one.
+ */
+const TEMPLE: BuildingDef = {
   id: asBuildingId('temple'),
   name: 'Temple',
   cost: 1,
   maintenance: 2,
+  effects: [],
 };
 
 const RULESET: RulesetView = {
