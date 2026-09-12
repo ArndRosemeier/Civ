@@ -170,6 +170,7 @@ import {
   DEFAULT_SETTINGS,
   FREE_UNITS_BASE,
   FREE_UNITS_PER_CITY,
+  MAX_EXPERIENCE,
   MIN_GROWTH_FOOD,
   RATE_TOTAL,
   UNIT_SUPPORT_COST,
@@ -182,9 +183,11 @@ import {
   asResourceId,
   asTileIndex,
   asUnitTypeId,
+  captureCity,
   cityProductionOptions,
   civPlayers,
   foodBoxSize,
+  hitPointsLeftOf,
   itemCost,
   newGame,
   nextUint32,
@@ -1055,6 +1058,20 @@ interface Corruption {
   readonly expected: string;
   readonly kind: BatteryKind;
   readonly corrupt: (clean: GameState) => GameState;
+  /**
+   * The transition's **event stream**, for the corruption of an invariant whose
+   * property is a claim about what *happened* rather than about what the state holds.
+   *
+   * M6's two transition predicates are the ones that need it: `captured-city-consistent`
+   * compares a `CityCaptured` line with the city it transferred, and
+   * `combat-hit-point-conservation` compares a `CombatResolved` line with the hit points
+   * on both sides of it. An empty event list is a transition in which neither of those
+   * things happened, so without this hook those two invariants could not be proved able
+   * to fire — and "an invariant that has never failed is decoration" is the whole claim
+   * this battery exists to make. Additive: every earlier entry leaves it out and gets
+   * `[]`, exactly as before.
+   */
+  readonly events?: (clean: GameState) => readonly GameEvent[];
 }
 
 const withCity = (state: GameState, index: number, change: (city: City) => City): GameState => {
@@ -1339,7 +1356,128 @@ const corruptions = (clean: GameState): readonly Corruption[] => {
       kind: 'transition',
       corrupt: (state) => withCity(state, 0, (city) => ({ ...city, shields: city.shields + 5 })),
     },
+
+    /* ---- M6: the six combat predicates ---- */
+
+    {
+      label: 'a unit stored with more hit points than its type has',
+      expected: 'unit-hit-points-in-range',
+      kind: 'shape',
+      corrupt: (state) => withUnit(state, 0, (unit) => ({ ...unit, hitPointsLeft: 99 })),
+    },
+    {
+      label: 'a live unit stored at 0 hit points',
+      expected: 'unit-hit-points-above-zero',
+      kind: 'shape',
+      corrupt: (state) => withUnit(state, 0, (unit) => ({ ...unit, hitPointsLeft: 0 })),
+    },
+    {
+      label: 'a promotion level above the experience cap',
+      expected: 'unit-experience-in-range',
+      kind: 'shape',
+      corrupt: (state) =>
+        withUnit(state, 0, (unit) => ({ ...unit, experience: MAX_EXPERIENCE + 1 })),
+    },
+    {
+      label: 'a unit standing on the tile of a city it does not own',
+      expected: 'unit-not-inside-foreign-city',
+      kind: 'shape',
+      corrupt: (state) => {
+        const city = mustFind(state.cities[0], 'a city');
+        const rival = mustFind(
+          state.players.find((player) => player.kind === 'civ' && player.id !== city.owner),
+          'a rival civilization',
+        );
+        return withUnit(state, 0, (unit) => ({ ...unit, owner: rival.id, tile: city.tile }));
+      },
+    },
+    {
+      label: "a capture event whose population is not the capture rule's answer",
+      expected: 'captured-city-consistent',
+      kind: 'transition',
+      corrupt: (state) => captureIn(state).state,
+      events: (clean) => {
+        const capture = captureIn(clean);
+        return [{ ...capture.event, population: capture.event.population + 1 }];
+      },
+    },
+    {
+      label: 'a battle whose attacker came out of it one hit healthier',
+      expected: 'combat-hit-point-conservation',
+      kind: 'transition',
+      // The heal, not a wound: a unit at one hit point cannot be wounded further, so the
+      // wounded form of this corruption would be a no-op for it.
+      corrupt: (state) =>
+        withUnit(state, 0, (unit) => ({ ...unit, hitPointsLeft: hitPointsLeftOf(unit) + 1 })),
+      events: (clean) => [battleEventIn(clean)],
+    },
   ];
+};
+
+/**
+ * A capture **the engine performed** on `state`, with the `CityCaptured` line the
+ * command layer would emit for it.
+ *
+ * Built with `captureCity` rather than by hand so that the corruption's *baseline* is a
+ * real capture: the battery's job is to prove that a broken transition is caught, and a
+ * baseline this file invented would only prove the probe agrees with itself.
+ */
+const captureIn = (
+  state: GameState,
+): { readonly state: GameState; readonly event: Extract<GameEvent, { type: 'CityCaptured' }> } => {
+  const target = mustFind(state.cities[0], 'a city');
+  const rival = mustFind(
+    state.players.find((player) => player.kind === 'civ' && player.id !== target.owner),
+    'a rival civilization',
+  );
+  const captured = captureCity(state, RULESET.buildings, target.id, rival.id);
+  if (captured === undefined) {
+    throw new Error(`captureCity found no city ${String(target.id)} to capture`);
+  }
+  return {
+    state: captured.state,
+    event: {
+      type: 'CityCaptured',
+      cityId: captured.city.id,
+      from: target.owner,
+      to: rival.id,
+      tile: captured.city.tile,
+      name: captured.city.name,
+      population: captured.city.population,
+      destroyed: captured.destroyed,
+    },
+  };
+};
+
+/**
+ * A `CombatResolved` line for the first unit of `state` fighting the first unit of
+ * another player — the shape the resolver emits, with the units' real identities.
+ *
+ * The corruption that pairs with it moves the *after-state's* hit points, so the event
+ * only has to name a battle that involves that unit; nothing here is a claim about what
+ * the fight did.
+ */
+const battleEventIn = (state: GameState): Extract<GameEvent, { type: 'CombatResolved' }> => {
+  const attacker = mustFind(state.units[0], 'a unit');
+  const defender = mustFind(
+    state.units.find((unit) => unit.owner !== attacker.owner),
+    'a unit of another player',
+  );
+  return {
+    type: 'CombatResolved',
+    attackerId: attacker.id,
+    attackerOwner: attacker.owner,
+    defenderId: defender.id,
+    defenderOwner: defender.owner,
+    target: attacker.tile,
+    outcome: 'defender-wins',
+    rounds: 1,
+    attackerLost: 0,
+    defenderLost: 0,
+    attackerWinPct: 33,
+    attackerSurvives: true,
+    defenderSurvives: true,
+  };
 };
 
 const contextFor = (
@@ -1366,7 +1504,7 @@ const runBattery = (clean: GameState): readonly BatteryOutcome[] =>
     const ctx = contextFor(
       corruption.corrupt(clean),
       corruption.kind === 'transition' ? clean : undefined,
-      [],
+      corruption.events?.(clean) ?? [],
     );
     const fired = [
       ...new Set(checkInvariants(ctx, CORE_INVARIANTS).map((violation) => violation.invariant)),
@@ -1383,7 +1521,7 @@ describe('3. invariants actually fire', () => {
     expect(clean.units.length).toBeGreaterThan(3);
   }, 120_000);
 
-  it('catches each deliberate corruption BY NAME, and can fire all twenty-one invariants', () => {
+  it('catches each deliberate corruption BY NAME, and can fire all twenty-seven invariants', () => {
     const clean = playedState(1, 8);
     const outcomes = runBattery(clean);
 
@@ -1462,7 +1600,9 @@ describe('3. invariants actually fire', () => {
     // registry and the prose that quotes its size drift apart. An assertion of the form
     // `>= 21` (which the CLI's own test makes, for a different reason: it must not go
     // stale against the registry) cannot see that drift.
-    expect(CORE_INVARIANTS.length).toBe(21);
+    // M6 raised the registry from 21 to 27; the literal is updated with it, for the
+    // reason this comment states (the CLI report prints the live size).
+    expect(CORE_INVARIANTS.length).toBe(27);
     expect(CORE_INVARIANTS.map((invariant) => invariant.name)).toContain('city-tile-unique');
 
     // Non-vacuity: the same appended city on a tile far from anything is clean, so the

@@ -118,6 +118,7 @@ import {
   asUnitTypeId,
   buildingCatalog,
   buildingDef,
+  CITY_DEFENSE_BONUS_PCT,
   citiesOf,
   cityById,
   cityGrowthTarget,
@@ -127,20 +128,27 @@ import {
   cityYields,
   civPlayers,
   connected,
+  defenderBonusPct,
   describe,
   err,
   foodBoxSize,
+  FORTIFY_BONUS_PCT,
+  hitPointsLabel,
   improvementCatalog,
   improvementDef,
   inBounds,
   indexToX,
   indexToY,
   isExplored,
+  isFortified,
   isWonder,
   itemCostOf,
   knownTechs,
   maintenanceOf,
+  MAX_EXPERIENCE,
+  neighbors8,
   ok,
+  planAttackUnit,
   planFoundCity,
   planSetProduction,
   planSetRates,
@@ -158,6 +166,7 @@ import {
   techCostOf,
   techDef,
   terrainAtIndex,
+  terrainDefenseBonus,
   tileIndex,
   unitById,
   unitCatalog,
@@ -166,7 +175,10 @@ import {
   unitsOnTile,
   unitSupport,
   unmetTechFor,
+  VETERAN_ATTACK_PCT,
   visibleTiles,
+  WALLS_BONUS_PCT,
+  WALLS_BUILDING,
   workSummary,
   type Command,
   type CommandOutcome,
@@ -248,7 +260,8 @@ export const PLAY_USAGE = `usage: civts play [--seed <int>] [--map-size <size>] 
   --god               render the whole map, ignoring fog (debugging only)
 
 Commands inside a session (also documented by "help"):
-  move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
+  move <unitId> <x> <y>      attack <unitId> <x> <y>     fortify <unitId>
+  found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
   work <unitId> <improve>    cancel <unitId>
   rates <tax> <science> <luxury>
@@ -380,6 +393,66 @@ const workOf = (ruleset: RulesetView, unit: Unit): string | undefined => {
   return work === undefined ? undefined : workSummary(ruleset, work);
 };
 
+/**
+ * A unit's hit points as this file prints them: `2/3 hp` (M6).
+ *
+ * `@civts/core`'s `hitPointsLabel` is the *one* spelling of that figure — the same
+ * function `textview` puts on its `work:` line — so the REPL does not own a second
+ * mapping from a hit point count to prose, exactly as `workOf` above does not own a
+ * second mapping from a job to a verb. The maximum is therefore asked of the unit's
+ * own type in one place, `maxHitPointsOf`' fallback included: a type this ruleset
+ * cannot describe renders the unit's own count rather than an invented `?`.
+ *
+ * This is the figure that makes a damaged unit *visible as damaged* in all four places
+ * this file names units: the `units:` line under every view, the `units` table, the
+ * `state` view's `your units:` line and the prose of a refusal about one.
+ */
+const unitHitPoints = (ruleset: RulesetView, unit: Unit): string =>
+  hitPointsLabel(unit, unitDef(ruleset, unit.type));
+
+/**
+ * What a city's tile gives a **defender standing in it**, as one line (M6) — the
+ * answer to "how hard is this city to take?", which is a question about the
+ * *modifiers* the engine will sum.
+ *
+ * Every figure is read from `combat.ts`: `terrainDefenseBonus` for the terrain part and
+ * `defenderBonusPct` for the sum (terrain + `CITY_DEFENSE_BONUS_PCT` + `WALLS_BONUS_PCT`
+ * when the city holds `WALLS_BUILDING`), so the number a player reads here is the number
+ * the applier will put into a battle — it cannot drift from the resolver, because no
+ * arithmetic is repeated here. `defenderBonusPct` is handed `fortified: false` on
+ * purpose: whether the defender is dug in is a fact about *that unit*, not about this
+ * city, and the line says so rather than assuming one.
+ *
+ * **The line also has to say what the city does NOT have**, because the honest answer to
+ * "what defends this city?" is "a unit, and nothing else": an undefended city is
+ * captured outright by `AttackUnit` — there is no city-versus-unit combat in M6 — so a
+ * view that printed a health bar or a defence strength for the city itself would be
+ * describing a mechanic the engine does not have.
+ */
+const cityDefenceLine = (state: GameState, ruleset: RulesetView, city: City): string => {
+  const terrain = terrainDefenseBonus(terrainDefAt(state, ruleset, city.tile) ?? {});
+  const walls = city.buildings.includes(WALLS_BUILDING);
+  const total = defenderBonusPct({
+    terrainBonusPct: terrain,
+    fortified: false,
+    inCity: true,
+    walls,
+  });
+
+  const parts = [`terrain +${String(terrain)}%`, `city +${String(CITY_DEFENSE_BONUS_PCT)}%`];
+  parts.push(
+    walls
+      ? `walls +${String(WALLS_BONUS_PCT)}% (it holds defensive walls)`
+      : `walls +0% (no "${String(WALLS_BUILDING)}" building here, so no wall bonus)`,
+  );
+  return (
+    `  defence: +${String(total)}% to a unit defending this tile (${parts.join(', ')}), plus ` +
+    `+${String(FORTIFY_BONUS_PCT)}% if that unit is fortified. ` +
+    'The city has no defence of its own: an undefended city is captured outright, so what ' +
+    'defends it is a unit standing here.'
+  );
+};
+
 /** An improvement as prose, with what it costs: `improvement "Mine" (3 turns)`. */
 const improvementLabel = (ruleset: RulesetView, id: ImprovementId): string => {
   const def = improvementDef(ruleset, id);
@@ -415,6 +488,15 @@ const improvementCatalogueHint = (ruleset: RulesetView): string => {
   return `buildable improvements: ${rows.join('; ')}`;
 };
 
+/**
+ * A unit as prose, for a refusal about it: its id, type, position, remaining movement,
+ * its hit points (M6) and what it is doing.
+ *
+ * Every field is a fact the engine holds, and the hit points are `units.ts`' own read of
+ * them through `hitPointsLabel` — a damaged unit must be visible as damaged *wherever* it
+ * is named, and a refusal that said "unit 3 (Warrior at 2,3 …)" about a unit one hit from
+ * death would be hiding the one number that decides whether attacking is a good idea.
+ */
 const unitLabel = (state: GameState, ruleset: RulesetView, unitId: UnitId): string => {
   const unit = unitById(state, unitId);
   if (unit === undefined) return `unit ${String(unitId)}`;
@@ -423,7 +505,8 @@ const unitLabel = (state: GameState, ruleset: RulesetView, unitId: UnitId): stri
   const job = workOf(ruleset, unit);
   return (
     `unit ${String(unit.id)} (${typeName(ruleset, unit.type)} at ` +
-    `${coordOf(state.map, unit.tile)}, ${String(unit.movementLeft)}/${max} movement left` +
+    `${coordOf(state.map, unit.tile)}, ${String(unit.movementLeft)}/${max} movement left, ` +
+    unitHitPoints(ruleset, unit) +
     // A working unit says so wherever it is named, because "why can this worker not
     // start a job?" is answered by the job it already has.
     `${job === undefined ? '' : `, ${job}`})`
@@ -456,7 +539,7 @@ const yourUnitsLines = (context: ErrorContext): readonly string[] => {
     const job = workOf(context.ruleset, unit);
     return (
       `${String(unit.id)} ${name} at ${coordOf(context.state.map, unit.tile)} ` +
-      `(${String(unit.movementLeft)} movement left` +
+      `(${String(unit.movementLeft)} movement left, ${unitHitPoints(context.ruleset, unit)}` +
       // What the unit is doing belongs with where it is: a bad id is a one-line fix,
       // and "that worker is already mining" is part of the line.
       `${job === undefined ? '' : `, ${job}`})`
@@ -521,6 +604,45 @@ const tileList = (map: GameMap, tiles: readonly TileIndex[], fallback: string): 
 /** `(x,y) (x,y) ...`, or `(none)` for an empty list. */
 const coordList = (context: ErrorContext, tiles: readonly TileIndex[]): string =>
   tileList(context.state.map, tiles, '(none)');
+
+/**
+ * The adjacent tiles `unitId` may attack right now (M6) — **asked of the engine's own
+ * `planAttackUnit`**, the same evaluator `applyCommand` refuses with and the same
+ * generator `actions.ts` advertises from.
+ *
+ * That is the whole point of the function: the "legal:" lesson under a refused `attack`
+ * must not be a second opinion about what may be attacked. An enemy unit on a tile, an
+ * undefended enemy city, a stack of two enemies (refused as `target-stacked`) and a
+ * friendly-occupied tile (nothing to attack) are each classified by the applier's own
+ * planner, so every target this function prints is a command the engine would accept.
+ *
+ * `neighbors8` is the engine's own adjacency — a unit attacks what it stands beside —
+ * never a second reading of "adjacent", and it never returns an off-map tile.
+ */
+const attackTargets = (context: ErrorContext, unitId: UnitId): readonly TileIndex[] => {
+  const unit = unitById(context.state, unitId);
+  if (unit === undefined) return [];
+  return neighbors8(context.state.map, unit.tile).filter(
+    (tile) => planAttackUnit(context.state, context.ruleset, context.playerId, unitId, tile).ok,
+  );
+};
+
+/** The lesson behind a refused `attack`: what that unit *can* reach instead. */
+const legalAttackLines = (context: ErrorContext, unitId: UnitId): readonly string[] => {
+  const targets = attackTargets(context, unitId);
+  const label = unitLabel(context.state, context.ruleset, unitId);
+  if (targets.length === 0) {
+    return [
+      `  legal: ${label} has nothing it can attack this turn - an attack needs an adjacent`,
+      '  tile holding exactly one enemy unit or an undefended enemy city, and movement left',
+      '  to spend ("end" refills movement).',
+    ];
+  }
+  return [
+    `  legal: ${label} can attack ${tileList(context.state.map, targets, '(none)')} - each is ` +
+      'adjacent and holds one enemy unit or an undefended enemy city.',
+  ];
+};
 
 /**
  * The tiles `cityId` may be assigned right now, asked one tile at a time of
@@ -1056,12 +1178,26 @@ const researchStanding = (state: GameState, ruleset: RulesetView, playerId: Play
  * M3 - what the two setter verbs accept.
  * ------------------------------------------------------------------ */
 
-/** The unit a command names, when it names one (`move`, `found`, the worker verbs). */
+/**
+ * The unit a command names, when it names one (`move`, `found`, the worker verbs, and
+ * M6's `attack` and `fortify`).
+ *
+ * This function is the *only* writer of an `ErrorContext`'s `unitId`, and every lesson
+ * that names the offending unit reads it back out — so a command missing from this list
+ * does not fail loudly: its refusals simply lose the sentence that says which unit they
+ * are about, and the loss is easy to miss because the typed error still names the id.
+ * M6's two verbs were missing here at first, and `unit-cannot-attack` was the tell: the
+ * "legal:" line under that refusal vanished (`legalMovesLines` needs this id) while the
+ * prose above it looked complete. The list covers every `Command` member that carries a
+ * `unitId`, for that reason, and `repl.test.ts` pins the lesson each one prints.
+ */
 const unitIdOf = (command: Command): UnitId | undefined =>
   command.type === 'MoveUnit' ||
   command.type === 'FoundCity' ||
   command.type === 'StartWork' ||
-  command.type === 'CancelWork'
+  command.type === 'CancelWork' ||
+  command.type === 'AttackUnit' ||
+  command.type === 'FortifyUnit'
     ? command.unitId
     : undefined;
 
@@ -1768,6 +1904,43 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         ),
         ...legalResearchLines(context),
       ].join('\n');
+
+    /* ---------------- M6: combat ---------------- */
+
+    // The three refusals `AttackUnit` can produce beyond the ones every unit command
+    // shares (`unknown-unit`, `not-your-unit`, `out-of-bounds`, `not-enough-movement`
+    // and `invalid-argument` above). Each lesson is built by *asking* the engine —
+    // `planAttackUnit` over the unit's eight neighbours (`legalAttackLines`) — so a
+    // refusal cannot advertise an attack the applier would refuse in turn, which is the
+    // keystone invariant applied to the wording.
+    case 'unit-cannot-attack':
+      return [
+        `error: unit-cannot-attack - ${unitLabel(context.state, context.ruleset, error.unitId)}`,
+        `  cannot attack: its type's attack is ${String(error.attack)}, and M6's rule is that a`,
+        '  unit with attack 0 may not attack at all. A type this ruleset does not describe',
+        '  reads as attack 0 too, because the engine can see no attack there.',
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'nothing-to-attack':
+      return [
+        `error: nothing-to-attack - (${coordOf(context.state.map, error.target)}) holds no enemy ` +
+          'unit',
+        `  and no enemy city, so there is nothing there for ` +
+          `${unitLabel(context.state, context.ruleset, error.unitId)} to attack.`,
+        ...legalAttackLines(context, error.unitId),
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'target-stacked':
+      return [
+        `error: target-stacked - (${coordOf(context.state.map, error.target)}) holds ` +
+          `${String(error.defenders)} enemy units,`,
+        '  and one attack resolves against exactly one of them. Which one would be picked is a',
+        '  rule this engine does not have (M2 lets units stack), so the attack is refused',
+        '  rather than aimed at a defender the command never named.',
+        ...legalAttackLines(context, error.unitId),
+      ].join('\n');
   }
 };
 /** A `SetupError` as prose. Shared with the `map` command, so both say the same thing. */
@@ -1894,7 +2067,8 @@ const resourcesLine = (state: GameState, ruleset: RulesetView, playerId: PlayerI
  * growing?" is a question about integers the engine already has, and a reader
  * should not have to add them up. M4c's two new lines answer the two questions a
  * city view gained with this wave: what is this city costing me to keep, and which
- * resources can its owner actually build on.
+ * resources can its owner actually build on. M6's third (`cityDefenceLine`) answers
+ * the one combat asks of a city: how much harder is a unit standing here to kill.
  */
 const cityDetailText = (state: GameState, ruleset: RulesetView, city: City): string => {
   const yields: CityYields = cityYields(state, ruleset, city.id);
@@ -1943,6 +2117,11 @@ const cityDetailText = (state: GameState, ruleset: RulesetView, city: City): str
   );
 
   lines.push(resourcesLine(state, ruleset, city.owner));
+
+  // M6: how hard the city's tile is to take, under the resources line and above the
+  // assignment — the two lines above say what the city *is* and what it *costs*, and
+  // this one says what standing in it is worth to a defender.
+  lines.push(cityDefenceLine(state, ruleset, city));
 
   lines.push(
     city.workedTiles.length === 0
@@ -2006,7 +2185,9 @@ const citiesTableText = (
         ]),
       );
     }
-    lines.push('  "city <cityId>" shows one in full: yields, queue, buildings and worked tiles.');
+    lines.push(
+      '  "city <cityId>" shows one in full: yields, queue, buildings, defence and worked tiles.',
+    );
   }
 
   if (others.length > 0) {
@@ -2087,7 +2268,8 @@ export interface ReplSession {
  * `HELP`.
  */
 export const COMMAND_SUMMARY =
-  'move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | ' +
+  'move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | ' +
+  'cities | city <cityId> | ' +
   'work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | ' +
   'work <unitId> <improvementId> | cancel <unitId> | ' +
   'rates <tax> <science> <luxury> | research <techId> | tech | ' +
@@ -2096,6 +2278,23 @@ export const COMMAND_SUMMARY =
 const HELP = `commands:
   move <unitId> <x> <y>   step one unit onto an adjacent tile (8-way). The cost is the
                           destination tile's move cost, paid from that unit's movement.
+  attack <unitId> <x> <y> attack one of the 8 adjacent tiles with that unit. The unit must
+                          have attack > 0 and movement left, and the tile must hold exactly
+                          one enemy unit (a battle, resolved against that defender with the
+                          tile's and its city's defence bonuses) or an undefended enemy
+                          city (which is CAPTURED: its population halves rounded down to a
+                          minimum of 1, its non-wonder buildings are destroyed, its queue
+                          and worked tiles are cleared, and it is not razed). Attacking
+                          spends ALL of the unit's remaining movement whether it wins or
+                          loses. The winner of a battle gains one experience level
+                          (capped at ${String(MAX_EXPERIENCE)}), worth +${String(VETERAN_ATTACK_PCT)}% attack each;
+                          a battle ends when one side is destroyed, so a unit is never left
+                          standing at 0 hit points. A tie in a round goes to the DEFENDER.
+                          "units" shows every unit's hit points; a city's "defence:" line
+                          shows what its tile and walls are worth to a defender.
+  fortify <unitId>        dig that unit in where it stands: +${String(FORTIFY_BONUS_PCT)}% defence until it moves.
+                          It requires movement left and costs the rest of the turn, and it
+                          prints a line because (unlike an attack) it emits no event.
   found <unitId>          found a city with that unit, which must be a settler standing on
                           land at least 2 tiles (counting diagonals) from every city. The
                           settler is consumed. New cities start at population 1 and work
@@ -2105,7 +2304,8 @@ const HELP = `commands:
                           and what it is building.
   city <cityId>           show one city in full: population, the food box and its
                           threshold, stored shields, the current item and its cost, the
-                          queue behind it, its buildings and the tiles it works.
+                          queue behind it, its buildings, what its tile is worth to a
+                          defending unit (its "defence:" line) and the tiles it works.
   work <cityId> <x> <y> ...   set which tiles that city's citizens work, one x y pair per
                           citizen (at most "population" pairs; an unassigned citizen works
                           nothing). With no pairs the assignment is cleared.
@@ -2150,8 +2350,9 @@ const HELP = `commands:
                           refills its movement, turn advances. An improvement finished this
                           turn counts towards this turn, and a unit produced this turn costs
                           support from this turn.
-  units                   list the units you can see, with position, movement left and
-                          what each one is doing.
+  units                   list the units you can see, with position, movement left, hit
+                          points (a damaged unit must be visible as damaged) and what each
+                          one is doing.
   state                   print seed, turn, revision, map size, RNG, your gold, rates,
                           beakers and luxuries, your research, what your units are doing and
                           the state hash.
@@ -2413,6 +2614,95 @@ const outcomeText = (
           'could pay with; the treasury is 0 (it never goes negative) and the unpaid gold is ' +
           'reported here rather than carried as a debt'
         );
+
+      /* ---------------- M6: combat ---------------- */
+
+      // The four combat events, each printed as a *real* line. This is the block the
+      // no-blank-line regression exists for: a missing `case` here would leave a silent
+      // empty line inside an `ok:` block, which is exactly how M3's city and hut events
+      // would have arrived (see the module note), so `attack`/`fortify` are covered by
+      // the same regression as every earlier event.
+      //
+      // `CombatResolved` prints the numbers the *resolver* produced rather than a
+      // re-derived summary: the per-round odds the draw was taken against, the rounds
+      // fought, each side's losses, and each side's fate. The odds come first because
+      // "it won" is only legible beside "it had a 31% chance per round" — and the
+      // `UnitDestroyed` line that follows says *which* unit died and why, so this line
+      // does not have to guess at a cause from a flag.
+      case 'CombatResolved': {
+        const fate =
+          event.attackerSurvives && !event.defenderSurvives
+            ? `the attacker holds the field and unit ${String(event.defenderId)} is destroyed`
+            : !event.attackerSurvives && event.defenderSurvives
+              ? `the defender holds the field and unit ${String(event.attackerId)} is destroyed`
+              : event.attackerSurvives
+                ? 'both sides are still standing, which a battle of this engine cannot leave'
+                : 'both sides were destroyed';
+        return (
+          `ok: COMBAT - unit ${String(event.attackerId)} ` +
+          `(${playerLabel(outcome.state, event.attackerOwner)}) attacked unit ` +
+          `${String(event.defenderId)} (${playerLabel(outcome.state, event.defenderOwner)}) at ` +
+          `${eventPlace(outcome, event.target)}: ${String(event.attackerWinPct)}% per-round odds ` +
+          `for the attacker (a draw below that wins, and a tie goes to the defender), ` +
+          `${String(event.rounds)} round(s) fought, the attacker lost ` +
+          `${String(event.attackerLost)} hit point(s) and the defender lost ` +
+          `${String(event.defenderLost)} - ${event.outcome}: ${fate}`
+        );
+      }
+
+      // **Why a unit is gone** is the whole reason this event carries a reason, so the
+      // line leads with the cause and names the killer when there is one. A death with
+      // no killer prints the absence rather than an empty parenthetical: "nothing is
+      // recorded as having killed it" is a true sentence about a bankrupt unit, and an
+      // invented `by unit undefined` would be a false one.
+      case 'UnitDestroyed': {
+        const killer =
+          event.byUnitId === undefined || event.byOwner === undefined
+            ? 'nothing is recorded as having killed it'
+            : `killed by unit ${String(event.byUnitId)} ` +
+              `(${playerLabel(outcome.state, event.byOwner)})`;
+        const why =
+          event.reason === 'combat'
+            ? 'it lost the battle it was fighting'
+            : "its owner's treasury could not pay its support";
+        return (
+          `ok: unit ${String(event.unitId)} (${typeName(ruleset, event.unitType)}, ` +
+          `${playerLabel(outcome.state, event.owner)}) is GONE from ` +
+          `${eventPlace(outcome, event.tile)}: ${why}, and ${killer}`
+        );
+      }
+
+      // Promotion is the reward for winning, so the line names the level it reached, the
+      // cap it was clamped against and what the level is *worth* — the bonus percentage
+      // read from `combat.ts` (`VETERAN_ATTACK_PCT`) rather than restated here, because
+      // "veteran 2" with no magnitude is a number a player cannot act on.
+      case 'UnitPromoted':
+        return (
+          `ok: unit ${String(event.unitId)} (${playerLabel(outcome.state, event.owner)}) won at ` +
+          `${eventPlace(outcome, event.tile)} and was promoted to veteran level ` +
+          `${String(event.experience)} of ${String(event.maxExperience)}; each level is ` +
+          `+${String(VETERAN_ATTACK_PCT)}% attack, and experience is never lost`
+        );
+
+      // A capture is not a battle, so this line reports what the *sack* did: the old
+      // owner, the new one, the population afterwards and every building destroyed, in
+      // destruction order. The wonder rule is printed as a fact about the event rather
+      // than as a promise: `destroyed` never names a wonder (`cities.ts` states the rule),
+      // and the line says so where a reader would otherwise wonder.
+      case 'CityCaptured':
+        return (
+          `ok: ${event.name} (city ${String(event.cityId)}) at ` +
+          `${eventPlace(outcome, event.tile)} was CAPTURED by ` +
+          `${playerLabel(outcome.state, event.to)} from ` +
+          `${playerLabel(outcome.state, event.from)}; population is now ` +
+          `${String(event.population)} and the sack destroyed ` +
+          (event.destroyed.length === 0
+            ? 'no buildings'
+            : `${String(event.destroyed.length)} building(s) (` +
+              `${event.destroyed.map((id) => buildingLabel(ruleset, id)).join(', ')})`) +
+          ' - a wonder is never destroyed by capture, the city is not razed, and its tile ' +
+          'improvements stay'
+        );
     }
 
     return assertNever(event);
@@ -2523,6 +2813,35 @@ const appliedCommandText = (
         '; "end" spends the pool, so it completes on the turn the pool covers the cost'
       );
     }
+
+    // M6: `AttackUnit` always emits an event — `CombatResolved` for a battle,
+    // `CityCaptured` for an undefended city — and `outcomeText` renders every event, so
+    // there is nothing left to add. It is listed rather than left to a `default` so that
+    // a *new* command is still a compile error here.
+    case 'AttackUnit':
+      return undefined;
+
+    // M6: `FortifyUnit` emits **no** event — the frozen M6 event list names no member
+    // for "the unit is dug in", which is exactly why `legalActions` does not advertise
+    // it (see `planFortifyUnit`) — so the state's own `fortified` flag is the record and
+    // this line is the report. It is read back out of the state the command produced
+    // rather than assumed, so a `fortify` the applier somehow did not write would say so
+    // instead of claiming a position that is not there.
+    case 'FortifyUnit': {
+      const unit = unitById(outcome.state, command.unitId);
+      const dug = unit !== undefined && isFortified(unit);
+      return (
+        `ok: unit ${String(command.unitId)} is ${
+          dug ? 'dug in where it stands' : 'NOT recorded as fortified'
+        }` +
+        (unit === undefined
+          ? ' (it is no longer in the state, so there is nothing left to fortify)'
+          : `; fortifying spends its remaining movement (${String(unit.movementLeft)} left), ` +
+            'and a unit that moves away is no longer fortified. It is worth ' +
+            `+${String(FORTIFY_BONUS_PCT)}% defence, and it emits no event, so this line is ` +
+            'the record of it')
+      );
+    }
   }
 
   // Reached only when every member above was handled, which is what makes the tail
@@ -2530,8 +2849,12 @@ const appliedCommandText = (
   return assertNever(command);
 };
 
-/** Column widths for the `units` table: marker, id, type, owner, at, move, terrain, job. */
-const UNIT_WIDTHS: readonly number[] = [1, 2, 10, 11, 8, 7, 11, 26];
+/**
+ * Column widths for the `units` table: marker, id, type, owner, at, move, hp, terrain,
+ * job. (`hp` is M6's column: the width holds `12/12`, the widest count the shipped
+ * catalog's hit points can produce.)
+ */
+const UNIT_WIDTHS: readonly number[] = [1, 2, 10, 11, 8, 7, 6, 11, 26];
 
 /** A padded row: every cell but the last is padded to its column's width. */
 const tableRow = (widths: readonly number[], cells: readonly string[]): string =>
@@ -2590,6 +2913,12 @@ export const createSession = (options: SessionOptions): ReplSession => {
    * `describe` marks player *starting* tiles, not units — so without this the
    * agent would have to cross-reference the `units` table to find itself on a
    * 60x60 grid. The view and the positions therefore travel together.
+   *
+   * M6 puts each unit's **hit points** beside its movement (`3/3 hp`), for the same
+   * reason the job is there: this line rides under every view, so it is the one place a
+   * damaged unit becomes visible without a second command. A unit one hit from death
+   * that this line printed as though it were whole would make every attack decision the
+   * agent takes from this line a guess.
    */
   const unitsLine = (): string => {
     const rows = visibleUnits();
@@ -2607,7 +2936,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
       return (
         `${unit.owner === playerId ? '*' : ' '}${String(unit.id)} p${String(unit.owner)} ` +
         `${name} @${coordOf(state.map, unit.tile)} ` +
-        `(${String(unit.movementLeft)}/${max} movement)${suffix}`
+        `(${String(unit.movementLeft)}/${max} movement, ${unitHitPoints(ruleset, unit)})${suffix}`
       );
     });
     return `units: ${parts.join('  ')}\n`;
@@ -2670,6 +2999,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
           'owner',
           'at',
           'move',
+          'hp',
           'terrain',
           'job',
           'legal',
@@ -2685,6 +3015,10 @@ export const createSession = (options: SessionOptions): ReplSession => {
             playerName(state, unit.owner),
             coordOf(state.map, unit.tile),
             `${String(unit.movementLeft)}/${def === undefined ? '?' : String(def.movement)}`,
+            // M6: the whole reason the table needed a new column is that a *damaged*
+            // unit has to be visible as damaged — every other column in this row
+            // describes the unit as though a wound had not happened.
+            unitHitPoints(ruleset, unit),
             terrainDefAt(state, ruleset, unit.tile)?.name ?? '?',
             // M4a: the job column, so the table answers "what is each of my units
             // doing?" without a second command. `(idle)` is the same spelling the
@@ -3182,6 +3516,83 @@ export const createSession = (options: SessionOptions): ReplSession => {
           unitId: asUnitId(unitId),
           to: tileIndex(state.map.width, x, y),
         });
+      }
+
+      /* ---------------- M6: the combat verbs ---------------- */
+
+      // `attack` is the same three arguments `move` takes — a unit id and a tile — and it
+      // parses them the same way, for the same reasons: a coordinate off the map is an
+      // *argument* error rather than a command the engine should see (`tileIndex` does not
+      // validate, so x=500 on a 60-wide map would silently become column 20), and a unit id
+      // that is not a whole number names no unit. The parsing is repeated rather than
+      // shared because it is not a *rule*: the rules this verb obeys are all in the engine
+      // (`planAttackUnit` decides adjacency, the target's contents and the movement cost),
+      // and the REPL adds no opinion of its own about any of them. The one thing the REPL
+      // does decide — because a command's payload cannot say it — is that `attack` is how a
+      // player says "take that tile", whether the tile holds a unit (a battle) or an
+      // undefended city (a capture); `planAttackUnit` picks between the two.
+      case 'attack': {
+        if (args.length !== 3) {
+          return malformed(
+            `"attack" needs 3 arguments: attack <unitId> <x> <y> (got ${String(args.length)})`,
+            'example: attack 3 12 9  ("units" lists your unit ids and their hit points)',
+          );
+        }
+
+        const unitId = intOf(args[0]);
+        if (unitId === undefined) {
+          return malformed(
+            `unit id must be a whole number (got "${args[0] ?? ''}")`,
+            'example: attack 3 12 9  ("units" lists your unit ids)',
+          );
+        }
+
+        const x = intOf(args[1]);
+        const y = intOf(args[2]);
+        if (x === undefined || y === undefined) {
+          return malformed(
+            `x and y must be whole numbers (got "${args[1] ?? ''}" and "${args[2] ?? ''}")`,
+            'the ruler above the map lists the valid columns and rows',
+          );
+        }
+
+        if (!inBounds(state.map, x, y)) {
+          return malformed(
+            `(${String(x)},${String(y)}) is outside the map (` +
+              `${String(state.map.width)}x${String(state.map.height)}): x must be ` +
+              `0..${String(state.map.width - 1)} and y must be ` +
+              `0..${String(state.map.height - 1)}`,
+            'the ruler above the map lists the valid columns and rows',
+          );
+        }
+
+        return applied({
+          type: 'AttackUnit',
+          unitId: asUnitId(unitId),
+          target: tileIndex(state.map.width, x, y),
+        });
+      }
+
+      // `fortify` takes the one argument `cancel` takes, and for the same reason: the
+      // position *is* the unit's own, so there is no tile to name. What it does is stated
+      // by the engine (`planFortifyUnit` requires ownership and movement left, and the
+      // applier spends the rest of the turn), and what a reader gets back is the
+      // `appliedCommandText` line, because this command emits no event.
+      case 'fortify': {
+        if (args.length !== 1) {
+          return malformed(
+            `"fortify" needs 1 argument: fortify <unitId> (got ${String(args.length)})`,
+            'example: fortify 3  ("units" lists your unit ids)',
+          );
+        }
+        const unitId = intOf(args[0]);
+        if (unitId === undefined) {
+          return malformed(
+            `unit id must be a whole number (got "${args[0] ?? ''}")`,
+            'example: fortify 3  ("units" lists your unit ids)',
+          );
+        }
+        return applied({ type: 'FortifyUnit', unitId: asUnitId(unitId) });
       }
 
       default:

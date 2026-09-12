@@ -1369,3 +1369,148 @@ people stop running.
   effect (research completion turns) reported — the milestone's balance evidence
   comes from the harness, not from eye.
 - The played golden, plus the fast tier still under 90 s.
+
+---
+
+# M6 contracts — FROZEN (combat and barbarians)
+
+Provenance rule unchanged: every new number is `placeholder`, unsourced, chosen to
+be playable, and never presented as Civ 3's.
+
+## Unit combat statistics
+
+`UnitSpec` gains required: `attack: number`, `defense: number`, `hitPoints: number`
+(all integers, `hitPoints >= 1`, `attack/defense >= 0`). A unit with `attack === 0`
+may not attack; that is a legality rule, not a footnote.
+
+**M6 content must actually use the gates M5 built.** No shipped row declares
+`requiresTech` today, which is exactly why two gating defects survived play testing.
+At least one new gated unit and one gated building/improvement must declare
+`requiresTech`, and at least one unit must declare `requiresResource`, so the gates
+are exercised by real content and not only by test overrides.
+
+Terrain defence: `TerrainSpec` gains `defenseBonus: number` (integer percentage,
+`>= 0`). `validateRuleset` rejects a negative or fractional bonus, a non-integer
+combat stat, and `hitPoints < 1`.
+
+## Units in play
+
+```ts
+export interface Unit {
+  // ...existing...
+  readonly hitPointsLeft: number;      // 1..hitPoints; a unit at 0 is DESTROYED, not stored at 0
+  readonly experience?: number;        // promotions earned; ABSENT when zero — never `undefined`
+  readonly fortified?: boolean;        // ABSENT when false
+}
+```
+
+`experience` and `fortified` are optional-and-omitted, never `| undefined`. A unit at
+0 hit points must be **removed**, not retained at 0 — a live unit with 0 HP is the
+kind of state that makes every later battle wrong, so it is also an invariant.
+
+## Combat resolution
+
+Combat lives in `packages/core/src/combat.ts` and is the ONE statement of the odds.
+
+```ts
+export interface CombatSide { readonly attack: number; readonly defense: number; readonly bonusPct: number; }
+export interface CombatResult {
+  readonly rounds: number;
+  readonly attackerLost: number;       // hit points lost
+  readonly defenderLost: number;
+  readonly outcome: 'attacker-wins' | 'defender-wins';
+  readonly attackerSurvives: boolean;
+  readonly defenderSurvives: boolean;
+}
+export function resolveCombat(ctx: CombatContext): CombatResult;   // PURE: draws from a passed RNG state
+```
+
+`resolveCombat` **takes the RNG state and returns the next one** — it does not reach
+into the world. Same discipline as the rest of the engine: pure, total, integer-only.
+
+Modifiers, all integer percentages summed then applied ONCE (the M4c compounding
+rule, for the same reason — flooring twice differs):
+
+- defender: terrain defence bonus, `+FORTIFY_BONUS_PCT` if fortified, `+CITY_DEFENSE_BONUS_PCT`
+  if defending a city, `+WALLS_BONUS_PCT` if that city holds defensive walls
+- attacker: `+VETERAN_ATTACK_PCT` per experience level
+- the defender wins ties (state it; a tie rule that is implicit is a tie rule that
+  changes when someone reorders a comparison)
+
+## Commands
+
+```ts
+| { readonly type: 'AttackUnit'; readonly unitId: UnitId; readonly target: TileIndex }
+| { readonly type: 'FortifyUnit'; readonly unitId: UnitId }
+```
+
+- `AttackUnit`: the unit is owned by the actor, has `attack > 0`, has movement left,
+  and the target is **adjacent** and holds exactly one enemy-occupied thing (a unit,
+  or a city). The attack consumes ALL remaining movement (attacking ends the unit's
+  turn) whether or not it succeeds.
+- Combat resolves unit-vs-unit. Attacking a city with a defender resolves against
+  that defender; attacking an **undefended** city captures it.
+- `FortifyUnit` sets `fortified`, requires movement left, costs the remaining
+  movement, and is cleared when the unit moves.
+- New `GameEvent` members: `CombatResolved`, `UnitDestroyed`, `UnitPromoted`,
+  `CityCaptured`. `UnitDestroyed` must say *why* (combat or bankruptcy), because a
+  unit vanishing with no reason is indistinguishable from a bug.
+- `legalActions`/`unitActions` must yield `AttackUnit` exactly where the applier
+  accepts it — the keystone invariant in BOTH directions, now an eighth generator.
+
+## Experience and promotion
+
+A unit that wins a combat gains one `experience` level, up to `MAX_EXPERIENCE`.
+Promotion emits `UnitPromoted`. Experience never decreases and is never lost by
+moving. Losing a combat that the unit survives grants nothing.
+
+## City capture
+
+An undefended city attacked by a unit is captured:
+
+- ownership changes to the attacker's player
+- population drops (placeholder rule: halved, floored, minimum 1)
+- buildings are destroyed deterministically — the same rule as bankruptcy
+  demolition (maintenance-descending), and a **wonder is never destroyed by
+  capture** (it is unique; destroying it would silently make it buildable again)
+- the captured city's production queue and worked tiles are cleared
+- the city is NOT razed, and its tile improvements and roads stay
+- emitting `CityCaptured` with the old and new owner
+
+Barbarians may capture cities; that is the point of barbarians. A captured city's
+fate must be reflected in the invariants — after capture, no invariant may be
+violable merely because ownership changed.
+
+## Barbarians are ENGINE behaviour, not a policy
+
+`sim` policies exist for civilizations. Barbarians have no policy and must be driven
+by the engine inside `advanceTurn`, deterministically:
+
+- a barbarian unit attacks an adjacent enemy unit or undefended city when it can
+- otherwise it moves toward the nearest known (to it) civilization city, breaking
+  ties by ascending tile index — never by map iteration order
+- barbarians never research, never build, never receive gold, and never benefit from
+  another player's roads
+- the step runs after the money loop and before the movement refill, and its position
+  is contractual; state it in the pipeline comment
+
+This must be deterministic and must not draw from any policy's RNG stream.
+
+## Acceptance evidence for M6
+
+- A combat-odds scenario: for known attack/defence/modifiers, assert the exact
+  per-round win chance and the distribution over a fixed seed set, **and** assert a
+  discriminating case where the compounded modifier differs from flooring twice.
+- A capture scenario: exact population after capture, exact buildings destroyed, the
+  wonder preserved, and the typed event.
+- An experience scenario: exact promotion threshold and the exact attack bonus it
+  grants.
+- A barbarian scenario: engine-driven attack and approach on a fixed seed, with the
+  exact tiles moved.
+- A **combat balance sweep** through `@civts/sim` (`scripts/combat-balance-sweep.ts`)
+  reporting measured outcomes across a modifier or stat sweep — the milestone's
+  balance evidence comes from the harness.
+- New invariants registered in `@civts/sim` (hit points in range, no live unit at 0
+  HP, experience in range, no unit inside an enemy city it does not own), each with a
+  fire case.
+- A played golden that INCLUDES combat, so battles are covered at hash level.

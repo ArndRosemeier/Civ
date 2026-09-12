@@ -281,6 +281,19 @@ const cmdKey = (cmd: Command): string => {
     // as the `SetRates` case keys the triple.
     case 'SetResearch':
       return `SetResearch ${String(cmd.tech)}`;
+    // M6's two combat commands, keyed by their payload for the M4a reason: two
+    // `AttackUnit`s naming different targets are different commands, and a key that
+    // dropped the target would call them equal — the exact false equivalence this
+    // comparator exists to prevent. `FortifyUnit` carries only its unit, so the unit
+    // is the whole key. Both are keyed although `actions.ts` yields only
+    // `AttackUnit` (`FortifyUnit` is a setting, reachable through `planFortifyUnit`):
+    // the switch is exhaustive on purpose, so a `Command` variant this comparator
+    // cannot name would be a typecheck failure rather than two different commands
+    // comparing equal.
+    case 'AttackUnit':
+      return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
+    case 'FortifyUnit':
+      return `FortifyUnit ${String(cmd.unitId)}`;
   }
 };
 
@@ -2535,6 +2548,12 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
     // scenario list is pinned: the assertion is unchanged in strength — nothing short of
     // "the file on disk is exactly what this build produces, for exactly these
     // scenarios" passes it.
+    //
+    // M6 adds a fifth entry, `played-civs2-seed42-combat` — the played world with one
+    // `AttackUnit` applied through the applier, which is the entry that covers combat at
+    // hash level. This file cannot recompute it (the script and the battle board live in
+    // `golden.test.ts`), so it is pinned by name; the three fresh worlds are still compared
+    // value for value.
     const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
     expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
@@ -2542,14 +2561,18 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
       'tiny-civs2-seed42',
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
+      'played-civs2-seed42-combat',
     ]);
     expect(stored.nodeMajor).toBe(Number.parseInt(process.versions.node, 10));
 
     const state = goldenState(42);
     expect(state.schemaVersion).toBe(SCHEMA_VERSION);
-    // 7, not 6: M5's `PlayerState.techs`. Named rather than written as `> 6` so a
-    // future schema bump has to come here and say so.
-    expect(SCHEMA_VERSION).toBe(7);
+    // 8, not 7: M6's `Unit.hitPointsLeft`, written by `newGame` on every starting unit
+    // (plus the two omitted-when-default keys `experience` and `fortified`, which a fresh
+    // game does **not** write). Named rather than written as `> 7` so a future schema bump
+    // has to come here and say so — M6 is the fifth deliberate bump, and its rehash went
+    // through the harness's opt-in path like the other four.
+    expect(SCHEMA_VERSION).toBe(8);
 
     // The four new keys are inside the canonical JSON `hashValue` hashes, so a shape
     // change of any of them — added, renamed, removed — trips the gate. This is the check
@@ -2567,6 +2590,16 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
     // empty list would make the containment check pass without hashing anything new).
     expect(canonical).toContain('"resources":');
     expect(state.map.resources.length).toBeGreaterThan(0);
+
+    // M6's new hashed shape, by the same argument a third time: a unit's health is inside
+    // the canonical JSON `hashValue` reads, so renaming or dropping the field trips the
+    // gate. Non-vacuous because a fresh game has units, and each one the engine placed
+    // carries the key at a value the engine's own reader agrees is alive.
+    expect(canonical).toContain('"hitPointsLeft":');
+    expect(state.units.length).toBeGreaterThan(0);
+    for (const unit of state.units) {
+      expect(unit.hitPointsLeft).toBeGreaterThanOrEqual(1);
+    }
 
     // Not vacuous: perturbing the money in memory moves the hash, and never to a stored
     // value. A golden that cannot fail is worthless.

@@ -11,8 +11,9 @@
  * 3. production for every city (city-id order), then
  * 4. research for every civilization (player-id order) — M5, then
  * 5. the money loop for every civilization (player-id order) — M4b, then
- * 6. every unit's movement refilled, then
- * 7. `turn += 1`.
+ * 6. the barbarian step (unit-id order) — M6, then
+ * 7. every unit's movement refilled, then
+ * 8. `turn += 1`.
  *
  * Why it is a module rather than a branch of `EndTurn`: the ordering is the kind
  * of rule that quietly gets re-derived. The CLI, a scenario harness, a "skip
@@ -72,11 +73,33 @@
  *   contributes to this turn — is the module note at the top of `tech.ts`. **Do not
  *   move this step after the money loop to "fix" it**; that is the double-credit the
  *   contract warns about.
+ * - **The barbarian step runs between the money loop and the refill (M6), and both
+ *   halves of that position are observable.** Barbarians have no policy (M6: "Barbarians
+ *   are ENGINE behaviour, not a policy"), so this is the only place their units ever
+ *   act, and `barbarians.ts` owns what they do.
+ *   - *After the money loop*, because the money loop is the turn's ledger for the
+ *     civilizations. A barbarian can take a city away from one of them — capture is
+ *     "the point of barbarians" — and the turn it does so is the turn its former owner
+ *     still collects that city's gold, because the bill was read from the world as it
+ *     stood two steps earlier. Running the barbarian step first would silently move a
+ *     captured city's revenue to the following turn, and the acceptance evidence pins
+ *     that number.
+ *   - *Before the refill*, because an attack costs a unit **all** of its remaining
+ *     movement. The refill is the last thing a turn does to the world, so it hands back
+ *     what a barbarian spent: a band that attacked this turn still has a full budget
+ *     when the next turn's step reads it — one action per turn, as M6 intends. With the
+ *     refill first, every barbarian would spend *next* turn's movement on this turn's
+ *     attack and act once every two turns.
+ *   - It draws nothing from any policy's stream: the step's only randomness is a
+ *     battle's, and `applyCommand` → `combat.ts` takes it from `state.rng`.
  * - **`revision` is not touched here.** It counts *applied commands* (M2
  *   invariant 2), and advancing a turn is one step of one command: `applyCommand`
  *   bumps it exactly once. This keeps the pipeline usable by a caller that is not
  *   a command (a test, a future "advance N turns" harness) without inventing
- *   revisions.
+ *   revisions. It stays true with M6's step: a barbarian's action is *applied* by
+ *   `applyCommand` — that is how it is guaranteed to be the same combat and movement
+ *   path a civilization uses — but nobody issued it as a command, so the step hands
+ *   back the revision it was given (`barbarians.ts` says this too).
  * - **Events, not diffs.** The events returned are the *world's* events — whose
  *   job finished, who grew, who starved, what was produced — in pipeline order.
  *   `TurnEnded` is not among them: it names the acting player and belongs to the
@@ -91,6 +114,15 @@
  */
 
 import type { GameEvent } from './commands.js';
+// M6's step of the pipeline. This is the one step that must reach *into* the command
+// layer at runtime — "a barbarian's battle is the same combat path a civilization's is"
+// means calling `applyCommand`, not re-resolving a battle out of `combat.ts` — so this
+// pair is a cycle (`commands.ts → turn.ts → barbarians.ts → commands.ts`) where the
+// other steps all keep the edge type-only. It is safe because the cycle is entered only
+// at call time: `barbarians.ts` reads the applier's bindings inside function bodies and
+// never while modules are being evaluated, so both directions work whichever one is
+// imported first. `barbarians.ts`' module note argues this at length.
+import { advanceBarbarians } from './barbarians.js';
 // M4b's step of the pipeline. `economy.ts` imports `GameEvent` from `commands.ts`
 // type-only, so this is the only runtime edge in the pair and there is no cycle.
 import { applyEconomy } from './economy.js';
@@ -143,8 +175,9 @@ export interface TurnOutcome {
  *   state, and it never silently drops the job the way a cancellation would.
  * - **The unit is idle afterwards**, by `withoutWork` — the key is removed, never
  *   written as `undefined`. That also releases the worker to start another job on
- *   the same turn it finishes one (movement is refilled at step 5, and `StartWork`
- *   requires movement), which is a **placeholder** reading of "a worker does one
+ *   the same turn it finishes one (movement is refilled at the end of the turn —
+ *   step 7 — and `StartWork` requires movement), which is a **placeholder** reading
+ *   of "a worker does one
  *   thing at a time": it is chosen to be playable and is not sourced from Civ 3.
  */
 const advanceWork = (state: GameState): TurnOutcome => {
@@ -211,9 +244,9 @@ const refillMovement = (state: GameState, ruleset: RulesetView): GameState => {
 /**
  * Advance the world by exactly one turn: work progress for every unit, then
  * growth for every city, then production for every city, then **research** for every
- * civilization, then **the money loop**, then refill movement, then `turn += 1` — in
- * that order, for the reasons in the module note (the first step is first because an
- * improvement finished this turn pays out this turn).
+ * civilization, then **the money loop**, then **the barbarian step**, then refill
+ * movement, then `turn += 1` — in that order, for the reasons in the module note (the
+ * first step is first because an improvement finished this turn pays out this turn).
  *
  * M5's step sits *after production and before the money loop*, and both halves of
  * that placement are the contract's:
@@ -256,8 +289,18 @@ const refillMovement = (state: GameState, ruleset: RulesetView): GameState => {
  *   disbanded this turn still exists when the refill runs, and "gone" is the
  *   honest answer.)
  *
- * The event list is in pipeline order — work, growth, production, research, money —
- * so a consumer reads what was built, then what was researched, then what both cost.
+ * M6's step is *after the money loop and before the refill* — the contract fixes that
+ * position, and both halves of it are observable. The module note above argues them;
+ * the short version is that a civilization still collects a city's gold on the turn a
+ * barbarian takes it (the ledger was read two steps earlier), and that an attack, which
+ * costs a unit all of its movement, is paid for out of *this* turn's budget because the
+ * refill that hands the budget back runs after it. `barbarians.ts` decides what the
+ * barbarians do; this function only decides when, and the step is a no-op for a state
+ * whose barbarian player owns no units (which is every state `newGame` builds).
+ *
+ * The event list is in pipeline order — work, growth, production, research, money,
+ * barbarians — so a consumer reads what was built, then what was researched, then what
+ * both cost, then what the barbarians did about it.
  *
  * Pure: the returned state is a fresh object built from `state`, which is never
  * modified, and the same `(state, ruleset)` always yields an equal result.
@@ -272,7 +315,13 @@ export const advanceTurn = (state: GameState, ruleset: RulesetView): TurnOutcome
   const researched = applyResearch(produced.state, ruleset);
   // M4b, step 5: income, upkeep and bankruptcy for every civilization.
   const paid = applyEconomy(researched.state, ruleset);
-  const refilled = refillMovement(paid.state, ruleset);
+  // M6, step 6: the barbarians' turn. Engine behaviour with no policy behind it, run
+  // *after* the money loop (so a city a barbarian captures this turn still paid its
+  // former owner this turn) and *before* the refill (so the movement an attack spends
+  // is this turn's, and the band is refilled at the end of it like every other unit).
+  // Moving this call changes outcomes in both directions — `turn.test.ts` pins both.
+  const barbarians = advanceBarbarians(paid.state, ruleset);
+  const refilled = refillMovement(barbarians.state, ruleset);
 
   return {
     state: { ...refilled, turn: refilled.turn + 1 },
@@ -282,6 +331,7 @@ export const advanceTurn = (state: GameState, ruleset: RulesetView): TurnOutcome
       ...produced.events,
       ...researched.events,
       ...paid.events,
+      ...barbarians.events,
     ],
   };
 };

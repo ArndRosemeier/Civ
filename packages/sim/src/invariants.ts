@@ -82,14 +82,19 @@
  */
 
 import {
+  CAPTURE_POPULATION_DIVISOR,
   IMPROVEMENT_KINDS,
+  MAX_EXPERIENCE,
   MIN_GROWTH_FOOD,
   UNIT_SUPPORT_COST,
+  cityAt,
   cityRadius,
   cityYields,
   compareTileResources,
   foodBoxSize,
+  hitPointsLeftOf,
   itemCost,
+  maxHitPointsOf,
   neighbors8,
   unitById,
   unitDef,
@@ -649,6 +654,21 @@ const cityPopulationAtLeastOne = (ctx: InvariantContext): readonly string[] =>
  * (bound 1) and the claim that holds whenever no growth-food building arrived after
  * growth ran (bound 2).
  *
+ * ## The second exemption, which M6 adds: a captured city
+ *
+ * Neither bound is claimed for a city whose food surplus is **not positive**, and the
+ * reason is a premise both bounds share: they are statements about a box the growth pass
+ * spent, and the pass spends nothing when there is nothing to spend. `applyGrowth` returns
+ * early on a surplus of exactly zero (the box keeps whatever it had) and draws a negative
+ * surplus down without ever comparing it to a threshold.
+ *
+ * What makes that premise reachable is M6's capture: `captureCity` clears the captured
+ * city's worked tiles, so a captured city has no tile yield at all — and one the
+ * *barbarians* hold keeps none, because no policy speaks for them — which leaves a box the
+ * sack preserved sitting at the full level for its new population turn after turn, legally.
+ * The sack's own promises are checked by `city-food-conservation`, which is where a reader
+ * asking about food arrives.
+ *
  * ## The one limit bound 2 has, stated rather than discovered later
  *
  * Bound 2 says "growth spent a box this full". That is a statement about a growth pass
@@ -675,6 +695,23 @@ const cityFoodBoxWithinThreshold = (ctx: InvariantContext): readonly string[] =>
           `goes below zero`,
       ];
     }
+
+    // M6: both bounds below are claims about a box the growth pass **spent**, and the pass
+    // only touches a box when the city has food to spare. `applyGrowth` returns early on a
+    // surplus of exactly zero — the box keeps whatever it had — and a negative surplus
+    // draws the box down without ever comparing it to a threshold. So the premise of both
+    // claims is `foodSurplus > 0`, stated here and read from the same `cityYields` the pass
+    // reads, rather than assumed.
+    //
+    // This is the shape a **sack** makes reachable, and the engine reaches it without any
+    // bug: `captureCity` clears the captured city's worked tiles, so a captured city has no
+    // tile yield at all — most visibly one the barbarians hold, because nothing assigns
+    // tiles for a player no policy speaks for. Its box, which the sack preserved, then sits
+    // at the full level for its new population turn after turn, legally, because nothing
+    // spends it. The sack's own promises (the halving, and that the box it inherited is the
+    // one growth left) are checked by `city-food-conservation`, which is where a reader
+    // asking about food arrives.
+    if (cityYields(ctx.state, ctx.rulesetView, city.id).foodSurplus <= 0) return [];
 
     const bare = foodBoxSize(city.population);
     if (box >= bare) {
@@ -932,6 +969,439 @@ const unitMovementInRange = (ctx: InvariantContext): readonly string[] => {
         `${label} has ${String(movement)} movement left, more than its ${String(def.movement)} ` +
           `per turn`,
       );
+    }
+  }
+
+  return problems;
+};
+
+/* ------------------------------------------------------------------ *
+ * M6 — combat
+ *
+ * The six predicates the combat wave adds, and the shape of every one of them: a
+ * claim about a *field the state states*, read through the engine's own readers
+ * (`hitPointsLeftOf`, `maxHitPointsOf`, `cityAt`) rather than through a second
+ * opinion, and a paired claim about the **event stream** where the property is a
+ * transition rather than a state (a capture, a battle's hit points).
+ *
+ * The measured magnitudes are *not* restated here: `MAX_EXPERIENCE` and
+ * `CAPTURE_POPULATION_DIVISOR` come from `@civts/core` (`combat.ts` and `cities.ts`),
+ * so a knob that moves moves these checks with it. Nothing below is a balance claim,
+ * and nothing here is a Civ 3 number — the same provenance rule the module doc states
+ * for the whole file.
+ *
+ * Two readings are deliberately **not** made, and both for the same reason (see the
+ * module doc's "reading the context honestly"): a turn's boundary is not the moment a
+ * capture happened. So `captured-city-consistent` does not compare the city's
+ * population or building list *after* the capture with what the sack left, because
+ * growth, starvation and production all run later in the same turn and may legally
+ * move both. What it checks instead are the facts no later step can undo: the city
+ * still exists, it changed hands, the sack is real, and the population in the event
+ * is the capture rule applied to the population the city had at the boundary.
+ * ------------------------------------------------------------------ */
+
+/** Every `CityCaptured` line of the transition. */
+const capturedEvents = (
+  events: readonly GameEvent[],
+): readonly Extract<GameEvent, { type: 'CityCaptured' }>[] =>
+  events.flatMap((event) => (event.type === 'CityCaptured' ? [event] : []));
+
+/** Every `UnitDestroyed` line of the transition. */
+const destroyedEvents = (
+  events: readonly GameEvent[],
+): readonly Extract<GameEvent, { type: 'UnitDestroyed' }>[] =>
+  events.flatMap((event) => (event.type === 'UnitDestroyed' ? [event] : []));
+
+/**
+ * The population a city held **at each moment it was captured** this transition, plus
+ * the population the event stream leaves it holding.
+ *
+ * Why this exists at all: a city's population has **two** writers since M6 — the growth
+ * pass, and a sack (`cities.ts`' `captureCity`, which halves it) — and they can both
+ * run in one turn, in either order. A civilization's attack happens in the *command*
+ * phase, before `advanceTurn`; a **barbarian's** attack happens inside the pipeline,
+ * after the growth pass and after production (`turn.ts` step 6). So "the population this
+ * city had at the boundary" (`previous.population`) is the wrong number to check a sack
+ * against whenever growth ran first, and "the population the state ends with" is the
+ * wrong number whenever growth ran after.
+ *
+ * The event stream is what resolves it, because it is **ordered**: this walks the
+ * transition's events in order, holding the last population any line named for this city
+ * (`CityGrew`, `CityStarved`, `CityCaptured`), and returns the value held at each
+ * capture. `after` is the same fold's final value — the population the stream says the
+ * city holds when the turn ends, which is what the state must show.
+ *
+ * A city with no such line at all falls back to `boundary`, the population
+ * `previous.state` held, which is the only thing a transition with no events can say.
+ */
+const captureTrail = (
+  events: readonly GameEvent[],
+  cityId: CityId,
+  boundary: number,
+): { readonly atCapture: readonly number[]; readonly after: number } => {
+  const atCapture: number[] = [];
+  let held = wholeNumber(boundary) ?? 0;
+
+  for (const event of events) {
+    if (event.type === 'CityGrew' || event.type === 'CityStarved') {
+      if (event.cityId !== cityId) continue;
+      const named = wholeNumber(event.population);
+      if (named !== undefined) held = named;
+      continue;
+    }
+    if (event.type !== 'CityCaptured') continue;
+    if (event.cityId !== cityId) continue;
+    atCapture.push(held);
+    const sacked = wholeNumber(event.population);
+    if (sacked !== undefined) held = sacked;
+  }
+
+  return { atCapture, after: held };
+};
+
+/**
+ * The index of the `CityCaptured` line for `cityId` that happened **after the
+ * production pass**, or `-1`.
+ *
+ * The money loop is the step immediately after production (`turn.ts`), so any event
+ * after the turn's first `IncomeCollected` line is after production too — and the only
+ * capture that can be there is the barbarian step's, since a civilization's attack is a
+ * command and commands run before the pipeline. This is how the checks below tell a
+ * sack that *cleared the city's worked tiles before production counted them* from one
+ * that cleared them *after*.
+ */
+const sackAfterProduction = (events: readonly GameEvent[], cityId: CityId): number => {
+  const moneyAt = events.findIndex((event) => event.type === 'IncomeCollected');
+  if (moneyAt === -1) return -1;
+  return events.findIndex(
+    (event, index) => index > moneyAt && event.type === 'CityCaptured' && event.cityId === cityId,
+  );
+};
+
+/** Every `CombatResolved` line of the transition. */
+const combatEvents = (
+  events: readonly GameEvent[],
+): readonly Extract<GameEvent, { type: 'CombatResolved' }>[] =>
+  events.flatMap((event) => (event.type === 'CombatResolved' ? [event] : []));
+
+/**
+ * `unit-hit-points-in-range` — a stored hit-point count is a whole number in
+ * `1..its own maximum`.
+ *
+ * **Absence is not a violation.** `units.ts` defines a unit with no `hitPointsLeft`
+ * as `DEFAULT_HIT_POINTS` (1) — that is the reading `hitPointsLeftOf` implements and
+ * the reading combat itself uses — so a state that omits the field states a value, it
+ * does not state *nothing*. The claim here is about the values a state states: a
+ * fraction, a zero, a negative or a count above the type's full health is a
+ * contradiction, and the maximum comes from `maxHitPointsOf`, the engine's own
+ * "full health for this unit" (whose fallback is the unit's own count, so a type the
+ * view cannot describe is bounded by what it claims rather than by an invented
+ * number — `unit-movement-in-range` reports that case instead because movement has no
+ * such fallback).
+ */
+const unitHitPointsInRange = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+
+  for (const unit of ctx.state.units) {
+    const stored = unit.hitPointsLeft;
+    if (stored === undefined) continue;
+
+    const label = `unit ${String(unit.id)} (${String(unit.type)})`;
+    const left = wholeNumber(stored);
+    if (left === undefined || left < 1) {
+      problems.push(
+        `${label} has ${describeValue(stored)} hit points left; a stored count is a whole ` +
+          'number >= 1, because a unit at 0 is destroyed rather than stored ' +
+          '(`withHitPointsLeft` is the only writer that lowers the field, and `removeUnit` ' +
+          'is what a wound to nothing ends in)',
+      );
+      continue;
+    }
+
+    const maximum = maxHitPointsOf(unitDef(ctx.rulesetView, unit.type), left);
+    if (left > maximum) {
+      problems.push(
+        `${label} has ${String(left)} hit points left, more than its ${String(maximum)} at full ` +
+          'health',
+      );
+    }
+  }
+
+  return problems;
+};
+
+/**
+ * `unit-hit-points-above-zero` — nothing in the world is a live unit at 0 hit points.
+ *
+ * Two readings of one rule, because "a unit at 0 is dead" is both a claim about the
+ * state and a claim about the transition that produced it:
+ *
+ * - a unit **in** `state.units` with a stored count of 0 or less is exactly the shape
+ *   the engine promises never to write (`woundUnit` removes the unit when the damage
+ *   takes it to nothing), so it is reported here;
+ * - a unit a `UnitDestroyed` line of this transition names must **not** still be in
+ *   the world. That is the same rule read from the other side, and it is what catches
+ *   a resolver that reports a death and leaves the corpse in the hashed state.
+ *
+ * `hitPointsLeftOf` is deliberately not used for the first reading: it floors at 1, so
+ * it *cannot* see the value this check is about. The state's own stored value is read
+ * directly, and absence is skipped for the reason `unit-hit-points-in-range` states.
+ */
+const unitHitPointsAboveZero = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+
+  for (const unit of ctx.state.units) {
+    const stored = wholeNumber(unit.hitPointsLeft);
+    if (stored !== undefined && stored <= 0) {
+      problems.push(
+        `unit ${String(unit.id)} (${String(unit.type)}) is in the world with ${String(stored)} ` +
+          'hit points left; a unit that reaches 0 is destroyed, not stored',
+      );
+    }
+  }
+
+  const present = new Set(ctx.state.units.map((unit) => Number(unit.id)));
+  for (const event of destroyedEvents(ctx.events)) {
+    if (!present.has(Number(event.unitId))) continue;
+    const why = event.reason === 'combat' ? 'in combat' : 'by bankruptcy';
+    problems.push(
+      `unit ${String(event.unitId)} was destroyed ${why} this transition and is still in ` +
+        'state.units',
+    );
+  }
+
+  return problems;
+};
+
+/**
+ * `unit-experience-in-range` — a stored promotion level is a whole number in
+ * `0..MAX_EXPERIENCE`.
+ *
+ * `MAX_EXPERIENCE` is the cap `combat.ts` states and `promoteUnit` clamps to, imported
+ * rather than restated. Absence means zero (`experienceOf`) and is not a violation;
+ * a value *above* the cap means a promotion that outran the cap.
+ */
+const unitExperienceInRange = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+
+  for (const unit of ctx.state.units) {
+    const stored = unit.experience;
+    if (stored === undefined) continue;
+
+    const earned = wholeNumber(stored);
+    if (earned === undefined || earned < 0 || earned > MAX_EXPERIENCE) {
+      problems.push(
+        `unit ${String(unit.id)} (${String(unit.type)}) has ${describeValue(stored)} experience; ` +
+          `a stored level is a whole number in 0..${String(MAX_EXPERIENCE)}, the cap ` +
+          '`promoteUnit` clamps a promotion to',
+      );
+    }
+  }
+
+  return problems;
+};
+
+/**
+ * `unit-not-inside-foreign-city` — a unit never stands inside a city it does not own.
+ *
+ * The city on a tile is what owns that tile, so an enemy unit standing on one is a
+ * state no command can reach: an undefended city changes hands when it is attacked
+ * (`captureCity` transfers it), and a defended one is a battle that leaves the
+ * defender where it was. `cityAt` is the engine's own "what city is on this tile", so
+ * the check cannot disagree with `planAttackUnit` about which tile holds a city.
+ */
+const unitNotInsideForeignCity = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+
+  for (const unit of ctx.state.units) {
+    const city = cityAt(ctx.state, unit.tile);
+    if (city === undefined || city.owner === unit.owner) continue;
+    problems.push(
+      `unit ${String(unit.id)} (${String(unit.type)}, owned by player ${String(unit.owner)}) ` +
+        `stands inside city ${String(city.id)} (${city.name}) on tile ` +
+        `${String(unit.tile)}, which player ${String(city.owner)} owns`,
+    );
+  }
+
+  return problems;
+};
+
+/**
+ * `captured-city-consistent` — a city a `CityCaptured` line names is consistent after
+ * the ownership change.
+ *
+ * Every claim below is one a later step of the same turn cannot undo, which is what
+ * makes this checkable at a turn boundary (see the block comment above for the two
+ * comparisons that are deliberately *not* made):
+ *
+ * - the city still exists — a capture transfers a city, it never removes one;
+ * - its owner is the event's `to` (the keystone invariant's own claim: the state and
+ *   the event stream tell one story about who holds the city);
+ * - its id, name and tile are the event's;
+ * - every building the sack destroyed is gone from the city (a destroyed building
+ *   cannot be rebuilt inside the same turn), the destroyed list holds no duplicate,
+ *   and no destroyed building is a **wonder** in this ruleset — the one class of
+ *   building a sack preserves;
+ * - with a `previous` snapshot: the event's `population` is the capture rule applied
+ *   to the population the city held **when it was taken** (`max(1, floor(population /
+ *   CAPTURE_POPULATION_DIVISOR))`, the divisor imported from `cities.ts`) — read from the
+ *   *ordered* event stream by `captureTrail`, because growth can run before a sack
+ *   (barbarians attack inside the pipeline) as well as after one (a civilization attacks
+ *   in the command phase) — and every building the city holds that the sack did *not*
+ *   destroy was already there.
+ */
+const capturedCityConsistent = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  const events = capturedEvents(ctx.events);
+  if (events.length === 0) return problems;
+
+  for (const event of events) {
+    const city = ctx.state.cities.find((each) => each.id === event.cityId);
+    if (city === undefined) {
+      problems.push(
+        `city ${String(event.cityId)} (${event.name}) was captured by player ` +
+          `${String(event.to)} and is not in state.cities; a capture transfers a city and ` +
+          'never removes it',
+      );
+      continue;
+    }
+
+    const label = `city ${String(city.id)} (${city.name})`;
+
+    // A city can change hands **twice in one turn** — a civilization takes it in the
+    // command phase and the barbarian step takes it back later — so only the *last* sack
+    // is the one the state reflects. Everything that compares the after-state with a
+    // sack's own effect (the owner, the sack's list of destroyed buildings) is therefore
+    // checked against the last line for this city, and the claims that hold for every
+    // sack regardless of what came after (the city still exists, it kept its identity,
+    // no sack takes a wonder, and every sack's population arithmetic) are checked for
+    // all of them.
+    const sacks = capturedEvents(ctx.events).filter((each) => each.cityId === event.cityId);
+    const isLastSack = sacks.indexOf(event) === sacks.length - 1;
+
+    if (isLastSack && city.owner !== event.to) {
+      problems.push(
+        `${label} is owned by player ${String(city.owner)} after a capture the event stream ` +
+          `credits to player ${String(event.to)}`,
+      );
+    }
+    if (city.tile !== event.tile) {
+      problems.push(
+        `${label} stands on tile ${String(city.tile)}, but the capture event names tile ` +
+          `${String(event.tile)}; a sack does not move a city`,
+      );
+    }
+    if (city.name !== event.name) {
+      problems.push(
+        `${label} is named ${JSON.stringify(city.name)}, but the capture event names ` +
+          `${JSON.stringify(event.name)}; a sack does not rename a city`,
+      );
+    }
+
+    const destroyed = new Set(event.destroyed.map((id) => String(id)));
+    if (destroyed.size !== event.destroyed.length) {
+      problems.push(
+        `${label} was sacked by an event that lists ${String(event.destroyed.length)} destroyed ` +
+          'building(s) with a duplicate in them',
+      );
+    }
+    for (const id of event.destroyed) {
+      if (isLastSack && city.buildings.some((held) => String(held) === String(id))) {
+        problems.push(
+          `${label} still holds building "${String(id)}", which the capture event lists as ` +
+            'destroyed',
+        );
+      }
+      const row = buildingRows(ctx.rulesetView).find((def) => def.id === id);
+      if (row?.wonder === true) {
+        problems.push(
+          `${label} lost the wonder "${row.name}" to a sack; a capture preserves every wonder`,
+        );
+      }
+    }
+
+    const before = ctx.previous?.cities.find((each) => each.id === event.cityId);
+    if (before === undefined) continue;
+
+    // The population the city held **when it was taken**, read from the ordered event
+    // stream rather than from the boundary: the growth pass can run before a sack (the
+    // barbarian step is inside the pipeline) and after one (a civilization attacks in the
+    // command phase), so `previous.population` is the right number only in the second
+    // case and `state.population` only sometimes. See `captureTrail`.
+    const trail = captureTrail(ctx.events, event.cityId, before.population);
+    const position = capturedEvents(ctx.events)
+      .filter((each) => each.cityId === event.cityId)
+      .indexOf(event);
+    const held = position === -1 ? before.population : trail.atCapture[position];
+    if (held === undefined) continue;
+
+    const expectedPopulation = Math.max(1, Math.floor(held / CAPTURE_POPULATION_DIVISOR));
+    if (event.population !== expectedPopulation) {
+      problems.push(
+        `${label} held ${String(held)} people when it was captured and the event says ` +
+          `${String(event.population)}; the capture rule is max(1, floor(population / ` +
+          `${String(CAPTURE_POPULATION_DIVISOR)})) = ${String(expectedPopulation)}`,
+      );
+    }
+
+    if (!isLastSack) continue;
+
+    const kept = city.buildings.filter((held) => !destroyed.has(String(held)));
+    const invented = kept.filter(
+      (held) => !before.buildings.some((was) => String(was) === String(held)),
+    );
+    if (invented.length > 0) {
+      problems.push(
+        `${label} holds ${invented.map((id) => `"${String(id)}"`).join(', ')} after a capture, ` +
+          'and the city it was taken from did not hold ' +
+          (invented.length === 1 ? 'it' : 'them'),
+      );
+    }
+  }
+
+  return problems;
+};
+
+/**
+ * `combat-hit-point-conservation` — a battle never raises a combatant's hit points.
+ *
+ * "Total hit points never increase through a battle", read per side, which is the
+ * stronger claim: the two combatants' counts *after* the battle are at most what they
+ * were at the boundary, so the total cannot rise either. A resolver that healed the
+ * winner — the natural bug, since it is the winner whose hit points survive to be
+ * written back — is what this catches.
+ *
+ * A combatant that is **not in `previous`** is skipped, and that is not a loophole:
+ * `previous` is the turn's boundary, and a band raised by a hut *earlier in the same
+ * turn* can fight inside that turn without having existed at the boundary, so the
+ * transition genuinely cannot say what it started with. `hitPointsLeftOf` is the
+ * engine's own reading (an absent field is one hit point), and a unit that is gone
+ * from the after-state counts as 0 — destroyed is the smallest count there is.
+ */
+const combatHitPointConservation = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  const previous = ctx.previous;
+  if (previous === undefined) return problems;
+
+  for (const event of combatEvents(ctx.events)) {
+    const sides = [
+      { role: 'attacker', id: event.attackerId, owner: event.attackerOwner },
+      { role: 'defender', id: event.defenderId, owner: event.defenderOwner },
+    ];
+    for (const side of sides) {
+      const before = previous.units.find((unit) => unit.id === side.id);
+      if (before === undefined) continue;
+      const after = ctx.state.units.find((unit) => unit.id === side.id);
+      const was = hitPointsLeftOf(before);
+      const now = after === undefined ? 0 : hitPointsLeftOf(after);
+      if (now > was) {
+        problems.push(
+          `unit ${String(side.id)} went into the battle on tile ${String(event.target)} with ` +
+            `${String(was)} hit points and has ${String(now)} after it, as the battle's ` +
+            `${side.role} (player ${String(side.owner)}); a battle never raises a combatant's ` +
+            'hit points, so the pair cannot total more than it started with',
+        );
+      }
     }
   }
 
@@ -1314,6 +1784,69 @@ const cityFoodConservation = (ctx: InvariantContext): readonly string[] => {
     const grew = grewEvents(ctx.events).filter((event) => event.cityId === id);
     const starved = starvedEvents(ctx.events).filter((event) => event.cityId === id);
 
+    // M6: a city can change hands inside a turn, and a sack **rewrites its population**
+    // (`cities.ts`' `captureCity` halves it). That is a second writer of a number this
+    // check used to be able to call the growth pass's alone, so the captured case is
+    // handled here: what the sack did is checked exactly (against the population the
+    // city held when it was taken, read from the *ordered* event stream by
+    // `captureTrail`), and the growth arithmetic below — which is stated over a
+    // population the sack replaced — is not run. Skipping it is not a weaker check in
+    // either direction: the sack's own rule is checked to the digit, and it is checked
+    // *here* rather than only in `captured-city-consistent`, because this is the check a
+    // reader asks about food.
+    const sacked = capturedEvents(ctx.events).filter((event) => event.cityId === id);
+    if (sacked.length > 0) {
+      const trail = captureTrail(ctx.events, id, popBefore);
+
+      for (let index = 0; index < sacked.length; index += 1) {
+        const capture = sacked[index];
+        if (capture === undefined) continue;
+        const held = trail.atCapture[index];
+        if (held === undefined) continue;
+        const expected = Math.max(1, Math.floor(held / CAPTURE_POPULATION_DIVISOR));
+        if (capture.population !== expected) {
+          problems.push(
+            `${label} was captured with a population of ${String(capture.population)} while it ` +
+              `held ${String(held)}; the capture rule is max(1, floor(population / ` +
+              `${String(CAPTURE_POPULATION_DIVISOR)})) = ${String(expected)}`,
+          );
+        }
+      }
+
+      // The state shows the last population the stream named for this city — the sack's
+      // own number unless the growth pass ran *after* it (a barbarian takes a city inside
+      // the pipeline, a civilization takes one before it).
+      if (popAfter !== trail.after) {
+        problems.push(
+          `${label}'s population is ${String(popAfter)} after being captured, but the event ` +
+            `stream leaves it holding ${String(trail.after)} (population ${String(popBefore)} at ` +
+            "the boundary, then whatever this turn's growth, starvation and sacks named)",
+        );
+      }
+
+      // The sack preserves the food box (`captureCity` copies it), so the box is still
+      // the growth pass's number whenever the pass named one — and a starvation always
+      // zeroes it. With no growth-pass line at all the box the sack inherited is not
+      // recoverable from the state, and nothing is claimed about it here.
+      const boxNamed = [...grew, ...starved].at(-1);
+      if (boxNamed !== undefined && boxAfter !== boxNamed.foodBox) {
+        problems.push(
+          `${label} was captured this turn and its food box is ${String(boxAfter)}, but the ` +
+            `growth pass left it at ${String(boxNamed.foodBox)} and a sack preserves the box`,
+        );
+      }
+
+      if (!ran && boxAfter !== boxBefore) {
+        problems.push(
+          `${label}'s food box moved ${String(boxBefore)} -> ${String(boxAfter)}, but this ` +
+            'transition carries no IncomeCollected line, so no turn pipeline ran: a command ' +
+            'never moves a food box (and a capture preserves it)',
+        );
+      }
+
+      continue;
+    }
+
     if (grew.length > 1) {
       problems.push(`${label} grew ${String(grew.length)} times in one turn`);
     }
@@ -1488,6 +2021,18 @@ const cityShieldConservation = (ctx: InvariantContext): readonly string[] => {
       continue;
     }
 
+    // M6: a sack that happens **after** the production pass — the barbarian step, which
+    // runs between the money loop and the refill — clears the captured city's worked
+    // tiles, so the assignment production counted is no longer the assignment the state
+    // shows and the bracket below cannot be computed from it. The sack itself preserves
+    // the stored shields (`captureCity`), so the number the arithmetic would check is
+    // exactly the one the cleared assignment hides. The claim is skipped, and said out
+    // loud here; the event/state agreement and the completion's own consequences below
+    // still run, and a *civilization's* sack needs no exemption at all: it happens in the
+    // command phase, before production, so the cleared assignment is the one production
+    // saw and the bracket is already about it.
+    if (sackAfterProduction(ctx.events, id) !== -1) continue;
+
     const completions = producedEvents(ctx.events).filter((event) => event.cityId === id);
     if (completions.length > 1) {
       problems.push(
@@ -1613,11 +2158,35 @@ const completionConsequences = (
 
   const spawned = unitById(ctx.state, unitId);
   if (spawned === undefined) {
+    // M6: the **barbarian step runs after production**, so a band can destroy a unit the
+    // same turn's production spawned — a death, not a disappearance. The claim becomes
+    // the one a death supports: it was killed in combat, as the right kind of unit, of
+    // the city's own owner. `UnitDisbanded` is checked first because the money loop's
+    // path still reports itself there, and its message says more about that case.
+    const killed = destroyedEvents(ctx.events).find(
+      (event) => event.unitId === unitId && event.reason === 'combat',
+    );
+    if (killed !== undefined) {
+      if (killed.owner !== cityAfter.owner) {
+        problems.push(
+          `unit ${String(unitId)} was killed in combat for player ${String(killed.owner)} but was ` +
+            `produced by ${label}`,
+        );
+      }
+      if (killed.unitType !== completion.item.id) {
+        problems.push(
+          `unit ${String(unitId)} was killed in combat as ${String(killed.unitType)}, not the ` +
+            `${String(completion.item.id)} ${label} built`,
+        );
+      }
+      return problems;
+    }
+
     const disbanded = disbandEvents(ctx.events).find((event) => event.unitId === unitId);
     if (disbanded === undefined) {
       problems.push(
         `${label} completed ${describeItem(completion.item)} as unit ${String(unitId)}, which is ` +
-          `in neither the state nor a UnitDisbanded event of the same turn`,
+          `in neither the state nor a UnitDisbanded or UnitDestroyed event of the same turn`,
       );
       return problems;
     }
@@ -1828,6 +2397,36 @@ export const CORE_INVARIANTS: readonly Invariant[] = [
     name: 'unit-movement-in-range',
     description: "A unit's remaining movement is a whole number within its own maximum.",
     check: unitMovementInRange,
+  },
+  {
+    name: 'unit-hit-points-in-range',
+    description: "A stored hit-point count is a whole number within the unit type's maximum.",
+    check: unitHitPointsInRange,
+  },
+  {
+    name: 'unit-hit-points-above-zero',
+    description: 'No unit in the world is at 0 hit points, and no destroyed unit lingers.',
+    check: unitHitPointsAboveZero,
+  },
+  {
+    name: 'unit-experience-in-range',
+    description: 'A stored promotion level is a whole number within the experience cap.',
+    check: unitExperienceInRange,
+  },
+  {
+    name: 'unit-not-inside-foreign-city',
+    description: 'A unit never stands on the tile of a city another player owns.',
+    check: unitNotInsideForeignCity,
+  },
+  {
+    name: 'captured-city-consistent',
+    description: 'A captured city changed hands, kept its identity, and was sacked as reported.',
+    check: capturedCityConsistent,
+  },
+  {
+    name: 'combat-hit-point-conservation',
+    description: "A battle never raises a combatant's hit points above what it started with.",
+    check: combatHitPointConservation,
   },
   {
     name: 'improvements-sorted-and-unique',

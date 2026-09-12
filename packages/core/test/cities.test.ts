@@ -15,13 +15,18 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { canonicalize, hashValue } from '@civts/testing';
 import {
+  CAPTURE_POPULATION_DIVISOR,
   CITY_RADIUS,
   FOOD_PER_CITIZEN,
   MIN_CITY_DISTANCE,
   autoAssignWorkedTiles,
   buildingCatalog,
   buildingDef,
+  buildingsLostToCapture,
+  captureCity,
+  capturedPopulation,
   citiesOf,
   cityAt,
   cityById,
@@ -717,5 +722,400 @@ describe('building catalog', () => {
     const other: ProductionItem = { kind: 'unit', id: asUnitTypeId('warrior') };
     expect(item.kind).toBe('building');
     expect(other.kind).toBe('unit');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M6 — capture: what a city becomes when it changes hands
+ *
+ * These are the *rules* of a capture, asserted directly on the module that owns
+ * them. The question "may this attack take that city" belongs to `commands.ts`
+ * (`planAttackUnit`) and is swept in `commands.test.ts`; what is pinned here is the
+ * aftermath — the halved and floored population, which buildings a sack takes and in
+ * what order, and the two fields M6 deliberately leaves alone.
+ *
+ * Every number in this section is a **placeholder** of ours. The contract states
+ * "halved, floored, minimum 1" and "(maintenance-descending)" without a source, and
+ * `CAPTURE_POPULATION_DIVISOR` says so where it is declared; nothing here is a
+ * Civ 3 figure, and none of it is claimed to be one.
+ * ------------------------------------------------------------------ */
+
+/**
+ * M6's building rows for this file: distinct maintenance values, two rows tied at 1
+ * (so the tie rule is exercised), a free row, and a wonder with the **highest**
+ * maintenance in the catalog — so "keep the cheap ones" cannot pass the wonder test
+ * by accident.
+ */
+const CAPTURE_RULESET: RulesetView = {
+  terrains: TERRAINS,
+  units: [],
+  buildings: [
+    { id: asBuildingId('granary'), name: 'Granary', cost: 10, maintenance: 0, effects: [] },
+    { id: asBuildingId('library'), name: 'Library', cost: 20, maintenance: 1, effects: [] },
+    { id: asBuildingId('walls'), name: 'City Walls', cost: 15, maintenance: 1, effects: [] },
+    { id: asBuildingId('marketplace'), name: 'Marketplace', cost: 12, maintenance: 2, effects: [] },
+    {
+      id: asBuildingId('pyramids'),
+      name: 'Pyramids',
+      cost: 30,
+      maintenance: 3,
+      effects: [],
+      wonder: true,
+    },
+  ],
+  improvements: [],
+  fidelity: 'tuned',
+};
+
+/** The catalog of that view, as `buildingsLostToCapture` takes it. */
+const CAPTURE_CATALOG = CAPTURE_RULESET.buildings ?? [];
+
+describe('capturedPopulation', () => {
+  it('halves, floors and never goes below 1', () => {
+    // Pinned as the placeholder rule it is, divisor included: 5 -> 2 (the floor bites),
+    // 4 -> 2, 3 -> 1, 2 -> 1, 1 -> 1 (the minimum bites).
+    expect(CAPTURE_POPULATION_DIVISOR).toBe(2);
+    expect([10, 9, 5, 4, 3, 2, 1].map((population) => capturedPopulation(population))).toEqual([
+      5, 4, 2, 2, 1, 1, 1,
+    ]);
+  });
+
+  it('answers the minimum for a population a real state could not hold', () => {
+    // Total on purpose: a hand-built or foreign save can carry a population that is not
+    // a positive whole number, and a fraction here would reach `canonicalize` and throw
+    // (or, worse, reach a growth step and make a city that never grows).
+    for (const population of [0, -1, -100, 1.5, 0.5, NaN, Infinity, -Infinity]) {
+      expect(capturedPopulation(population)).toBe(1);
+    }
+  });
+
+  it('is monotonic, and always an integer', () => {
+    // The property a retune must not break, stated independently of the divisor: a
+    // bigger city never loses less than a smaller one, and the answer is always a whole
+    // number of citizens at least 1.
+    let previous = 1;
+    for (let population = 1; population <= 60; population += 1) {
+      const after = capturedPopulation(population);
+      expect(Number.isInteger(after)).toBe(true);
+      expect(after).toBeGreaterThanOrEqual(1);
+      expect(after).toBeLessThanOrEqual(population);
+      expect(after).toBeGreaterThanOrEqual(previous);
+      previous = after;
+    }
+  });
+
+  it('does not read the city — a number in, a number out', () => {
+    // The rule is a function of the population alone, which is what makes it pinnable
+    // without a board. Stated as its own test because the tempting alternative (a
+    // capture that consults buildings, terrain or a granary) would be a different rule.
+    expect(capturedPopulation.length).toBe(1);
+  });
+});
+
+describe('buildingsLostToCapture', () => {
+  it('destroys every non-wonder building, maintenance-descending, ties to the last built', () => {
+    const held = city(0, 0, CENTRE, {
+      buildings: [
+        asBuildingId('granary'), // maintenance 0
+        asBuildingId('library'), // maintenance 1, built first of the two
+        asBuildingId('walls'), // maintenance 1, built second
+        asBuildingId('marketplace'), // maintenance 2
+        asBuildingId('pyramids'), // maintenance 3 — a wonder, and therefore kept
+      ],
+    });
+
+    expect(buildingsLostToCapture(CAPTURE_CATALOG, held)).toEqual([
+      asBuildingId('marketplace'), // 2
+      asBuildingId('walls'), // 1, and later in the list than the library
+      asBuildingId('library'), // 1
+      asBuildingId('granary'), // 0 — destroyed even though it is free to keep
+    ]);
+  });
+
+  it('never destroys a wonder, whoever holds it and however dear it is', () => {
+    // The wonder here has the *highest* maintenance in the catalog, so an order that
+    // simply took the expensive rows first would have taken it: this is the exemption
+    // being tested rather than the sort.
+    for (const buildings of [
+      [asBuildingId('pyramids')],
+      [asBuildingId('pyramids'), asBuildingId('marketplace')],
+      [asBuildingId('marketplace'), asBuildingId('pyramids'), asBuildingId('granary')],
+    ]) {
+      expect(
+        buildingsLostToCapture(CAPTURE_CATALOG, city(0, 0, CENTRE, { buildings })),
+      ).not.toContain(asBuildingId('pyramids'));
+    }
+
+    // …and a city holding nothing but a wonder loses nothing at all: "no buildings
+    // destroyed" is a legal answer, and the empty list is how it is spelled.
+    expect(
+      buildingsLostToCapture(
+        CAPTURE_CATALOG,
+        city(0, 0, CENTRE, {
+          buildings: [asBuildingId('pyramids')],
+        }),
+      ),
+    ).toEqual([]);
+    expect(buildingsLostToCapture(CAPTURE_CATALOG, city(0, 0, CENTRE))).toEqual([]);
+  });
+
+  it('destroys a row the catalog does not describe, ordered as a free one', () => {
+    // A city holding an entry nothing can keep or apply is exactly the state a sack
+    // should clean up, and treating it as maintenance 0 is the honest reading: the
+    // engine has no number for it. The tie with the granary is broken by list position
+    // — the *later* entry goes first — so an unknown row built after a granary comes
+    // first, and one built before it comes second.
+    const unknownFirst = city(0, 0, CENTRE, {
+      buildings: [asBuildingId('spaceship'), asBuildingId('granary')],
+    });
+    const unknownLast = city(0, 0, CENTRE, {
+      buildings: [asBuildingId('granary'), asBuildingId('spaceship')],
+    });
+
+    expect(buildingsLostToCapture(CAPTURE_CATALOG, unknownFirst)).toEqual([
+      asBuildingId('granary'),
+      asBuildingId('spaceship'),
+    ]);
+    expect(buildingsLostToCapture(CAPTURE_CATALOG, unknownLast)).toEqual([
+      asBuildingId('spaceship'),
+      asBuildingId('granary'),
+    ]);
+  });
+
+  it('destroys everything when the ruleset describes no buildings at all', () => {
+    // "No buildings" is an empty catalog, not a missing field (see `buildingCatalog`):
+    // a view with no rows cannot say which of a city's entries is a wonder, so every
+    // entry is an unknown row — and unknown rows are destroyed.
+    const held = city(0, 0, CENTRE, {
+      buildings: [asBuildingId('library'), asBuildingId('pyramids')],
+    });
+
+    expect(buildingsLostToCapture([], held)).toEqual([
+      asBuildingId('pyramids'),
+      asBuildingId('library'),
+    ]);
+  });
+
+  it('destroys a duplicated entry twice, because it is two entries', () => {
+    // The same reading `cityMaintenance` takes of a duplicate: the state holds two
+    // buildings, so the sack takes two. The event's list is a report of what was
+    // destroyed, and reporting one would understate what the city lost.
+    const held = city(0, 0, CENTRE, {
+      buildings: [asBuildingId('library'), asBuildingId('library')],
+    });
+
+    expect(buildingsLostToCapture(CAPTURE_CATALOG, held)).toEqual([
+      asBuildingId('library'),
+      asBuildingId('library'),
+    ]);
+  });
+
+  it('is deterministic: the same city gives the same order every time', () => {
+    // The order is part of the event a capture emits, so it has to be a function of the
+    // city rather than of a sort that happens to be stable. Every row is asked twice
+    // and the results compared, which is what a comparator that is not a total order
+    // fails.
+    const held = city(0, 0, CENTRE, {
+      buildings: [
+        asBuildingId('granary'),
+        asBuildingId('library'),
+        asBuildingId('walls'),
+        asBuildingId('marketplace'),
+        asBuildingId('granary'),
+      ],
+    });
+
+    const first = buildingsLostToCapture(CAPTURE_CATALOG, held);
+    const second = buildingsLostToCapture(CAPTURE_CATALOG, held);
+    expect(second).toEqual(first);
+    expect(first).toHaveLength(5); // every entry, the wonder-free city losing all of them
+    // Nothing is invented and nothing is dropped: the multiset is the city's.
+    expect([...first].sort()).toEqual([...held.buildings].sort());
+  });
+
+  it('reads the catalog it is handed and nothing else', () => {
+    // The catalog is a parameter rather than a field of the state: the caller decides
+    // which rows exist, which is what keeps this rule usable from a save load whose
+    // ruleset may have moved on. A catalog that describes nothing takes everything.
+    const held = city(0, 0, CENTRE, { buildings: [asBuildingId('granary')] });
+    expect(buildingsLostToCapture(CAPTURE_CATALOG, held)).toEqual([asBuildingId('granary')]);
+    expect(buildingsLostToCapture([], held)).toEqual([asBuildingId('granary')]);
+  });
+});
+
+describe('captureCity', () => {
+  /** A city of player 1 on the map's middle tile, holding everything a sack touches. */
+  const TARGET = city(0, 1, CENTRE, {
+    name: 'City 1',
+    population: 5,
+    foodBox: 7,
+    shields: 3,
+    production: { kind: 'building', id: asBuildingId('marketplace') },
+    queue: [
+      { kind: 'building', id: asBuildingId('library') },
+      { kind: 'unit', id: asUnitTypeId('warrior') },
+    ],
+    buildings: [
+      asBuildingId('granary'),
+      asBuildingId('library'),
+      asBuildingId('walls'),
+      asBuildingId('pyramids'),
+    ],
+    workedTiles: [asTileIndex(at(3, 2))],
+  });
+
+  /** Player 0's city elsewhere, so "only the captured city changed" is checkable. */
+  const BYSTANDER = city(1, 0, at(0, 0), { population: 3, workedTiles: [asTileIndex(at(1, 0))] });
+
+  const board = (): GameState =>
+    state(
+      [TARGET, BYSTANDER],
+      [
+        { tile: asTileIndex(CENTRE), kind: asImprovementId('mine') },
+        { tile: asTileIndex(at(3, 2)), kind: asImprovementId('irrigation') },
+      ],
+    );
+
+  it('changes hands, keeps its identity, and does not raze the city', () => {
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    expect(capture.city.owner).toBe(asPlayerId(0));
+    expect(capture.city.id).toBe(asCityId(0));
+    expect(capture.city.name).toBe('City 1');
+    expect(capture.city.tile).toBe(asTileIndex(CENTRE));
+    // Still exactly two cities, the same two ids, in the same order: a captured city is
+    // not removed and no new city is created (`nextCityId` is the state's, untouched).
+    expect(capture.state.cities.map((each) => Number(each.id))).toEqual([0, 1]);
+    expect(capture.state.nextCityId).toBe(before.nextCityId);
+    expect(cityById(capture.state, asCityId(0))?.owner).toBe(asPlayerId(0));
+    expect(citiesOf(capture.state, asPlayerId(0)).map((each) => Number(each.id))).toEqual([0, 1]);
+    expect(citiesOf(capture.state, asPlayerId(1))).toEqual([]);
+  });
+
+  it('halves the population and destroys the non-wonder buildings, in one step', () => {
+    const capture = captureCity(board(), CAPTURE_CATALOG, asCityId(0), asPlayerId(2));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    expect(capture.city.population).toBe(2); // floor(5 / 2)
+    expect(capture.destroyed).toEqual([
+      asBuildingId('walls'),
+      asBuildingId('library'),
+      asBuildingId('granary'),
+    ]);
+    expect(capture.city.buildings).toEqual([asBuildingId('pyramids')]);
+    // A barbarian can take a city too: ownership is ownership, and there is no third
+    // "razed" state to fall into.
+    expect(capture.city.owner).toBe(asPlayerId(2));
+  });
+
+  it('clears the production head and the queue without writing an undefined key', () => {
+    const capture = captureCity(board(), CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    // Absent, not present-and-undefined: `production: undefined` is the spelling this
+    // state cannot represent, and the M3 bug class the M5 workstream re-pinned.
+    expect(Object.hasOwn(capture.city, 'production')).toBe(false);
+    expect(capture.city.queue).toEqual([]);
+    // The rebuilt city is the object the state holds — one city, one object, so a
+    // caller cannot update one and read the other.
+    expect(cityById(capture.state, asCityId(0))).toBe(capture.city);
+  });
+
+  it('clears the worked tiles and frees them for whoever claims them next', () => {
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    expect(capture.city.workedTiles).toEqual([]);
+    // Freed in practice: the released tile is exactly what an auto-assignment of the
+    // captured city's two remaining citizens will now consider.
+    const reassigned = autoAssignWorkedTiles(capture.state, NO_BUILDINGS, asCityId(0));
+    expect(reassigned).toHaveLength(2);
+    expect(new Set(reassigned).size).toBe(2);
+  });
+
+  it('leaves the stored food, the stored shields and the tile improvements alone', () => {
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    // M6's list of what a capture changes is ownership, population, buildings, queue
+    // and worked tiles. A granary emptied by the sack, or a shield pool looted, would be
+    // a sixth change invented here rather than implemented.
+    expect(capture.city.foodBox).toBe(7);
+    expect(capture.city.shields).toBe(3);
+    // The countryside is not part of the city: same list object, same entries, and a
+    // mine on the captured city's own tile survives.
+    expect(capture.state.improvements).toBe(before.improvements);
+    expect(capture.state.improvements).toHaveLength(2);
+  });
+
+  it('bumps neither the revision nor the turn, and writes nothing else', () => {
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    // M2's invariant: `revision` counts applied *commands*, and a capture is one step of
+    // one `AttackUnit`. The command layer bumps it once, like every other command.
+    expect(capture.state.revision).toBe(before.revision);
+    expect(capture.state.turn).toBe(before.turn);
+    // Fog, the map, the players, the RNG and the units are the same objects: a capture is
+    // a change to one city, and every other part of the state is passed through.
+    expect(capture.state.explored).toBe(before.explored);
+    expect(capture.state.map).toBe(before.map);
+    expect(capture.state.players).toBe(before.players);
+    expect(capture.state.rng).toBe(before.rng);
+    expect(capture.state.units).toBe(before.units);
+    expect(capture.state.improvements).toBe(before.improvements);
+    // The bystander is the same object with the same owner: one city changed hands, not
+    // two.
+    expect(cityById(capture.state, asCityId(1))).toBe(BYSTANDER);
+    expect(capture.state.cities).not.toBe(before.cities);
+  });
+
+  it('is pure: the state it is handed is not modified', () => {
+    const before = board();
+    const snapshot = structuredClone(before);
+
+    captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+
+    expect(before).toEqual(snapshot);
+    // The stored city itself, too: not one field of the input was written.
+    expect(before.cities[0]).toBe(TARGET);
+    expect(TARGET.owner).toBe(asPlayerId(1));
+    expect(TARGET.population).toBe(5);
+    expect(TARGET.buildings).toHaveLength(4);
+  });
+
+  it('reports nothing at all for a city the state does not hold', () => {
+    // "What did capturing it do?" has the honest answer `undefined` when there is no such
+    // city — a caller cannot conquer what is not there, and inventing an empty capture
+    // would hand back a state that looks like a successful one.
+    const before = board();
+    expect(captureCity(before, CAPTURE_CATALOG, asCityId(9), asPlayerId(0))).toBeUndefined();
+    expect(captureCity(state([]), CAPTURE_CATALOG, asCityId(0), asPlayerId(0))).toBeUndefined();
+  });
+
+  it('is deterministic and hashes: the same capture twice is the same state', () => {
+    const before = board();
+    const first = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const second = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (first === undefined || second === undefined) throw new Error('the fixture holds city 0');
+
+    expect(second.state).toEqual(first.state);
+    expect(canonicalize(first.state)).toBe(canonicalize(second.state));
+    expect(hashValue(first.state)).toBe(hashValue(second.state));
+    expect(hashValue(first.state)).not.toBe(hashValue(before));
+  });
+
+  it('does not consult the RNG: a capture draws nothing', () => {
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    expect(capture.state.rng).toEqual(before.rng);
+    expect(capture.state.rng).toBe(before.rng);
   });
 });

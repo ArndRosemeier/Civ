@@ -28,6 +28,14 @@
  * of `tech.ts`; the last section below *measures* it, with a board where the other
  * reading would complete a tech a turn early.
  *
+ * M6's barbarian step slots between the money loop and the movement refill, and this
+ * file pins that position too — because barbarians have no policy, the step is the only
+ * thing they ever do, and both halves of its place are observable: a civilization still
+ * collects a city's gold on the turn a barbarian takes it (the ledger ran first), and a
+ * band that spent its movement on an attack ends the turn whole (the refill ran last).
+ * `barbarians.test.ts` owns *what* the step does; the section below owns *when*, and both
+ * are measured by composing the other order out of the same exported passes.
+ *
  * Every number is a **placeholder** rule of ours: the free-unit allowance, the
  * support cost and the rate total are unsourced and chosen to be playable (see
  * `economy.ts` and `state.ts`). Nothing here is claimed to be Civ 3's.
@@ -35,8 +43,18 @@
 
 import { describe, expect, it } from 'vitest';
 import { hashValue } from '@civts/testing';
+// M6's step of the pipeline, called directly by the section that pins its *position*: the
+// order is only observable by composing the other order out of the same passes.
+import { advanceBarbarians } from '../src/barbarians.js';
 import { type BuildingDef, type City } from '../src/cities.js';
-import { FREE_UNITS_PER_CITY, FREE_UNITS_BASE, UNIT_SUPPORT_COST } from '../src/economy.js';
+import { applyCommand } from '../src/commands.js';
+import {
+  FREE_UNITS_PER_CITY,
+  FREE_UNITS_BASE,
+  UNIT_SUPPORT_COST,
+  applyEconomy,
+  playerIncome,
+} from '../src/economy.js';
 import {
   asBuildingId,
   asCityId,
@@ -650,5 +668,230 @@ describe('advanceTurn — the research step', () => {
     expect(hashValue(state)).toBe(before);
     expect(hashValue(first.state)).toBe(hashValue(second.state));
     expect(first.events).toEqual(second.events);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M6 — the barbarian step's position in the pipeline
+ * ------------------------------------------------------------------ */
+
+/**
+ * M6 fixes the barbarian step's place in the order — **after the money loop, before the
+ * movement refill** — and this section is the file where that position is pinned, exactly
+ * as the research step's and the money loop's are above. `barbarians.test.ts` owns what a
+ * barbarian *does*; what is measured here is only *when*, and each half of the position is
+ * measured by showing what the other order would have produced:
+ *
+ * - **After the money loop.** A barbarian can take a city from a civilization, and the
+ *   turn it does so is the turn its former owner still collects that city's gold: the
+ *   ledger was read from the world two steps earlier. Composing the reversed order out of
+ *   the same exported passes (`advanceBarbarians` then `applyEconomy`) shows the opposite
+ *   result — zero income for the player that just lost its only city — so the assertion is
+ *   discriminating rather than decorative.
+ * - **Before the refill.** An attack costs a unit the whole of its remaining movement, and
+ *   the refill runs after the step, so a band that fought this turn still starts the next
+ *   one whole. Running `advanceBarbarians` on the same board directly — which is what a
+ *   pipeline with the refill *first* would leave in the state — shows the unit at zero.
+ *
+ * The barbarian fixtures are this file's own: a `military` row with an attack, a barbarian
+ * player, and the boards the other steps' sections already use. As everywhere else in this
+ * file, every number is a **placeholder** of ours, chosen to make the order visible, and
+ * none of it is claimed to be Civ 3's.
+ */
+
+/** Nothing explored anywhere on the 4×4 fixture map — legality must not care. */
+const UNSEEN: readonly boolean[] = Array.from({ length: 16 }, () => false);
+
+/** An attack-capable `military` row: `turn.test.ts`'s own `WARRIOR` has `attack: 0`. */
+const RAIDER: UnitDef = {
+  id: asUnitTypeId('raider'),
+  role: 'military',
+  name: 'Raider',
+  attack: 4,
+  defense: 3,
+  hitPoints: 3,
+  movement: 1,
+  cost: 1,
+  domain: 'land',
+};
+
+/** The catalog the barbarian section runs on: the file's rows plus one that can fight. */
+const BARBARIAN_RULESET: TechView = { ...RULESET, units: [...RULESET.units, RAIDER] };
+
+const BARBARIANS = player(2, {
+  kind: 'barbarian',
+  name: 'Barbarians',
+  treasury: 0,
+  startingTile: asTileIndex(10),
+});
+
+const RAIDER_OWNER = asPlayerId(2);
+
+/** A raider owned by the barbarian player; `owner` is what `unit()` above fixes to P0. */
+const raider = (id: number, tile: number): Unit => ({
+  ...unit(id, RAIDER, tile),
+  owner: RAIDER_OWNER,
+  hitPointsLeft: RAIDER.hitPoints ?? 1,
+});
+
+/**
+ * The capture board: `TRADING_CITY` (5 commerce a turn, 3 gold at the default rates) on
+ * tile 5, with a raider one step away on tile 10. `explored` carries three rows because
+ * this board has three players — the barbarian player is a player like any other.
+ */
+const captureTurnBoard = (): GameState =>
+  board({
+    players: [player(0), player(1), BARBARIANS],
+    explored: [UNSEEN, UNSEEN, UNSEEN],
+    cities: [TRADING_CITY()],
+    units: [raider(3, 10)],
+  });
+
+/** Which barbarian event, if any, a step's `events` contain — the ones a band can emit. */
+const BARBARIAN_EVENT_TYPES: readonly string[] = [
+  'UnitMoved',
+  'CombatResolved',
+  'CityCaptured',
+  'UnitPromoted',
+  'UnitDestroyed',
+  'HutEntered',
+  'BarbariansSpawned',
+];
+
+/** The money and research events the loop above emits. */
+const LEDGER_EVENT_TYPES: readonly string[] = ['IncomeCollected', 'UpkeepPaid'];
+
+describe('M6 — the barbarian step runs after the money loop and before the refill', () => {
+  it('pays a civilization for a city on the turn a barbarian takes it away', () => {
+    const state = captureTurnBoard();
+
+    // What the ledger would have reported for player 0 if nothing had changed hands: the
+    // city's own commerce, split at the player's rates. This is the number the position
+    // promises, read from the same rule the loop reads.
+    const owed = playerIncome(state, BARBARIAN_RULESET, P0);
+    expect(owed.gold).toBe(3);
+
+    const outcome = advanceTurn(state, BARBARIAN_RULESET);
+
+    const collected = outcome.events.filter(
+      (event) => event.type === 'IncomeCollected' && event.playerId === P0,
+    );
+    expect(collected).toStrictEqual([
+      {
+        type: 'IncomeCollected',
+        playerId: P0,
+        gold: owed.gold,
+        beakers: owed.beakers,
+        luxuries: owed.luxuries,
+      },
+    ]);
+
+    // The capture happened in the same turn, and it happened *after* the ledger was read.
+    const captured = outcome.events.findIndex((event) => event.type === 'CityCaptured');
+    expect(captured).toBeGreaterThan(-1);
+    expect(outcome.state.cities[0]?.owner).toBe(RAIDER_OWNER);
+    expect(outcome.events.findIndex((event) => event.type === 'IncomeCollected')).toBeLessThan(
+      captured,
+    );
+  });
+
+  it('would have paid the civilization nothing if the step ran first — the position is observable', () => {
+    const state = captureTurnBoard();
+
+    // The reversed order, composed out of the same exported passes: the barbarians act,
+    // and only then is the ledger read. The city is the barbarian player's by then, so the
+    // civilization it was taken from collects nothing.
+    const barbariansFirst = advanceBarbarians(state, BARBARIAN_RULESET);
+    const thenPaid = applyEconomy(barbariansFirst.state, BARBARIAN_RULESET);
+
+    expect(barbariansFirst.events.some((event) => event.type === 'CityCaptured')).toBe(true);
+    const collected = thenPaid.events.filter(
+      (event) => event.type === 'IncomeCollected' && event.playerId === P0,
+    );
+    expect(collected).toStrictEqual([
+      { type: 'IncomeCollected', playerId: P0, gold: 0, beakers: 0, luxuries: 0 },
+    ]);
+
+    // So the two orders disagree about a number the acceptance evidence pins, by exactly
+    // the city's income.
+    expect(playerIncome(state, BARBARIAN_RULESET, P0).gold).toBe(3);
+  });
+
+  it('hands back the movement a band spent, because the refill runs after the step', () => {
+    // The attack board: the raider takes the city on tile 5 with the whole of its turn.
+    const attackBoard = captureTurnBoard();
+    const fought = advanceTurn(attackBoard, BARBARIAN_RULESET);
+    const attackerInPipeline = fought.state.units.find((each) => each.id === asUnitId(3));
+
+    // The same step run on the same board, with no refill after it — which is exactly the
+    // state a pipeline whose refill came *first* would be left holding at the end of the
+    // turn. The unit is at zero there, and whole in the pipeline.
+    const stepOnly = advanceBarbarians(attackBoard, BARBARIAN_RULESET);
+    const attackerAfterStep = stepOnly.state.units.find((each) => each.id === asUnitId(3));
+
+    expect(attackerAfterStep?.movementLeft).toBe(0);
+    expect(attackerInPipeline?.movementLeft).toBe(RAIDER.movement);
+
+    // And the same for a band that simply walked: the walk costs the step, and the refill
+    // gives it back. `TRADING_CITY`'s city is the target, two steps away on the 4×4 board.
+    const walkBoard = board({
+      players: [player(0), player(1), BARBARIANS],
+      explored: [UNSEEN, UNSEEN, UNSEEN],
+      cities: [city(0, 0, { population: 1, workedTiles: [] })],
+      units: [raider(3, 10)],
+    });
+    const walked = advanceTurn(walkBoard, BARBARIAN_RULESET);
+    expect(walked.events).toContainEqual({
+      type: 'UnitMoved',
+      unitId: asUnitId(3),
+      from: asTileIndex(10),
+      to: asTileIndex(5),
+      cost: 1,
+      movementLeft: 0,
+    });
+    expect(walked.state.units.find((each) => each.id === asUnitId(3))?.movementLeft).toBe(
+      RAIDER.movement,
+    );
+  });
+
+  it('puts every barbarian event after the ledger and before nothing else in the turn', () => {
+    const outcome = advanceTurn(captureTurnBoard(), BARBARIAN_RULESET);
+    const types = outcome.events.map((event) => event.type);
+
+    const lastLedger = types.reduce(
+      (last, type, at) => (LEDGER_EVENT_TYPES.includes(type) ? at : last),
+      -1,
+    );
+    const firstBarbarian = types.findIndex((type) => BARBARIAN_EVENT_TYPES.includes(type));
+
+    expect(lastLedger).toBeGreaterThan(-1);
+    expect(firstBarbarian).toBeGreaterThan(-1);
+    expect(lastLedger).toBeLessThan(firstBarbarian);
+    // The step is last: nothing but the barbarians' own business follows it, which is what
+    // "before the refill" means at the level of the event stream (the refill emits nothing).
+    expect(types.slice(firstBarbarian).every((type) => BARBARIAN_EVENT_TYPES.includes(type))).toBe(
+      true,
+    );
+  });
+
+  it('leaves `revision` alone while a barbarian acts, and EndTurn still bumps it exactly once', () => {
+    const state = captureTurnBoard();
+    expect(state.revision).toBe(0);
+
+    // A step of the world is not a command: `advanceBarbarians` applies each of its actions
+    // through the applier — which is what makes them the same combat and movement path a
+    // civilization uses — and hands the revision back untouched.
+    const step = advanceBarbarians(state, BARBARIAN_RULESET);
+    expect(step.events.some((event) => event.type === 'CityCaptured')).toBe(true);
+    expect(step.state.revision).toBe(state.revision);
+    expect(advanceTurn(state, BARBARIAN_RULESET).state.revision).toBe(state.revision);
+
+    // ...while the command that *did* order the turn bumps it exactly once, exactly as it
+    // does on a board with no barbarian in sight.
+    const turn = applyCommand(state, P0, { type: 'EndTurn' }, BARBARIAN_RULESET);
+    expect(turn.ok).toBe(true);
+    if (!turn.ok) return;
+    expect(turn.value.state.revision).toBe(state.revision + 1);
+    expect(turn.value.events.some((event) => event.type === 'CityCaptured')).toBe(true);
   });
 });

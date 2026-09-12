@@ -243,7 +243,7 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     expect(hashOf(CATALOG, 'the shipped catalog again')).toBe(SHIPPED_HASH);
   });
 
-  it('is c06c522342e59cfc, and b6d9de8d3bed6ba0 with resources and units reversed', () => {
+  it('is 01bc03c374363110, and 5db0937200bb25b0 with resources and units reversed', () => {
     // These two numbers are the requirement's own measured fact, and pinning them is
     // what ties the property below to the real catalog. **If this assertion fails, the
     // catalog's content or order moved**: that is either an intentional content change
@@ -258,14 +258,26 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     // golden state hashes moved in the same wave and were rehashed through the harness's
     // opt-in path, which is the corroboration the paragraph above asks for. No row was
     // reordered, and the arrangement property below is asserted unchanged.
-    expect(SHIPPED_HASH).toBe('c06c522342e59cfc');
+    //
+    // **M6 re-measured them a second time, for the same two reasons M5 did.** The cause
+    // is content again, not order: M6 gives every terrain row the `defenseBonus` spelling
+    // of its defence percentage, gives every unit row real combat statistics
+    // (`hitPoints`), adds four unit rows (archer, spearman, horseman, transport), two
+    // techs (map-making, horseback-riding) and the tech gates the M6 contract requires
+    // shipped content to declare, and gives the temple a `requiresTech`. The pins were
+    // `c06c522342e59cfc` and `b6d9de8d3bed6ba0`. The golden state hashes moved in the same
+    // wave (SCHEMA_VERSION 7 -> 8) and were regenerated through the harness's opt-in path,
+    // which is the same corroboration: a golden hash movement with no shape change would
+    // be a semantic bug, and this is neither. No row was reordered — the three-arrangement
+    // sweep below still passes, which is what says so.
+    expect(SHIPPED_HASH).toBe('01bc03c374363110');
     const reversedUnits = arranged(CATALOG, 'units', reverseOrder(CATALOG.units.length));
     const reversedBoth = arranged(
       reversedUnits,
       'resources',
       reverseOrder(CATALOG.resources.length),
     );
-    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('b6d9de8d3bed6ba0');
+    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('5db0937200bb25b0');
   });
 });
 

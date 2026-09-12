@@ -35,6 +35,38 @@
  * M5 moved them a fourth time (`SCHEMA_VERSION` 6 -> 7: `PlayerState` gained
  * `techs` and the optional `researching`), and regenerated the file the same way.
  *
+ * **M6 moves them a fifth time (`SCHEMA_VERSION` 7 -> 8), and the movement is bigger than
+ * the version bump suggests.** Two independent things changed inside the hashed JSON:
+ *
+ * - `Unit` gained `hitPointsLeft`, which `newGame` writes on every starting unit — one new
+ *   key per unit, so no state can hash the same; and the two omitted-when-default keys
+ *   `experience` and `fortified`, which `newGame` deliberately does *not* write, because a
+ *   fresh settler has taken no damage, earned no promotion and is not dug in. The old and
+ *   new hashes are recorded in this commit's message, and the *shape* claim is the one
+ *   that matters: a key holding `undefined` would not have round-tripped, and the file is
+ *   written through the harness's own opt-in path either way.
+ * - The shipped catalog changed too — M6 gives every unit row real combat statistics,
+ *   adds gated rows, and gives every terrain the `defenseBonus` the M6 contract names. The
+ *   three *fresh-seed* entries therefore move even though the ruleset is not hashed: a
+ *   starting army's units carry the `hitPoints` their definitions declare, and the set of
+ *   units `newGame` can place depends on which rows the catalog offers.
+ *
+ * Regenerated with `CIVTS_WRITE_GOLDENS=1`, never by hand, and this test passes **without**
+ * that variable afterwards — which is the property that makes the file a gate rather than a
+ * transcript. A `rehash: <reason>` line belongs in the commit message for the same reason
+ * it did the previous four times.
+ *
+ * **M6 adds a *third* kind of entry beside those: a battle.** `played-civs2-seed42-combat`
+ * is the played world with one `AttackUnit` applied through the command path — the applier,
+ * not the resolver — chosen and placed entirely by engine code. It exists because M6's
+ * acceptance list asks for "a played golden that INCLUDES combat, so battles are covered at
+ * hash level", and it is stored in the file rather than hashed inside the test so the fight
+ * is pinned across engine revisions. It is a separate scenario rather than more turns of the
+ * played one because that script cannot reach an enemy on this map: the two civilizations
+ * start 37 tiles apart, and the unit it produces is the *scout*, whose attack is 0. The
+ * entry list moved from four to five, and the five are pinned by name here and in every
+ * adversarial suite that reads this file.
+ *
  * **M5 also adds a second kind of entry: a *played* state.** The three seed entries
  * are `newGame` output — a fresh world nobody has touched — which pins generation and
  * assembly but never exercises a command. `played-civs2-seed42` is the same tiny map
@@ -54,19 +86,26 @@ import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
+  MAX_EXPERIENCE,
   applyCommand,
   civPlayers,
+  hitPointsLeftOf,
   newGame,
   planSetResearch,
+  spawnUnit,
+  unitById,
+  unitDef,
+  unitMoveOptions,
   type Command,
   type GameEvent,
   type GameState,
   type RulesetView,
   type Settings,
   type SetupError,
+  type UnitId,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset, type RulesetError } from '@civts/rules';
-import { hashValue } from '../src/index.js';
+import { canonicalize, hashValue } from '../src/index.js';
 import {
   goldensPath,
   loadGoldens,
@@ -92,6 +131,13 @@ const GOLDEN_CIV_COUNT = 2;
  */
 const PLAYED_SEED = 42;
 const PLAYED_ENTRY_NAME = `played-civs${String(GOLDEN_CIV_COUNT)}-seed${String(PLAYED_SEED)}`;
+/**
+ * M6's own scenario: the played world above, plus one battle applied through the command
+ * path (`AttackUnit`). It is a separate entry rather than more turns inside the played one
+ * because the played map cannot reach a fight — see the entry-list test below — and it is
+ * named after the world it is built on so a reader can see where it comes from.
+ */
+const COMBAT_ENTRY_NAME = `${PLAYED_ENTRY_NAME}-combat`;
 
 /**
  * How many turns the played script ends. Fixed rather than "until something
@@ -112,7 +158,8 @@ const GOLDEN_NOTE =
   'State hashes for packages/testing/test/golden.test.ts ' +
   '(seeds 1, 42, 1337; map size tiny; 2 civilizations; plus one played 30-turn game ' +
   'on seed 42, which founds a city, builds an improvement, produces a unit and a ' +
-  'building, grows, researches a tech and runs the money loop). ' +
+  'building, grows, researches a tech and runs the money loop; plus one battle applied ' +
+  'to that played game with AttackUnit, stored as played-civs2-seed42-combat). ' +
   'Hashes are only guaranteed for a pinned (engine revision, Node major): ' +
   'changing one requires an intentional regeneration and a "rehash: <reason>" note in the commit message.';
 
@@ -351,6 +398,130 @@ const playedGame = (): PlayedGame => {
   return { state, events };
 };
 
+/**
+ * M6's combat golden: **a battle fought through the applier**, on the played world.
+ *
+ * M6's acceptance list asks for "a played golden that INCLUDES combat, so battles are
+ * covered at hash level". This is that entry — `COMBAT_ENTRY_NAME` — and it is deliberately
+ * the strongest version of it available:
+ *
+ * - **The battle is a command.** The attack goes through `applyCommand` as
+ *   `{ type: 'AttackUnit' }`, so the stored state is what the *command path* produces:
+ *   legality (`planAttackUnit`), the resolver, the damage, the death of a unit that
+ *   reaches 0, a possible promotion, the `CombatResolved`/`UnitDestroyed`/`UnitPromoted`
+ *   events, and the advance of the world's RNG all happen in one applied command. An
+ *   earlier draft of this fixture called `resolveCombat` and applied the losses with
+ *   `woundUnit` by hand, and it said so plainly — that version hashed the resolver's
+ *   arithmetic but proved nothing about the applier, which is where a generator and an
+ *   applier can disagree. Neither the resolver call nor the hand-wound loss survives here.
+ * - **The board is the played world**, not a fresh one: `playedGame()`'s 30-turn state, with
+ *   its city, its produced unit, its improvement and its researched tech, is the base.
+ * - **Every choice is made by the engine.** The attacker is the first shipped row that may
+ *   attack (`attack > 0`, M6's own legality rule; the played world's produced unit is the
+ *   *scout*, whose attack is 0, which is why this fixture places combatants at all). Its
+ *   tile is its owner's starting tile and the defender's is the **first tile in
+ *   `unitMoveOptions`** — the engine's own answer about where that land unit may go — so
+ *   this file holds no opinion about terrain, domains or occupancy. The defender is the
+ *   next attack-capable row, owned by the other civilization, and it is *placed on* the
+ *   chosen tile rather than moved there, because a move onto an enemy-occupied tile is the
+ *   one move the engine refuses.
+ * - **Throwing rather than degrading.** A refused attack, or an accepted one with no
+ *   `CombatResolved` event, throws. A battle that silently did not happen would hash as
+ *   though the golden covered combat while containing none.
+ *
+ * The stored entry's own assertions (`resolves a real battle...`, below) check the state
+ * against the applier's account of it, so the entry is never taken on trust.
+ */
+interface CombatGame {
+  /** The played world with both combatants placed on it, before the attack. */
+  readonly before: GameState;
+  /** The same world after `AttackUnit`: wounded units, and any that died simply gone. */
+  readonly state: GameState;
+  readonly attacker: UnitId;
+  readonly defender: UnitId;
+  /** The battle the *applier* reported, read off its own event rather than re-resolved. */
+  readonly combat: CombatEvent;
+  /** Every event the attack emitted, in order. */
+  readonly events: readonly GameEvent[];
+}
+
+/** The event `AttackUnit` emits for the unit-vs-unit half of its two shapes. */
+type CombatEvent = Extract<GameEvent, { readonly type: 'CombatResolved' }>;
+
+const combatGame = (): CombatGame => {
+  const played = playedGame().state;
+  const sides = civPlayers(played);
+
+  // The two rows that may attack, in catalog order: the same pair every run, and a catalog
+  // retune changes it deliberately. `attack > 0` is M6's legality rule read directly — a
+  // row with no attack strength is not a candidate, which is why the scout is skipped.
+  const combatants = RULESET.units.filter((row) => row.attack > 0).slice(0, 2);
+  const attackerDef = combatants[0];
+  const defenderDef = combatants[1] ?? combatants[0];
+  if (attackerDef === undefined || defenderDef === undefined) {
+    throw new Error(
+      'the combat golden needs at least one catalog unit with attack > 0, and this ruleset has none',
+    );
+  }
+
+  const attackerSide = sides[0];
+  const defenderSide = sides[1] ?? sides[0];
+  if (attackerSide === undefined || defenderSide === undefined) {
+    throw new Error('the played world has no civilizations to fight with');
+  }
+
+  // 1. The attacker, placed by the engine's own helper on its owner's starting tile.
+  const attackerSpawn = spawnUnit(played, attackerDef, attackerSide.id, attackerSide.startingTile);
+
+  // 2. The defender's tile: the first destination the engine says this attacker may move to.
+  //    Read from `unitMoveOptions` rather than computed here, so the fixture cannot disagree
+  //    with the mover about what terrain a land unit may stand on.
+  const destinations = unitMoveOptions(attackerSpawn.state, RULESET, attackerSpawn.unit.id);
+  const target = destinations[0];
+  if (target === undefined) {
+    throw new Error(
+      `the combat golden's attacker at ${String(attackerSide.startingTile)} has nowhere to go, ` +
+        'so no enemy can be placed beside it',
+    );
+  }
+  const defenderSpawn = spawnUnit(attackerSpawn.state, defenderDef, defenderSide.id, target);
+  const board = defenderSpawn.state;
+  const attacker = attackerSpawn.unit;
+  const defender = defenderSpawn.unit;
+
+  // 3. The attack, through the command path — the whole subject of this entry.
+  const applied = applyCommand(
+    board,
+    attackerSide.id,
+    { type: 'AttackUnit', unitId: attacker.id, target },
+    RULESET,
+  );
+  if (!applied.ok) {
+    throw new Error(
+      `the combat golden's attack was refused: ${JSON.stringify(applied.error)}. ` +
+        'A combat golden that contains no battle is worse than no entry at all.',
+    );
+  }
+  const combat = applied.value.events.find(
+    (event): event is CombatEvent => event.type === 'CombatResolved',
+  );
+  if (combat === undefined) {
+    throw new Error(
+      'the applier accepted the attack but reported no CombatResolved event, so the entry ' +
+        'would hash a battle nobody can account for',
+    );
+  }
+
+  return {
+    before: board,
+    state: applied.value.state,
+    attacker: attacker.id,
+    defender: defender.id,
+    combat,
+    events: applied.value.events,
+  };
+};
+
 /** The hashes this build of the engine produces, in scenario order. */
 const actualEntries = (): readonly GoldenEntry[] => [
   ...GOLDEN_SEEDS.map((seed) => ({ name: entryName(seed), hash: hashValue(mustState(seed)) })),
@@ -358,7 +529,24 @@ const actualEntries = (): readonly GoldenEntry[] => [
   // state that thirty turns of play have moved — which is exactly what makes it a
   // different entry rather than a duplicate of `tiny-civs2-seed42`.
   { name: PLAYED_ENTRY_NAME, hash: hashValue(playedGame().state) },
+  // M6's battle, stored as an entry rather than hashed in a test: the acceptance item is
+  // about the golden *file* covering combat, and an unstored hash gates nothing across
+  // engine revisions. `combatGame` applies a real `AttackUnit` to the played world.
+  { name: COMBAT_ENTRY_NAME, hash: hashValue(combatGame().state) },
 ];
+
+/** One entry's stored hash, or a failure that names the entry even when the file is absent. */
+const readEntryHash = (name: string): string => {
+  const stored = requireStored();
+  const entry = stored.entries.find((candidate) => candidate.name === name);
+  if (entry === undefined) {
+    throw failure(`golden file ${goldensPath()} has no entry "${name}"`, [
+      `expected: an entry named "${name}"`,
+      `actual:   ${stored.entries.map((candidate) => candidate.name).join(', ')}`,
+    ]);
+  }
+  return entry.hash;
+};
 
 const runningNodeMajor = (): number => {
   const major = process.versions.node.split('.')[0];
@@ -384,8 +572,8 @@ const failure = (heading: string, lines: readonly string[]): Error =>
 
 const missingFileError = (): Error =>
   failure(`golden file missing: ${goldensPath()}`, [
-    `expected: the committed golden file with ${String(GOLDEN_SEEDS.length + 1)} entries ` +
-      `(${[...GOLDEN_SEEDS.map((seed) => entryName(seed)), PLAYED_ENTRY_NAME].join(', ')})`,
+    `expected: the committed golden file with ${String(GOLDEN_SEEDS.length + 2)} entries ` +
+      `(${[...GOLDEN_SEEDS.map((seed) => entryName(seed)), PLAYED_ENTRY_NAME, COMBAT_ENTRY_NAME].join(', ')})`,
     'actual:   no file at that path',
   ]);
 
@@ -438,7 +626,7 @@ describe('golden scenarios', () => {
     // played state on the same seed it would mean the play changed nothing.
     const hashes = actualEntries().map((entry) => entry.hash);
     expect(new Set(hashes).size).toBe(actualEntries().length);
-    expect(hashes.length).toBe(GOLDEN_SEEDS.length + 1);
+    expect(hashes.length).toBe(GOLDEN_SEEDS.length + 2);
     for (const hash of hashes) expect(hash).toMatch(/^[0-9a-f]{16}$/);
   });
 
@@ -537,16 +725,294 @@ describe('golden scenarios', () => {
     expect(hashValue(first.state)).not.toBe(hashValue(mustState(1337)));
   });
 
+  /*
+   * ------------------------------------------------------------------ *
+   * M6: what every stored state has to say about units
+   * ------------------------------------------------------------------ *
+   */
+
+  it('stores units that are all alive, at whole hit points, with no key holding undefined', () => {
+    // M6 puts a unit's health inside the hashed JSON, so the *invariants* of that field are
+    // what this milestone's golden has to prove — a stored state carrying a unit at 0 hit
+    // points would be a state describing something the engine says cannot exist, and it
+    // would hash perfectly well. Checked on every entry, fresh and played alike, because a
+    // played world is where a wounded unit would first appear.
+    // Every stored scenario, fresh and played alike, because a played world is where a
+    // wounded unit would first appear. The states are built once here rather than through
+    // `actualEntries`, which would recompute the played game per entry.
+    const scenarios: readonly (readonly [string, GameState])[] = [
+      ...GOLDEN_SEEDS.map((seed): readonly [string, GameState] => [
+        entryName(seed),
+        mustState(seed),
+      ]),
+      [PLAYED_ENTRY_NAME, playedGame().state],
+      // M6's battle, where a unit is *actually wounded* — the reason the field exists. A
+      // stored state is exactly where a unit at 0 hit points would survive unnoticed, so
+      // this scenario is checked by the same rule as the others rather than trusted.
+      [COMBAT_ENTRY_NAME, combatGame().state],
+    ];
+    for (const [name, state] of scenarios) {
+      expect(state.units.length, `${name} has no units to check`).toBeGreaterThan(0);
+
+      for (const unit of state.units) {
+        expect(Number.isInteger(unit.hitPointsLeft), `${name} unit ${String(unit.id)}`).toBe(true);
+        expect(unit.hitPointsLeft).toBeGreaterThanOrEqual(1);
+        // …and above its catalog maximum is equally impossible: `hitPointsLeft` is a
+        // resource that is spent, never banked.
+        const def = unitDef(RULESET, unit.type);
+        expect(def).toBeDefined();
+        expect(unit.hitPointsLeft).toBeLessThanOrEqual(def?.hitPoints ?? 1);
+
+        // A unit that is not promoted and not dug in must carry neither key, and no key at
+        // all may hold `undefined` — that is the spelling that cannot survive a JSON round
+        // trip. `canonicalize` throws on it, so this call is the assertion.
+        //
+        // `experience` is the one key that may legitimately be present in a stored state:
+        // M6's promotion writes it on the winner of a battle, and the combat entry is where
+        // that happened. Where it is present it must be a positive whole number inside the
+        // engine's cap — never the default zero (which the schema omits) and never a
+        // fraction — and it may appear in *no other* scenario, which is the rule that keeps
+        // a stray promotion from hiding in the fresh worlds.
+        expect('fortified' in unit).toBe(false);
+        if (unit.experience === undefined) {
+          expect('experience' in unit).toBe(false);
+        } else {
+          expect(name, `${name} carries a promotion outside the combat entry`).toBe(
+            COMBAT_ENTRY_NAME,
+          );
+          expect(Number.isInteger(unit.experience)).toBe(true);
+          expect(unit.experience).toBeGreaterThanOrEqual(1);
+          expect(unit.experience).toBeLessThanOrEqual(MAX_EXPERIENCE);
+        }
+        expect(() => canonicalize(unit)).not.toThrow();
+      }
+
+      // The whole state, not only its units: a stray `undefined` anywhere would make the
+      // stored file unreadable in exactly the way the version bump exists to avoid.
+      expect(() => canonicalize(state)).not.toThrow();
+    }
+  });
+
+  it('hashes the hit points, so a golden cannot be blind to combat damage', () => {
+    // The property the entry is *for*. M6's whole point is that a unit can be hurt, so a
+    // state's hash has to move when it is — otherwise a battle could happen, change the
+    // game, and leave every golden in this file reporting "unchanged". Asserted by
+    // perturbing the field the milestone added rather than by trusting that it is hashed.
+    const played = playedGame().state;
+    // The victim is chosen as a unit that *can* be wounded — one whose row declares more than
+    // one hit point — because the perturbation has to stay inside `1..hitPoints` to be a state
+    // the engine could really produce. That such a unit exists is itself part of the
+    // assertion: a played golden whose every unit had one hit point could not express damage
+    // at all, and this test would have nothing to prove.
+    const victim = played.units.find((unit) => (unitDef(RULESET, unit.type)?.hitPoints ?? 1) >= 2);
+    expect(
+      victim,
+      'the played golden contains no unit with more than one hit point, so damage is unrepresentable',
+    ).toBeDefined();
+    if (victim === undefined) return;
+
+    const maximum = unitDef(RULESET, victim.type)?.hitPoints ?? 1;
+    expect(maximum).toBeGreaterThanOrEqual(2);
+
+    const wounded: GameState = {
+      ...played,
+      units: played.units.map((unit) =>
+        unit.id === victim.id ? { ...unit, hitPointsLeft: maximum - 1 } : unit,
+      ),
+    };
+    const woundedVictim = wounded.units.find((unit) => unit.id === victim.id);
+    if (woundedVictim === undefined) throw new Error('the wounded copy lost the unit it wounded');
+    expect(hitPointsLeftOf(woundedVictim)).toBe(maximum - 1);
+    expect(hashValue(wounded)).not.toBe(hashValue(played));
+    expect(unitById(wounded, victim.id)?.hitPointsLeft).toBe(maximum - 1);
+
+    // And it is the *field* that moved the hash, not the array identity: the same mutation
+    // written as the same value changes nothing.
+    const same: GameState = { ...played, units: played.units.map((unit) => ({ ...unit })) };
+    expect(hashValue(same)).toBe(hashValue(played));
+  });
+
+  it('plays a world whose M6 statistics are the shipped ones, not a fixture', () => {
+    // The played golden is built from `CATALOG` through `validateRuleset`, so its units'
+    // hit points come from real content: this asserts the two are connected. A fixture
+    // ruleset would satisfy every invariant above while proving nothing about what ships.
+    const played = playedGame().state;
+    const types = new Set(played.units.map((unit) => unit.type));
+
+    for (const type of types) {
+      const shipped = CATALOG.units.find((candidate) => candidate.id === type);
+      expect(shipped, `${String(type)} is not a shipped unit row`).toBeDefined();
+      for (const unit of played.units.filter((candidate) => candidate.type === type)) {
+        expect(unit.hitPointsLeft).toBe(shipped?.hitPoints ?? 1);
+      }
+    }
+  });
+
+  it('plays a real battle through the applier, and stores it as a hash', () => {
+    // M6's acceptance item: "a played golden that INCLUDES combat, so battles are covered at
+    // hash level". The battle is an applied `AttackUnit` — the command path, not a resolver
+    // call — on the played world, and its hash is a **stored entry** in
+    // `goldens/state.json`, so the fight is pinned across engine revisions like every other
+    // scenario rather than only inside one build.
+    const played = playedGame().state;
+    const first = combatGame();
+    const second = combatGame();
+
+    // The stored entry is this state: the file's hash for the name and the hash computed
+    // here are the same number, so "the golden includes a battle" is a fact about the file
+    // rather than a claim about this test. In regeneration mode the file is written *from*
+    // `actualEntries` after this, so only the read path is compared against the disk.
+    expect(actualEntries().find((entry) => entry.name === COMBAT_ENTRY_NAME)?.hash).toBe(
+      hashValue(first.state),
+    );
+    if (!WRITE_MODE) {
+      expect(readEntryHash(COMBAT_ENTRY_NAME)).toBe(hashValue(first.state));
+    }
+
+    // Determinism first: two runs of the same world produce the same state, which is the
+    // property a golden hash is for.
+    expect(hashValue(first.state)).toBe(hashValue(second.state));
+    expect(first.state).toEqual(second.state);
+
+    // …and the battle is *in* the state, not merely around it. A state that hashed the same
+    // as the world it was played on would be a combat entry in name only.
+    expect(hashValue(first.state)).not.toBe(hashValue(played));
+
+    // The attack really was accepted as a command, and it emitted the applier's own account
+    // of the fight — odds, rounds and both sides' losses — which the assertions below read
+    // instead of re-resolving the battle. `attackerWinPct` is the resolver's figure, and the
+    // clamp M6 states (1..99, so neither side is ever certain) holds on it.
+    expect(first.events[0]?.type).toBe('CombatResolved');
+    expect(first.combat.attackerId).toBe(first.attacker);
+    expect(first.combat.defenderId).toBe(first.defender);
+    expect(first.combat.attackerOwner).toBe(civPlayers(played)[0]?.id);
+    expect(first.combat.target).toBe(unitById(first.before, first.defender)?.tile);
+    expect(first.combat.attackerWinPct).toBeGreaterThanOrEqual(1);
+    expect(first.combat.attackerWinPct).toBeLessThanOrEqual(99);
+    expect(first.combat.rounds).toBeGreaterThanOrEqual(1);
+    expect(first.combat.attackerLost + first.combat.defenderLost).toBeGreaterThan(0);
+
+    // A unit that died, died *of this battle* and says so: the `UnitDestroyed` event names
+    // the killer and the reason, and the reason is combat rather than a disband.
+    const killed = first.events.filter((event) => event.type === 'UnitDestroyed');
+    for (const event of killed) {
+      expect(event.reason).toBe('combat');
+      expect(event.byUnitId).toBe(
+        event.unitId === first.attacker ? first.defender : first.attacker,
+      );
+    }
+
+    const beforeIds = new Set(first.before.units.map((unit) => Number(unit.id)));
+    const afterIds = new Set(first.state.units.map((unit) => Number(unit.id)));
+    const dead = [...beforeIds].filter((id) => !afterIds.has(id));
+
+    // Exactly the units `defenderSurvives`/`attackerSurvives` say are gone — no more, no
+    // fewer, and always one of the two combatants.
+    expect(dead.length).toBe(
+      (first.combat.attackerSurvives ? 0 : 1) + (first.combat.defenderSurvives ? 0 : 1),
+    );
+    // …and the death events say exactly as much: the roster is short by one unit, and the
+    // applier reported one `UnitDestroyed` for each side it says did not survive.
+    expect(killed.length).toBe(dead.length);
+    for (const id of dead) {
+      expect([Number(first.attacker), Number(first.defender)]).toContain(id);
+    }
+    // A destroyed unit is *removed*, never retained at 0 hit points (M6's invariant), so the
+    // roster shrinks by exactly the number that died.
+    expect(first.state.units.length).toBe(beforeIds.size - dead.length);
+
+    // The survivors are wounded by exactly the hit points the resolver charged them, which is
+    // the other half of "the result is the state".
+    const beforeOf = (id: UnitId): number => {
+      const unit = first.before.units.find((candidate) => candidate.id === id);
+      if (unit === undefined) throw new Error(`the board lost unit ${String(id)} before the fight`);
+      return hitPointsLeftOf(unit);
+    };
+    const afterOf = (id: UnitId): number | undefined => {
+      const unit = first.state.units.find((candidate) => candidate.id === id);
+      return unit === undefined ? undefined : hitPointsLeftOf(unit);
+    };
+    // A survivor is down *exactly* the hit points the resolver charged it; a casualty took at
+    // least everything it had left and is no longer on the board. Stated as one rule so the
+    // two sides cannot be checked by two different standards.
+    const expectWounds = (id: UnitId, lost: number, survives: boolean): void => {
+      const before = beforeOf(id);
+      if (survives) {
+        expect(afterOf(id)).toBe(before - lost);
+      } else {
+        expect(afterOf(id)).toBeUndefined();
+        expect(lost).toBeGreaterThanOrEqual(before);
+      }
+    };
+    expectWounds(first.attacker, first.combat.attackerLost, first.combat.attackerSurvives);
+    expectWounds(first.defender, first.combat.defenderLost, first.combat.defenderSurvives);
+
+    // The stream moved too: a battle that drew dice and left the world's RNG untouched would
+    // replay the same dice in the next battle.
+    expect(first.state.rng).not.toEqual(played.rng);
+
+    // And M6's invariants survive the fight: no live unit at 0 hit points, no unit above its
+    // catalog maximum, and no key holding `undefined` (which would make a save unreadable).
+    const promoted = first.state.units.filter((unit) => unit.experience !== undefined);
+    for (const unit of first.state.units) {
+      const def = unitDef(RULESET, unit.type);
+      expect(hitPointsLeftOf(unit)).toBeGreaterThanOrEqual(1);
+      expect(hitPointsLeftOf(unit)).toBeLessThanOrEqual(def?.hitPoints ?? 1);
+      // `fortified` is absent here: neither `spawnUnit` nor the attack fortifies anyone.
+      expect('fortified' in unit).toBe(false);
+      // `experience` is present *only* on a unit that won a battle, which is the promotion
+      // rule — and this state is the one place in the file where that can be true, so the
+      // field is checked here rather than assumed absent. Where it is present it is a whole
+      // number inside the engine's cap; the default zero is never written, because the schema
+      // omits it, and a presence check plus a value check is what catches a zero slip through.
+      if (unit.experience === undefined) {
+        expect('experience' in unit).toBe(false);
+      } else {
+        expect(Number.isInteger(unit.experience)).toBe(true);
+        expect(unit.experience).toBeGreaterThanOrEqual(1);
+        expect(unit.experience).toBeLessThanOrEqual(MAX_EXPERIENCE);
+        expect([first.attacker, first.defender]).toContain(unit.id);
+      }
+    }
+    expect(() => canonicalize(first.state)).not.toThrow();
+
+    // Every promotion the state carries is one the applier *reported*, with the level it
+    // reports: the event and the field cannot disagree about how seasoned a winner is, and a
+    // promotion written without an event (or the other way round) fails here.
+    const promotions = first.events.filter((event) => event.type === 'UnitPromoted');
+    const byId = (a: { readonly unitId: UnitId }, b: { readonly unitId: UnitId }): number =>
+      Number(a.unitId) - Number(b.unitId);
+    expect([...promotions].sort(byId).map((event) => Number(event.unitId))).toEqual(
+      [...promoted].sort((a, b) => Number(a.id) - Number(b.id)).map((unit) => Number(unit.id)),
+    );
+    for (const event of promotions) {
+      const unit = first.state.units.find((candidate) => candidate.id === event.unitId);
+      expect(unit?.experience).toBe(event.experience);
+      expect(event.maxExperience).toBe(MAX_EXPERIENCE);
+    }
+  });
+
   it('stores the played entry beside the fresh ones, under its own name', () => {
-    // The list itself: four entries, all distinct, the played one last and named for
-    // what it is. `actualEntries` is the single source both the comparison and the
+    // The list itself: five entries, all distinct, the two played ones last and named for
+    // what they are. `actualEntries` is the single source both the comparison and the
     // regeneration read, so a drift between "what is checked" and "what is written"
     // is impossible by construction.
+    //
+    // **M6 makes it five.** The combat entry (`COMBAT_ENTRY_NAME`) is the milestone's
+    // acceptance item — a played state that includes a battle — and it is stored under its
+    // own name rather than folded into the played entry, because the played script cannot
+    // reach an enemy: the two civilizations' starts are 37 tiles apart on this map, and the
+    // unit the script produces is the *scout*, whose attack is 0. Rather than pushing the
+    // played scenario's turn count past 40 and hoping a generated map has a land path, the
+    // battle is its own scenario whose board is the played world plus an applied
+    // `AttackUnit` — engine-placed combatants, engine legality, engine dice. The entry list
+    // is pinned by name here *and* in the adversarial suites, which were updated with it.
     const entries = actualEntries();
-    expect(entries).toHaveLength(GOLDEN_SEEDS.length + 1);
+    expect(entries).toHaveLength(GOLDEN_SEEDS.length + 2);
     expect(entries.map((entry) => entry.name)).toEqual([
       ...GOLDEN_SEEDS.map(entryName),
       PLAYED_ENTRY_NAME,
+      COMBAT_ENTRY_NAME,
     ]);
     expect(new Set(entries.map((entry) => entry.hash)).size).toBe(entries.length);
   });

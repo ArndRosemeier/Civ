@@ -29,6 +29,7 @@
 import {
   DEFAULT_SETTINGS,
   IMPROVEMENT_KINDS,
+  MAX_EXPERIENCE,
   MIN_GROWTH_FOOD,
   applyCommand,
   asCityId,
@@ -38,14 +39,19 @@ import {
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  captureCity,
   cityProductionOptions,
   cityRadius,
   civPlayers,
   citiesOf,
+  cityYields,
   foodBoxSize,
+  hitPointsLeftOf,
   legalActions,
+  maxHitPointsOf,
   newGame,
   unitActions,
+  unitDef,
   unitMoveOptions,
   type BuildingId,
   type City,
@@ -165,6 +171,35 @@ const withPlayer = (
  * types deliberately cannot express.
  */
 const malformedState = (value: unknown): GameState => value as GameState;
+
+/** The same cast for one unit row, for the shapes the `Unit` type deliberately excludes. */
+const malformedUnit = (value: unknown): Unit => value as Unit;
+
+/**
+ * `BASE` with its first city **fed**: the same city, working one tile that pays food.
+ *
+ * The box bound is a claim about a box the growth **spent**, and `applyGrowth` spends
+ * nothing on a surplus of zero — it returns early and the box keeps whatever it had. The
+ * played fixture's city works no tiles at all and has a surplus of exactly zero, which is
+ * a state the engine reaches constantly (a city between assignments, and every city the
+ * barbarians hold, since no policy assigns tiles for them). A fire case for that bound
+ * therefore has to be a city the pass would have spent a box on, so every case below is
+ * built on this one.
+ *
+ * The tile is chosen by the engine's own arithmetic — the first tile in the city's radius
+ * whose assignment gives a positive `foodSurplus` — rather than by naming terrain here.
+ */
+const fedCity = (state: GameState): GameState => {
+  const city = mustFind(
+    state.cities.find((each) => each.id === BASE_CITY.id),
+    'the fixture city',
+  );
+  for (const tile of cityRadius(state, city.tile)) {
+    const candidate = withCity(state, city.id, (each) => ({ ...each, workedTiles: [tile] }));
+    if (cityYields(candidate, VIEW, city.id).foodSurplus > 0) return candidate;
+  }
+  throw new Error('no tile in the fixture city radius pays a food surplus');
+};
 
 /**
  * `count` distinct tiles inside a city's radius, the centre excluded — the centre is
@@ -465,6 +500,65 @@ const BASE_UNIT: Unit = mustFind(BASE.units[0], 'a unit in the played state');
 const BASE_CIV: PlayerState = mustFind(civPlayers(BASE)[0], 'a civilization in the played state');
 
 /* ------------------------------------------------------------------ *
+ * M6 — the capture fixture
+ * ------------------------------------------------------------------ */
+
+/** A capture the *engine* performed, with the `CityCaptured` line it would report. */
+interface CaptureFixture {
+  /** The played state the city was taken from (`BASE`), as the transition's boundary. */
+  readonly previous: GameState;
+  readonly state: GameState;
+  readonly event: Extract<GameEvent, { type: 'CityCaptured' }>;
+  readonly cityId: CityId;
+  readonly from: PlayerId;
+  readonly to: PlayerId;
+}
+
+/**
+ * **A genuine capture transition**, built by `captureCity` itself — the engine's own
+ * implementation of the rule (`cities.ts`), not a second statement of it here.
+ *
+ * That choice is the whole point of the fixture: `captured-city-consistent` is a claim
+ * that the *state* and the *event stream* tell one story about a capture, so the clean
+ * pair it is tested against has to be a capture the engine actually performed. A
+ * hand-written "captured" state would only prove that the check agrees with this test.
+ * The event is assembled from the `CityCapture` the engine returned (`city`, `destroyed`)
+ * and the ids the caller chose, which is exactly what `commands.ts` puts on the payload.
+ *
+ * `BASE` is a played state with more than one city and more than one civilization
+ * (asserted where it is defined), so a rival always exists to take the city.
+ */
+const captureFixture = (): CaptureFixture => {
+  const target = mustFind(BASE.cities[0], 'a city in the played state');
+  const rival = mustFind(
+    civPlayers(BASE).find((player) => player.id !== target.owner),
+    'a rival civilization in the played state',
+  );
+  const captured = captureCity(BASE, RULESET.buildings, target.id, rival.id);
+  if (captured === undefined) {
+    throw new Error(`captureCity found no city ${String(target.id)} to capture`);
+  }
+
+  return {
+    previous: BASE,
+    state: captured.state,
+    event: {
+      type: 'CityCaptured',
+      cityId: captured.city.id,
+      from: target.owner,
+      to: rival.id,
+      tile: captured.city.tile,
+      name: captured.city.name,
+      population: captured.city.population,
+      destroyed: captured.destroyed,
+    },
+    cityId: target.id,
+    from: target.owner,
+    to: rival.id,
+  };
+};
+
+/* ------------------------------------------------------------------ *
  * 1. The clean baseline — the registry must not fire on real play
  * ------------------------------------------------------------------ */
 
@@ -472,7 +566,11 @@ describe('the registry on real play', () => {
   it('is importable by its package name, with unique names and one-line descriptions', () => {
     // The import at the top of this file is itself the evidence that `@civts/sim`
     // resolves by name; this test pins the shape of what it resolved to.
-    expect(CORE_INVARIANTS.length).toBeGreaterThanOrEqual(21);
+    // M6 raised the registry from 21 to 27 (the six combat predicates below). The
+    // bound is a floor rather than an equality on purpose — the CLI's report prints the
+    // live size, and this assertion is about the registry having grown, not about the
+    // exact number, which the adversarial battery pins as a literal.
+    expect(CORE_INVARIANTS.length).toBeGreaterThanOrEqual(27);
     const names = CORE_INVARIANTS.map((invariant) => invariant.name);
     expect(new Set(names).size).toBe(names.length);
     for (const invariant of CORE_INVARIANTS) {
@@ -694,7 +792,8 @@ describe('every invariant fires on a deliberately broken state', () => {
     // `growth-food` reduction, and growth spends the reduced requirement, which never
     // exceeds the bare curve, so no turn leaves a box this full. This is the state the
     // `BROKEN_STATES` table uses.
-    const atBare = withCity(BASE, BASE_CITY.id, (city) => ({
+    const fed = fedCity(BASE);
+    const atBare = withCity(fed, BASE_CITY.id, (city) => ({
       ...city,
       foodBox: foodBoxSize(city.population),
     }));
@@ -722,7 +821,7 @@ describe('every invariant fires on a deliberately broken state', () => {
     ).toHaveLength(1);
 
     const negative = contextFor({
-      state: withCity(BASE, BASE_CITY.id, (city) => ({ ...city, foodBox: -1 })),
+      state: withCity(fed, BASE_CITY.id, (city) => ({ ...city, foodBox: -1 })),
     });
     expect(messagesOf('city-food-box-within-threshold', negative)[0]).toContain('food box -1');
     expect(messagesOf('city-food-box-within-threshold', contextFor({ state: BASE }))).toEqual([]);
@@ -735,6 +834,7 @@ describe('every invariant fires on a deliberately broken state', () => {
     // gained is caught here and not by bound 1. It is claimed only when the state's
     // building list is the list growth measured against, which the events decide.
     const granary = mustFind(GROWTH_FOOD_BUILDINGS[0], 'a shipped growth-food building');
+    const fed = fedCity(BASE);
     const held = holding(BASE_CITY, granary.id);
     const bare = foodBoxSize(held.population);
     const reduced = reducedThreshold(held);
@@ -744,7 +844,7 @@ describe('every invariant fires on a deliberately broken state', () => {
     expect(reduced).toBeGreaterThanOrEqual(MIN_GROWTH_FOOD);
 
     const withBox = (box: number): GameState =>
-      withCity(BASE, BASE_CITY.id, (city) => ({ ...holding(city, granary.id), foodBox: box }));
+      withCity(fed, BASE_CITY.id, (city) => ({ ...holding(city, granary.id), foodBox: box }));
 
     // Fires: a box in [reduced, bare) with nothing in the events that moved the
     // threshold, so growth saw the very threshold the state carries.
@@ -944,17 +1044,32 @@ describe('every invariant fires on a deliberately broken state', () => {
       // when nothing happened this turn, and (the fix) caught identically when its owner
       // reported a shortfall. The two message lists must be the same list, so the clause is
       // gone rather than merely reordered.
+      let skippedForNoSurplus = 0;
       const probes = sweep().flatMap(({ seed, result }) =>
         result.finalState.cities.flatMap((city) => {
           const bare = foodBoxSize(city.population);
           const reduced = reducedThreshold(city);
           if (reduced >= bare) return []; // no growth-food row: this bound is not stricter here
+          // **The bound's premise, read from the city the case is built on (M6).** Both
+          // bounds are claims about a box the growth pass *spent*, and `applyGrowth`
+          // returns early on a surplus of exactly zero, so a box at or above the reduced
+          // threshold is legal for a city with no food to spare — the shape a **sack**
+          // makes reachable, because `captureCity` clears the captured city's worked
+          // tiles and nothing reassigns them for a barbarian owner. Asking the same
+          // `cityYields` the pass reads keeps this a fire case for the cities where the
+          // claim applies instead of a case the check correctly declines to make.
+          if (cityYields(result.finalState, VIEW, city.id).foodSurplus <= 0) {
+            skippedForNoSurplus += 1;
+            return [];
+          }
           return [{ seed, state: result.finalState, city, reduced }];
         }),
       );
       // Non-vacuity: the sweep really contains cities a `growth-food` building lowers the
-      // threshold for, so the loop below is not an empty loop.
+      // threshold for *and* that have food to spare, so the loop below is not an empty
+      // loop — and the cities it passed over are counted rather than silently dropped.
       expect(probes.length).toBeGreaterThan(0);
+      expect(skippedForNoSurplus).toBeGreaterThan(0);
 
       for (const { state, city, reduced } of probes) {
         const full = withCity(state, city.id, (candidate) => ({ ...candidate, foodBox: reduced }));
@@ -975,7 +1090,8 @@ describe('every invariant fires on a deliberately broken state', () => {
       console.log(
         `food-box sweep: ${String(probes.length)} reduced-threshold city probes over ` +
           `${String(SWEEP_SEEDS.length)} seeds x ${String(SWEEP_TURNS)} turns, all caught with and ` +
-          `without the owner's shortfall`,
+          `without the owner's shortfall; ${String(skippedForNoSurplus)} city-turns skipped for ` +
+          'having no food surplus, where the bound makes no claim',
       );
     },
     300_000,
@@ -1157,6 +1273,286 @@ describe('every invariant fires on a deliberately broken state', () => {
     });
     expect(messagesOf('unit-movement-in-range', unknown)[0]).toContain('not in the ruleset');
     expect(messagesOf('unit-movement-in-range', contextFor({ state: BASE }))).toEqual([]);
+  });
+
+  it('unit-hit-points-in-range: more hit points than the type has, and a fractional count', () => {
+    const unit = BASE_UNIT;
+    const full = maxHitPointsOf(unitDef(VIEW, unit.type), hitPointsLeftOf(unit));
+
+    const tooMany = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, hitPointsLeft: full + 1 })),
+    });
+    expect(messagesOf('unit-hit-points-in-range', tooMany)[0]).toContain('more than its');
+
+    const fractional = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, hitPointsLeft: 1.5 })),
+    });
+    expect(messagesOf('unit-hit-points-in-range', fractional)[0]).toContain('whole number >= 1');
+
+    // The paired clean cases: the same unit one hit below full health, the whole played
+    // state, and a unit whose field is **absent** — which the engine reads as one hit
+    // point (`hitPointsLeftOf`), so a state that omits the key states a legal value
+    // rather than nothing. That last one is written by hand because the type cannot
+    // express "no key": `spawnUnit` is the writer that always sets it.
+    const wounded = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({
+        ...each,
+        hitPointsLeft: Math.max(1, full - 1),
+      })),
+    });
+    expect(messagesOf('unit-hit-points-in-range', wounded)).toEqual([]);
+    expect(messagesOf('unit-hit-points-in-range', contextFor({ state: BASE }))).toEqual([]);
+    const absent = withUnit(BASE, unit.id, (each) => {
+      const copy: Record<string, unknown> = { ...each };
+      delete copy['hitPointsLeft'];
+      return malformedUnit(copy);
+    });
+    expect(messagesOf('unit-hit-points-in-range', contextFor({ state: absent }))).toEqual([]);
+  });
+
+  it('unit-hit-points-above-zero: a unit stored at 0, and a corpse the state kept', () => {
+    const unit = BASE_UNIT;
+    const dead = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, hitPointsLeft: 0 })),
+    });
+    expect(messagesOf('unit-hit-points-above-zero', dead)[0]).toContain('is in the world with 0');
+
+    // The same rule read from the event stream: the transition says the unit died and
+    // the state still holds it.
+    const destroyedLine = {
+      type: 'UnitDestroyed',
+      unitId: unit.id,
+      owner: unit.owner,
+      unitType: unit.type,
+      tile: unit.tile,
+      reason: 'combat',
+      byUnitId: asUnitId(Number(unit.id) + 900),
+      byOwner: unit.owner,
+    } as const;
+    const lingering = contextFor({ state: BASE, events: [destroyedLine] });
+    expect(messagesOf('unit-hit-points-above-zero', lingering)[0]).toContain(
+      'still in state.units',
+    );
+    // A bankruptcy death is the same claim, and says so in the message.
+    const bankrupt = contextFor({
+      state: BASE,
+      events: [{ ...destroyedLine, reason: 'bankruptcy' }],
+    });
+    expect(messagesOf('unit-hit-points-above-zero', bankrupt)[0]).toContain('by bankruptcy');
+
+    // Paired clean cases: the played state, a wound that stops at one hit point, and a
+    // `UnitDestroyed` line for a unit that is genuinely not in the state.
+    expect(messagesOf('unit-hit-points-above-zero', contextFor({ state: BASE }))).toEqual([]);
+    const oneLeft = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, hitPointsLeft: 1 })),
+    });
+    expect(messagesOf('unit-hit-points-above-zero', oneLeft)).toEqual([]);
+    const gone = contextFor({
+      state: BASE,
+      events: [{ ...destroyedLine, unitId: asUnitId(9999) }],
+    });
+    expect(messagesOf('unit-hit-points-above-zero', gone)).toEqual([]);
+  });
+
+  it('unit-experience-in-range: a level above the cap, and a fractional one', () => {
+    const unit = BASE_UNIT;
+    const above = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, experience: MAX_EXPERIENCE + 1 })),
+    });
+    expect(messagesOf('unit-experience-in-range', above)[0]).toContain(
+      `whole number in 0..${String(MAX_EXPERIENCE)}`,
+    );
+
+    const fractional = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, experience: 0.5 })),
+    });
+    expect(messagesOf('unit-experience-in-range', fractional)[0]).toContain('0.5');
+
+    // Paired clean cases: every level the cap allows, and the played state itself (whose
+    // units carry no `experience` key at all — absence *is* zero promotions).
+    for (let level = 0; level <= MAX_EXPERIENCE; level += 1) {
+      const legal = contextFor({
+        state: withUnit(BASE, unit.id, (each) => ({ ...each, experience: level })),
+      });
+      expect(messagesOf('unit-experience-in-range', legal)).toEqual([]);
+    }
+    expect(messagesOf('unit-experience-in-range', contextFor({ state: BASE }))).toEqual([]);
+  });
+
+  it("unit-not-inside-foreign-city: a rival standing in someone else's city", () => {
+    const city = mustFind(BASE.cities[0], 'a city');
+    const rival = mustFind(
+      civPlayers(BASE).find((player) => player.id !== city.owner),
+      'a rival civilization',
+    );
+
+    const squatter = contextFor({
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({
+        ...unit,
+        owner: rival.id,
+        tile: city.tile,
+      })),
+    });
+    const message = mustFind(
+      messagesOf('unit-not-inside-foreign-city', squatter)[0],
+      'a violation message',
+    );
+    expect(message).toContain(`stands inside city ${String(city.id)}`);
+    expect(message).toContain(`which player ${String(city.owner)} owns`);
+
+    // Paired clean cases: the *same tile* with the city's own owner standing on it (only
+    // the owner differs from the violating state above), and the played state itself.
+    const welcome = contextFor({
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({
+        ...unit,
+        owner: city.owner,
+        tile: city.tile,
+      })),
+    });
+    expect(messagesOf('unit-not-inside-foreign-city', welcome)).toEqual([]);
+    expect(messagesOf('unit-not-inside-foreign-city', contextFor({ state: BASE }))).toEqual([]);
+  });
+
+  it('captured-city-consistent: the capture rule, the sack, and a wonder the sack may not take', () => {
+    const fixture = captureFixture();
+    const captured = mustFind(
+      fixture.state.cities.find((city) => city.id === fixture.cityId),
+      'the captured city',
+    );
+    // Non-vacuity: the fixture really is a capture — it changed hands — so the clean
+    // case below is a transition and not the absence of one.
+    expect(captured.owner).toBe(fixture.to);
+    expect(captured.owner).not.toBe(fixture.from);
+
+    expect(
+      messagesOf(
+        'captured-city-consistent',
+        contextFor({ state: fixture.state, previous: fixture.previous, events: [fixture.event] }),
+      ),
+    ).toEqual([]);
+    // With no `previous` snapshot the boundary arithmetic is skipped, and the
+    // event/state agreement still holds.
+    expect(
+      messagesOf(
+        'captured-city-consistent',
+        contextFor({ state: fixture.state, events: [fixture.event] }),
+      ),
+    ).toEqual([]);
+    // A transition in which nothing was captured says nothing.
+    expect(
+      messagesOf('captured-city-consistent', contextFor({ state: BASE, previous: BASE })),
+    ).toEqual([]);
+
+    // The event's population is the capture rule's answer, not a number of its own.
+    const wrongPopulation = contextFor({
+      state: fixture.state,
+      previous: fixture.previous,
+      events: [{ ...fixture.event, population: fixture.event.population + 1 }],
+    });
+    expect(messagesOf('captured-city-consistent', wrongPopulation)[0]).toContain(
+      'the capture rule is',
+    );
+
+    // The city never changed hands.
+    const notTaken = contextFor({ state: BASE, previous: BASE, events: [fixture.event] });
+    expect(messagesOf('captured-city-consistent', notTaken)[0]).toContain('is owned by player');
+
+    // A sack that takes a wonder: the catalog is what decides that a building is one,
+    // and the message names it.
+    const wonder = mustFind(
+      RULESET.buildings.find((def) => def.wonder === true),
+      'a wonder in the shipped catalog',
+    );
+    const wonderSacked = contextFor({
+      state: BASE,
+      previous: BASE,
+      events: [{ ...fixture.event, destroyed: [wonder.id] }],
+    });
+    expect(messagesOf('captured-city-consistent', wonderSacked).join('\n')).toContain(
+      'a capture preserves every wonder',
+    );
+
+    // A building that appeared out of a sack: the city holds one the city it was taken
+    // from never had. Built on top of the genuine capture so that only this claim moves.
+    const invented = withCity(fixture.state, fixture.cityId, (city) => ({
+      ...city,
+      buildings: [...city.buildings, wonder.id],
+    }));
+    const inventedMessages = messagesOf(
+      'captured-city-consistent',
+      contextFor({ state: invented, previous: fixture.previous, events: [fixture.event] }),
+    );
+    expect(inventedMessages.join('\n')).toContain('after a capture');
+  });
+
+  it('combat-hit-point-conservation: a winner that came out of the battle healthier', () => {
+    const unit = BASE_UNIT;
+    const enemy = mustFind(
+      BASE.units.find((each) => each.owner !== unit.owner),
+      'an enemy unit in the played state',
+    );
+    const event: Extract<GameEvent, { type: 'CombatResolved' }> = {
+      type: 'CombatResolved',
+      attackerId: unit.id,
+      attackerOwner: unit.owner,
+      defenderId: enemy.id,
+      defenderOwner: enemy.owner,
+      target: unit.tile,
+      outcome: 'defender-wins',
+      rounds: 1,
+      attackerLost: 0,
+      defenderLost: 0,
+      attackerWinPct: 33,
+      attackerSurvives: true,
+      defenderSurvives: true,
+    };
+
+    // The heal: the attacker's stored count is one *higher* after the battle than it was
+    // at the boundary, which no battle may do — the natural bug, since the winner's hit
+    // points are the ones written back.
+    const healed = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({
+        ...each,
+        hitPointsLeft: hitPointsLeftOf(each) + 1,
+      })),
+      previous: BASE,
+      events: [event],
+    });
+    expect(messagesOf('combat-hit-point-conservation', healed)[0]).toContain('never raises');
+
+    // Paired clean cases: the same battle with the attacker one hit lower, with the
+    // attacker destroyed outright (0 after), with no battle in the transition at all,
+    // and with a combatant that did not exist at the boundary (a band raised inside the
+    // same turn) — that last one is skipped rather than guessed, which is the point.
+    const wounded = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({
+        ...each,
+        hitPointsLeft: Math.max(1, hitPointsLeftOf(each) - 1),
+      })),
+      previous: BASE,
+      events: [event],
+    });
+    expect(messagesOf('combat-hit-point-conservation', wounded)).toEqual([]);
+
+    const destroyedOutright = contextFor({
+      state: { ...BASE, units: BASE.units.filter((each) => each.id !== unit.id) },
+      previous: BASE,
+      events: [event],
+    });
+    expect(messagesOf('combat-hit-point-conservation', destroyedOutright)).toEqual([]);
+
+    const noBattle = contextFor({ state: BASE, previous: BASE });
+    expect(messagesOf('combat-hit-point-conservation', noBattle)).toEqual([]);
+
+    const raisedThisTurn = contextFor({
+      state: withUnit(BASE, unit.id, (each) => ({
+        ...each,
+        hitPointsLeft: hitPointsLeftOf(each) + 1,
+      })),
+      previous: { ...BASE, units: BASE.units.filter((each) => each.id !== unit.id) },
+      events: [event],
+    });
+    expect(messagesOf('combat-hit-point-conservation', raisedThisTurn)).toEqual([]);
   });
 
   it('improvements-sorted-and-unique: pairs out of order and a duplicate', () => {
@@ -1526,6 +1922,12 @@ describe('every invariant fires on a deliberately broken state', () => {
       'unit-tile-in-bounds',
       'unit-owner-exists',
       'unit-movement-in-range',
+      'unit-hit-points-in-range',
+      'unit-hit-points-above-zero',
+      'unit-experience-in-range',
+      'unit-not-inside-foreign-city',
+      'captured-city-consistent',
+      'combat-hit-point-conservation',
       'improvements-sorted-and-unique',
       'resources-sorted-and-unique',
       'wonder-held-by-one-city',
@@ -1570,7 +1972,7 @@ const BROKEN_STATES: Readonly<Record<string, () => InvariantContext>> = {
     contextFor({ state: withCity(BASE, BASE_CITY.id, (city) => ({ ...city, population: 0 })) }),
   'city-food-box-within-threshold': () =>
     contextFor({
-      state: withCity(BASE, BASE_CITY.id, (city) => ({
+      state: withCity(fedCity(BASE), BASE_CITY.id, (city) => ({
         ...city,
         foodBox: foodBoxSize(city.population),
       })),
@@ -1640,6 +2042,78 @@ const BROKEN_STATES: Readonly<Record<string, () => InvariantContext>> = {
   'unit-movement-in-range': () =>
     contextFor({
       state: withUnit(BASE, BASE_UNIT.id, (unit) => ({ ...unit, movementLeft: 12345 })),
+    }),
+  'unit-hit-points-in-range': () =>
+    contextFor({
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({ ...unit, hitPointsLeft: 12345 })),
+    }),
+  'unit-hit-points-above-zero': () =>
+    contextFor({
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({ ...unit, hitPointsLeft: 0 })),
+    }),
+  'unit-experience-in-range': () =>
+    contextFor({
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({
+        ...unit,
+        experience: MAX_EXPERIENCE + 1,
+      })),
+    }),
+  'unit-not-inside-foreign-city': () =>
+    contextFor({
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({
+        ...unit,
+        owner: mustFind(
+          civPlayers(BASE).find((player) => player.id !== mustFind(BASE.cities[0], 'a city').owner),
+          'a rival civilization',
+        ).id,
+        tile: mustFind(BASE.cities[0], 'a city').tile,
+      })),
+    }),
+  'captured-city-consistent': () =>
+    contextFor({
+      state: captureFixture().state,
+      previous: BASE,
+      events: [
+        {
+          ...captureFixture().event,
+          population: captureFixture().event.population + 1,
+        },
+      ],
+    }),
+  'combat-hit-point-conservation': () =>
+    contextFor({
+      // The heal, not a wound: the after-state is one hit *healthier* than the boundary,
+      // which is the only direction this check may fire in. (Written as `+ 1` on the
+      // after-state rather than `- 1` on the boundary because a unit at one hit point
+      // cannot be wounded any further, so the wounded form would be clean for it.)
+      state: withUnit(BASE, BASE_UNIT.id, (unit) => ({
+        ...unit,
+        hitPointsLeft: hitPointsLeftOf(unit) + 1,
+      })),
+      previous: BASE,
+      events: [
+        {
+          type: 'CombatResolved',
+          attackerId: BASE_UNIT.id,
+          attackerOwner: BASE_UNIT.owner,
+          defenderId: mustFind(
+            BASE.units.find((unit) => unit.owner !== BASE_UNIT.owner),
+            'an enemy unit',
+          ).id,
+          defenderOwner: mustFind(
+            BASE.units.find((unit) => unit.owner !== BASE_UNIT.owner),
+            'an enemy unit',
+          ).owner,
+          target: BASE_UNIT.tile,
+          outcome: 'defender-wins',
+          rounds: 1,
+          attackerLost: 0,
+          defenderLost: 0,
+          attackerWinPct: 33,
+          attackerSurvives: true,
+          defenderSurvives: true,
+        },
+      ],
     }),
   'improvements-sorted-and-unique': () =>
     contextFor({

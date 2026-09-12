@@ -35,6 +35,12 @@ export * from './production.js';
 export * from './turn.js';
 export * from './hut.js';
 export * from './units.js';
+// M6's combat resolver: the ONE statement of the odds, the modifier table and the tie
+// rule. After `units.js` because it reads a unit's statistics through the same
+// `UnitDef` view and is the only module that does. It imports nothing but `rng.js`
+// (type and `nextBelow`), so it adds no edge to the command or turn layers — those
+// call it, never the other way round.
+export * from './combat.js';
 export * from './commands.js';
 export * from './actions.js';
 export * from './fog.js';

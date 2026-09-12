@@ -1,22 +1,26 @@
 {
-  "note": "State hashes for packages/testing/test/golden.test.ts (seeds 1, 42, 1337; map size tiny; 2 civilizations; plus one played 30-turn game on seed 42, which founds a city, builds an improvement, produces a unit and a building, grows, researches a tech and runs the money loop). Hashes are only guaranteed for a pinned (engine revision, Node major): changing one requires an intentional regeneration and a \"rehash: <reason>\" note in the commit message.",
+  "note": "State hashes for packages/testing/test/golden.test.ts (seeds 1, 42, 1337; map size tiny; 2 civilizations; plus one played 30-turn game on seed 42, which founds a city, builds an improvement, produces a unit and a building, grows, researches a tech and runs the money loop; plus one battle applied to that played game with AttackUnit, stored as played-civs2-seed42-combat). Hashes are only guaranteed for a pinned (engine revision, Node major): changing one requires an intentional regeneration and a \"rehash: <reason>\" note in the commit message.",
   "nodeMajor": 24,
   "entries": [
     {
       "name": "tiny-civs2-seed1",
-      "hash": "7f8b0949114fe6f3"
+      "hash": "0fcbdf5564556c3a"
     },
     {
       "name": "tiny-civs2-seed42",
-      "hash": "acc2e281926ead8f"
+      "hash": "9209534b36689b8a"
     },
     {
       "name": "tiny-civs2-seed1337",
-      "hash": "659c0d9dd790708d"
+      "hash": "0bebdfa8140c8168"
     },
     {
       "name": "played-civs2-seed42",
-      "hash": "f9849fa910c6cb83"
+      "hash": "d996db0609411f23"
+    },
+    {
+      "name": "played-civs2-seed42-combat",
+      "hash": "0958b4ca8c863258"
     }
   ]
 }

@@ -24,6 +24,15 @@
 
 import { describe, expect, it } from 'vitest';
 import { canonicalize, hashValue } from '@civts/testing';
+// M6's combat constants, **read** rather than copied: the battle sections below assert
+// the odds `combat.ts` computes, so a retune of a bonus has to move this file's
+// assertions on purpose instead of passing them silently.
+import {
+  CITY_DEFENSE_BONUS_PCT,
+  FORTIFY_BONUS_PCT,
+  MAX_EXPERIENCE,
+  WALLS_BONUS_PCT,
+} from '../src/combat.js';
 import {
   MIN_CITY_DISTANCE,
   cityById,
@@ -33,7 +42,9 @@ import {
 } from '../src/cities.js';
 import {
   applyCommand,
+  planAttackUnit,
   planCancelWork,
+  planFortifyUnit,
   planFoundCity,
   planMove,
   planSetProduction,
@@ -58,6 +69,7 @@ import {
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  type BuildingId,
   type PlayerId,
 } from '../src/ids.js';
 import {
@@ -71,7 +83,7 @@ import {
 import type { GameMap, ResourceDef, RulesetView, TerrainDef, TerrainRole } from '../src/map.js';
 import { applyProduction, itemCost, itemCostOf } from '../src/production.js';
 import { isOk, type Result } from '../src/result.js';
-import { nextBelow, seedRng } from '../src/rng.js';
+import { nextBelow, seedRng, type RngState } from '../src/rng.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
 import {
   DEFAULT_RATES,
@@ -87,7 +99,12 @@ import {
 import { researchProblem, researchingOf, type TechDef } from '../src/tech.js';
 import { advanceTurn } from '../src/turn.js';
 import {
+  experienceOf,
+  fullHitPoints,
+  hitPointsLeftOf,
+  isFortified,
   spawnUnit,
+  unitById,
   withWork,
   withoutWork,
   type Unit,
@@ -413,6 +430,23 @@ const unit = (
   owner: asPlayerId(owner),
   tile: asTileIndex(tile),
   movementLeft,
+});
+
+/**
+ * The same unit as `unit()`, plus the M6 field `spawnUnit` writes: a unit that enters
+ * play is at full health, which for a fixture row that declares no `hitPoints` is one
+ * point (`fullHitPoints`). Spelled as a helper because three different tests assert what
+ * a spawn produced, and all three have to agree with `units.ts` about it.
+ */
+const freshUnit = (
+  id: number,
+  type: UnitDef,
+  owner: number,
+  tile: number,
+  movementLeft: number,
+): Unit => ({
+  ...unit(id, type, owner, tile, movementLeft),
+  hitPointsLeft: fullHitPoints(type),
 });
 
 /** A city with M3's shape and playable defaults; every field is spelled out. */
@@ -2829,6 +2863,10 @@ describe('production.ts — shields and completion', () => {
       owner: P0,
       tile: asTileIndex(13),
       movementLeft: SCOUT.movement,
+      // M6: a unit leaves the slipway at full health, and a row that declares no
+      // `hitPoints` (this fixture's every military row) is one point
+      // (`fullHitPoints`).
+      hitPointsLeft: fullHitPoints(SCOUT),
     });
     expect(outcome.state.nextUnitId).toBe(4);
     // Units stay sorted by id, and nothing else about them moved.
@@ -3331,6 +3369,9 @@ describe('units.ts — spawnUnit', () => {
       owner: P0,
       tile: asTileIndex(8),
       movementLeft: SCOUT.movement,
+      // M6: "full movement" comes with full hit points, and `hitPointsLeft` is written
+      // rather than left absent, so a spawned unit is complete on arrival.
+      hitPointsLeft: fullHitPoints(SCOUT),
     });
     expect(spawned.state.nextUnitId).toBe(STATE.nextUnitId + 1);
     expect(spawned.state.units).toHaveLength(STATE.units.length + 1);
@@ -3451,11 +3492,12 @@ describe('applyCommand — M3 goody huts', () => {
     expect(outcome.state.map.huts).toEqual([]);
     expect(tileOf(outcome.state, 0)).toBe(HUT_TILE);
     // The band are ordinary units of an ordinary player: barbarians, on land tiles
-    // next to the hut, at full movement, and the ids continue the state's sequence.
+    // next to the hut, at full movement and full health, and the ids continue the
+    // state's sequence.
     expect(outcome.state.nextUnitId).toBe(5);
     expect(outcome.state.units.slice(3)).toStrictEqual([
-      unit(3, WARRIOR, 2, 1, WARRIOR.movement),
-      unit(4, WARRIOR, 2, 5, WARRIOR.movement),
+      freshUnit(3, WARRIOR, 2, 1, WARRIOR.movement),
+      freshUnit(4, WARRIOR, 2, 5, WARRIOR.movement),
     ]);
 
     // The input is untouched — map, RNG and unit list alike.
@@ -3494,7 +3536,7 @@ describe('applyCommand — M3 goody huts', () => {
     // stands on the hut tile with the mover: M2 lets one player's units stack.
     expect(outcome.state.units.slice(2)).toStrictEqual([
       unit(2, WARRIOR, 1, 6, 0),
-      unit(3, WARRIOR, 0, HUT_TILE, WARRIOR.movement),
+      freshUnit(3, WARRIOR, 0, HUT_TILE, WARRIOR.movement),
     ]);
     expect(
       outcome.state.units.filter((candidate) => candidate.tile === asTileIndex(HUT_TILE)),
@@ -3891,5 +3933,990 @@ describe('planSetResearch agrees with the applier, over the whole catalog and be
       expect(plan.value.tech).toBe('pottery');
       expect(plan.value.player.id).toBe(P0);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M6 — attacking, fortifying and city capture
+ *
+ * The fixture below is the M2 board with a combat catalog bolted on, and the shared
+ * `RULESET` above is deliberately untouched: nothing in the M2–M5 sections may move
+ * because M6 arrived, and a battle needs statistics (`attack`, `defense`,
+ * `hitPoints`) those fixture rows do not pin.
+ *
+ * Every number asserted here is either a **placeholder** of ours (the halved, floored,
+ * minimum-1 capture population; which buildings a sack takes and in what order) or a
+ * constant `combat.ts` declares and this file *reads* rather than re-derives
+ * (`VETERAN_ATTACK_PCT`, `FORTIFY_BONUS_PCT`, `CITY_DEFENSE_BONUS_PCT`,
+ * `WALLS_BONUS_PCT`, `MAX_EXPERIENCE`). None of it is Civ 3's, and the odds quoted in
+ * the comments are the *engine's* arithmetic — `floor(attack * 100 / (attack + defense))`
+ * with the defender's summed modifiers floored once — not a claim about the real game.
+ * ------------------------------------------------------------------ */
+
+/** Attack 3, defence 1, **one** hit point: cheap enough to script every battle exactly. */
+const LEGION: UnitDef = {
+  id: asUnitTypeId('legion'),
+  role: 'military',
+  name: 'Legion',
+  attack: 3,
+  defense: 1,
+  hitPoints: 1,
+  movement: 2,
+  cost: 3,
+  domain: 'land',
+};
+
+/** Defence 4, attack 1, one hit point: the wall the modifier chain is measured against. */
+const PHALANX: UnitDef = {
+  id: asUnitTypeId('phalanx'),
+  role: 'military',
+  name: 'Phalanx',
+  attack: 1,
+  defense: 4,
+  hitPoints: 1,
+  movement: 2,
+  cost: 3,
+  domain: 'land',
+};
+
+/** `attack: 0`: M6's "may not attack" row — "a legality rule, not a footnote". */
+const CIVILIAN: UnitDef = {
+  id: asUnitTypeId('civilian'),
+  role: 'military',
+  name: 'Civilian',
+  attack: 0,
+  defense: 1,
+  hitPoints: 1,
+  movement: 2,
+  cost: 1,
+  domain: 'land',
+};
+
+/**
+ * M6's building rows, with distinct maintenance values and one wonder, so both claims
+ * of the capture rule are visible at once: the destruction order (maintenance
+ * descending, ties to the most recently completed) and the wonder exemption — the
+ * Pyramids carry the *highest* maintenance in this catalog and are still kept, so
+ * "destroy the expensive ones first" cannot pass these tests by accident.
+ */
+const M6_BUILDINGS: readonly BuildingDef[] = [
+  { id: asBuildingId('granary'), name: 'Granary', cost: 10, maintenance: 0, effects: [] },
+  { id: asBuildingId('library'), name: 'Library', cost: 20, maintenance: 1, effects: [] },
+  { id: asBuildingId('walls'), name: 'City Walls', cost: 15, maintenance: 1, effects: [] },
+  { id: asBuildingId('marketplace'), name: 'Marketplace', cost: 12, maintenance: 2, effects: [] },
+  {
+    id: asBuildingId('pyramids'),
+    name: 'Pyramids',
+    cost: 30,
+    maintenance: 3,
+    effects: [],
+    wonder: true,
+  },
+];
+
+/** The M2 fixture view plus M6's unit and building rows — nothing else moved. */
+const M6_RULESET: TechView = {
+  ...RULESET,
+  units: [...RULESET.units, LEGION, PHALANX, CIVILIAN],
+  buildings: M6_BUILDINGS,
+};
+
+/**
+ * A seed whose **first** `nextBelow(state, 100)` draw is exactly `roll`.
+ *
+ * A one-hit-point battle is decided by that single draw, so this is how a test states
+ * *what the dice were* instead of hoping a seed produces the branch it wants: with
+ * `roll = 0` the attacker wins the first round (`0 < threshold` always), and with
+ * `roll = 99` the defender does (`99 >= threshold` for every threshold the resolver can
+ * produce, since `MAX_WIN_PCT` is 99). The search is over seeds, integer-only and
+ * terminates on the first match, so it is as deterministic as a literal — the same
+ * device `combat.test.ts` uses, for the same reason.
+ */
+const seedWithFirstRoll = (roll: number): RngState => {
+  for (let seed = 0; seed < 100000; seed += 1) {
+    const candidate = seedRng(seed);
+    if (nextBelow(candidate, 100)[0] === roll) return candidate;
+  }
+  throw new Error(`no seed in range draws ${String(roll)} first`);
+};
+
+const ATTACKER = 0;
+const DEFENDER = 1;
+
+/** The unit with this id, or a thrown error — a test's own `unitById`, without a cast. */
+const mustUnit = (state: GameState, id: number): Unit => {
+  const found = unitById(state, asUnitId(id));
+  if (found === undefined) throw new Error(`the board has no unit ${String(id)}`);
+  return found;
+};
+
+/**
+ * A battle board: player 0's legion on tile 5 with a full turn, player 1's phalanx on
+ * tile 6 (adjacent grassland; every terrain in this fixture has a zero defence bonus,
+ * so nothing is attributed to the ground).
+ *
+ * `defenderCity` puts a city of the defender's owner on the defender's tile — the
+ * arrangement that produces the city and wall bonuses — and `hitPoints` overrides both
+ * units' current health, so a multi-round battle needs no new catalog row
+ * (`hitPointsLeftOf` reads the unit's field, not the row's maximum).
+ */
+const battleBoard = (options: {
+  readonly roll: number;
+  readonly fortified?: boolean;
+  readonly hitPoints?: number;
+  readonly defenderCity?: readonly BuildingId[];
+  readonly defenderOwner?: number;
+  readonly defenderType?: UnitDef;
+  readonly attackerType?: UnitDef;
+  readonly attackerMovement?: number;
+  readonly extraEnemy?: boolean;
+}): GameState => {
+  const hp = options.hitPoints ?? 1;
+  const attackerType = options.attackerType ?? LEGION;
+  const defenderType = options.defenderType ?? PHALANX;
+  const attacker: Unit = {
+    ...unit(ATTACKER, attackerType, 0, 5, options.attackerMovement ?? 2),
+    hitPointsLeft: hp,
+  };
+  const defender: Unit = {
+    ...unit(DEFENDER, defenderType, options.defenderOwner ?? 1, 6, defenderType.movement),
+    hitPointsLeft: hp,
+    ...(options.fortified === true ? { fortified: true } : {}),
+  };
+  const units: readonly Unit[] =
+    options.extraEnemy === true
+      ? [attacker, defender, { ...unit(2, PHALANX, 1, 6, 0), hitPointsLeft: hp }]
+      : [attacker, defender];
+
+  const base = withUnits({ ...STATE, rng: seedWithFirstRoll(options.roll) }, units);
+  if (options.defenderCity === undefined) return base;
+
+  return withCities(base, [
+    city(0, options.defenderOwner ?? 1, 6, { buildings: [...options.defenderCity] }),
+  ]);
+};
+
+/**
+ * The capture board: player 0's legion on tile 5 and player 1's city on tile 6, with one
+ * phalanx standing in it when `defended`. `city` overrides the city's fields, so a
+ * capture test states the city it is capturing in one line.
+ */
+const siegeBoard = (
+  options: { readonly defended?: boolean; readonly city?: Partial<City> } = {},
+): GameState => {
+  const units: readonly Unit[] =
+    options.defended === true
+      ? [unit(ATTACKER, LEGION, 0, 5, LEGION.movement), unit(DEFENDER, PHALANX, 1, 6, 0)]
+      : [unit(ATTACKER, LEGION, 0, 5, LEGION.movement)];
+  const base = withUnits({ ...STATE, rng: seedWithFirstRoll(0) }, units);
+  return withCities(base, [city(0, 1, 6, { name: 'City 1', population: 5, ...options.city })]);
+};
+
+/** The whole `UnitDestroyed` payload for a unit, so a death is asserted in full. */
+const destroyedEvent = (each: Unit, killer: Unit): GameEvent => ({
+  type: 'UnitDestroyed',
+  unitId: each.id,
+  owner: each.owner,
+  unitType: each.type,
+  tile: each.tile,
+  reason: 'combat',
+  byUnitId: killer.id,
+  byOwner: killer.owner,
+});
+
+const attack = (unitId: number, target: number): Command => ({
+  type: 'AttackUnit',
+  unitId: asUnitId(unitId),
+  target: asTileIndex(target),
+});
+
+const fortify = (unitId: number): Command => ({ type: 'FortifyUnit', unitId: asUnitId(unitId) });
+
+/** The one `CombatResolved` event of an outcome, or a thrown error naming what happened. */
+const combatEvent = (
+  events: readonly GameEvent[],
+): Extract<GameEvent, { type: 'CombatResolved' }> => {
+  const found = events.find(
+    (event): event is Extract<GameEvent, { type: 'CombatResolved' }> =>
+      event.type === 'CombatResolved',
+  );
+  if (found === undefined)
+    throw new Error(`expected a CombatResolved event: ${JSON.stringify(events)}`);
+  return found;
+};
+
+/** The one `CityCaptured` event of an outcome, or a thrown error naming what happened. */
+const captureEvent = (
+  events: readonly GameEvent[],
+): Extract<GameEvent, { type: 'CityCaptured' }> => {
+  const found = events.find(
+    (event): event is Extract<GameEvent, { type: 'CityCaptured' }> => event.type === 'CityCaptured',
+  );
+  if (found === undefined)
+    throw new Error(`expected a CityCaptured event: ${JSON.stringify(events)}`);
+  return found;
+};
+
+/** Every player whose city holds `building`, in player-id order. */
+const holdersOf = (state: GameState, building: BuildingId): readonly PlayerId[] =>
+  [
+    ...new Set(
+      state.cities.filter((each) => each.buildings.includes(building)).map((each) => each.owner),
+    ),
+  ].sort((a, b) => Number(a) - Number(b));
+
+describe('applyCommand — AttackUnit resolves a battle through combat.ts', () => {
+  it('destroys the defender, leaves the attacker standing, and reports every number once', () => {
+    // Attack 3 against defence 4: floor(3 * 100 / (3 + 4)) = 42% a round. A draw of 0
+    // wins the round for the attacker, and one hit point each means one round is the
+    // whole battle — so every number below is hand-checkable.
+    const outcome = mustOk(apply(battleBoard({ roll: 0 }), P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(outcome.events).toEqual([
+      {
+        type: 'CombatResolved',
+        attackerId: asUnitId(ATTACKER),
+        attackerOwner: P0,
+        defenderId: asUnitId(DEFENDER),
+        defenderOwner: P1,
+        target: asTileIndex(6),
+        outcome: 'attacker-wins',
+        rounds: 1,
+        attackerLost: 0,
+        defenderLost: 1,
+        attackerWinPct: 42,
+        attackerSurvives: true,
+        defenderSurvives: false,
+      },
+      destroyedEvent(unit(DEFENDER, PHALANX, 1, 6, 0), unit(ATTACKER, LEGION, 0, 5, 2)),
+      {
+        type: 'UnitPromoted',
+        unitId: asUnitId(ATTACKER),
+        owner: P0,
+        tile: asTileIndex(5),
+        experience: 1,
+        maxExperience: MAX_EXPERIENCE,
+      },
+    ]);
+
+    // The world: the defender is gone, the attacker holds its ground, and its turn is
+    // spent — an attack costs the whole turn whether or not it succeeds.
+    expect(outcome.state.units.map((each) => Number(each.id))).toEqual([ATTACKER]);
+    const survivor = mustUnit(outcome.state, ATTACKER);
+    expect(survivor.tile).toBe(5);
+    expect(survivor.movementLeft).toBe(0);
+    expect(hitPointsLeftOf(survivor)).toBe(1);
+    expect(experienceOf(survivor)).toBe(1);
+    expect(outcome.state.revision).toBe(STATE.revision + 1);
+  });
+
+  it('hands the round to the defender at a draw of 99, and destroys the attacker', () => {
+    const outcome = mustOk(apply(battleBoard({ roll: 99 }), P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(combatEvent(outcome.events)).toEqual({
+      type: 'CombatResolved',
+      attackerId: asUnitId(ATTACKER),
+      attackerOwner: P0,
+      defenderId: asUnitId(DEFENDER),
+      defenderOwner: P1,
+      target: asTileIndex(6),
+      outcome: 'defender-wins',
+      rounds: 1,
+      attackerLost: 1,
+      defenderLost: 0,
+      attackerWinPct: 42,
+      attackerSurvives: false,
+      defenderSurvives: true,
+    });
+
+    // The *defender* won that combat, so the defender is the unit that earns the level:
+    // "a unit that wins a combat" is whichever side is left standing, not the attacker.
+    expect(outcome.events).toContainEqual({
+      type: 'UnitPromoted',
+      unitId: asUnitId(DEFENDER),
+      owner: P1,
+      tile: asTileIndex(6),
+      experience: 1,
+      maxExperience: MAX_EXPERIENCE,
+    });
+    expect(outcome.state.units.map((each) => Number(each.id))).toEqual([DEFENDER]);
+    // Being attacked costs the defender nothing but hit points: M6 makes an attack spend
+    // the *attacker's* whole turn, and a defender's movement is its own to spend on its
+    // own turn.
+    expect(mustUnit(outcome.state, DEFENDER).movementLeft).toBe(PHALANX.movement);
+  });
+
+  it('reads the defender’s modifiers through combat.ts, and floors the sum exactly once', () => {
+    // The same attacker against the same defender (attack 3 against defence 4) in four
+    // arrangements. Each modifier is a *summed* percentage with one floor at the end, so
+    // the odds walk 42 -> 33 -> 27 -> 25 and every step is asserted exactly:
+    //
+    //   in the open              floor(3 * 100 / (3 + 4))         = 42
+    //   the defender's own city  defence floor(4 * 150 / 100) = 6  -> floor(300 / 9)  = 33
+    //   …and it holds walls      defence floor(4 * 200 / 100) = 8  -> floor(300 / 11) = 27
+    //   …and it is fortified     defence floor(4 * 225 / 100) = 9  -> floor(300 / 12) = 25
+    //
+    // The last step is the compounding rule doing real work: 50 + 50 + 25 summed and
+    // floored once gives 9, where flooring each modifier on the way in would give
+    // floor(floor(floor(4*1.5)=6 *1.5)=9 *1.25) = 11 and different odds. A command layer
+    // that scaled the defence itself, or handed the resolver a pre-floored number, fails
+    // one of these four assertions.
+    const open = mustOk(apply(battleBoard({ roll: 0 }), P0, attack(ATTACKER, 6), M6_RULESET));
+    const inCity = mustOk(
+      apply(battleBoard({ roll: 0, defenderCity: [] }), P0, attack(ATTACKER, 6), M6_RULESET),
+    );
+    const withWalls = mustOk(
+      apply(
+        battleBoard({ roll: 0, defenderCity: [asBuildingId('walls')] }),
+        P0,
+        attack(ATTACKER, 6),
+        M6_RULESET,
+      ),
+    );
+    const dugIn = mustOk(
+      apply(
+        battleBoard({ roll: 0, defenderCity: [asBuildingId('walls')], fortified: true }),
+        P0,
+        attack(ATTACKER, 6),
+        M6_RULESET,
+      ),
+    );
+
+    expect(combatEvent(open.events).attackerWinPct).toBe(42);
+    expect(combatEvent(inCity.events).attackerWinPct).toBe(33);
+    expect(combatEvent(withWalls.events).attackerWinPct).toBe(27);
+    expect(combatEvent(dugIn.events).attackerWinPct).toBe(25);
+
+    // The same four steps against the constants rather than the arithmetic, so a retune
+    // of a bonus has to change this test on purpose instead of silently passing.
+    expect(CITY_DEFENSE_BONUS_PCT).toBe(50);
+    expect(WALLS_BONUS_PCT).toBe(50);
+    expect(FORTIFY_BONUS_PCT).toBe(25);
+  });
+
+  it('gives the city and wall bonuses only to the city’s own defender', () => {
+    // A third player's unit standing in somebody else's walled city is not defending
+    // those walls. This states the reading rather than leaving it to the code: the
+    // defender gets the open-ground odds, not the city's.
+    const third = {
+      ...battleBoard({ roll: 0, defenderOwner: 2 }),
+      players: [...STATE.players, player(2, 7)],
+    };
+    const board = withCities(third, [city(0, 1, 6, { buildings: [asBuildingId('walls')] })]);
+    const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(combatEvent(outcome.events).attackerWinPct).toBe(42);
+  });
+
+  it('spends the attacker’s whole turn even in a battle it does not win outright', () => {
+    // Three hit points each and a first draw of 99: the attacker loses the opening round
+    // (3 -> 2) and the battle runs on. Whatever the rest of the stream does, the attack
+    // has cost the unit its turn, and the damage it took is written into the state.
+    const outcome = mustOk(
+      apply(battleBoard({ roll: 99, hitPoints: 3 }), P0, attack(ATTACKER, 6), M6_RULESET),
+    );
+    const result = combatEvent(outcome.events);
+
+    expect(result.rounds).toBeGreaterThan(1);
+    expect(result.attackerLost).toBeGreaterThan(0);
+    const attacker = unitById(outcome.state, asUnitId(ATTACKER));
+    if (attacker === undefined) {
+      // It died — and then the loss is the resolver's own answer, with no movement left
+      // to spend because there is no unit to spend it.
+      expect(result.attackerSurvives).toBe(false);
+    } else {
+      expect(attacker.movementLeft).toBe(0);
+      expect(hitPointsLeftOf(attacker)).toBe(3 - result.attackerLost);
+    }
+  });
+
+  it('is reproducible from the seed, and consumes the battle’s draws from the state’s RNG', () => {
+    // One hit point each means one round, one roll, one draw from the world's stream —
+    // so the RNG the battle returns can be checked against the stream position after
+    // *exactly one* draw, rather than against "something different".
+    const board = battleBoard({ roll: 0 });
+    const [drawn, afterOneDraw] = nextBelow(board.rng, 100);
+    expect(drawn).toBe(0); // the dice this board was built to throw
+
+    const first = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+    const second = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(combatEvent(second.events)).toEqual(combatEvent(first.events));
+    expect(second.state).toEqual(first.state);
+    expect(hashValue(second.state)).toBe(hashValue(first.state));
+    expect(first.state.rng).toEqual(afterOneDraw);
+
+    // A longer battle consumes one draw per round, in order: the same board at three hit
+    // points a side is decided after `rounds` rolls, and the state must have moved down
+    // the stream by exactly that many. This is the reproducibility claim stated as
+    // arithmetic — the state is the whole source of randomness, and nothing is dropped.
+    const long = battleBoard({ roll: 99, hitPoints: 3 });
+    const played = mustOk(apply(long, P0, attack(ATTACKER, 6), M6_RULESET));
+    let expected = long.rng;
+    for (let round = 0; round < combatEvent(played.events).rounds; round += 1) {
+      expected = nextBelow(expected, 100)[1];
+    }
+    expect(played.state.rng).toEqual(expected);
+  });
+
+  it('never leaves a live unit at zero hit points, and destroys exactly one side per battle', () => {
+    // The structural claims behind the event list, swept rather than sampled: a battle
+    // resolved by this command kills exactly one of the two units (the loop runs until a
+    // side has nothing left, and a round costs one hit point), and no unit in the
+    // resulting state is at or below zero.
+    for (let roll = 0; roll < 100; roll += 1) {
+      const board = battleBoard({ roll, hitPoints: 3 });
+      const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+      const result = combatEvent(outcome.events);
+      const deaths = outcome.events.filter((event) => event.type === 'UnitDestroyed');
+
+      expect(deaths).toHaveLength(1);
+      expect(result.attackerSurvives).toBe(!result.defenderSurvives);
+      expect(outcome.state.units).toHaveLength(1);
+      for (const each of outcome.state.units) expect(hitPointsLeftOf(each)).toBeGreaterThan(0);
+
+      // "Losing a combat the unit survives grants nothing" is therefore *vacuously* true
+      // in this engine — the loser never survives — and the stronger claim that is
+      // testable holds instead: a promotion always names a unit the state still holds.
+      for (const event of outcome.events) {
+        if (event.type !== 'UnitPromoted') continue;
+        expect(outcome.state.units.some((each) => each.id === event.unitId)).toBe(true);
+        expect(experienceOf(mustUnit(outcome.state, Number(event.unitId)))).toBe(event.experience);
+      }
+    }
+  });
+
+  it('leaves no trace of a unit it destroys', () => {
+    const board = battleBoard({ roll: 0 });
+    const before = hashValue(board);
+    const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+    const dead = unit(DEFENDER, PHALANX, 1, 6, 0);
+
+    // Gone, by every read the engine offers.
+    expect(outcome.state.units.some((each) => each.id === dead.id)).toBe(false);
+    expect(unitById(outcome.state, dead.id)).toBeUndefined();
+    // …and the id is not handed out again: `nextUnitId` is untouched, so a unit produced
+    // later takes a fresh id rather than the dead one's (M2's counter rule).
+    expect(outcome.state.nextUnitId).toBe(board.nextUnitId);
+    // The death is stated, with its reason and its killer. A unit vanishing with no event
+    // would be indistinguishable from a bug, which is why `UnitDestroyed` has a `reason`
+    // at all.
+    expect(outcome.events).toContainEqual(destroyedEvent(dead, unit(ATTACKER, LEGION, 0, 5, 2)));
+    // The state is still canonical — no key holds `undefined` — and it hashes.
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+    expect(hashValue(outcome.state)).not.toBe(before);
+  });
+
+  it('never touches the state it is handed, and a refused attack changes nothing', () => {
+    const board = battleBoard({ roll: 0 });
+    const before = hashValue(board);
+
+    apply(board, P0, attack(ATTACKER, 6), M6_RULESET);
+    apply(board, P0, attack(ATTACKER, 4), M6_RULESET);
+
+    expect(hashValue(board)).toBe(before);
+    expect(board.revision).toBe(0);
+  });
+});
+
+describe('applyCommand — AttackUnit refusals, each named', () => {
+  it('refuses a unit whose type declares no attack, and reports the attack it saw', () => {
+    const board = battleBoard({ roll: 0, attackerType: CIVILIAN });
+
+    expect(
+      refusedAs(apply(board, P0, attack(ATTACKER, 6), M6_RULESET), 'unit-cannot-attack'),
+    ).toEqual({ kind: 'unit-cannot-attack', unitId: asUnitId(ATTACKER), attack: 0 });
+  });
+
+  it('refuses a unit whose type the ruleset does not describe at all', () => {
+    // The same refusal for the same reason: a type nothing describes has no attack the
+    // engine can see, which is reported as 0. The row is in the state, not in this view.
+    const board = battleBoard({ roll: 0, attackerType: makeDef('ghost', 'military', 2, 1) });
+    const error = refusedAs(
+      apply(board, P0, attack(ATTACKER, 6), M6_RULESET),
+      'unit-cannot-attack',
+    );
+
+    expect(error.kind === 'unit-cannot-attack' && error.attack).toBe(0);
+  });
+
+  it('refuses an attack with no movement left to spend, saying what it needed and had', () => {
+    const board = battleBoard({ roll: 0, attackerMovement: 0 });
+
+    expect(
+      refusedAs(apply(board, P0, attack(ATTACKER, 6), M6_RULESET), 'not-enough-movement'),
+    ).toEqual({ kind: 'not-enough-movement', unitId: asUnitId(ATTACKER), needed: 1, available: 0 });
+  });
+
+  it('refuses a tile with nothing on it, and one holding only the actor’s own side', () => {
+    // Tiles 4, 9 and 10 are the attacker's other neighbours: empty grassland, a hill, and
+    // more grassland, all of them with nothing to fight.
+    for (const target of [4, 9, 10]) {
+      expect(
+        refusedAs(
+          apply(battleBoard({ roll: 0 }), P0, attack(ATTACKER, target), M6_RULESET),
+          'nothing-to-attack',
+        ),
+      ).toEqual({
+        kind: 'nothing-to-attack',
+        unitId: asUnitId(ATTACKER),
+        target: asTileIndex(target),
+      });
+    }
+
+    // A city the actor already owns is not a target either: there is nothing there to
+    // take, and the tile would otherwise be a legal step for its own units.
+    refusedAs(
+      apply(siegeBoard({ city: { owner: P0 } }), P0, attack(ATTACKER, 6), M6_RULESET),
+      'nothing-to-attack',
+    );
+  });
+
+  it('refuses a tile holding two enemy units rather than choosing a victim', () => {
+    // Two enemy units on one tile is legal stacking (M2 sets no stacking limit), and M6's
+    // rule is "exactly one enemy-occupied thing" — so this refuses with the count found
+    // rather than inventing "attack the lowest id", which would decide every stacked
+    // battle in the game invisibly.
+    expect(
+      refusedAs(
+        apply(battleBoard({ roll: 0, extraEnemy: true }), P0, attack(ATTACKER, 6), M6_RULESET),
+        'target-stacked',
+      ),
+    ).toEqual({
+      kind: 'target-stacked',
+      unitId: asUnitId(ATTACKER),
+      target: asTileIndex(6),
+      defenders: 2,
+    });
+  });
+
+  it('refuses a non-adjacent target, an off-map one and one that is not a tile', () => {
+    const board = battleBoard({ roll: 0 });
+
+    // Tile 15 is two steps away (tile 5 is (1,1) and tile 15 is (3,3)), and path movement
+    // is not in the engine: an attack is a single adjacent strike, so this is an argument
+    // error rather than a silently expanded path.
+    const far = refusedAs(apply(board, P0, attack(ATTACKER, 15), M6_RULESET), 'invalid-argument');
+    expect(far.kind === 'invalid-argument' && far.detail).toContain('adjacent');
+
+    refusedAs(apply(board, P0, attack(ATTACKER, 16), M6_RULESET), 'out-of-bounds');
+    refusedAs(apply(board, P0, attack(ATTACKER, -1), M6_RULESET), 'out-of-bounds');
+    refusedAs(apply(board, P0, attack(ATTACKER, 1.5), M6_RULESET), 'invalid-argument');
+  });
+
+  it("refuses another player's unit, an unknown unit and an unknown actor", () => {
+    const board = battleBoard({ roll: 0 });
+
+    refusedAs(apply(board, P1, attack(ATTACKER, 6), M6_RULESET), 'not-your-unit');
+    refusedAs(apply(board, P0, attack(77, 6), M6_RULESET), 'unknown-unit');
+    refusedAs(apply(board, asPlayerId(9), attack(ATTACKER, 6), M6_RULESET), 'unknown-player');
+  });
+
+  it('refuses to walk onto a city of another player — the other half of M2’s enemy rule', () => {
+    // M6's invariant "no unit inside an enemy city it does not own" has to be unreachable
+    // by legal play, and this is the rule that makes it so: the step is refused with the
+    // same error an enemy unit's tile gets, and attacking is the way to take the tile.
+    const board = siegeBoard();
+    expect(refusedAs(apply(board, P0, move(ATTACKER, 6), M6_RULESET), 'occupied-by-enemy')).toEqual(
+      { kind: 'occupied-by-enemy', unitId: asUnitId(ATTACKER), to: asTileIndex(6) },
+    );
+
+    // …and once the city is the mover's own, the same step is legal. The turn has to be
+    // refilled first: the capture itself spent the attacker's movement.
+    const captured = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+    const refilled = withMovement(captured.state, ATTACKER, LEGION.movement);
+    const stepped = mustOk(apply(refilled, P0, move(ATTACKER, 6), M6_RULESET));
+
+    expect(mustUnit(stepped.state, ATTACKER).tile).toBe(6);
+  });
+});
+
+describe('applyCommand — FortifyUnit', () => {
+  it('digs in, spends the whole turn, emits nothing, and bumps the revision once', () => {
+    const board = battleBoard({ roll: 0 });
+    const outcome = mustOk(apply(board, P0, fortify(ATTACKER), M6_RULESET));
+    const dug = mustUnit(outcome.state, ATTACKER);
+
+    expect(isFortified(dug)).toBe(true);
+    expect(dug.movementLeft).toBe(0);
+    // The command's only effect is the flag, so it emits no event — which is exactly why
+    // `legalActions` does not advertise it (`actions.ts` states the decision).
+    expect(outcome.events).toEqual([]);
+    expect(outcome.state.revision).toBe(board.revision + 1);
+    // The other player's unit is untouched, and the state stays canonical.
+    expect(mustUnit(outcome.state, DEFENDER).movementLeft).toBe(PHALANX.movement);
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+  });
+
+  it('refuses a second fortification in the same turn, through the movement rule', () => {
+    // No "already fortified" special case exists: the first fortification spends the
+    // movement, so the second simply has none to spend.
+    const dug = mustOk(apply(battleBoard({ roll: 0 }), P0, fortify(ATTACKER), M6_RULESET));
+
+    refusedAs(apply(dug.state, P0, fortify(ATTACKER), M6_RULESET), 'not-enough-movement');
+  });
+
+  it('refuses an unknown unit, an unknown actor and another player’s unit', () => {
+    const board = battleBoard({ roll: 0 });
+
+    refusedAs(apply(board, P0, fortify(77), M6_RULESET), 'unknown-unit');
+    refusedAs(apply(board, asPlayerId(9), fortify(ATTACKER), M6_RULESET), 'unknown-player');
+    refusedAs(apply(board, P1, fortify(ATTACKER), M6_RULESET), 'not-your-unit');
+  });
+
+  it('is cleared by a move, and survives a turn the unit spends standing still', () => {
+    const dug = mustOk(apply(battleBoard({ roll: 0 }), P0, fortify(ATTACKER), M6_RULESET));
+
+    // Ending the turn refills the movement and leaves the flag alone: being fortified is
+    // where the unit is dug in, not a per-turn resource.
+    const next = mustOk(apply(dug.state, P0, END_TURN, M6_RULESET));
+    const still = mustUnit(next.state, ATTACKER);
+    expect(isFortified(still)).toBe(true);
+    expect(still.movementLeft).toBe(LEGION.movement);
+
+    // …and the step out of the trench drops it, through `clearFortified`: the key is
+    // *absent*, never present-and-undefined.
+    const stepped = mustOk(apply(next.state, P0, move(ATTACKER, 4), M6_RULESET));
+    const gone = mustUnit(stepped.state, ATTACKER);
+    expect(gone.tile).toBe(4);
+    expect(isFortified(gone)).toBe(false);
+    expect(Object.hasOwn(gone, 'fortified')).toBe(false);
+    expect(() => canonicalize(stepped.state)).not.toThrow();
+  });
+
+  it('makes the defender harder to hit, because the command layer reads the flag', () => {
+    // Attack 3 against defence 4 in the open: floor(3 * 100 / (3 + 4)) = 42%. Fortified:
+    // defence floor(4 * 125 / 100) = 5, so floor(300 / 8) = 37%.
+    const plain = mustOk(apply(battleBoard({ roll: 0 }), P0, attack(ATTACKER, 6), M6_RULESET));
+    const dugIn = mustOk(
+      apply(battleBoard({ roll: 0, fortified: true }), P0, attack(ATTACKER, 6), M6_RULESET),
+    );
+
+    expect(combatEvent(plain.events).attackerWinPct).toBe(42);
+    expect(combatEvent(dugIn.events).attackerWinPct).toBe(37);
+  });
+});
+
+describe('applyCommand — an attack on an undefended city captures it', () => {
+  it('expends the attacker’s whole turn, leaves it where it stood, and promotes nobody', () => {
+    const board = siegeBoard();
+    const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+
+    // No `CombatResolved` and no `UnitPromoted`: no shot was fired, and M6 grants a level
+    // for winning a *combat*.
+    expect(outcome.events.map((event) => event.type)).toEqual(['CityCaptured']);
+    const attacker = mustUnit(outcome.state, ATTACKER);
+    expect(attacker.tile).toBe(5);
+    expect(attacker.movementLeft).toBe(0);
+    expect(experienceOf(attacker)).toBe(0);
+    // A capture is not random, so it draws nothing from the world's stream.
+    expect(outcome.state.rng).toEqual(board.rng);
+  });
+
+  it('turns a defended city into a battle, and the city stays its owner’s when the guard dies', () => {
+    // "Attacking a city with a defender resolves against that defender", and the capture
+    // is the *undefended* case — so killing the guard is not a capture, and the city
+    // changes hands only to an attack that finds nobody home.
+    const outcome = mustOk(
+      apply(siegeBoard({ defended: true }), P0, attack(ATTACKER, 6), M6_RULESET),
+    );
+
+    expect(outcome.events.some((event) => event.type === 'CombatResolved')).toBe(true);
+    expect(outcome.events.some((event) => event.type === 'UnitDestroyed')).toBe(true);
+    expect(outcome.events.some((event) => event.type === 'CityCaptured')).toBe(false);
+    expect(cityById(outcome.state, asCityId(0))?.owner).toBe(P1);
+    expect(cityById(outcome.state, asCityId(0))?.population).toBe(5);
+  });
+
+  it('refuses a city that is not adjacent, and one that is already the actor’s', () => {
+    // Tile 15 is two steps from the attacker, so a city there is out of reach: M6 has no
+    // siege machinery and no ranged strike.
+    refusedAs(apply(siegeBoard(), P0, attack(ATTACKER, 15), M6_RULESET), 'invalid-argument');
+
+    // The same undefended city, already owned by the attacker: there is nothing to take.
+    refusedAs(
+      apply(siegeBoard({ city: { owner: P0 } }), P0, attack(ATTACKER, 6), M6_RULESET),
+      'nothing-to-attack',
+    );
+  });
+});
+
+describe('applyCommand — capture changes exactly what M6 says it changes', () => {
+  /**
+   * A city whose every field the capture rule touches is set to a value a default would
+   * hide: population 5 (so halving *and* flooring are visible), four buildings of
+   * distinct maintenance including a wonder, a production head *and* a queue, one worked
+   * tile, stored food and stored shields.
+   */
+  const TARGET: Partial<City> = {
+    name: 'City 1',
+    population: 5,
+    foodBox: 7,
+    shields: 3,
+    production: buildingItem('marketplace'),
+    queue: [unitItem('legion')],
+    buildings: [
+      asBuildingId('granary'),
+      asBuildingId('library'),
+      asBuildingId('walls'),
+      asBuildingId('pyramids'),
+    ],
+    workedTiles: [asTileIndex(5)],
+  };
+
+  const targetBoard = (overrides: Partial<City> = {}): GameState =>
+    siegeBoard({ city: { ...TARGET, ...overrides } });
+
+  it('hands the city over, halves and floors its population, and keeps it on the map', () => {
+    const board = targetBoard();
+    const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+    const after = cityById(outcome.state, asCityId(0));
+
+    expect(after?.owner).toBe(P0);
+    expect(after?.population).toBe(2); // floor(5 / 2): the placeholder capture rule
+    // Not razed: same id, same name, same tile, still in `state.cities`, and the id
+    // counter is untouched because nothing was created.
+    expect(after?.name).toBe('City 1');
+    expect(after?.tile).toBe(6);
+    expect(outcome.state.cities).toHaveLength(1);
+    expect(outcome.state.nextCityId).toBe(board.nextCityId);
+  });
+
+  it('destroys every non-wonder building, maintenance-descending, and keeps the wonder', () => {
+    const outcome = mustOk(apply(targetBoard(), P0, attack(ATTACKER, 6), M6_RULESET));
+    const after = cityById(outcome.state, asCityId(0));
+    const event = captureEvent(outcome.events);
+
+    // The library and the walls both cost 1 to keep and the walls come *second* in the
+    // list, so the tie breaks to the most recently completed; the granary costs nothing
+    // and is destroyed anyway — which is where a capture differs from the bankruptcy
+    // demolition, whose rule is a *stopping* rule ("take rows until their maintenance
+    // covers what went unpaid") and which therefore skips a free row.
+    expect(event.destroyed).toEqual([
+      asBuildingId('walls'),
+      asBuildingId('library'),
+      asBuildingId('granary'),
+    ]);
+    expect(after?.buildings).toEqual([asBuildingId('pyramids')]);
+
+    // The wonder carries the *highest* maintenance in this catalog, so an order that
+    // simply took the expensive rows first would have destroyed it. It is globally unique
+    // (M4c), and a wonder destroyed by capture would silently become buildable again —
+    // the whole reason the exemption exists.
+    expect(event.destroyed).not.toContain(asBuildingId('pyramids'));
+    // …and it is now the new owner's, so nothing anywhere may start another one.
+    expect(after?.owner).toBe(P0);
+    expect(holdersOf(outcome.state, asBuildingId('pyramids'))).toEqual([P0]);
+  });
+
+  it('clears the production head and the queue, and leaves the stored food and shields', () => {
+    const outcome = mustOk(apply(targetBoard(), P0, attack(ATTACKER, 6), M6_RULESET));
+    const after = cityById(outcome.state, asCityId(0));
+
+    // The key is **absent**, never present-and-undefined: the one spelling this state
+    // cannot represent, and the reason `captureCity` rebuilds the city rather than
+    // spreading a `production: undefined` over it.
+    expect(after).toBeDefined();
+    if (after === undefined) return;
+    expect(Object.hasOwn(after, 'production')).toBe(false);
+    expect(after.queue).toEqual([]);
+    // The contract's list of what a capture changes does not mention the stored food or
+    // the stored shields, so both survive — stated here rather than discovered later.
+    expect(after.foodBox).toBe(7);
+    expect(after.shields).toBe(3);
+    expect(() => canonicalize(outcome.state)).not.toThrow();
+  });
+
+  it('clears the worked tiles, freeing them for whoever claims them next', () => {
+    const outcome = mustOk(apply(targetBoard(), P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(cityById(outcome.state, asCityId(0))?.workedTiles).toEqual([]);
+  });
+
+  it('leaves every tile improvement and road exactly where it was', () => {
+    // A mine on the captured city's own tile and a road under the attacker's feet:
+    // sacking a city is not a reason for the countryside to change, as M6 says outright.
+    const roads: GameState = {
+      ...targetBoard(),
+      improvements: [
+        { tile: asTileIndex(6), kind: asImprovementId('mine') },
+        { tile: asTileIndex(5), kind: asImprovementId('road') },
+      ],
+    };
+    const outcome = mustOk(apply(roads, P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(outcome.state.improvements).toBe(roads.improvements);
+  });
+
+  it('reports the capture with the old owner, the new one and the population after it', () => {
+    const board = targetBoard();
+    const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(captureEvent(outcome.events)).toEqual({
+      type: 'CityCaptured',
+      cityId: asCityId(0),
+      from: P1,
+      to: P0,
+      tile: asTileIndex(6),
+      name: 'City 1',
+      population: 2,
+      destroyed: [asBuildingId('walls'), asBuildingId('library'), asBuildingId('granary')],
+    });
+    expect(outcome.state.revision).toBe(board.revision + 1);
+  });
+
+  it('never takes a captured city below population 1', () => {
+    for (const population of [1, 2, 3, 4, 5, 6]) {
+      const outcome = mustOk(
+        apply(targetBoard({ population }), P0, attack(ATTACKER, 6), M6_RULESET),
+      );
+      // Halved and floored, with the minimum stated as the rule it is rather than as a
+      // side effect of the divisor.
+      expect(cityById(outcome.state, asCityId(0))?.population).toBe(
+        Math.max(1, Math.floor(population / 2)),
+      );
+    }
+  });
+
+  it('lets a barbarian take a city too — ownership is ownership', () => {
+    // The rule is "an adjacent undefended enemy city", with no `kind` check — the same
+    // reading `planFoundCity` takes of a barbarian settler.
+    const barbarians: GameState = {
+      ...siegeBoard(),
+      players: [...STATE.players, player(2, 7, 'barbarian')],
+    };
+    const horde = withUnits(barbarians, [unit(ATTACKER, LEGION, 2, 5, LEGION.movement)]);
+    const outcome = mustOk(apply(horde, asPlayerId(2), attack(ATTACKER, 6), M6_RULESET));
+
+    expect(cityById(outcome.state, asCityId(0))?.owner).toBe(asPlayerId(2));
+    // Taken *from* player 1, the city's owner: a barbarian capture is the same rule with
+    // different players, not a third code path.
+    expect(captureEvent(outcome.events).from).toBe(P1);
+  });
+});
+
+describe('planAttackUnit agrees with the applier, over every unit and every tile', () => {
+  /**
+   * The eighth generator's half of the keystone property, in both directions and over a
+   * deliberately wider universe than the generator's output: **every** tile index from
+   * one before the board to one past it (plus a half-step, since a `TileIndex` is a
+   * number at runtime), for every unit of every actor, plus an actor the state does not
+   * hold.
+   */
+  const BOARDS: readonly (readonly [string, GameState])[] = [
+    ['a plain battle', battleBoard({ roll: 0 })],
+    ['a defended city', siegeBoard({ defended: true })],
+    ['an undefended city', siegeBoard()],
+    ['a stacked tile', battleBoard({ roll: 0, extraEnemy: true })],
+    ['a spent attacker', battleBoard({ roll: 0, attackerMovement: 0 })],
+    ['a civilian', battleBoard({ roll: 0, attackerType: CIVILIAN })],
+    [
+      'a fortified defender in a walled city',
+      battleBoard({ roll: 0, fortified: true, defenderCity: [asBuildingId('walls')] }),
+    ],
+    ['the M2 board with no combat units at all', STATE],
+  ];
+
+  it('accepts exactly what the applier accepts, with the same typed refusal', () => {
+    let accepted = 0;
+
+    for (const [label, board] of BOARDS) {
+      const size = board.map.width * board.map.height;
+      for (const actor of [P0, P1, asPlayerId(9)]) {
+        for (const each of board.units) {
+          for (let target = -1; target <= size; target += 1) {
+            for (const tile of [asTileIndex(target), asTileIndex(target + 0.5)]) {
+              const plan = planAttackUnit(board, M6_RULESET, actor, each.id, tile);
+              const applied = apply(
+                board,
+                actor,
+                { type: 'AttackUnit', unitId: each.id, target: tile },
+                M6_RULESET,
+              );
+
+              expect(applied.ok, `${label}: plan/applier disagree on tile ${String(tile)}`).toBe(
+                plan.ok,
+              );
+              if (!plan.ok && !applied.ok) expect(applied.error).toEqual(plan.error);
+              if (applied.ok) accepted += 1;
+            }
+          }
+        }
+      }
+    }
+
+    // Non-vacuity: the sweep has to have found attacks the engine accepts, or "the two
+    // agree" would be a statement about two functions that both only ever say no.
+    expect(accepted).toBeGreaterThan(0);
+  });
+
+  it('publishes the shape the applier acts on, for both a battle and a capture', () => {
+    const battle = planAttackUnit(
+      battleBoard({ roll: 0 }),
+      M6_RULESET,
+      P0,
+      asUnitId(ATTACKER),
+      asTileIndex(6),
+    );
+    expect(battle.ok).toBe(true);
+    if (battle.ok && battle.value.kind === 'battle') {
+      expect(battle.value.unit.id).toBe(asUnitId(ATTACKER));
+      expect(battle.value.defender.id).toBe(asUnitId(DEFENDER));
+      expect(battle.value.target).toBe(6);
+    } else {
+      throw new Error('the defended board must plan a battle');
+    }
+
+    const capture = planAttackUnit(
+      siegeBoard(),
+      M6_RULESET,
+      P0,
+      asUnitId(ATTACKER),
+      asTileIndex(6),
+    );
+    expect(capture.ok).toBe(true);
+    if (capture.ok && capture.value.kind === 'capture') {
+      expect(capture.value.city.id).toBe(asCityId(0));
+      expect(capture.value.target).toBe(6);
+    } else {
+      throw new Error('the undefended board must plan a capture');
+    }
+  });
+
+  it('is a pure read: planning a battle neither mutates the state nor draws from its RNG', () => {
+    const board = battleBoard({ roll: 0 });
+    const before = hashValue(board);
+    const rng = board.rng;
+
+    planAttackUnit(board, M6_RULESET, P0, asUnitId(ATTACKER), asTileIndex(6));
+    planAttackUnit(board, M6_RULESET, P0, asUnitId(ATTACKER), asTileIndex(4));
+
+    expect(hashValue(board)).toBe(before);
+    // The plan is a legality question, and legality must never consume the world's
+    // randomness: a generator the AI calls per unit per frame would otherwise change the
+    // game by asking about it.
+    expect(board.rng).toEqual(rng);
+  });
+});
+
+describe('planFortifyUnit agrees with the applier', () => {
+  it('accepts exactly what the applier accepts, for every unit and every actor', () => {
+    let accepted = 0;
+
+    for (const board of [battleBoard({ roll: 0 }), siegeBoard(), STATE]) {
+      for (const actor of [P0, P1, asPlayerId(9)]) {
+        for (let id = 0; id <= board.nextUnitId; id += 1) {
+          const unitId = asUnitId(id);
+          const plan = planFortifyUnit(board, actor, unitId);
+          const applied = apply(board, actor, { type: 'FortifyUnit', unitId }, M6_RULESET);
+
+          expect(applied.ok).toBe(plan.ok);
+          if (!plan.ok && !applied.ok) expect(applied.error).toEqual(plan.error);
+          if (applied.ok) accepted += 1;
+        }
+      }
+    }
+
+    expect(accepted).toBeGreaterThan(0);
   });
 });

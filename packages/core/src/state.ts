@@ -80,7 +80,10 @@ import {
 import { err, ok, type Result } from './result.js';
 import type { RngState } from './rng.js';
 import { MAP_DIMENSIONS, type Settings } from './settings.js';
-import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js';
+// M6: `fullHitPoints` is the one reader of a unit definition's `hitPoints`, so
+// `newGame` cannot invent a starting health of its own that disagrees with the value
+// `spawnUnit` gives a unit produced during play.
+import { fullHitPoints, unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js';
 
 /**
  * Bumped whenever the persisted shape of `GameState` changes incompatibly.
@@ -124,8 +127,17 @@ import { unitCatalog, type Unit, type UnitDef, type UnitRole } from './units.js'
  *   Regenerated intentionally, through the harness's documented path
  *   (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a `rehash:` line
  *   (INTERFACES.md M5, "Research").
+ * - 8 — M6: `Unit` gains `hitPointsLeft` (required in the contract; `units.ts` records
+ *   why it is *optional on the engine's view* while `UnitSpec` requires it) plus the two
+ *   omitted-when-default keys `experience` and `fortified`. `newGame` writes
+ *   `hitPointsLeft` on every unit it places and writes **neither** of the optional two,
+ *   because a starting settler has taken no damage, earned no promotion and is not
+ *   dug in. That is one new key per starting unit on top of a shape change, so every
+ *   golden hash moves and the version records it — regenerated intentionally, through
+ *   the harness's documented path (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a
+ *   `rehash:` line (INTERFACES.md M6, "Units in play").
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** What a player *is*: a civilization, or the barbarians. */
 export type PlayerKind = 'civ' | 'barbarian';
@@ -442,6 +454,22 @@ const startingMovement = (def: UnitDef): number =>
   Number.isInteger(def.movement) && def.movement > 0 ? def.movement : 0;
 
 /**
+ * Hit points a freshly placed starting unit gets (M6).
+ *
+ * Full health, which is what "a unit that has just been created" means everywhere else
+ * in the engine — `units.ts`' `spawnUnit` sets the same value for the same reason.
+ * `newGame` builds its units by hand (there is no state to spawn into yet), so this is
+ * one of the two places a *new* unit's health is decided; keeping it consistent with
+ * `spawnUnit` is the whole point of it being a named function rather than a literal.
+ *
+ * The totality rule `fullHitPoints` states applies here too, and for a sharper reason
+ * than movement: a `hitPointsLeft` of `0` written into a fresh state would be a live
+ * unit at zero hit points — the state M6 says must not exist and `@civts/sim` names as
+ * an invariant. A definition the engine cannot read therefore yields 1, never 0.
+ */
+const startingHitPoints = (def: UnitDef): number => fullHitPoints(def);
+
+/**
  * Whether a land unit may stand on `tile`: the ruleset describes its terrain and
  * that terrain is not impassable.
  *
@@ -685,6 +713,11 @@ export const newGame = (
       owner,
       tile,
       movementLeft: startingMovement(def),
+      // M6: a starting unit begins at full health. `experience` and `fortified` are
+      // deliberately **not** written — a fresh settler has earned no promotion and is
+      // not dug in, and this state spells both of those facts by the key being ABSENT,
+      // never by writing `undefined` or a `0`/`false` placeholder (see `units.ts`).
+      hitPointsLeft: startingHitPoints(def),
     });
     occupied.add(Number(tile));
   };

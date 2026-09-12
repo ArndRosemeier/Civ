@@ -464,14 +464,28 @@ export const mayStartBuilding = (
 };
 
 /**
- * The building rows `city` may start, in catalog order — the option list a city's
- * production menu shows, and the set `mayStartBuilding` accepts.
+ * The building rows `city` may start **as far as a ruleset-free reading can tell**,
+ * in catalog order: the set `mayStartBuilding` accepts — the row is described, the
+ * city does not already hold it, and no city anywhere holds a wonder of that id.
+ *
+ * **This is not the production menu, and it is not "what the applier accepts".** It
+ * has no `RulesetView`, so it cannot see either gating dimension: an unmet
+ * `requiresTech` and an unconnected `requiresResource` are asked of
+ * `resources.ts`' `productionGate`, which is the one verdict the planner
+ * (`SetProduction`), the completion pass and the menu all ask. `actions.ts`'
+ * `cityProductionOptions` is the menu, and it filters these rows through that gate
+ * — so a row can be *startable* here and absent there, which is exactly the case
+ * M6 made reachable by giving a shipped building (the temple, on Ceremonial Burial)
+ * a tech requirement. Use this reader for the questions it can answer — "is this
+ * row described, unheld, and not another city's wonder?" — and the gate for the
+ * ones it cannot. (Its doc comment used to claim it *was* the menu and could never
+ * disagree with the applier; M4c's `requiresResource` for units and M6's
+ * `requiresTech` for buildings each made that false, and the `m4c-adversarial`
+ * keystone sweep asserts the corrected equivalence.)
  *
  * Built by filtering the catalog through `mayStartBuilding` rather than restating
- * its checks, so a menu can never offer something the applier would refuse or hide
- * something it would accept. Catalog order (data order) is the menu's order: it is
- * the ruleset's own editorial order, identical on every run, and not a property of
- * this filter.
+ * its checks, and in catalog order (data order): the ruleset's own editorial order,
+ * identical on every run, and not a property of this filter.
  */
 export const availableBuildings = (
   state: GameState,

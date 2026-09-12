@@ -224,8 +224,8 @@ const standable = (state: GameState, ruleset: RulesetView, tile: TileIndex): boo
 
 /**
  * The tiles a band from the hut on `hut` may occupy: the adjacent tiles a land
- * unit may stand on that hold no unit of *another* player, in ascending tile
- * index order.
+ * unit may stand on that hold no unit **and no city** of another player, in
+ * ascending tile index order.
  *
  * "Another player" means "not the barbarians": band members may share a tile with
  * each other or with an existing barbarian, because stacking one's own units is
@@ -233,6 +233,15 @@ const standable = (state: GameState, ruleset: RulesetView, tile: TileIndex): boo
  * state is unreachable through the command layer (a moving unit may not enter an
  * enemy tile), and manufacturing it here would hand the mover a tile it could
  * never have walked into.
+ *
+ * **M6 extends that sentence to cities, and this filter is where it is enforced.**
+ * Since M6 a tile holding another player's *city* is refused by the mover with the
+ * same `occupied-by-enemy`, and the registry carries the matching invariant
+ * (`unit-not-inside-foreign-city`): a band placed inside a foreign city would be a
+ * state no command could produce, and it is reachable from real play — a band tile
+ * that a civilization had just walked out of — which is how the hole was found
+ * (200-seed `duel`/3-civ sweeps in `@civts/sim`'s full tier, two runs on which the
+ * invariant fired on a hut's band).
  *
  * The sort states the order outright rather than relying on `neighbors8`'s loop,
  * because *which* tiles the band occupies is part of the state and of the
@@ -247,7 +256,20 @@ const bandTiles = (
   [...neighbors8(state.map, Number(hut))]
     .sort((a, b) => Number(a) - Number(b))
     .filter((tile) => standable(state, ruleset, tile))
-    .filter((tile) => !unitsOnTile(state, tile).some((unit) => unit.owner !== barbarian.id));
+    .filter((tile) => !unitsOnTile(state, tile).some((unit) => unit.owner !== barbarian.id))
+    // **The city half of the same rule (M6).** A tile held by another player's *city* is
+    // no more placeable than one held by their unit: `planMove` refuses to enter it
+    // (`occupied-by-enemy`), so a band standing inside a foreign city is a state the
+    // command layer cannot produce — and M6 registers exactly that as the invariant
+    // `unit-not-inside-foreign-city`. A band on a city tile is also *useful* to nobody:
+    // the city it stands in is defended by a unit that cannot take it, and the band's
+    // own step will refuse to enter any other foreign city. `cityAt` is the engine's own
+    // "what city is on this tile", so this filter and the mover cannot disagree about
+    // which tiles hold a city.
+    .filter((tile) => {
+      const city = cityAt(state, tile);
+      return city === undefined || city.owner === barbarian.id;
+    });
 
 /** A `HutEntered` event for `unit`, with no unit given (the `unit` reward spells its own). */
 const hutEntered = (unit: Unit, reward: HutRewardKind): GameEvent => ({

@@ -253,6 +253,39 @@
  *   never as `undefined`, matching `PlayerState.researching`'s "absence is what 'not
  *   researching' means".
  *
+ * M6 extends the builder for the sixth time, and it is the first extension that is
+ * **also a migration** — the reason is a trap the DSL had been setting for five
+ * milestones without anyone stepping in it twice:
+ *
+ * - **`addUnit` takes combat options, and hit points are now always written.**
+ *   `addUnit(playerIndex, type, at, setup?)` gains `hitPointsLeft`, `experience` and
+ *   `fortified`, which are exactly the three facts M6 gives a unit and exactly the
+ *   three a combat scenario has to state: *this* warrior is wounded, *that* one is
+ *   a veteran, *the other* one is dug in. A scenario could state none of them
+ *   before, so no scenario-level combat test was possible at all — the same gap
+ *   `addHut` closed for M3 and `addCity` for M3's queue.
+ *
+ *   The migration is the default. `UnitPlacement` used to leave `hitPointsLeft`
+ *   **absent**, and absence is not "full health" in this state: `hitPointsLeftOf`
+ *   reads a missing field as `DEFAULT_HIT_POINTS` (1), so every unit a scenario
+ *   ever placed was a unit **one hit from death**, silently, and a scenario that
+ *   said nothing about health was stating the most fragile world the engine can
+ *   hold. That was invisible while nothing dealt damage and it is a landmine now
+ *   that M6 does. So the builder writes what `spawnUnit` writes — `fullHitPoints(def)`
+ *   — and a scenario that wants a wound asks for one. `experience` and `fortified`
+ *   keep the state's own spelling for "none": absent, never `0`/`false`.
+ *
+ *   Validation is the command layer's rule, asked in the same place: a scenario
+ *   cannot state a unit the engine could never produce, so `hitPointsLeft` must be
+ *   a whole number in `1..fullHitPoints(def)` (a wound is not a resurrection, and a
+ *   unit with more hit points than its type has is a unit no battle can create),
+ *   `experience` must be a whole number in `0..MAX_EXPERIENCE` (the cap
+ *   `promoteUnit` clamps to), and `fortified` is `true` or nothing — `false` is not
+ *   a spelling this state has. A fortified unit is placed with **no movement left**,
+ *   which is what `FortifyUnit` leaves behind: fortifying costs the movement point,
+ *   and a fortified unit with movement to spend is a state the command layer cannot
+ *   reach.
+ *
  * The one other edit is a *migration*, not an extension: `describeGameError`'s
  * message table gained the two error members M4c added to `GameError`
  * (`resource-not-connected` and `wonder-already-built`). Without those case labels
@@ -321,6 +354,7 @@
 import {
   DEFAULT_RATES,
   MAP_DIMENSIONS,
+  MAX_EXPERIENCE,
   MIN_CITY_DISTANCE,
   RATE_TOTAL,
   SCHEMA_VERSION,
@@ -337,6 +371,7 @@ import {
   compareTileResources,
   distance8,
   err,
+  fullHitPoints,
   improvementCatalog,
   improvementDef,
   inBounds,
@@ -491,7 +526,22 @@ export interface ScenarioBuilder {
    * rule, and it is the only implementation of it).
    */
   connectRoad(from: readonly [number, number], to: readonly [number, number]): ScenarioBuilder;
-  addUnit(playerIndex: number, type: UnitTypeId, at: readonly [number, number]): ScenarioBuilder;
+  /**
+   * Place a unit (M2), optionally wounded, promoted or dug in (M6).
+   *
+   * `setup` states only what M6 added: `hitPointsLeft` (whole, `1..` the type's own
+   * maximum — an omitted value is **full health**, which is what `spawnUnit` writes and
+   * what this builder now always writes), `experience` (whole, `0..MAX_EXPERIENCE`) and
+   * `fortified` (`true` only, and the unit is placed with no movement left, exactly as
+   * `FortifyUnit` leaves it). A value outside those ranges throws here, at the call that
+   * named it, because such a unit is one no command can produce.
+   */
+  addUnit(
+    playerIndex: number,
+    type: UnitTypeId,
+    at: readonly [number, number],
+    setup?: UnitSetup,
+  ): ScenarioBuilder;
   /** State a city outright (M3) — the only way a scenario can have a queue at all. */
   addCity(playerIndex: number, at: readonly [number, number], options?: CitySetup): ScenarioBuilder;
   /**
@@ -852,11 +902,39 @@ const describeSetupError = (error: SetupError): string => {
  * ------------------------------------------------------------------ */
 
 /** A unit the scenario asked for, before ids and tiles are handed out. */
+/**
+ * How a scenario states a unit's health, and (M6) what combat made stateable.
+ *
+ * Every field is optional and an omitted field means what the state's own readers say
+ * it means: full hit points (`fullHitPoints(def)`, the value `spawnUnit` writes), no
+ * promotions (`experienceOf` reads absence as 0) and not fortified (`isFortified`).
+ *
+ * `fortified` is typed `true` rather than `boolean` for the reason
+ * `BuildingPatch.wonder` is: `false` is not how this state spells "not fortified", so
+ * a type that admitted it would be advertising a second spelling. The runtime check in
+ * `addUnit` refuses a `false` from a caller the type system does not cover (a JSON
+ * scenario), so the rule holds for every caller rather than only for TypeScript ones.
+ */
+export interface UnitSetup {
+  /** Hit points to place the unit with; `1..fullHitPoints(def)`. Defaults to full. */
+  readonly hitPointsLeft?: number;
+  /** Promotions to place the unit with; `0..MAX_EXPERIENCE`. `0` means none. */
+  readonly experience?: number;
+  /** Place the unit already dug in — with no movement left, as `FortifyUnit` leaves it. */
+  readonly fortified?: true;
+}
+
 interface UnitPlacement {
   readonly playerIndex: number;
   readonly def: UnitDef;
   readonly x: number;
   readonly y: number;
+  /** The hit points the unit is placed with — always resolved, never absent (M6). */
+  readonly hitPointsLeft: number;
+  /** Promotions, `0` for none; written to the state only when positive. */
+  readonly experience: number;
+  /** Whether the unit is placed dug in; `false` is spelled by the field being absent. */
+  readonly fortified: boolean;
 }
 
 /**
@@ -1223,7 +1301,19 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
       type: placement.def.id,
       owner: asPlayerId(placement.playerIndex),
       tile,
-      movementLeft: placement.def.movement,
+      // A fortified unit has spent its movement (`FortifyUnit` charges the point), and
+      // `spawnUnit`'s "full movement" is the reading for every other unit.
+      movementLeft: placement.fortified ? 0 : placement.def.movement,
+      // **M6's migration**: hit points are written for every unit this builder places,
+      // where they used to be left out. Absence is not full health in this state — it is
+      // `DEFAULT_HIT_POINTS` (1), a unit one hit from death — so the old shape stated the
+      // most fragile world the engine can hold while reading like an untouched one.
+      hitPointsLeft: placement.hitPointsLeft,
+      // Absence is the state's spelling for "none" of the other two, so each key is
+      // written only when it says something (`exactOptionalPropertyTypes`: a key holding
+      // `undefined` is not a shape `canonicalize` will accept).
+      ...(placement.experience > 0 ? { experience: placement.experience } : {}),
+      ...(placement.fortified ? { fortified: true } : {}),
     });
   }
 
@@ -1902,7 +1992,7 @@ export const createScenarioBuilder = (
       return builder;
     },
 
-    addUnit(playerIndex, type, at) {
+    addUnit(playerIndex, type, at, setup = {}) {
       checkPlayerIndex('addUnit', playerIndex);
 
       const def = unitDef(world.ruleset, type);
@@ -1918,7 +2008,55 @@ export const createScenarioBuilder = (
 
       const [x, y] = at;
       checkTile(x, y);
-      world.placements.push({ playerIndex, def, x, y });
+
+      // M6. The three facts, validated against the engine's own readings rather than
+      // against numbers written here: `fullHitPoints` is the same "how much health does
+      // this type have" `spawnUnit` writes a new unit with, and `MAX_EXPERIENCE` is the
+      // cap `promoteUnit` clamps a promotion to. A scenario that states a unit outside
+      // those ranges states a unit no command can produce, and this builder refuses those
+      // at the call that named them (see the module note on the two failure channels).
+      const maximum = fullHitPoints(def);
+      const hitPointsLeft = setup.hitPointsLeft ?? maximum;
+      if (!Number.isInteger(hitPointsLeft) || hitPointsLeft < 1 || hitPointsLeft > maximum) {
+        throw new Error(
+          `scenario builder: addUnit(${String(playerIndex)}, "${type}", ...) asks for ` +
+            `${String(setup.hitPointsLeft)} hit points, and a "${type}" has 1..${String(maximum)}: ` +
+            'a wound is not a resurrection, and more hit points than the type has is a unit no ' +
+            'battle can leave behind',
+        );
+      }
+
+      const experience = setup.experience ?? 0;
+      if (!Number.isInteger(experience) || experience < 0 || experience > MAX_EXPERIENCE) {
+        throw new Error(
+          `scenario builder: addUnit(${String(playerIndex)}, "${type}", ...) asks for ` +
+            `${String(setup.experience)} experience, and a promotion level is a whole number in ` +
+            `0..${String(MAX_EXPERIENCE)} (a unit at the cap wins without another event)`,
+        );
+      }
+
+      // Read through `unknown` on purpose: the declared type already says `true | undefined`,
+      // so the only caller this check exists for is one the type system does not cover (a
+      // JSON scenario), and a comparison the compiler knows is always false cannot be
+      // written against the declared type.
+      const fortified: unknown = setup.fortified;
+      if (fortified !== undefined && fortified !== true) {
+        throw new Error(
+          `scenario builder: addUnit(${String(playerIndex)}, "${type}", ...) asks for ` +
+            `fortified: ${JSON.stringify(fortified)}; fortification is stated as \`true\` or ` +
+            'omitted — `false` is not a spelling this state has (`isFortified` reads absence)',
+        );
+      }
+
+      world.placements.push({
+        playerIndex,
+        def,
+        x,
+        y,
+        hitPointsLeft,
+        experience,
+        fortified: setup.fortified === true,
+      });
       return builder;
     },
 

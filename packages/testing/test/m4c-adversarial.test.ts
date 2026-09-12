@@ -187,8 +187,13 @@ import {
   newGame,
   placeholder,
   planSetProduction,
+  productionGate,
   playerIncome,
   resourceGate,
+  // M6: the engine's one structural read of a row's `requiresTech`, so this file can ask
+  // which shipped unit is gated on a *resource alone* — `UnitDef` does not declare the
+  // field, and reading it here by hand would be a second opinion about where it lives.
+  requiresTechOf,
   spawnUnit,
   splitCommerce,
   tileIndex,
@@ -247,15 +252,37 @@ const unitOfRole = (role: 'settler' | 'worker' | 'military'): UnitTypeId => {
 const SETTLER: UnitTypeId = unitOfRole('settler');
 const MILITARY: UnitTypeId = unitOfRole('military');
 
-/** M4c's one resource-gated unit, found by *requirement* rather than by id. */
+/**
+ * M4c's resource-gated unit, found by *requirement* rather than by id.
+ *
+ * **M6 made this a two-row question and the fixture now says which row it means.** The
+ * shipped catalog gained a second resource-gated unit (the horseman, on horses), and that
+ * row is *also* tech-gated on Horseback Riding — so "the first row with a
+ * `requiresResource`" stopped being the unit this file is about: every assertion below is
+ * about the **resource** gate, and a row that is refused for a missing tech as well would
+ * make the menu tests fail for the other gate's reason (which is exactly what happened on
+ * integration: `cityProductionOptions` stopped offering the gated unit even with the road
+ * built). The row is therefore chosen as the shipped unit that requires a resource and
+ * **no** tech, and `GATED_RESOURCE` is read off that same row, so the two fixtures cannot
+ * disagree. The tech-gated gating path is `m5-adversarial.test.ts`' and
+ * `m6-adversarial.test.ts`' subject, not this file's.
+ */
 const GATED_UNIT: UnitTypeId = (() => {
-  const def = RULESET.units.find((unit) => unit.requiresResource !== undefined);
-  if (def === undefined) throw new Error('the shipped catalog gates no unit on a resource');
+  // `requiresTechOf` rather than a field read: `UnitDef` (the engine's structural view)
+  // does not *declare* `requiresTech` — M5 reads it structurally, through this one
+  // function — so asking for the field directly is not even a type error away, it is a
+  // different question. This is the engine's own single read of the field.
+  const def = RULESET.units.find(
+    (unit) => unit.requiresResource !== undefined && requiresTechOf(unit) === undefined,
+  );
+  if (def === undefined) {
+    throw new Error('the shipped catalog gates no unit on a resource alone');
+  }
   return def.id;
 })();
 
 const GATED_RESOURCE: ResourceId = (() => {
-  const def = RULESET.units.find((unit) => unit.requiresResource !== undefined);
+  const def = RULESET.units.find((unit) => unit.id === GATED_UNIT);
   const required = def?.requiresResource;
   if (required === undefined) throw new Error('the gated unit names no resource');
   return required;
@@ -399,6 +426,19 @@ const cmdKey = (cmd: Command): string => {
     // improvement kind.
     case 'SetResearch':
       return `SetResearch ${String(cmd.tech)}`;
+    // M6's two combat commands, keyed by their payload for the M4a reason: two
+    // `AttackUnit`s naming different targets are different commands, and a key that
+    // dropped the target would call them equal — the exact false equivalence this
+    // comparator exists to prevent. `FortifyUnit` carries only its unit, so the unit
+    // is the whole key. Both are keyed although `actions.ts` yields only
+    // `AttackUnit` (`FortifyUnit` is a setting, reachable through `planFortifyUnit`):
+    // the switch is exhaustive on purpose, so a `Command` variant this comparator
+    // cannot name would be a typecheck failure rather than two different commands
+    // comparing equal.
+    case 'AttackUnit':
+      return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
+    case 'FortifyUnit':
+      return `FortifyUnit ${String(cmd.unitId)}`;
   }
 };
 
@@ -590,6 +630,9 @@ interface KeystoneTotals {
   productionCandidates: number;
   productionAccepted: number;
   productionOffered: number;
+  startableBuildings: number;
+  startableButGated: number;
+  buildingsOffered: number;
   gatedBlocks: number;
   gatedOpens: number;
 }
@@ -614,6 +657,21 @@ interface KeystoneRun {
  *   offers and (for buildings) `availableBuildings` all agree — and for the gated
  *   unit that verdict is `resourceGate`'s, so the gate is not a fifth opinion but
  *   the one the other four ask.
+ *
+ *   **The building half is stated as an equivalence with the gate, not as an
+ *   equality between the two readings (M6).** `availableBuildings` answers a
+ *   question that needs no ruleset and therefore has no tech dimension — the row is
+ *   described, the city does not hold it, and no other city holds a wonder of that
+ *   id — while the *menu* asks `productionGate`, which M5 made the one verdict for
+ *   both dimensions (an unmet `requiresTech`, or an unconnected `requiresResource`)
+ *   and M6 widened by giving a shipped **building** a tech requirement (the temple
+ *   and Ceremonial Burial). A menu therefore withholds a startable building whose
+ *   gate is shut, which is correct and is now what this sweep asserts:
+ *   `offered === (available && gate open)`, plus the two implications on their own
+ *   (`!available ⇒ !offered`, and `offered ⇒ available`) so the equivalence cannot
+ *   pass by both sides being false. The older equality is kept in the message above
+ *   as the shape it used to have: it was true only while every startable building
+ *   was ungated.
  */
 const keystoneSweep = (
   seeds: readonly number[],
@@ -636,6 +694,10 @@ const keystoneSweep = (
     productionCandidates: 0,
     productionAccepted: 0,
     productionOffered: 0,
+    /** M6: buildings `availableBuildings` allows, and how many of those the gate holds shut. */
+    startableBuildings: 0,
+    startableButGated: 0,
+    buildingsOffered: 0,
     gatedBlocks: 0,
     gatedOpens: 0,
   };
@@ -736,14 +798,32 @@ const keystoneSweep = (
               ),
             );
             if (item.kind === 'building') {
+              // M6: the menu is the gate *and* the startable set, so the equality this
+              // check used to make is now the equivalence below. Both implications are
+              // asserted separately, so a menu that offered nothing at all — or a
+              // startable set that was empty — could not satisfy it vacuously.
+              const startableHere = startable.has(itemKey(item));
+              const gateShut = productionGate(state, RULESET, city.owner, item).kind !== 'open';
               rec.check(
-                startable.has(itemKey(item)) === offered,
+                offered === (startableHere && !gateShut),
                 where(
                   step,
-                  `${String(city.id)} ${itemKey(item)}: availableBuildings and ` +
-                    `cityProductionOptions disagree`,
+                  `${String(city.id)} ${itemKey(item)}: availableBuildings says ` +
+                    `startable=${String(startableHere)}, the gate says ` +
+                    `shut=${String(gateShut)} and cityProductionOptions offered=${String(offered)}`,
                 ),
               );
+              rec.check(
+                !offered || startableHere,
+                where(
+                  step,
+                  `${String(city.id)} ${itemKey(item)}: offered although availableBuildings ` +
+                    'would not let the city start it',
+                ),
+              );
+              if (startableHere) totals.startableBuildings += 1;
+              if (startableHere && gateShut) totals.startableButGated += 1;
+              if (offered) totals.buildingsOffered += 1;
             }
 
             // The gate itself, for every item: the verdict is `resourceGate`'s and
@@ -931,6 +1011,13 @@ describe('1. keystone — the generators, the applier and the production gate ag
       expect(totals.productionAccepted).toBeGreaterThan(0);
       expect(totals.productionOffered).toBeGreaterThan(0);
       expect(totals.gatedBlocks).toBeGreaterThan(0);
+      // …and the M6 dimension of the gate was really exercised: a building the city may
+      // start whose gate is shut, which is the case the equivalence above was widened
+      // for. Without this the widened clause could be vacuous — a catalog with no
+      // tech-gated building would satisfy it while testing nothing.
+      expect(totals.startableBuildings).toBeGreaterThan(0);
+      expect(totals.startableButGated).toBeGreaterThan(0);
+      expect(totals.buildingsOffered).toBeGreaterThan(0);
     },
     300_000,
   );
@@ -3450,7 +3537,19 @@ describe('8. goldens: still a real gate, and what covers what', () => {
     // command script. The three values below are the M5 ones, and the assertion is
     // unchanged in strength: the file must hold exactly the scenarios it names, value
     // for value, or the gate is red.
-    expect(computed).toEqual(['7f8b0949114fe6f3', 'acc2e281926ead8f', '659c0d9dd790708d']);
+    //
+    // **M6 moved them a sixth time** (`SCHEMA_VERSION` 7 -> 8: `Unit.hitPointsLeft`, which
+    // `newGame` writes on every starting unit), again through the harness's opt-in path and
+    // again with a rehash note in the commit message. The values it replaced were
+    // `7f8b0949114fe6f3`, `acc2e281926ead8f` and `659c0d9dd790708d`, quoted so the
+    // movement can be checked against a shape change rather than taken on trust.
+    //
+    // **M6 also adds a fifth entry** — `played-civs2-seed42-combat`, the played world with
+    // one `AttackUnit` applied through the applier — and *that* one moves the file's shape
+    // rather than the three hashes below: this file cannot recompute it (it holds neither
+    // the played script nor a battle board), so it is pinned by name, and the three fresh
+    // worlds are still compared value for value against the same three values.
+    expect(computed).toEqual(['0fcbdf5564556c3a', '9209534b36689b8a', '0bebdfa8140c8168']);
     const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
     expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
@@ -3458,8 +3557,12 @@ describe('8. goldens: still a real gate, and what covers what', () => {
       'tiny-civs2-seed42',
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
+      'played-civs2-seed42-combat',
     ]);
-    expect(SCHEMA_VERSION).toBe(7);
+    // 8, not 7: M6's `Unit.hitPointsLeft` (plus the two omitted-when-default keys
+    // `experience` and `fortified`). Named rather than written as `> 7`, so the next
+    // schema bump has to come here and say so.
+    expect(SCHEMA_VERSION).toBe(8);
     expect(stored.nodeMajor).toBe(Number(process.versions.node.split('.')[0]));
 
     // The field is really inside the digest, which is what makes the rehash an M4c

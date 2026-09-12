@@ -22,13 +22,20 @@
  * `buildings.test.ts`): the effect magnitudes, the costs and the maintenance. None
  * of it is claimed to be Civ 3's; the shipped catalog's rows are `placeholder(...)`
  * in `@civts/rules` and are exercised end to end in `buildings.test.ts`.
+ *
+ * M6 adds one section, and it is about a *non*-change: a captured city has no
+ * production head and an empty queue (`cities.ts`' `captureCity` clears both), so
+ * this module passes it through and banks its shields like any other city. The
+ * section exists because the alternative — a completion pass that re-examines an
+ * empty head, or a "captured this turn" flag — would be a second writer for a rule
+ * the state already states.
  */
 
 import { describe, expect, it } from 'vitest';
 import { hashValue } from '@civts/testing';
 import { cityProductionOptions } from '../src/actions.js';
 import { availableBuildings, mayStartBuilding } from '../src/buildings.js';
-import type { BuildingDef, City, ProductionItem } from '../src/cities.js';
+import { captureCity, type BuildingDef, type City, type ProductionItem } from '../src/cities.js';
 import { applyEconomy } from '../src/economy.js';
 import {
   asBuildingId,
@@ -492,5 +499,92 @@ describe('M5 gating — a tech-gated unit waits, and completes once the tech is 
     const second = applyProduction(first.state, TECH_RULESET);
     expect(second.events.map((event) => event.type)).toEqual(['CityProduced']);
     expect(second.state.cities[0]?.shields).toBe(6 - LEGION.cost);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M6 — a captured city banks its shields and completes nothing
+ * ------------------------------------------------------------------ */
+
+describe('a captured city banks its shields and completes nothing (M6)', () => {
+  it('adds this turn’s shields to the pool and produces no item, with no branch here', () => {
+    // M6 changes a city's queue and its production head at the moment it is taken
+    // (`cities.ts`' `captureCity`: both are cleared) and changes nothing at all here.
+    // That division is worth a test rather than a comment, because the tempting
+    // alternative — a "was this city captured this turn?" flag, or a completion pass
+    // that second-guesses an empty head — is exactly the kind of second writer this
+    // engine keeps out: the state says "building nothing", so nothing is built.
+    //
+    // The board is a city of three citizens working two grassland tiles: 3 shields a
+    // turn, with a temple under construction and a factory queued behind it.
+    const target = bigCity(0, 1, 5, {
+      shields: 3,
+      production: building('temple'),
+      queue: [building('factory')],
+    });
+    const before = board([target]);
+
+    // Non-vacuity first: on the board as it stands, this turn *does* complete the
+    // temple, the shields are charged and the queued factory is promoted into the
+    // head — so "nothing happened" below is about the capture and not about a turn
+    // that never produces anything.
+    const uncaptured = applyProduction(before, RULESET);
+    expect(uncaptured.events.map((event) => event.type)).toEqual(['CityProduced']);
+    expect(uncaptured.state.cities[0]?.buildings.map(String)).toEqual(['temple']);
+    expect(uncaptured.state.cities[0]?.production).toEqual(building('factory'));
+
+    // The same city, taken by player 0 before the production step runs.
+    const capture = captureCity(before, BUILDINGS, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    // What the capture did, stated here as the premise of the production assertion:
+    // the owner changed, the head is gone and the queue is empty. The temple is *not*
+    // in the destroyed list because it was never built — it was being built, which is
+    // exactly why clearing the head is the whole of this module's involvement: there is
+    // no half-finished row for a later step to complete.
+    expect(capture.city.owner).toBe(asPlayerId(0));
+    expect(Object.hasOwn(capture.city, 'production')).toBe(false);
+    expect(capture.city.queue).toEqual([]);
+    expect(capture.destroyed).toEqual([]);
+
+    const after = applyProduction(capture.state, RULESET);
+
+    // One citizen, no worked tiles: the centre alone, so 1 shield this turn — banked on
+    // top of the 3 the city already held (a capture does not loot the pool).
+    expect(after.state.cities[0]?.shields).toBe(3 + 1);
+    expect(after.state.cities[0]?.buildings.map(String)).toEqual([]);
+    expect(after.state.cities[0]?.production).toBeUndefined();
+    // Nothing completed, so nothing is announced: a `CityProduced` here would tell a
+    // consumer that a city built something it never chose to build.
+    expect(after.events).toEqual([]);
+    // …and the pool really did grow, so "nothing happened" is about completions and not
+    // about a city that stopped earning.
+    expect(after.state.cities[0]?.shields).toBeGreaterThan(capture.city.shields);
+  });
+
+  it('starts from a clean head at the new owner’s next choice, in the same turn', () => {
+    // The consequence of the state the capture leaves behind: the new owner may set
+    // production immediately (the setter's own rules are `commands.test.ts`'), and
+    // nothing about the old owner's choice can still complete.
+    const target = bigCity(0, 1, 5, { shields: 3, production: building('temple') });
+    const capture = captureCity(board([target]), BUILDINGS, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    const chosen: GameState = {
+      ...capture.state,
+      cities: capture.state.cities.map((each) =>
+        each.id === asCityId(0) ? { ...each, production: building('factory') } : each,
+      ),
+    };
+    // The same turn, the same production step: one shield in the pool is not enough for
+    // a factory (cost 20), so the honest answer is "nothing yet" — and the pool keeps
+    // growing rather than being reset by the change of hands.
+    const first = applyProduction(chosen, RULESET);
+    expect(first.events).toEqual([]);
+    expect(first.state.cities[0]?.shields).toBe(3 + 1);
+
+    const second = applyProduction(first.state, RULESET);
+    expect(second.state.cities[0]?.shields).toBe(3 + 1 + 1);
+    expect(second.state.cities[0]?.production).toEqual(building('factory'));
   });
 });

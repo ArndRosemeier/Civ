@@ -60,6 +60,18 @@
  * alone (a step would cancel the job); anything else steps toward the best ground
  * it can reach, scored as an integer tuple.
  *
+ * **M6 adds combat, after research and before a unit moves.** A unit that can make a
+ * *profitable* attack makes it, a military unit in contact with an enemy that cannot
+ * attacks nothing and **fortifies** instead, and anything else falls through to the
+ * movement it did before. "Profitable" is not this file's opinion: the attack's odds are
+ * the `attackerWinPct` on the `CombatResolved` line the **applier itself** reports when
+ * the attack is folded on a scratch copy of the state, and the threshold that turns those
+ * odds into a decision is `attackOddsFloorPct`, one placeholder number in
+ * `SIMPLE_POLICY_TUNING`. A **capture** — an undefended enemy city — is always taken:
+ * there is no battle to lose, so there are no odds to weigh. See the section comment
+ * above `bestAttack` for why the policy reads the odds rather than the result, and for
+ * what "avoid" is and is not taken to mean here.
+ *
  * **M5 adds research, between the two.** Once per turn the policy picks the tech its
  * own ranking prefers among the ones `researchProblem` calls legal and issues one
  * `SetResearch` — so a simulated game actually walks the tech tree instead of banking
@@ -101,14 +113,17 @@ import {
   applyCommand,
   autoAssignWorkedTiles,
   citiesOf,
+  cityAt,
   cityProductionOptions,
   inBounds,
   indexToX,
   indexToY,
   isExplored,
+  isFortified,
   itemCost,
   improvementDef,
   knownTechs,
+  neighbors8,
   planFoundCity,
   researchProblem,
   researchingOf,
@@ -121,9 +136,11 @@ import {
   unitById,
   unitCatalog,
   unitDef,
+  unitsOnTile,
   VISIBILITY_RADIUS,
   type City,
   type Command,
+  type GameEvent,
   type GameState,
   type ImprovementId,
   type PlayerId,
@@ -161,6 +178,20 @@ export interface SimplePolicyTuning {
   readonly targetCities: number;
   readonly workersPerCity: number;
   readonly defendersPerCity: number;
+  /**
+   * The per-round odds (the applier's own `attackerWinPct`, in whole percent) at which
+   * this AI is willing to start a battle. **PLACEHOLDER: unsourced, chosen to be
+   * playable, not a Civ 3 figure and not a measured optimum.**
+   *
+   * It is a threshold on the *per-round* number the engine reports, not on the battle's
+   * overall probability, and that is a deliberate simplification: working out the
+   * battle's own probability means restating the resolver's race (how many rounds each
+   * side survives, and that ties go to the defender), which would be a second statement
+   * of `combat.ts`' rule and would drift from it. At `50` the attacker is at least as
+   * likely to win a round as to lose one, which is the crudest honest reading of
+   * "profitable"; a sweep varies it (`scripts/combat-balance-sweep.ts`).
+   */
+  readonly attackOddsFloorPct: number;
 }
 
 /** The defaults `simplePolicy` uses when a caller overrides nothing. PLACEHOLDER. */
@@ -168,6 +199,7 @@ export const SIMPLE_POLICY_TUNING: SimplePolicyTuning = {
   targetCities: 4,
   workersPerCity: 1,
   defendersPerCity: 1,
+  attackOddsFloorPct: 50,
 };
 
 /**
@@ -831,6 +863,112 @@ const chooseResearch = (
  * One turn of the simple policy
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * M6 — combat
+ * ------------------------------------------------------------------ */
+
+/** The `AttackUnit` command, as the enumerator issues it. */
+type AttackCommand = Extract<Command, { type: 'AttackUnit' }>;
+
+/** What one fold of an attack told this policy about it. */
+interface AttackChoice {
+  readonly command: AttackCommand;
+  /** Whether it takes an undefended city rather than fighting a defender. */
+  readonly capture: boolean;
+  /** The applier's own per-round odds, in whole percent (`CombatResolved.attackerWinPct`). */
+  readonly odds: number;
+}
+
+/**
+ * The best attack this unit may make, or `undefined` when it may make none.
+ *
+ * **The policy asks the engine, in the strongest form available.** Every candidate comes
+ * from `unitActions` (the enumerator that shares `planAttackUnit` with the applier, so
+ * this cannot propose an attack the applier would refuse — the keystone invariant, both
+ * directions), and every candidate is then *folded* through `applyCommand` on the
+ * scratch state. What is read off that fold is the engine's **own answer about the
+ * fight**: the `attackerWinPct` on the `CombatResolved` event for a battle, and the
+ * presence of a `CityCaptured` event for a capture. No statistic here is recomputed from
+ * the ruleset — terrain bonuses, city walls, fortification, the veteran bonus and the
+ * odds formula itself are all `combat.ts`' rule, and a policy that re-derived them would
+ * be a second home for it.
+ *
+ * **The fold is discarded, and that is not a wasted draw.** `applyCommand` is pure, so
+ * the scratch fold advances a copy of the RNG that goes nowhere; the attack this function
+ * selects is applied again, once, by `attempt` on the real `current` — which draws from
+ * the same state and therefore produces the same battle. What is deliberately **not**
+ * read off the fold is the *result*: `attackerSurvives` and the losses would tell this
+ * policy in advance exactly which attacks win, and a policy with perfect foresight plays
+ * a game no balance sweep is measuring. The decision is taken on the **odds**, which are
+ * a pure function of the state and carry no draw at all.
+ *
+ * A capture ranks above every battle (there is no defender to lose to), and within
+ * either kind the higher odds win; a tie keeps the **earlier** candidate, which is the
+ * enumerator's own order (ascending tile index), so the choice is total without a second
+ * comparison being invented here.
+ */
+const bestAttack = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  unitId: UnitId,
+): AttackChoice | undefined => {
+  let best: AttackChoice | undefined;
+
+  for (const command of unitActions(state, ruleset, unitId)) {
+    if (command.type !== 'AttackUnit') continue;
+
+    const outcome = applyCommand(state, playerId, command, ruleset);
+    if (!outcome.ok) continue;
+
+    const resolved = outcome.value.events.find(
+      (event): event is Extract<GameEvent, { type: 'CombatResolved' }> =>
+        event.type === 'CombatResolved',
+    );
+    const capture = outcome.value.events.some((event) => event.type === 'CityCaptured');
+    // A legal attack that produced neither line would be an engine bug, not a choice:
+    // `planAttackUnit` decides between exactly those two cases, and both emit their
+    // event. Counting it as odds 0 (rather than skipping it) keeps this total and keeps
+    // such an attack out of the "profitable" branch, which is the conservative reading.
+    const choice: AttackChoice = {
+      command,
+      capture,
+      odds: resolved === undefined ? 0 : resolved.attackerWinPct,
+    };
+
+    if (best === undefined) {
+      best = choice;
+      continue;
+    }
+    const rank = compareRanks(
+      [choice.capture ? 1 : 0, choice.odds],
+      [best.capture ? 1 : 0, best.odds],
+    );
+    if (rank > 0) best = choice;
+  }
+
+  return best;
+};
+
+/**
+ * Is this unit face to face with an enemy — an enemy unit or an enemy city on one of
+ * the eight tiles beside it?
+ *
+ * Both readings are the engine's: adjacency is `neighbors8` (the same ring
+ * `planAttackUnit` and `planMove` use), "who is on this tile" is `unitsOnTile`, and
+ * "whose city is this" is `cityAt`. No line of sight, no reachability and no threat
+ * model is involved, because this engine has none of those and this policy is a
+ * placeholder.
+ */
+const inContact = (state: GameState, playerId: PlayerId, unit: Unit): boolean => {
+  for (const tile of neighbors8(state.map, unit.tile)) {
+    if (unitsOnTile(state, tile).some((other) => other.owner !== playerId)) return true;
+    const city = cityAt(state, tile);
+    if (city !== undefined && city.owner !== playerId) return true;
+  }
+  return false;
+};
+
 /** How many steps a unit may be handed this turn: its own budget, or the guard. */
 const stepBudget = (movement: number): number => {
   const own = Number.isInteger(movement) && movement > 0 ? movement : 0;
@@ -926,6 +1064,29 @@ const planTurn = (ctx: PolicyContext, tuning: SimplePolicyTuning): readonly Comm
       continue;
     }
 
+    // M6: combat, and it comes **before any movement**. An attack spends the unit's
+    // whole remaining movement (`applyBattle`), so proposing a step first would either
+    // waste the step or make the attack unaffordable — and a `FortifyUnit` is refused
+    // without movement for the same reason.
+    //
+    // The order inside this block is the whole policy: fight only when the engine's own
+    // odds clear the floor (or when there is a city to take and nobody to fight), and
+    // otherwise, in contact, **hold the ground**. "Avoid" is read here as "does not
+    // wander": this AI has no threat model and no pathfinder, so walking away from a
+    // stronger enemy is a strategy claim it does not make, whereas standing still behind
+    // the fortification bonus is a rule the engine already states.
+    const attack = bestAttack(current, ruleset, playerId, unitId);
+    if (attack !== undefined && (attack.capture || attack.odds >= tuning.attackOddsFloorPct)) {
+      if (attempt(attack.command)) continue;
+    }
+
+    if (def.role === 'military' && inContact(current, playerId, unit)) {
+      // Only when it is not already dug in: `FortifyUnit` is about spending a movement
+      // point, and re-issuing it every turn would be a command that says nothing.
+      if (!isFortified(unit)) attempt({ type: 'FortifyUnit', unitId });
+      continue;
+    }
+
     const rank =
       def.role === 'settler'
         ? settleRanker(ruleset, playerId, unitId)
@@ -978,6 +1139,7 @@ export const simplePolicy = (patch: Partial<SimplePolicyTuning> = {}): Policy =>
     targetCities: patch.targetCities ?? SIMPLE_POLICY_TUNING.targetCities,
     workersPerCity: patch.workersPerCity ?? SIMPLE_POLICY_TUNING.workersPerCity,
     defendersPerCity: patch.defendersPerCity ?? SIMPLE_POLICY_TUNING.defendersPerCity,
+    attackOddsFloorPct: patch.attackOddsFloorPct ?? SIMPLE_POLICY_TUNING.attackOddsFloorPct,
   };
 
   return {

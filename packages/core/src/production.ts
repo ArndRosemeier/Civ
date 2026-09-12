@@ -54,8 +54,21 @@
  *   asks, so a queue entry the menu would never have offered cannot be produced here
  *   either. M4c deliberately re-checked the resource half only in a comment
  *   ("provably unreachable: roads are only ever added"); M5 turns that into a check
- *   and extends it to the tech half, where the planner's own wiring is still owed —
- *   named in `resources.ts` rather than implied.
+ *   and extends it to the tech half, and M5's integration wave landed the planner's
+ *   own wiring — `planSetProduction` asks the same verdict and refuses with the typed
+ *   `tech-required`, so the gate now has the three askers `resources.ts` names rather
+ *   than two askers and an owed patch. (This bullet said the wiring was still owed
+ *   until that landed; `resources.ts`' wiring note says the same.)
+ * - **M6: a captured city builds nothing, and that is visible here.** `cities.ts`'
+ *   `captureCity` clears the production head and the queue — the conquering player has
+ *   not ordered anything — so this pass finds a city with no `production` key and no
+ *   queue, banks its shields (they are not in the capture rule's list of what changes)
+ *   and completes nothing. There is no branch for it here, and that is the point: the
+ *   capture rule is stated once, in `cities.ts`, and this module simply obeys the state
+ *   it is handed rather than re-implementing "a captured city's queue is empty". A
+ *   placement-wait and a gate refusal bank shields in the same way, so the three cases
+ *   share one code path — and `production.test.ts` pins the captured case by number, so
+ *   a future "clear the queue here too" would fail a test rather than pass review.
  * - **Integers only** (PLAN.md §5.3), and no ambient state: costs come from the
  *   ruleset, yields from `cityYields`, and nothing here draws from the RNG or
  *   reads a clock.
@@ -243,11 +256,10 @@ export const applyProduction = (state: GameState, ruleset: RulesetView): Product
     //
     // M4c left this as a *comment* rather than a check, because re-asking the
     // resource gate was provably unreachable for a state the command layer could
-    // build ("roads are only ever added"). M5 makes it a check, on the same
-    // reachability argument plus one more: the gate's *tech* dimension is enforced
-    // here and in `actions.ts`' menu while `planSetProduction` does not ask it yet
-    // (the wiring `resources.ts` names as owed), so this is the one place the
-    // pipeline refuses a tech-gated item rather than producing it.
+    // build ("roads are only ever added"). M5 makes it a check, and M5's integration
+    // wave closed the other half of the wiring: `planSetProduction` now asks this same
+    // verdict, so the gate is not merely enforced twice by this pass but by the
+    // planner that offers the item as well — one rule, three askers.
     if (productionGate(current, ruleset, city.owner, item).kind !== 'open') {
       current = withCity(current, { ...city, shields });
       continue;

@@ -27,7 +27,12 @@
  *   enumeration, for the reasons in the `SetRates` note below. M5's `planSetResearch`
  *   is the seventh, on the same queried side and for a related reason — the tree is
  *   content the UI renders in full, refusals included, so it is not a generator's
- *   job to enumerate it.
+ *   job to enumerate it. **M6's `planAttackUnit` is the eighth, and it extends the
+ *   *enumerated* half**: an attack is a unit's action against one of its 8 neighbours
+ *   — a finite list the unit either can or cannot reach — so `unitActions` yields one
+ *   `AttackUnit` per adjacent tile the applier's own evaluator accepts, and
+ *   `actions.test.ts` sweeps a candidate universe of *every* tile (legal and illegal
+ *   alike) through `planAttackUnit` against `applyCommand` in both directions.
  * - **`StartWork` is enumerated over the catalog, and that is complete.** The
  *   command names an improvement kind, so "every way this worker may start work"
  *   is exactly "every kind this ruleset can build here" — a finite list read from
@@ -110,18 +115,34 @@
  * - **Deterministic order.** Units are visited in `state.units` order (sorted by
  *   id, INTERFACES.md M2); each unit yields `FoundCity` (when it can found), then
  *   one `StartWork` per accepted catalog kind, then `CancelWork` (when it is
- *   working), then its moves, sorted ascending by tile index; `EndTurn` is last.
+ *   working), then its moves, sorted ascending by tile index, then its attacks,
+ *   sorted ascending by tile index (M6); `EndTurn` is last.
  *   The own-tile actions come before the moves because a move *relocates* the unit
  *   and relocation cancels a job (M4a) — the irreversible side effect sits last,
- *   after the choices that keep the unit where it is. Two calls on the same state
- *   yield identical sequences — a precondition for the AI, for transcripts and for
- *   state hashes.
+ *   after the choices that keep the unit where it is — and the attacks come after the
+ *   moves because an attack spends the unit's whole remaining movement whether or not
+ *   it succeeds, which makes it strictly more committing than a step. Two calls on the
+ *   same state yield identical sequences — a precondition for the AI, for transcripts
+ *   and for state hashes.
+ * - **`FortifyUnit` (M6) is a ninth evaluator on the queried side, not a generator.**
+ *   `planFortifyUnit` is the applier's own decision (the unit is the actor's and has
+ *   movement left to spend), and it is stated once — but `legalActions` yields no
+ *   `FortifyUnit`, for exactly the reason the three setters and the rate slider are not
+ *   yielded: **it emits no `GameEvent`**, the committed adversarial sweeps treat "an
+ *   advertised action applied without emitting an event" as a generator that has
+ *   drifted, and the frozen M6 event list names no member for "the unit dug in". The
+ *   state is the record (`Unit.fortified`), the way `SetWorkedTiles`' payload is the
+ *   record of an assignment. `actions.test.ts` sweeps a candidate universe of fortify
+ *   commands through `planFortifyUnit` against `applyCommand` in both directions and
+ *   asserts that **no** generator advertises it — the same shape M4b's rate sweep has.
  * - **Fog is not a legality rule in M2.** Whether a tile is explored never
  *   affects a unit's options (INTERFACES.md M2, "Fog"): visibility is a rendering
  *   concern for `textview`, not a movement constraint. Nor is it one in M3 —
  *   founding a city does not require that the player has "seen" the site, only
  *   that the settler is standing on it — nor in M4a, where a worker improves the
- *   tile it stands on and nothing asks who else has looked at it.
+ *   tile it stands on and nothing asks who else has looked at it, nor in M6, where a
+ *   unit may attack a tile it has explored or not: what it can attack is decided by
+ *   adjacency and by what is standing there.
  * - **`legalActions` is lazy.** It is a generator so a caller that wants the
  *   first legal action (the REPL, a scripted scenario, a search that prunes)
  *   never materialises the whole space (PLAN.md §5.2).
@@ -129,6 +150,7 @@
 
 import { buildingCatalog, cityById, type ProductionItem } from './cities.js';
 import {
+  planAttackUnit,
   planCancelWork,
   planFoundCity,
   planMove,
@@ -183,7 +205,9 @@ export const unitMoveOptions = (
  *    in catalog order (M4a) — a worker's defining action, and one that commits the
  *    rest of its turn;
  * 3. `CancelWork` when the unit is working — the way back out of a job;
- * 4. one `MoveUnit` per tile in `unitMoveOptions` order.
+ * 4. one `MoveUnit` per tile in `unitMoveOptions` order;
+ * 5. one `AttackUnit` per *adjacent* tile the attack is legal against, in ascending
+ *    tile order (M6).
  *
  * The own-tile actions come before the moves because a move relocates the unit and
  * *relocation cancels an in-flight job* (M4a): the destructive act is listed last,
@@ -191,20 +215,33 @@ export const unitMoveOptions = (
  * own-tile group because a caller scanning the list for "what can this unit do
  * here?" should see the whole answer before the list starts offering to walk away.
  *
+ * **The attacks come after the moves**, and that is the same ordering principle one
+ * step further: an attack spends the unit's *whole* remaining movement whether or not
+ * it succeeds (`commands.ts`), so it is the most committing thing on this list —
+ * strictly more committing than a step, which at least leaves the unit able to step
+ * again when it can afford two tiles. A caller that walks the list in order therefore
+ * reaches the reversible options first. The group is a filtered scan of the 8
+ * neighbours through `planAttackUnit` (the applier's own evaluator), never an
+ * enumeration of the command space, for the reason `unitMoveOptions` gives: this is
+ * the AI's and the UI's hot path.
+ *
  * A unit's actions are its own: `EndTurn` is a *player* action, not something a
  * unit does, so it is yielded by `legalActions` alone. Neither are the two city
  * commands — see the module note on why they are queries rather than enumerated
- * actions. An unknown unit has no actions; the empty list is the answer, not an
- * error, because asking about a unit that is not there is a question the UI asks
- * every frame.
+ * actions — and neither is `FortifyUnit`, which M6 places on the queried side for the
+ * same reason: it emits no event. An unknown unit has no actions; the empty list is the
+ * answer, not an error, because asking about a unit that is not there is a question the
+ * UI asks every frame.
  *
  * Every command below is offered exactly when the applier's own evaluator accepts
- * it: `planFoundCity`, `planStartWork`, `planCancelWork`, `planMove` — acting as
- * the unit's own owner, since a per-unit query has no acting player. So a settler
- * is not offered a city it cannot found, a scout is not offered a mine, a worker
- * standing on grassland is not offered a mine, a worker on an already-mined hill
- * is not offered that mine again, and a worker with no movement left is offered no
- * job at all.
+ * it: `planFoundCity`, `planStartWork`, `planCancelWork`, `planMove`, `planAttackUnit`
+ * — acting as the unit's own owner, since a per-unit query has no acting player. So a
+ * settler is not offered a city it cannot found, a scout is not offered a mine, a
+ * worker standing on grassland is not offered a mine, a worker on an already-mined
+ * hill is not offered that mine again, a worker with no movement left is offered no
+ * job at all, and a unit is offered an attack on exactly the tiles where a battle or a
+ * capture would actually be resolved — not on an empty tile, not on a tile holding two
+ * enemy units, and not on one holding only its own side.
  */
 export const unitActions = (
   state: GameState,
@@ -239,7 +276,18 @@ export const unitActions = (
     to,
   }));
 
-  return [...found, ...started, ...cancelled, ...moves];
+  // M6's eighth generator. The candidate list is the adjacency ring and the filter is
+  // `planAttackUnit`, so the yielded set *is* the applier's accepted set: a tile with
+  // nothing to attack yields nothing (`nothing-to-attack`), a tile with two enemy units
+  // yields nothing (`target-stacked`), a tile with only the unit's own side yields
+  // nothing, and a unit with nothing left to spend yields nothing. Sorted ascending
+  // rather than trusting `neighbors8`' order, exactly as `unitMoveOptions` does.
+  const attacks: readonly Command[] = neighbors8(state.map, unit.tile)
+    .filter((target) => planAttackUnit(state, ruleset, unit.owner, unitId, target).ok)
+    .sort((a, b) => a - b)
+    .map((target): Command => ({ type: 'AttackUnit', unitId, target }));
+
+  return [...found, ...started, ...cancelled, ...moves, ...attacks];
 };
 
 /**
@@ -300,10 +348,13 @@ export const cityProductionOptions = (
     // reimplemented here: an item whose own row — or whose *resource*'s row — demands
     // a tech this owner has not researched is not offered, because the production
     // pass will not complete it (`production.ts` asks the same gate). Two askers, one
-    // verdict (`productionGate`), which is the same arrangement M4c gave the resource
-    // rule. Owed wiring, named in `resources.ts` and in the report rather than
-    // implied: `planSetProduction` itself does not ask this gate yet, so until it does
-    // this conjunct is the only place the *menu* refuses a tech-gated item.
+    // verdict (`productionGate`): the planner asks it too (`planSetProduction`, called
+    // one line above), so this conjunct is a redundant restatement of a rule the
+    // planner already applies — a gated item is absent from the menu *and* refused by
+    // `applyCommand` with the same typed `tech-required`. Written as the same verdict
+    // rather than as a filter of its own, which is why the agreement is by
+    // construction instead of by review. (The comment here used to say the planner's
+    // wiring was owed; M5's integration wave closed it, and the header says so.)
     if (productionGate(state, ruleset, city.owner, item).kind !== 'open') continue;
     options.push(item);
   }

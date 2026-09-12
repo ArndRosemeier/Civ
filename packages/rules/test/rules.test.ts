@@ -10,6 +10,7 @@ import {
   asTechId,
   asTerrainId,
   asUnitTypeId,
+  fullHitPoints,
   isPlaceholder,
   type BuildingEffect,
   type BuildingEffectKind,
@@ -17,6 +18,7 @@ import {
   type Provenance,
   type ResourceKind,
   type ResourceId,
+  type TechId,
   type UnitRole,
 } from '@civts/core';
 import {
@@ -34,6 +36,7 @@ import {
   type ProvenanceSection,
   type ResourceSpec,
   type TechSpec,
+  type TerrainSpec,
   type UnitSpec,
 } from '../src/index.js';
 
@@ -123,6 +126,96 @@ const withTechs = (patches: readonly (readonly [string, Partial<TechSpec>])[]): 
     return patch === undefined ? t : { ...t, ...patch[1] };
   }),
 });
+
+/**
+ * The catalog with one terrain row replaced — the terrain counterpart of `withUnit` and
+ * friends, added in M6 because that is when a terrain row grew a field the validator has
+ * to police (`defenseBonus`). `patch` is `Partial<TerrainSpec>`, so the cases below reach
+ * a broken row the way a JSON catalog would rather than through a cast.
+ */
+/**
+ * What a terrain case may change. Wider than `Partial<TerrainSpec>` in exactly one place:
+ * `defenseBonus` accepts an explicit `undefined`, which means **"this row must carry no
+ * such key at all"**. That is a state `exactOptionalPropertyTypes` forbids anyone to write,
+ * and it is the state a pre-M6 catalog has, so the helper below is where it is reached —
+ * the same argument `withRawWonder` makes about `wonder: false`.
+ */
+interface TerrainPatch {
+  readonly role?: TerrainSpec['role'];
+  readonly name?: string;
+  readonly moveCost?: number;
+  readonly defenseBonusPct?: number;
+  readonly yields?: TerrainSpec['yields'];
+  readonly impassable?: boolean;
+  readonly defenseBonus?: number | undefined;
+}
+
+/**
+ * The catalog with one terrain row patched.
+ *
+ * `Object.assign` rather than a spread, because a spread cannot *remove* a key: the M6
+ * case this helper exists for is a row that must not carry `defenseBonus` even though the
+ * shipped row does, and `Object.assign` skips `undefined` sources while a spread would
+ * copy an explicit `undefined` across. The cast is a claim about data the builder cannot
+ * prove (every shipped row does declare the field), not a way to quiet a type error — the
+ * same distinction `withRawEffects` draws.
+ */
+/**
+ * A copy of a terrain row with the M6 name **removed**.
+ *
+ * Neither a spread nor `Object.assign` can drop a key: a rest-pattern copy writes the
+ * removed key back, and an `Object.assign` whose source carries `defenseBonus: undefined`
+ * still creates the key (`'defenseBonus' in row` reports it as present). `delete` on an
+ * *optional* property is the one spelling that really removes it, and the callers assert
+ * `'defenseBonus' in row === false` afterwards, so the removal is checked rather than
+ * trusted — this is the same trap the state writers in `core/units.ts` are built around,
+ * reached here deliberately because "the row has no such key" is the input under test.
+ */
+const withoutTerrainBonus = (row: TerrainSpec): TerrainSpec => {
+  const copy = { ...row };
+  delete copy.defenseBonus;
+  return copy;
+};
+
+/** The same thing for a unit row's `hitPoints` — a row with no combat statistics at all. */
+const withoutHitPoints = (row: UnitSpec): UnitSpec => {
+  const copy = { ...row };
+  delete copy.hitPoints;
+  return copy;
+};
+
+const withTerrainRow = (id: string, patch: TerrainPatch): Catalog => ({
+  ...CATALOG,
+  terrains: CATALOG.terrains.map((t) => (t.id === id ? Object.assign({}, t, patch) : t)),
+});
+
+/**
+ * The catalog with one row's `requiresTech` replaced by raw data (M6).
+ *
+ * Same reasoning as `withRawEffects`: the interesting failures are the ones the type
+ * system cannot express — a number, an object, an id no row defines — and the field has
+ * to be reached the way a malformed JSON catalog reaches it. The value is written through
+ * a cast on a *spread row*, which is a claim about data the checker is about to verify
+ * rather than a way to quiet a type error, exactly as `withRawWonder` argues.
+ */
+const withRawRequiresTech = (
+  section: 'units' | 'buildings' | 'improvements' | 'resources',
+  id: string,
+  value: unknown,
+): Catalog => {
+  const patched = (rows: readonly { readonly id: string }[]): readonly { readonly id: string }[] =>
+    rows.map((row) => (row.id === id ? ({ ...row, requiresTech: value } as typeof row) : row));
+  switch (section) {
+    case 'units':
+      return { ...CATALOG, units: patched(UNITS) as readonly UnitSpec[] };
+    case 'buildings':
+      return { ...CATALOG, buildings: patched(BUILDINGS) as readonly BuildingSpec[] };
+    case 'improvements':
+      return { ...CATALOG, improvements: patched(IMPROVEMENTS) as readonly ImprovementSpec[] };
+    case 'resources':
+      return { ...CATALOG, resources: patched(RESOURCES) as readonly ResourceSpec[] };
+  }
+};
 
 /** The cycle ids a rejected catalog reported, or `undefined` if it was accepted. */
 const cycleOf = (catalog: Catalog): readonly string[] | undefined => {
@@ -369,29 +462,373 @@ describe('unit catalog', () => {
     expect(r.ok).toBe(true);
   });
 
+  /* ---------------- M6: the combat statistics ---------------- */
+
+  it('declares whole-number combat statistics on every row, and at least one hit point', () => {
+    // The contract makes attack/defense/hitPoints required on `UnitSpec`. `hitPoints`
+    // cannot be a required *property* (see its field doc), so validation is where the
+    // requirement lives — which means "no shipped row omits it" is the assertion that
+    // proves the requirement is satisfied by real content rather than only by the type.
+    for (const u of UNITS) {
+      expect(u.hitPoints, `${u.id} must declare hitPoints`).toBeDefined();
+      expect(Number.isInteger(u.attack)).toBe(true);
+      expect(Number.isInteger(u.defense)).toBe(true);
+      expect(Number.isInteger(u.hitPoints)).toBe(true);
+      expect(u.attack).toBeGreaterThanOrEqual(0);
+      expect(u.defense).toBeGreaterThanOrEqual(0);
+      expect(u.hitPoints).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('gives the military rows DISTINCT statistics, so the resolver’s output varies', () => {
+    // The statistics have to actually distinguish the rows: if every military row read
+    // 2/2/3 then `resolveCombat` would return the same odds whatever it computed, and a
+    // battle scenario could not tell a working resolver from a broken one.
+    // Every military row is distinct on all three numbers. The archer and the horseman are
+    // the near miss that makes this worth asserting: they share attack and defence (3/1) and
+    // differ only in hit points and mobility, which is a *deliberate* pair — the same fighter
+    // with and without a horse, gated differently — so a test that only compared
+    // attack/defence would call the table fine and a test that compared nothing would call
+    // any table fine.
+    const military = UNITS.filter((u) => u.role === 'military');
+    const profiles = military.map(
+      (u) => `${String(u.attack)}/${String(u.defense)}/${String(u.hitPoints)}`,
+    );
+    expect(military.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(profiles).size).toBe(profiles.length);
+
+    // And the land rows are pairwise distinct on attack/defence too, so no two of them are
+    // the same fighter.
+    const land = military.filter((u) => u.domain === 'land');
+    const landStats = land.map((u) => `${String(u.attack)}/${String(u.defense)}`);
+    expect(new Set(landStats).size).toBe(landStats.length);
+  });
+
+  it('ships units with attack 0, so "no attack, no attack order" has content behind it', () => {
+    // The M6 rule is a legality rule, not a footnote: a unit with `attack === 0` may not
+    // attack at all. A rule no shipped row can trigger is a rule nothing tests — the exact
+    // mistake M5 made with `requiresTech` — so zero-attack content is required, and at
+    // least one of them is in the `military` role, where "surely a warship may attack" is
+    // the assumption the rule has to defeat.
+    const unarmed = UNITS.filter((u) => u.attack === 0);
+    expect(unarmed.length).toBeGreaterThanOrEqual(2);
+    expect(unarmed.some((u) => u.role === 'military')).toBe(true);
+    // And validation accepts them: `attack: 0` is content, not a defect.
+    expect(validateRuleset(CATALOG, 'tuned').ok).toBe(true);
+  });
+
+  it('rejects a fractional combat statistic, naming the field', () => {
+    const r = validateRuleset(withUnit('warrior', { attack: 1.5, defense: 0.5 }), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(fieldsOf(r.error)).toContain('attack');
+      expect(fieldsOf(r.error)).toContain('defense');
+    }
+  });
+
+  it('rejects a negative combat statistic', () => {
+    const r = validateRuleset(withUnit('warrior', { defense: -1 }), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'units',
+        id: asUnitTypeId('warrior'),
+        field: 'defense',
+        detail: 'must not be negative',
+      });
+    }
+    expect(validateRuleset(withUnit('warrior', { attack: -1 }), 'tuned').ok).toBe(false);
+  });
+
+  it('rejects a hitPoints below 1 — zero is a unit that is born destroyed', () => {
+    // A unit's `hitPointsLeft` starts at this number, and M6's rule is that a unit at 0 hit
+    // points does not exist. So `0` is refused rather than rounded up to 1: content that
+    // asks for a unit that is already destroyed is a content error, not a value to repair
+    // silently.
+    for (const broken of [0, -1]) {
+      const r = validateRuleset(withUnit('warrior', { hitPoints: broken }), 'tuned');
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toContainEqual({
+          kind: 'invalid-value',
+          catalog: 'units',
+          id: asUnitTypeId('warrior'),
+          field: 'hitPoints',
+          detail: 'must be >= 1',
+        });
+      }
+    }
+  });
+
+  it('accepts a row that omits hitPoints, and reads it as one hit point', () => {
+    // The documented compromise (see `checkUnit`): absence is accepted because the override
+    // applier and the fixture catalogs in this tree rebuild unit rows without it, and
+    // rejecting it would fail those paths for a reason that has nothing to do with combat.
+    // What is asserted here is that absence is *read* rather than assumed: the engine's
+    // totality rule turns a silent row into exactly one hit point, and never into zero.
+    // `withoutHitPoints` (above) really removes the key — see its note for why a spread and
+    // `Object.assign` both fail to — and the assertion below checks the removal rather than
+    // trusting it, because a row that kept `hitPoints: undefined` would be a different input.
+    const omitted: Catalog = {
+      ...CATALOG,
+      units: CATALOG.units.map((u) => (u.id === asUnitTypeId('warrior') ? withoutHitPoints(u) : u)),
+    };
+    const warriorRow = omitted.units.find((u) => u.id === asUnitTypeId('warrior'));
+    expect('hitPoints' in (warriorRow ?? {})).toBe(false);
+    const r = validateRuleset(omitted, 'tuned');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const warrior = r.value.units.find((u) => u.id === asUnitTypeId('warrior'));
+      expect('hitPoints' in (warrior ?? {})).toBe(false);
+      expect(fullHitPoints(warrior)).toBe(1);
+    }
+  });
+
+  it('rejects a fractional hitPoints', () => {
+    const r = validateRuleset(withUnit('warrior', { hitPoints: 2.5 }), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(fieldsOf(r.error)).toContain('hitPoints');
+  });
+
+  /* ---------------- M6: terrain defence ---------------- */
+
+  it('gives every terrain row the M6 defenseBonus, equal to its defenseBonusPct', () => {
+    // Two names for one magnitude. The shipped rows declare both and agree, so a
+    // disagreement is a content error the validator catches; the assertion here pins the
+    // agreement at the content level as well, so a row that quietly dropped one of them
+    // fails a test rather than only being tolerated by the reader's fallback.
+    for (const t of CATALOG.terrains) {
+      expect(t.defenseBonus, `${t.id} must declare defenseBonus`).toBeDefined();
+      expect(Number.isInteger(t.defenseBonus)).toBe(true);
+      expect(t.defenseBonus).toBeGreaterThanOrEqual(0);
+      expect(t.defenseBonus).toBe(t.defenseBonusPct);
+    }
+  });
+
+  it('rejects a negative or fractional terrain defense bonus, under either name', () => {
+    for (const broken of [-10, 1.5]) {
+      const byPct = validateRuleset(
+        withTerrainRow(asTerrainId('hills'), { defenseBonusPct: broken, defenseBonus: undefined }),
+        'tuned',
+      );
+      expect(byPct.ok).toBe(false);
+      if (!byPct.ok) expect(fieldsOf(byPct.error)).toContain('defenseBonusPct');
+
+      const byM6Name = validateRuleset(
+        withTerrainRow(asTerrainId('hills'), { defenseBonus: broken }),
+        'tuned',
+      );
+      expect(byM6Name.ok).toBe(false);
+      if (!byM6Name.ok) expect(fieldsOf(byM6Name.error)).toContain('defenseBonus');
+    }
+  });
+
+  it('rejects a row whose two spellings of the terrain bonus disagree', () => {
+    // This is the check that makes "one number, two names" safe: the combat reader prefers
+    // `defenseBonus`, so a row that said 50 in `defenseBonusPct` and 0 in `defenseBonus`
+    // would fight as though the terrain gave nothing while every report of the older field
+    // showed 50. Refused at load time instead.
+    const r = validateRuleset(
+      withTerrainRow(asTerrainId('hills'), { defenseBonusPct: 50, defenseBonus: 25 }),
+      'tuned',
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const error = r.error.find((e) => e.kind === 'invalid-value' && e.field === 'defenseBonus');
+      expect(error).toBeDefined();
+      if (error?.kind === 'invalid-value') {
+        expect(error.id).toBe(asTerrainId('hills'));
+        expect(error.detail).toContain('must equal defenseBonusPct (50)');
+      }
+    }
+  });
+
+  it('accepts a terrain row that declares only defenseBonusPct — and defaults it to 0', () => {
+    // The fallback the combat reader relies on: a view whose rows predate M6 — every
+    // hand-built `TerrainDef` in this tree — is legal, and "declares nothing" means no
+    // terrain defence rather than an error. The row is written out in full rather than
+    // patched, because `TerrainSpec.defenseBonus` is an optional *property* and
+    // `exactOptionalPropertyTypes` forbids spelling its absence as an explicit `undefined`.
+    const hills = CATALOG.terrains.find((t) => t.id === asTerrainId('hills'));
+    expect(hills).toBeDefined();
+    if (hills === undefined) return;
+    const withoutM6Name = withoutTerrainBonus(hills);
+    expect('defenseBonus' in withoutM6Name).toBe(false);
+    const onlyPct = validateRuleset({ ...CATALOG, terrains: [withoutM6Name] }, 'tuned');
+    // Rejected only for the *roles* the trimmed catalog no longer covers, never for the
+    // missing field: that is the point of the case.
+    const complaints = onlyPct.ok ? [] : fieldsOf(onlyPct.error);
+    expect(complaints).not.toContain('defenseBonus');
+    expect(complaints).not.toContain('defenseBonusPct');
+  });
+
   /* ---------------- M4c: the resource gate ---------------- */
 
-  it('gates exactly one shipped unit, on a shipped strategic resource, and names both', () => {
+  it('gates shipped units on a shipped strategic resource, and names both', () => {
     // M4c's resource gating has to be reachable from *shipped* content, not only
     // from a hand-built ruleset view — the same lesson M4b's accepted debt taught
     // about maintenance. Asserted by value, so it cannot silently regress to "no
     // shipped unit requires anything" while the engine still claims to gate.
     const gated = UNITS.filter((u) => u.requiresResource !== undefined);
-    expect(gated.map((u) => u.id)).toEqual([asUnitTypeId('swordsman')]);
-    expect(gated[0]?.requiresResource).toBe(asResourceId('iron'));
-
-    const iron = RESOURCES.find((r) => r.id === asResourceId('iron'));
-    expect(iron?.kind).toBe('strategic');
+    // In catalog order, which is the order the table declares them.
+    expect(gated.map((u) => u.id)).toEqual([asUnitTypeId('horseman'), asUnitTypeId('swordsman')]);
+    // Every requirement names a real strategic resource: a gate on a bonus or a luxury
+    // would be a gate M4c's `resourceGate` cannot satisfy, since those are never
+    // "connected" as strategic resources are.
+    for (const unit of gated) {
+      const resource = RESOURCES.find((r) => r.id === unit.requiresResource);
+      expect(resource, `${unit.id} requires a row that exists`).toBeDefined();
+      expect(resource?.kind).toBe('strategic');
+    }
+    const horseman = gated.find((u) => u.id === asUnitTypeId('horseman'));
+    const swordsman = gated.find((u) => u.id === asUnitTypeId('swordsman'));
+    expect(horseman?.requiresResource).toBe(asResourceId('horses'));
+    expect(swordsman?.requiresResource).toBe(asResourceId('iron'));
   });
 
-  it('keeps the gated unit last, so "the first military land unit" is still the warrior', () => {
-    // `hut.ts` gives away and spawns the first `military`-role land row in catalog
-    // order. A gated row inserted above the warrior would make huts hand out a
-    // unit a city may not even be able to build — a behavioural change smuggled in
-    // by content order. Pinned here because nothing else would notice.
-    const firstMilitaryLand = UNITS.find((u) => u.role === 'military' && u.domain === 'land');
+  it('keeps the first military land row ungated, so huts still hand out the warrior', () => {
+    // `hut.ts` gives away and spawns the *cheapest* `military`-role land row (ties by id).
+    // A gated or more expensive row placed above the warrior would make huts hand out a
+    // unit a city may not even be able to build — a behavioural change smuggled in by
+    // content *order*. Pinned here because nothing else would notice.
+    const militaryLand = UNITS.filter((u) => u.role === 'military' && u.domain === 'land');
+    const firstMilitaryLand = militaryLand[0];
     expect(firstMilitaryLand?.id).toBe(asUnitTypeId('warrior'));
-    expect(UNITS[UNITS.length - 1]?.id).toBe(asUnitTypeId('swordsman'));
+    expect(firstMilitaryLand?.requiresResource).toBeUndefined();
+    expect(firstMilitaryLand?.requiresTech).toBeUndefined();
+    // …and it stays the cheapest row that can fight, which is the other half of "what a
+    // hut hands out".
+    const cheapest = [...militaryLand].sort((a, b) => a.cost - b.cost)[0];
+    expect(cheapest?.id).toBe(asUnitTypeId('warrior'));
+
+    // The whole table's cheapest row is the scout, which is what the played golden's fixed
+    // script produces and what `hut.ts` calls the cheapest unit a catalog defines. It must
+    // stay ungated too, or the golden's script would be refused by a gate it cannot pass.
+    const cheapestAny = [...UNITS].sort((a, b) => a.cost - b.cost)[0];
+    expect(cheapestAny?.id).toBe(asUnitTypeId('scout'));
+    expect(cheapestAny?.requiresTech).toBeUndefined();
+    expect(cheapestAny?.requiresResource).toBeUndefined();
+  });
+
+  /* ---------------- M6: the tech gate is USED, not merely available ---------------- */
+
+  it('ships at least one unit with requiresTech, and one row gated on both gates', () => {
+    // The M6 requirement, verbatim: "M6 content must actually use the gates M5 built. No
+    // shipped row declares `requiresTech` today, which is exactly why two gating defects
+    // survived play testing." So the assertion is *not* "the field exists" — it is "shipped
+    // rows declare it", by id and by named tech, so it cannot quietly go back to nothing.
+    const gated = UNITS.filter((u) => u.requiresTech !== undefined);
+    expect(gated.length).toBeGreaterThanOrEqual(2);
+
+    const archer = UNITS.find((u) => u.id === asUnitTypeId('archer'));
+    expect(archer?.requiresTech).toBe(asTechId('warrior-code'));
+    // Every named tech is a row the tree really defines, which is what `validateRuleset`
+    // enforces and what makes `techUnlocks` report something.
+    for (const unit of gated) {
+      expect(TECHS.some((t) => t.id === unit.requiresTech)).toBe(true);
+    }
+
+    // The row that carries both gates: a resource *and* a technology. They are independent
+    // dimensions, and this is the case where getting their order wrong in a planner shows.
+    const horseman = UNITS.find((u) => u.id === asUnitTypeId('horseman'));
+    expect(horseman?.requiresResource).toBe(asResourceId('horses'));
+    expect(horseman?.requiresTech).toBe(asTechId('horseback-riding'));
+  });
+
+  it('carries requiresTech through the type, as an absent key when it is unset', () => {
+    expectTypeOf<UnitSpec['requiresTech']>().toEqualTypeOf<TechId | undefined>();
+    for (const u of UNITS.filter((unit) => unit.requiresTech === undefined)) {
+      expect('requiresTech' in u).toBe(false);
+    }
+  });
+
+  it('ships a gated BUILDING too, so the requirement is not met by units alone', () => {
+    // "At least one new gated unit and one gated building/improvement must declare
+    // `requiresTech`" — the building half, asserted by id so a later retune cannot silently
+    // un-use the gate while the engine still claims to gate production.
+    const gated = BUILDINGS.filter((b) => b.requiresTech !== undefined);
+    expect(gated.length).toBeGreaterThanOrEqual(1);
+    const temple = BUILDINGS.find((b) => b.id === asBuildingId('temple'));
+    expect(temple?.requiresTech).toBe(asTechId('ceremonial-burial'));
+    // Every named tech is a row the tree really defines — the same guarantee the unit half
+    // gets from `validateRuleset`, stated here so a broken reference fails a *content* test
+    // as well as a validation one.
+    for (const building of gated) {
+      expect(TECHS.some((t) => t.id === building.requiresTech)).toBe(true);
+    }
+  });
+
+  it('keeps the cheapest building ungated, so the first thing a city can build always can be', () => {
+    // The played golden sets its city to produce the cheapest building in the catalog on a
+    // board with no technologies, and a *player* in the same position would be stuck with an
+    // empty production list if the cheapest row were gated. Pinned by value: the cheapest
+    // row is the granary and it requires nothing.
+    const cheapest = [...BUILDINGS].sort((a, b) => a.cost - b.cost)[0];
+    expect(cheapest?.id).toBe(asBuildingId('granary'));
+    expect(cheapest?.requiresTech).toBeUndefined();
+
+    // …and the gated building is strictly more expensive, so the gate cannot be the only
+    // reason it is not built first.
+    const temple = BUILDINGS.find((b) => b.id === asBuildingId('temple'));
+    expect(temple?.cost).toBeGreaterThan(cheapest?.cost ?? 0);
+  });
+
+  it('rejects a building requiresTech that names no row in the tech catalog', () => {
+    const r = validateRuleset(withRawRequiresTech('buildings', 'temple', 'philosophy'), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'buildings',
+        id: asBuildingId('temple'),
+        field: 'requiresTech',
+        detail: 'names tech "philosophy", which this catalog does not define',
+      });
+    }
+  });
+
+  it('rejects an improvement requiresTech that names no row in the tech catalog', () => {
+    const r = validateRuleset(withRawRequiresTech('improvements', 'mine', 'philosophy'), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const error = r.error.find((e) => e.kind === 'invalid-value' && e.field === 'requiresTech');
+      expect(error).toBeDefined();
+      if (error?.kind === 'invalid-value') {
+        expect(error.id).toBe(asImprovementId('mine'));
+        expect(error.catalog).toBe('improvements');
+      }
+    }
+  });
+
+  it('rejects a resource requiresTech that names no row in the tech catalog', () => {
+    const r = validateRuleset(
+      withRawRequiresTech('resources', 'iron', asTechId('philosophy')),
+      'tuned',
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const error = r.error.find((e) => e.kind === 'invalid-value' && e.field === 'requiresTech');
+      expect(error).toBeDefined();
+      if (error?.kind === 'invalid-value') {
+        expect(error.catalog).toBe('resources');
+        expect(error.detail).toContain('philosophy');
+      }
+    }
+  });
+
+  it('rejects a unit requiresTech that names no row in the tech catalog', () => {
+    const r = validateRuleset(withRawRequiresTech('units', 'archer', 'philosophy'), 'tuned');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContainEqual({
+        kind: 'invalid-value',
+        catalog: 'units',
+        id: asUnitTypeId('archer'),
+        field: 'requiresTech',
+        detail: 'names tech "philosophy", which this catalog does not define',
+      });
+    }
   });
 
   it('rejects a requiresResource that names no row in the resource catalog', () => {

@@ -52,6 +52,25 @@
  * one to be exactly the setting it claims and to touch nothing else in the state, and
  * requires that none of them is advertised.
  *
+ * `AttackUnit` (M6) is the **eighth generator**, and it goes on the enumerated side
+ * with movement and work: "what may this unit attack" is a finite list read from the
+ * board — the tiles it stands beside that hold exactly one enemy-occupied thing — so
+ * `unitActions` yields it and the candidate universe below grew to include every
+ * adjacent tile for every unit, legal and illegal alike (`assertAttackAgreement`
+ * states the two directions directly, including that an accepted attack *is*
+ * advertised). The board is exactly where M6 makes this interesting: on the hand-built
+ * fixture player 0's settler stands beside player 1's warrior, so the eighth generator
+ * produces a real attack on the boards M2 wrote for movement — one more action than
+ * before, and the counts below say so.
+ *
+ * `FortifyUnit` is the **ninth evaluator**, and it stays on the *queried* side with the
+ * setters and the rates, for the reason `actions.ts` gives where it declines to yield
+ * one: it emits no event, so an advertised fortification would break the committed
+ * adversarial sweeps' rule that every advertised action says what it did — and a
+ * "dig in" button needs a planner (`planFortifyUnit`), not an enumeration.
+ * `assertFortifyAgreement` checks both halves of that: the applier's verdict is the
+ * plan's, and no generator ever yields one, however fortified the board.
+ *
  * The walk covers eight states — a hand-built board, one with cities, a starved
  * one, a rich one, the unknown-type one, real `newGame` boards, and the M4a worker
  * boards (idle, working, and on an already-improved tile) — and applies every
@@ -80,7 +99,9 @@ import {
 } from '../src/cities.js';
 import {
   applyCommand,
+  planAttackUnit,
   planCancelWork,
+  planFortifyUnit,
   planSetProduction,
   planSetRates,
   planSetResearch,
@@ -129,6 +150,8 @@ import {
 import { researchingOf, type TechDef } from '../src/tech.js';
 import { advanceTurn } from '../src/turn.js';
 import {
+  isFortified,
+  unitById,
   unitCatalog,
   withWork,
   type Unit,
@@ -455,6 +478,14 @@ const startWork = (unitId: number, kind: string): Command => ({
 
 const cancelWork = (unitId: number): Command => ({ type: 'CancelWork', unitId: asUnitId(unitId) });
 
+const attack = (unitId: number, target: number): Command => ({
+  type: 'AttackUnit',
+  unitId: asUnitId(unitId),
+  target: asTileIndex(target),
+});
+
+const fortify = (unitId: number): Command => ({ type: 'FortifyUnit', unitId: asUnitId(unitId) });
+
 const setRates = (tax: number, science: number, luxury: number): Command => ({
   type: 'SetRates',
   rates: { tax, science, luxury },
@@ -586,6 +617,24 @@ const generatedBoard = (seed: number): GameState => {
 const isMove = (cmd: Command): cmd is Extract<Command, { type: 'MoveUnit' }> =>
   cmd.type === 'MoveUnit';
 
+/**
+ * Does the per-unit generator offer this unit an attack on this tile? The M6
+ * counterpart of asking `unitMoveOptions` whether a step is offered, and the
+ * question the two-direction sweeps below ask over every tile rather than over a
+ * hand-picked few.
+ */
+const offersAttack = (
+  state: GameState,
+  ruleset: RulesetView,
+  actor: PlayerId,
+  unitId: number,
+  target: number,
+): boolean =>
+  actor === state.units.find((each) => each.id === asUnitId(unitId))?.owner &&
+  unitActions(state, ruleset, asUnitId(unitId)).some(
+    (cmd) => cmd.type === 'AttackUnit' && cmd.target === asTileIndex(target),
+  );
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
@@ -678,6 +727,14 @@ const commandKey = (cmd: Command): string => {
     // exists to prevent (the same reason the M4a keys carry their payload).
     case 'SetResearch':
       return `SetResearch:${String(cmd.tech)}`;
+    // M6: both halves of the payload. Two attacks on different tiles are different
+    // commands, and a key that dropped the target would collapse a whole battle line
+    // into one entry — which would silently break the rate sweep's `keys.size` count
+    // rather than failing an assertion about the key.
+    case 'AttackUnit':
+      return `AttackUnit:${String(Number(cmd.unitId))}:${String(Number(cmd.target))}`;
+    case 'FortifyUnit':
+      return `FortifyUnit:${String(Number(cmd.unitId))}`;
   }
 };
 
@@ -686,7 +743,9 @@ const commandKey = (cmd: Command): string => {
  * every tile index from one before the board to one past it for each of the
  * player's units, one non-integer index (a `TileIndex` is a number at runtime,
  * and a client can hand over 1.5), `FoundCity`, one `StartWork` per catalog kind
- * **plus one for a kind no row describes**, `CancelWork`, and `EndTurn`.
+ * **plus one for a kind no row describes**, `CancelWork`, one `AttackUnit` per
+ * tile index (the same walk as movement — an attack is a tile, so the space is
+ * the board), `FortifyUnit` for every unit, and `EndTurn`.
  *
  * It is deliberately wider than the generator's output — that is what makes the
  * completeness check meaningful: the applier must reject everything here that the
@@ -718,6 +777,18 @@ const candidateCommands = (
     // and the cancel is one entry per unit.
     for (const kind of kinds) candidates.push(startWork(Number(owner.id), kind));
     candidates.push(cancelWork(Number(owner.id)));
+    // M6: an attack is named by a tile, so the attack space is the board — the same
+    // walk as movement, and for the same reason: the applier's rule is "an adjacent
+    // tile holding exactly one enemy thing", and the only way to show that *nothing
+    // else* is accepted is to hand it every tile there is, including a fractional
+    // one and an off-map one.
+    for (let tile = -1; tile <= size; tile += 1) candidates.push(attack(Number(owner.id), tile));
+    candidates.push({ type: 'AttackUnit', unitId: owner.id, target: asTileIndex(1.5) });
+    // `FortifyUnit` is deliberately **not** here: this universe feeds the completeness
+    // check, which demands that everything the applier accepts is advertised, and a
+    // fortification is exactly the command no generator advertises (M6's ninth
+    // evaluator). Its two directions are asserted by `assertFortifyAgreement` below,
+    // which is the setters' shape rather than this one.
   }
   candidates.push({ type: 'EndTurn' });
 
@@ -987,6 +1058,112 @@ const assertWorkAgreement = (
   return { checked, accepted, refused: checked - accepted };
 };
 
+/** What one attack sweep measured, so a caller can prove it was not vacuous. */
+interface AttackTotals {
+  readonly checked: number;
+  readonly accepted: number;
+  readonly refused: number;
+}
+
+/**
+ * M6's half of the keystone property for the **eighth generator** — and the reason
+ * it is asserted here as well as in the candidate sweep: `planAttackUnit` is the
+ * evaluator `applyCommand` consults, so for every unit of `playerId` and every tile
+ * index on (and off) the board —
+ *
+ * - the applier's verdict must be the plan evaluator's, with the *same* typed
+ *   refusal (a defender refused as `target-stacked` by one and fought by the other
+ *   would fail here, as would a battle one calls a capture), and
+ * - an accepted one must be advertised by `legalActions`, which is the completeness
+ *   claim the setters and the rates deliberately do not make: "what this unit may
+ *   attack" is a finite list read off the board, exactly like "where may it walk",
+ *   so an accepted attack that no generator yielded is a real bug — an AI that can
+ *   never take a city it is standing beside.
+ */
+const assertAttackAgreement = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): AttackTotals => {
+  const yielded = new Set([...legalActions(state, ruleset, playerId)].map(commandKey));
+  const size = state.map.width * state.map.height;
+
+  let checked = 0;
+  let accepted = 0;
+
+  for (const unit of state.units) {
+    if (unit.owner !== playerId) continue;
+    const candidates: readonly Command[] = [
+      ...Array.from({ length: size + 2 }, (_, index) => attack(Number(unit.id), index - 1)),
+      { type: 'AttackUnit', unitId: unit.id, target: asTileIndex(1.5) },
+    ];
+
+    for (const cmd of candidates) {
+      checked += 1;
+      const applied = applyCommand(state, playerId, cmd, ruleset);
+      if (cmd.type !== 'AttackUnit') throw new Error(`not an attack: ${cmd.type}`);
+      const planned = planAttackUnit(state, ruleset, playerId, cmd.unitId, cmd.target);
+
+      expect(applied.ok).toBe(planned.ok);
+      if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+
+      if (applied.ok) {
+        accepted += 1;
+        expect(yielded.has(commandKey(cmd))).toBe(true);
+      }
+    }
+  }
+
+  return { checked, accepted, refused: checked - accepted };
+};
+
+/** What one fortify sweep measured, so a caller can prove it was not vacuous. */
+interface FortifyTotals {
+  readonly checked: number;
+  readonly accepted: number;
+  readonly refused: number;
+}
+
+/**
+ * M6's other half, for the **ninth evaluator**: `FortifyUnit` is a *decision*, like
+ * the city setters and the rates, so its two directions are stated against
+ * `planFortifyUnit` — the applier's own evaluator, with the same typed refusal — and
+ * against the claim that no generator advertises it. The universe is every unit id
+ * the state could refer to (including two it does not hold), because the interesting
+ * refusals here are `unknown-unit` and `not-your-unit` as much as the movement one.
+ */
+const assertFortifyAgreement = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): FortifyTotals => {
+  const yielded = new Set([...legalActions(state, ruleset, playerId)].map(commandKey));
+
+  let checked = 0;
+  let accepted = 0;
+
+  for (let id = -1; id <= state.nextUnitId + 1; id += 1) {
+    checked += 1;
+    // The same candidate `applyCommand` is handed, so the two verdicts are about one
+    // command rather than about two constructions of it.
+    const unitId = asUnitId(id);
+    const cmd = fortify(id);
+    const applied = applyCommand(state, playerId, cmd, ruleset);
+    const planned = planFortifyUnit(state, playerId, unitId);
+
+    expect(applied.ok).toBe(planned.ok);
+    if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);
+    // Neither direction is advertised: a fortification says nothing to a consumer,
+    // so an action list that offered one would be offering a silent no-op (the
+    // adversarial sweeps require every advertised action to emit an event).
+    expect(yielded.has(commandKey(cmd))).toBe(false);
+
+    if (applied.ok) accepted += 1;
+  }
+
+  return { checked, accepted, refused: checked - accepted };
+};
+
 /**
  * The rate candidate universe (M4b): every integer triple in
  * `[-1, RATE_TOTAL + 1]³` — 2197 of them, so both directions are swept rather than
@@ -1196,23 +1373,84 @@ describe('unitMoveOptions', () => {
 });
 
 describe('unitActions', () => {
-  it('offers FoundCity first, then one MoveUnit per option', () => {
+  it('offers FoundCity, then one MoveUnit per option, then the attacks (M6)', () => {
+    // Order is part of the contract: the actions that do not leave the unit's own
+    // tile come first (`FoundCity`), then the steps, then the attacks — an attack is
+    // a step's *replacement* for the turn (it spends all the movement), so a client
+    // walking the list sees the reversible choices before the committed one.
     expect(unitActions(STATE, RULESET, asUnitId(0))).toEqual([
       foundCity(0),
       ...unitMoveOptions(STATE, RULESET, asUnitId(0)).map((to) => move(0, to)),
+      // Tile 6 is the one neighbour holding an enemy: player 1's warrior. The settler
+      // *may* attack it (its type's `attack` is 1), which is M6's rule and not a
+      // judgement about what a settler ought to do.
+      attack(0, 6),
     ]);
   });
 
-  it('offers an idle worker its jobs in catalog order, then its steps', () => {
+  it('offers attacks exactly where the applier accepts them, and nowhere else', () => {
+    // The eighth generator's two directions, swept per unit per tile rather than
+    // asserted as a list: `unitActions` must offer `AttackUnit` on a tile exactly
+    // when `applyCommand` accepts it, on every board below, so a generator that
+    // offered a battle the applier refuses (or hid one it accepts) fails here.
+    const size = STATE.map.width * STATE.map.height;
+    for (const board of [STATE, CITY_STATE, SHARED_STATE, WORKER_STATE, MINED_STATE]) {
+      for (const id of [0, 1, 2, 3]) {
+        for (let target = -1; target <= size; target += 1) {
+          // Each unit is asked as its own owner, which is who the per-unit
+          // generator speaks for — so a foreign unit is asked and must be refused
+          // by both (it is never advertised for the wrong player).
+          const unit = unitById(board, asUnitId(id));
+          const actor = unit?.owner ?? P0;
+          expect(offersAttack(board, RULESET, actor, id, target)).toBe(
+            applyCommand(board, actor, attack(id, target), RULESET).ok,
+          );
+        }
+      }
+    }
+
+    // …and the sweep is not a comparison of two constants: it sees both verdicts,
+    // on the same unit and on different tiles.
+    expect(offersAttack(STATE, RULESET, P0, 0, 6)).toBe(true); // player 1's warrior next door
+    expect(offersAttack(STATE, RULESET, P0, 0, 4)).toBe(false); // empty grassland
+    expect(offersAttack(STATE, RULESET, P0, 1, 6)).toBe(false); // the scout has spent its movement
+    expect(offersAttack(STATE, RULESET, P0, 0, 15)).toBe(false); // mountains, and two steps away
+    expect(offersAttack(STATE, RULESET, P0, 0, 16)).toBe(false); // off the map
+  });
+
+  it('offers a capture exactly where the applier takes the city', () => {
+    // The capture half of the same rule, on a board where it exists: player 0's
+    // scout on 10 (movement 3) is diagonally beside *player 1's* city on 5, which
+    // holds no defender — so the only thing standing between the scout and the city
+    // is that the generator must offer it and the applier must accept it.
+    const board = withMovement(SHARED_STATE, 1, SCOUT.movement);
+
+    expect(offersAttack(board, RULESET, P0, 1, 5)).toBe(true);
+    expect(applyCommand(board, P0, attack(1, 5), RULESET).ok).toBe(true);
+    // Tile 6, beside the same scout, holds player 1's warrior: a battle rather than a
+    // capture — and both are offered, because both are legal.
+    expect(offersAttack(board, RULESET, P0, 1, 6)).toBe(true);
+    // The city cannot be walked into instead: the move generator refuses a tile
+    // holding another player's city (M6's "no unit inside an enemy city it does not
+    // own"), so the attack is the only way in and the two rules have to agree about
+    // which commands lead where.
+    expect(unitMoveOptions(board, RULESET, asUnitId(1))).not.toContain(5);
+  });
+
+  it('offers an idle worker its jobs in catalog order, then its steps, then its attacks', () => {
     // The catalog is road, mine, irrigation; the worker stands on hills, so
     // irrigation is not buildable there and is not offered. Moves come last: a step
     // relocates the unit, and M4a cancels a job when a unit relocates, so the
-    // actions that leave the worker in place are listed first.
+    // actions that leave the worker in place are listed first. M6's attacks come
+    // after the steps, for the reason the section above states.
     expect(unitActions(WORKER_STATE, RULESET, asUnitId(3))).toEqual([
       startWork(3, 'road'),
       startWork(3, 'mine'),
       move(3, 4),
       move(3, 5),
+      // Tile 1's neighbours are 0 (ocean), 2 (mountains), 4, 5 and 6 — and 6 holds
+      // player 1's warrior, one diagonal step away.
+      attack(3, 6),
     ]);
   });
 
@@ -1221,6 +1459,7 @@ describe('unitActions', () => {
       cancelWork(3),
       move(3, 4),
       move(3, 5),
+      attack(3, 6),
     ]);
     // No StartWork while a job is running, whatever the kind.
     expect(
@@ -1357,7 +1596,8 @@ describe('legalActions', () => {
     const actions = [...legalActions(STATE, RULESET, P0)];
 
     // The settler's FoundCity comes before its moves (see `unitActions`); the
-    // scout has spent its movement and offers nothing; EndTurn is last.
+    // scout has spent its movement and offers nothing; the settler's attack on player
+    // 1's warrior follows its steps; EndTurn is last.
     expect(actions).toEqual([
       foundCity(0),
       move(0, 1),
@@ -1365,6 +1605,7 @@ describe('legalActions', () => {
       move(0, 8),
       move(0, 9),
       move(0, 10),
+      attack(0, 6),
       { type: 'EndTurn' },
     ]);
   });
@@ -1384,8 +1625,9 @@ describe('legalActions', () => {
     // materialise the whole space (PLAN.md §5.2).
     const walk = legalActions(STATE, RULESET, P0);
     expect(walk.next().done).toBe(false);
-    // Seven in total (FoundCity, five moves, EndTurn), one of them already taken.
-    expect([...walk]).toHaveLength(6);
+    // Eight in total (FoundCity, five moves, the attack on tile 6, EndTurn), one of
+    // them already taken.
+    expect([...walk]).toHaveLength(7);
   });
 
   it('yields nothing at all for a player that does not exist', () => {
@@ -1418,17 +1660,32 @@ describe('legalActions', () => {
       expect(applyCommand(state, P0, setProduction(0, unitItem('scout')), RULESET).ok).toBe(true);
     }
   });
+
+  it('does not advertise FortifyUnit either, however legal it is (M6)', () => {
+    // The same division, one milestone on, and stated here as well as in
+    // `actions.ts`: fortifying is legal, it changes the state and it is worth a
+    // button — but it emits no event, so advertising it would break the committed
+    // sweeps' "an advertised action says what it did" rule. What the UI needs is the
+    // planner, not a generator, so the sweeps below check the planner's verdict
+    // against the applier's instead.
+    for (const state of [STATE, CITY_STATE, SHARED_STATE, WORKER_STATE]) {
+      const actions = [...legalActions(state, RULESET, P0)];
+      expect(actions.some((cmd) => cmd.type === 'FortifyUnit')).toBe(false);
+      expect(applyCommand(state, P0, fortify(0), RULESET).ok).toBe(true);
+    }
+  });
 });
 
 describe('keystone — the generator and the applier agree, in both directions', () => {
   it('holds for the hand-built board, exhaustively, for both players', () => {
-    // Soundness: FoundCity plus 5 settler moves plus 1 EndTurn for player 0; 1
-    // EndTurn for player 1 (its warrior has spent everything, and a warrior cannot
-    // found). Completeness: the applier accepts those same 8 and nothing else.
+    // Soundness: FoundCity plus 5 settler moves plus — M6 — the settler's attack on
+    // player 1's warrior next door, plus 1 EndTurn for player 0; 1 EndTurn for player
+    // 1 (its warrior has spent everything, so it may not attack, and a warrior cannot
+    // found). Completeness: the applier accepts those same 9 and nothing else.
     // Asserted exactly, so the walk cannot pass vacuously.
-    expect(assertEveryLegalActionApplies(STATE, RULESET, [P0, P1])).toBe(8);
-    expect(assertEveryUnitActionApplies(STATE, RULESET)).toBe(6);
-    expect(assertKeystone(STATE, RULESET, P0)).toEqual({ yielded: 7, accepted: 7 });
+    expect(assertEveryLegalActionApplies(STATE, RULESET, [P0, P1])).toBe(9);
+    expect(assertEveryUnitActionApplies(STATE, RULESET)).toBe(7);
+    expect(assertKeystone(STATE, RULESET, P0)).toEqual({ yielded: 8, accepted: 8 });
     expect(assertKeystone(STATE, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
   });
 
@@ -1438,8 +1695,8 @@ describe('keystone — the generator and the applier agree, in both directions',
     // found (its city on 13 is exactly MIN_CITY_DISTANCE away) — so the counts
     // match the cityless board. That is the point: adding cities did not change
     // what is *enumerated*, only what is *queried*.
-    expect(assertEveryLegalActionApplies(CITY_STATE, RULESET, [P0, P1])).toBe(8);
-    expect(assertKeystone(CITY_STATE, RULESET, P0)).toEqual({ yielded: 7, accepted: 7 });
+    expect(assertEveryLegalActionApplies(CITY_STATE, RULESET, [P0, P1])).toBe(9);
+    expect(assertKeystone(CITY_STATE, RULESET, P0)).toEqual({ yielded: 8, accepted: 8 });
     expect(assertKeystone(CITY_STATE, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
   });
 
@@ -1452,38 +1709,45 @@ describe('keystone — the generator and the applier agree, in both directions',
 
     // A spent settler cannot *move*, but it can still *found*: founding costs no
     // movement in M3 (it consumes the unit instead), so each player offers one
-    // action more than M2's board did.
+    // action more than M2's board did. Nobody may attack either — an attack spends
+    // movement, so a unit with none has nothing to spend.
     expect(assertEveryLegalActionApplies(starved, RULESET, [P0, P1])).toBe(3);
     expect(assertKeystone(starved, RULESET, P0)).toEqual({ yielded: 2, accepted: 2 });
     expect(assertKeystone(starved, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
 
-    expect(assertEveryLegalActionApplies(rich, RULESET, [P0, P1])).toBe(14);
-    expect(assertKeystone(rich, RULESET, P0)).toEqual({ yielded: 13, accepted: 13 });
+    // The rich board gives the scout its movement back: six steps *and* an attack on
+    // the warrior beside it, on top of the settler's seven. A diagonal step counts,
+    // which is why a scout two tiles away in x still stands beside tile 6.
+    expect(assertEveryLegalActionApplies(rich, RULESET, [P0, P1])).toBe(16);
+    expect(assertKeystone(rich, RULESET, P0)).toEqual({ yielded: 15, accepted: 15 });
     expect(assertKeystone(rich, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
   });
 
   it('holds on the M4a worker boards, exhaustively, for both players', () => {
-    // Soundness: the settler's FoundCity plus 5 settler moves, the worker's 2 jobs
-    // (road, then mine — irrigation is not hills work) plus 2 worker moves, and one
-    // EndTurn: 11 for player 0. Player 1's warrior has spent its movement and can
-    // neither found nor work, so it has the EndTurn alone. Completeness: the applier
-    // accepts those same 11 and nothing else — so the walk cannot pass vacuously.
-    expect(assertEveryLegalActionApplies(WORKER_STATE, RULESET, [P0, P1])).toBe(12);
-    expect(assertEveryUnitActionApplies(WORKER_STATE, RULESET)).toBe(10);
-    expect(assertKeystone(WORKER_STATE, RULESET, P0)).toEqual({ yielded: 11, accepted: 11 });
+    // Soundness: the settler's FoundCity plus 5 settler moves plus its attack on tile
+    // 6, the worker's 2 jobs (road, then mine — irrigation is not hills work) plus 2
+    // worker moves plus its own attack on the same warrior (tile 1 is diagonally
+    // beside tile 6), and one EndTurn: 13 for player 0. Player 1's warrior has spent
+    // its movement and can neither found, work nor attack, so it has the EndTurn
+    // alone. Completeness: the applier accepts those same 13 and nothing else — so
+    // the walk cannot pass vacuously.
+    expect(assertEveryLegalActionApplies(WORKER_STATE, RULESET, [P0, P1])).toBe(14);
+    expect(assertEveryUnitActionApplies(WORKER_STATE, RULESET)).toBe(12);
+    expect(assertKeystone(WORKER_STATE, RULESET, P0)).toEqual({ yielded: 13, accepted: 13 });
     expect(assertKeystone(WORKER_STATE, RULESET, P1)).toEqual({ yielded: 1, accepted: 1 });
 
     // A worker mid-job: the two jobs are gone, the cancel takes their place, and the
     // steps stay — a step is still legal, and it cancels the job (M4a), which is
-    // exactly why the generator must keep offering it.
-    expect(assertEveryLegalActionApplies(WORKING_STATE, RULESET, [P0, P1])).toBe(11);
-    expect(assertEveryUnitActionApplies(WORKING_STATE, RULESET)).toBe(9);
-    expect(assertKeystone(WORKING_STATE, RULESET, P0)).toEqual({ yielded: 10, accepted: 10 });
+    // exactly why the generator must keep offering it. The attack is unaffected: it
+    // does not touch the job, and M6's attack list does not read it.
+    expect(assertEveryLegalActionApplies(WORKING_STATE, RULESET, [P0, P1])).toBe(13);
+    expect(assertEveryUnitActionApplies(WORKING_STATE, RULESET)).toBe(11);
+    expect(assertKeystone(WORKING_STATE, RULESET, P0)).toEqual({ yielded: 12, accepted: 12 });
 
     // A tile that already carries a mine: that job is refused, the road is not.
-    expect(assertEveryLegalActionApplies(MINED_STATE, RULESET, [P0, P1])).toBe(11);
-    expect(assertEveryUnitActionApplies(MINED_STATE, RULESET)).toBe(9);
-    expect(assertKeystone(MINED_STATE, RULESET, P0)).toEqual({ yielded: 10, accepted: 10 });
+    expect(assertEveryLegalActionApplies(MINED_STATE, RULESET, [P0, P1])).toBe(13);
+    expect(assertEveryUnitActionApplies(MINED_STATE, RULESET)).toBe(11);
+    expect(assertKeystone(MINED_STATE, RULESET, P0)).toEqual({ yielded: 12, accepted: 12 });
   });
 
   it('holds for a worker with no movement left: no job, no step, and no command the applier would take', () => {
@@ -1491,9 +1755,9 @@ describe('keystone — the generator and the applier agree, in both directions',
 
     expect(unitActions(spent, RULESET, asUnitId(3))).toEqual([]);
     // Four units' worth of nothing to do plus the two EndTurns: the settler's
-    // FoundCity and five steps, and nothing else.
-    expect(assertEveryLegalActionApplies(spent, RULESET, [P0, P1])).toBe(8);
-    expect(assertKeystone(spent, RULESET, P0)).toEqual({ yielded: 7, accepted: 7 });
+    // FoundCity, five steps and its attack, and nothing else.
+    expect(assertEveryLegalActionApplies(spent, RULESET, [P0, P1])).toBe(9);
+    expect(assertKeystone(spent, RULESET, P0)).toEqual({ yielded: 8, accepted: 8 });
   });
 
   it('agrees for the two work evaluators — the fourth and fifth generators', () => {
@@ -1547,6 +1811,90 @@ describe('keystone — the generator and the applier agree, in both directions',
       accepted: 0,
       refused: 5,
     });
+  });
+
+  it('agrees for the attack evaluator — the eighth generator (M6)', () => {
+    // Both directions, on boards where attacks really happen: the hand-built board
+    // (a settler beside a warrior), the city board, the shared board, the worker
+    // boards, a board where an attack would capture an undefended city, and a board
+    // where the target is a stack. Each must accept *and* refuse, or the sweep would
+    // be comparing two functions that only ever say the same word.
+    const boards: readonly (readonly [string, GameState])[] = [
+      ['the hand-built board', STATE],
+      ['a board with cities', CITY_STATE],
+      ['two cities', SHARED_STATE],
+      ['a worker board', WORKER_STATE],
+      ['a spent board', { ...STATE, units: STATE.units.map((u) => ({ ...u, movementLeft: 0 })) }],
+      ['a capture in reach', withMovement(SHARED_STATE, 1, SCOUT.movement)],
+      ['the unknown-type board', ghostState(0)],
+    ];
+
+    for (const [label, board] of boards) {
+      for (const actor of [P0, P1]) {
+        const totals = assertAttackAgreement(board, RULESET, actor);
+        expect(totals.checked, `${label}: no tile was asked`).toBeGreaterThan(0);
+        expect(totals.accepted + totals.refused, `${label}: counts disagree`).toBe(totals.checked);
+      }
+      expect(assertAttackAgreement(board, RULESET, asPlayerId(9)).checked, label).toBe(0);
+    }
+
+    // The exact shape on the hand-built board for player 0, so the sweep cannot pass
+    // by asking nothing: two units of player 0's (the settler, and the scout that has
+    // spent its movement), 19 tile candidates each — every index from -1 to 16 plus
+    // the fractional one — and exactly one accepted, the warrior on tile 6.
+    expect(assertAttackAgreement(STATE, RULESET, P0)).toEqual({
+      checked: 38,
+      accepted: 1,
+      refused: 37,
+    });
+
+    // …and the attacker's own tile is never a target, even though it holds a unit:
+    // a `distance8` of 0 is not 1, and "attack yourself" is not a battle.
+    expect(applyCommand(STATE, P0, attack(0, 5), RULESET).ok).toBe(false);
+  });
+
+  it('agrees for the fortify evaluator — the ninth, and the one no generator advertises (M6)', () => {
+    // The setters' shape, for the one evaluator whose *only* effect is a flag: the
+    // applier's verdict and its typed refusal must be the planner's, and no walk may
+    // ever advertise one.
+    for (const board of [STATE, CITY_STATE, SHARED_STATE, WORKER_STATE]) {
+      const totals = assertFortifyAgreement(board, RULESET, P0);
+      expect(totals.checked).toBeGreaterThan(0);
+      expect(totals.accepted).toBeGreaterThan(0); // a settler at full movement may dig in
+      // Only unit 0 (and the worker on the worker boards) may: everything else is
+      // either spent, another player's, or an id the state does not hold.
+      expect(totals.refused).toBeGreaterThan(0);
+    }
+
+    // A spent board: nothing may fortify at all, which is the movement rule and not a
+    // separate branch — so the accepted count is zero and the sweep still checked.
+    // The universe is one id before the state's first unit to one past its last, so
+    // six here (ids -1..4 at `nextUnitId = 3`): the `unknown-unit` refusals are swept
+    // alongside the movement ones.
+    const spent: GameState = {
+      ...STATE,
+      units: STATE.units.map((u) => ({ ...u, movementLeft: 0 })),
+    };
+    expect(assertFortifyAgreement(spent, RULESET, P0)).toEqual({
+      checked: 6,
+      accepted: 0,
+      refused: 6,
+    });
+
+    // An actor that is not there: every candidate is `unknown-player`, by both.
+    expect(assertFortifyAgreement(STATE, RULESET, asPlayerId(9))).toEqual({
+      checked: 6,
+      accepted: 0,
+      refused: 6,
+    });
+
+    // And the state a fortification produced really is fortified — the sweeps above
+    // compare verdicts, and this says what the accepted verdict *did*.
+    const dug = applyCommand(WORKER_STATE, P0, fortify(0), RULESET);
+    if (!dug.ok) throw new Error('the settler should have been able to dig in');
+    const unit0 = unitById(dug.value.state, asUnitId(0));
+    expect(unit0 !== undefined && isFortified(unit0)).toBe(true);
+    expect(dug.value.state.revision).toBe(WORKER_STATE.revision + 1);
   });
 
   it('agrees for the rate evaluator — the sixth generator, over every integer triple', () => {

@@ -4,6 +4,7 @@ import {
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  hitPointsLeftOf,
   withWork,
   withoutWork,
   type Unit,
@@ -369,13 +370,23 @@ describe('hashValue', () => {
  * ------------------------------------------------------------------ */
 
 describe('an optional field, absent versus undefined', () => {
-  /** An idle worker: `newGame`/`spawnUnit` build this with no `work` key at all. */
+  /**
+   * An idle worker: `newGame`/`spawnUnit` build this with no `work` key at all.
+   *
+   * M6 adds `hitPointsLeft`, and a unit the engine creates carries it — so the fixture
+   * carries it too, and the assertions below can then make the stronger claim they were
+   * always trying to make: `withWork`/`withoutWork` **preserve** the fields that are
+   * nothing to do with a job. A rebuild that dropped a wounded worker's remaining hit
+   * points would silently heal it, and an absent key in the fixture would have hidden
+   * exactly that.
+   */
   const idleWorker = (): Unit => ({
     id: asUnitId(0),
     type: asUnitTypeId('worker'),
     owner: asPlayerId(0),
     tile: asTileIndex(5),
     movementLeft: 1,
+    hitPointsLeft: 1,
   });
 
   it('hashes a unit with a job and a unit without one, both JSON-stable', () => {
@@ -393,6 +404,16 @@ describe('an optional field, absent versus undefined', () => {
     expect(Object.hasOwn(working, 'work')).toBe(true);
     expect(Object.hasOwn(withoutWork(working), 'work')).toBe(false);
     expect(withoutWork(working)).toEqual(idle);
+
+    // Attaching or clearing a job is neither a healing event, a promotion nor a
+    // fortification (M6): the health the unit had is the health it keeps, and the two
+    // omitted-when-default keys stay omitted rather than becoming `undefined`.
+    expect(hitPointsLeftOf(working)).toBe(1);
+    expect(hitPointsLeftOf(withoutWork(working))).toBe(1);
+    for (const unit of [idle, working, withoutWork(working)]) {
+      expect(Object.hasOwn(unit, 'experience')).toBe(false);
+      expect(Object.hasOwn(unit, 'fortified')).toBe(false);
+    }
 
     // A save is JSON, so the hash of a state and of its round trip must agree —
     // for both shapes, which is exactly what an `undefined` valued key would break.

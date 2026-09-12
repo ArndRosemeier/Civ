@@ -20,9 +20,14 @@
  * Everything runs on `@civts/rules`' `CATALOG` through the same `validateRuleset`
  * the CLI runs, so a scenario measures the engine the game actually plays.
  *
- * **M3, M4a, M4b, M4c and M5 appended their own acceptance evidence to this file**,
- * each in its own numbered section at the end, so one run of one file is the
- * milestone suite. M5's section (16) is the last: research *timing* (the exact turn a
+ * **M3, M4a, M4b, M4c, M5 and M6 appended their own acceptance evidence to this
+ * file**, each in its own numbered section at the end, so one run of one file is
+ * the milestone suite. M6's section (17) is the last: combat odds for the known
+ * modifier list (including the arithmetic that separates compounding from flooring
+ * twice), a capture with its exact population and its exact list of destroyed
+ * buildings, a promotion ladder with the exact attack bonus at each level, and a
+ * barbarian band's exact route to a city it then takes. M5's section (16) was the
+ * last before it: research *timing* (the exact turn a
  * tech completes, the beaker remainder carried into the next tech, and beakers banked
  * when nothing is selected), prerequisites (an unmet one refused; a completed tech
  * unlocking exactly what it should and nothing else), and gating (a tech-gated item
@@ -40,6 +45,7 @@ import {
   HUT_REWARD_KINDS,
   HUT_REWARD_PROVENANCE,
   MAP_DIMENSIONS,
+  MAX_EXPERIENCE,
   RATE_TOTAL,
   SCHEMA_VERSION,
   STARTING_TREASURY,
@@ -66,22 +72,31 @@ import {
   cityById,
   cityMaintenance,
   cityProductionOptions,
+  capturedPopulation,
   cityYields,
   civPlayers,
   connected,
+  defenderBonusPct,
+  drawsWin,
+  experienceOf,
   foodBoxSize,
   hasImprovement,
+  hitPointsLeftOf,
   hutAt,
   improvementDef,
   improvementsAt,
+  indexToX,
+  indexToY,
   isConnected,
   isExplored,
+  isFortified,
   isPlaceholder,
   isWonder,
   knownTechs,
   loadSettings,
   maintenanceOf,
   mayStartBuilding,
+  modifiedDefense,
   neighbors8,
   newGame,
   nextBelow,
@@ -104,6 +119,8 @@ import {
   unitSupport,
   unitsOnTile,
   unmetTechFor,
+  veteranAttack,
+  winPct,
   planStartWork,
   visibleTiles,
   type City,
@@ -113,6 +130,7 @@ import {
   type BuildingId,
   type GameError,
   type GameEvent,
+  type GameMap,
   type GameState,
   type HutRewardKind,
   type ImprovementId,
@@ -124,6 +142,7 @@ import {
   type RulesetView,
   type TechId,
   type TileIndex,
+  type Unit,
   type UnitTypeId,
   type UnitWork,
 } from '@civts/core';
@@ -8378,5 +8397,1205 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
       expect(text).not.toMatch(/once bronze-working is known the applier accepts StartWork/);
       expect(text).not.toMatch(/the fixture really has a worker/);
     });
+  });
+});
+
+/* ---- 17. M6: combat odds, capture, promotion and barbarians ------- */
+
+/**
+ * M6's acceptance evidence, under M2's discipline (restated because M6 is the
+ * milestone where it matters most): a scenario builds a world by hand and *probes* it,
+ * so an assertion is about the rule and not about what a generator happened to roll.
+ *
+ * The four scenarios, and what each one is the only evidence for:
+ *
+ * 1. `combat-odds-known-modifiers` — a battle's per-round chance is
+ *    `floor(attack * 100 / (attack + defence))` over the defender's modifiers
+ *    **summed and floored once**. One case per modifier in `defenderBonusPct`'s list
+ *    (terrain, fortification, the city itself, walls), plus the case that exists only
+ *    to separate compounding from flooring twice: a fortified spearman on grassland is
+ *    `floor(3 * 1.35) = 4` defence, so a warrior attacks at 20% — and the
+ *    floor-after-each-modifier reading reports `floor(floor(3 * 1.1) * 1.25) = 3` for
+ *    25%. Same world, same units, eight points of odds apart, so no rounding accident
+ *    can hide a regression.
+ * 2. `capture-takes-half-and-spares-wonders` — a capture is not a battle: the city
+ *    keeps its id, name and tile, its population is `max(1, floor(population / 2))`,
+ *    its non-wonder buildings are destroyed in maintenance-descending order, its
+ *    wonders survive, its queue and assignment are cleared and its stores are untouched.
+ * 3. `a-win-promotes-one-level` — a won battle raises the winner by **exactly one**
+ *    level up to `MAX_EXPERIENCE`, announces it only when the level actually rose, and
+ *    buys `floor(attack * (100 + 25 * level) / 100)` attack: a ladder whose rungs are
+ *    visible as odds, and which stops mattering at the cap.
+ * 4. `a-band-approaches-and-sacks` — the barbarian step is engine behaviour: a band
+ *    walks a **route** (a ridge across its path makes it detour), one tile per turn at
+ *    movement 1, taking the lowest tile index among the steps that close the distance,
+ *    drawing **nothing** from the state's RNG on the way, and taking the undefended
+ *    city it arrives beside — halved, as any capture is.
+ *
+ * Every assertion below is written as a **probe** — a command applied inside `assert`
+ * to the state the scenario actually built — rather than as a scripted `run`. The
+ * reason is the falsification test under each scenario: `assertOf` re-runs a scenario's
+ * own assertions against a *variant world*, and a probe re-measures that world, so a
+ * variant that breaks the rule really does break the assertions. A scripted `run` would
+ * fix the commands at definition time and the variants would measure nothing.
+ */
+
+// `SETTLER`, `GRANARY`, `BARBARIANS`, `LIBRARY`, `WALLS` and `PYRAMIDS` are already
+// defined above (they are M2's/M4c's fixtures), so M6 adds only what it needs.
+const ARCHER = asUnitTypeId('archer');
+const SPEARMAN = asUnitTypeId('spearman');
+const TEMPLE = asBuildingId('temple');
+
+/** Attack `(x, y)` with `unitId` (M6). */
+const attack = (unitId: number, x: number, y: number): Command => ({
+  type: 'AttackUnit',
+  unitId: asUnitId(unitId),
+  target: at(x, y),
+});
+
+/** Dig in (M6): an event of its own there is none, and the movement point is spent. */
+const fortify = (unitId: number): Command => ({ type: 'FortifyUnit', unitId: asUnitId(unitId) });
+
+/** The battles in an event list, in the order they were fought. */
+const battles = (events: readonly GameEvent[]) =>
+  events.filter((event) => event.type === 'CombatResolved');
+
+/** The captures in an event list, in order. */
+const captures = (events: readonly GameEvent[]) =>
+  events.filter((event) => event.type === 'CityCaptured');
+
+/** The promotions in an event list, in order. */
+const promotions = (events: readonly GameEvent[]) =>
+  events.filter((event) => event.type === 'UnitPromoted');
+
+/** The steps one unit took, in order — the route it walked, as the events saw it. */
+const stepsOf = (events: readonly GameEvent[], unitId: number) =>
+  events
+    .filter((event) => event.type === 'UnitMoved')
+    .filter((event) => Number(event.unitId) === unitId);
+
+/** `id` in `state`, or a loud failure (a scenario bug, not a rule to assert). */
+const unitOf = (state: GameState, id: number): Unit => {
+  const unit = unitById(state, asUnitId(id));
+  if (unit === undefined) throw new Error(`unit ${String(id)} is not in the state`);
+  return unit;
+};
+
+/** `building:temple, unit:warrior` — a production list a failure message can be read from. */
+const describeItems = (items: readonly ProductionItem[]): string =>
+  items.map((item) => `${item.kind}:${item.id}`).join(', ');
+
+/** A tile as a coordinate pair, for reading and for `label`. */
+const xyOf = (map: GameMap, tile: TileIndex): readonly [number, number] => [
+  indexToX(map, tile),
+  indexToY(map, tile),
+];
+
+/**
+ * A probe: apply `command` as Rome to a state, and hand back the outcome, or
+ * `undefined` when the applier refused it. It never throws, because a *refused*
+ * command is one of the things an assertion here has to be able to report.
+ */
+const probe = (
+  state: GameState,
+  ruleset: RulesetView,
+  command: Command,
+): CommandOutcome | undefined => romeApply(state, ruleset, command);
+
+/**
+ * The wrong reading, computed here on purpose: floor after **each** modifier instead of
+ * once after their sum. `combat.ts`' `defenderBonusPct` + `modifiedDefense` are the
+ * right reading; this function exists so the assertion that pins the right one can name
+ * the number the wrong one produces.
+ */
+const flooredAfterEach = (defense: number, bonuses: readonly number[]): number =>
+  bonuses.reduce((value, pct) => Math.floor((value * (100 + pct)) / 100), defense);
+
+/* ---- 17a. The odds, one case per modifier -------------------------- */
+
+/**
+ * One battle's inputs and the numbers the engine must produce from them, all stated by
+ * hand: `bonusPct` is the **sum** the defender's list comes to, `defense` is that sum
+ * floored once onto the defender's row, and `expectedPct` is the attacker's per-round
+ * chance.
+ */
+interface OddsCase {
+  readonly name: string;
+  readonly attackerAt: readonly [number, number];
+  readonly defenderAt: readonly [number, number];
+  readonly defenderType: UnitTypeId;
+  readonly fortified: boolean;
+  readonly inCity: boolean;
+  readonly tile: 'grassland' | 'hills' | 'mountains';
+  readonly terrainBonusPct: number;
+  readonly walls: boolean;
+  readonly bonusPct: number;
+  readonly defense: number;
+  readonly expectedPct: number;
+  /** What the floor-after-each-modifier reading gives — the wrong answer, stated. */
+  readonly wrongDefense: number;
+  readonly wrongPct: number;
+}
+
+/**
+ * Every attacker is a warrior (attack 1), so the only column that varies is the
+ * *defender's* — which is what makes the table evidence about the modifier list rather
+ * than about the attack statistics.
+ */
+const ODDS_CASES: readonly OddsCase[] = [
+  {
+    name: 'a bare warrior on grassland',
+    attackerAt: [5, 5],
+    defenderAt: [6, 5],
+    defenderType: WARRIOR,
+    fortified: false,
+    inCity: false,
+    tile: 'grassland',
+    terrainBonusPct: 10,
+    walls: false,
+    bonusPct: 10,
+    defense: 2,
+    expectedPct: 33,
+    wrongDefense: 2,
+    wrongPct: 33,
+  },
+  {
+    name: 'a fortified spearman on grassland (compounding, not flooring twice)',
+    attackerAt: [5, 10],
+    defenderAt: [6, 10],
+    defenderType: SPEARMAN,
+    fortified: true,
+    inCity: false,
+    tile: 'grassland',
+    terrainBonusPct: 10,
+    walls: false,
+    bonusPct: 35,
+    defense: 4,
+    expectedPct: 20,
+    wrongDefense: 3,
+    wrongPct: 25,
+  },
+  {
+    name: 'a warrior behind walls in its own city on hills',
+    attackerAt: [21, 20],
+    defenderAt: [20, 20],
+    defenderType: WARRIOR,
+    fortified: false,
+    inCity: true,
+    tile: 'hills',
+    terrainBonusPct: 50,
+    walls: true,
+    bonusPct: 150,
+    defense: 5,
+    expectedPct: 16,
+    wrongDefense: 6,
+    wrongPct: 14,
+  },
+  {
+    name: 'a spearman standing on mountains',
+    attackerAt: [5, 15],
+    defenderAt: [6, 15],
+    defenderType: SPEARMAN,
+    fortified: false,
+    inCity: false,
+    tile: 'mountains',
+    terrainBonusPct: 100,
+    walls: false,
+    bonusPct: 100,
+    defense: 6,
+    expectedPct: 14,
+    wrongDefense: 6,
+    wrongPct: 14,
+  },
+];
+
+/** `at(...)` for a table row's coordinate pair. */
+const tileAt = (pair: readonly [number, number]): TileIndex => at(pair[0], pair[1]);
+
+/**
+ * The odds world: two civilizations, four battle grounds far enough apart that no
+ * attacker has two neighbours, and Carthage's city on the hills of case 3.
+ *
+ * Unit ids are dense in creation order, so row `i`'s attacker is `2 + 2 * i` and its
+ * defender `3 + 2 * i` — and the assertions check that rather than assume it, because a
+ * reordered setup would otherwise silently measure the wrong pair.
+ */
+const oddsSetup =
+  (weakens: 'nothing' | 'no-fortify' | 'no-walls' | 'flat-mountains') =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    let builder = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, SETTLER, [2, 2])
+      .addUnit(1, SETTLER, [35, 35]);
+
+    for (const row of ODDS_CASES) {
+      const terrain = weakens === 'flat-mountains' ? 'grassland' : row.tile;
+      builder = builder.setTile(row.defenderAt[0], row.defenderAt[1], terrain);
+    }
+
+    builder = builder.addCity(1, [20, 20], {
+      name: 'Ostia',
+      buildings: weakens === 'no-walls' ? [] : [WALLS],
+    });
+
+    for (const row of ODDS_CASES) {
+      const fortified = row.fortified && weakens !== 'no-fortify';
+      builder = builder
+        .addUnit(0, WARRIOR, row.attackerAt)
+        .addUnit(1, row.defenderType, row.defenderAt, fortified ? { fortified: true } : {});
+    }
+    return builder;
+  };
+
+const combatOddsScenario = defineScenario({
+  name: 'combat-odds-known-modifiers',
+  settings: DUEL_SETTINGS,
+  setup: oddsSetup('nothing'),
+  assert: (after, ruleset) => {
+    const checks: ScenarioAssertion[] = [];
+
+    // The table is evidence only if its rows disagree: four identical expectations
+    // would be satisfied by any engine that reported one number four times.
+    const distinct = new Set(ODDS_CASES.map((row) => row.expectedPct));
+    checks.push(
+      check(
+        distinct.size >= 3,
+        'the four cases expect at least three different chances, so the table cannot be ' +
+          `satisfied by one number repeated: [${ODDS_CASES.map((row) => String(row.expectedPct)).join(', ')}]`,
+      ),
+    );
+
+    // The tie rule, as a boundary: a round is the attacker's only while the draw is
+    // BELOW the threshold, so the threshold itself belongs to the defender.
+    checks.push(
+      check(
+        drawsWin(19, 20) && !drawsWin(20, 20),
+        'the defender holds a round the attacker did not win: drawsWin(19, 20) is true ' +
+          'and drawsWin(20, 20) is false',
+      ),
+    );
+
+    for (const [index, row] of ODDS_CASES.entries()) {
+      const attackerId = 2 + 2 * index;
+      const defenderId = 3 + 2 * index;
+      const attackValue = unitDef(ruleset, WARRIOR)?.attack ?? -1;
+      const defenseValue = unitDef(ruleset, row.defenderType)?.defense ?? -1;
+
+      const outcome = probe(after, ruleset, attack(attackerId, ...row.defenderAt));
+      const event = outcome === undefined ? undefined : battles(outcome.events)[0];
+      const attacker = unitById(after, asUnitId(attackerId));
+      const defender = unitById(after, asUnitId(defenderId));
+
+      // Read outside the condition chain: `isFortified` takes a unit, and the narrowing a
+      // `defender?.owner === ...` test performs does not reach a later argument.
+      const defenderFortified = defender === undefined ? false : isFortified(defender);
+      checks.push(
+        check(
+          attacker?.owner === ROME &&
+            attacker.type === WARRIOR &&
+            Number(attacker.tile) === Number(tileAt(row.attackerAt)) &&
+            defender?.owner === CARTHAGE &&
+            defender.type === row.defenderType &&
+            Number(defender.tile) === Number(tileAt(row.defenderAt)) &&
+            defenderFortified === row.fortified,
+          `${row.name}: warrior ${String(attackerId)} stands on ${label(...row.attackerAt)} ` +
+            `and ${row.defenderType} ${String(defenderId)} on ${label(...row.defenderAt)}, ` +
+            `fortified ${String(defenderFortified)}`,
+        ),
+      );
+
+      checks.push(
+        check(
+          event !== undefined &&
+            Number(event.attackerId) === attackerId &&
+            Number(event.defenderId) === defenderId &&
+            Number(event.target) === Number(tileAt(row.defenderAt)) &&
+            event.defenderOwner === CARTHAGE,
+          `${row.name}: the battle is fought over ${label(...row.defenderAt)} and names both ` +
+            `units (got ${
+              event === undefined
+                ? 'no battle at all'
+                : `attacker ${String(event.attackerId)} vs defender ${String(event.defenderId)} on tile ${String(event.target)}`
+            })`,
+        ),
+      );
+
+      // The modifier list, as the engine sums it...
+      const summed = defenderBonusPct({
+        terrainBonusPct: row.terrainBonusPct,
+        fortified: row.fortified,
+        inCity: row.inCity,
+        walls: row.walls,
+      });
+      checks.push(
+        check(
+          summed === row.bonusPct,
+          `${row.name}: the defender's modifiers SUM to ${String(row.bonusPct)}% (terrain ` +
+            `${String(row.terrainBonusPct)} + fortify ${String(row.fortified ? 25 : 0)} + city ` +
+            `${String(row.inCity ? 50 : 0)} + walls ${String(row.walls ? 50 : 0)}), got ` +
+            `${String(summed)}%`,
+        ),
+      );
+
+      // ...floored ONCE onto the defender's own defence...
+      const modified = modifiedDefense(defenseValue, summed);
+      checks.push(
+        check(
+          modified === row.defense,
+          `${row.name}: ${String(defenseValue)} defence at ${String(summed)}% is floor(` +
+            `${String(defenseValue)} * ${String(100 + summed)} / 100) = ${String(row.defense)}, ` +
+            `got ${String(modified)}`,
+        ),
+      );
+
+      // ...and the chance that follows from it.
+      checks.push(
+        check(
+          winPct(attackValue, modified) === row.expectedPct,
+          `${row.name}: attack ${String(attackValue)} against defence ${String(modified)} is ` +
+            `floor(${String(attackValue)} * 100 / ${String(attackValue + modified)}) = ` +
+            `${String(row.expectedPct)}%`,
+        ),
+      );
+
+      // The number the engine actually reported, which is what the table is for.
+      checks.push(
+        check(
+          event?.attackerWinPct === row.expectedPct,
+          `${row.name}: the battle reports a ${String(row.expectedPct)}% chance per round, got ` +
+            (event === undefined ? 'no battle' : `${String(event.attackerWinPct)}%`),
+        ),
+      );
+
+      // The discriminator, named: the floor-after-each-modifier reading of the SAME
+      // inputs, and the odds it would produce. Every row but the fortified
+      // spearman agrees under both readings — which is exactly why that row exists.
+      const bonuses = [
+        row.terrainBonusPct,
+        ...(row.fortified ? [25] : []),
+        ...(row.inCity ? [50] : []),
+        ...(row.inCity && row.walls ? [50] : []),
+      ];
+      const wrongDefense = flooredAfterEach(defenseValue, bonuses);
+      const wrongPct = winPct(attackValue, wrongDefense);
+      const separates = wrongPct !== row.expectedPct;
+      checks.push(
+        check(
+          wrongDefense === row.wrongDefense && wrongPct === row.wrongPct,
+          `${row.name}: flooring after EACH modifier would give defence ` +
+            `${String(row.wrongDefense)} and ${String(row.wrongPct)}%, got ` +
+            `${String(wrongDefense)} and ${String(wrongPct)}%`,
+        ),
+      );
+      checks.push(
+        check(
+          separates === (row.wrongPct !== row.expectedPct),
+          separates
+            ? `${row.name}: this row SEPARATES compounding from flooring twice: the wrong ` +
+                `reading gives ${String(wrongPct)}% where the engine gives ` +
+                `${String(row.expectedPct)}%`
+            : `${row.name}: with one modifier the two readings agree (both ` +
+                `${String(wrongPct)}%), so this row cannot separate them`,
+        ),
+      );
+    }
+
+    return checks;
+  },
+});
+
+describe('M6 scenario: combat odds for the known modifiers', () => {
+  it('fights the four battles and reports the table it claims', () => {
+    const result = runScenario(combatOddsScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The same four battles again, read off the engine's own events, so the numbers the
+    // reply quotes are visible here and not only inside the scenario's assertions.
+    const world = buildWorld(oddsSetup('nothing'));
+    const fought = ODDS_CASES.map((row, index) =>
+      probe(world, RULESET, attack(2 + 2 * index, ...row.defenderAt)),
+    ).map((outcome) => battles(outcome?.events ?? [])[0]);
+
+    expect(fought.map((event) => event?.attackerWinPct)).toEqual([33, 20, 16, 14]);
+    expect(fought.map((event) => Number(event?.defenderId))).toEqual([3, 5, 7, 9]);
+    // ...and the odds decide the battles: the attacker takes the two it was favoured in
+    // (33% and 20%) and loses the two it was not. 3 hit points a side and one point a
+    // round, so the winner of a round costs its opponent a point: the attacker's two
+    // wins run 5 rounds (it lost 2 points on the way) and its two losses run 3 (it lost
+    // three, which is all it had).
+    expect(fought.map((event) => event?.outcome)).toEqual([
+      'attacker-wins',
+      'attacker-wins',
+      'defender-wins',
+      'defender-wins',
+    ]);
+    expect(fought.map((event) => event?.rounds)).toEqual([5, 5, 3, 3]);
+    expect(fought.map((event) => event?.attackerLost)).toEqual([2, 2, 3, 3]);
+    expect(fought.map((event) => event?.defenderLost)).toEqual([3, 3, 0, 0]);
+  });
+
+  it('fortifying spends the movement, and buys what the arithmetic says', () => {
+    const world = buildWorld(oddsSetup('nothing'));
+
+    expect(isFortified(unitOf(world, 2))).toBe(false);
+    const dug = probe(world, RULESET, fortify(2));
+
+    // Digging in is a state change with no announcement, and it costs the turn.
+    expect(dug?.events).toEqual([]);
+    expect(dug === undefined ? undefined : isFortified(unitOf(dug.state, 2))).toBe(true);
+    expect(dug === undefined ? undefined : unitOf(dug.state, 2).movementLeft).toBe(0);
+    // ...so a second fortify has nothing left to spend, and is refused for that reason.
+    expect(
+      dug === undefined ? undefined : refusal(applyCommand(dug.state, ROME, fortify(2), RULESET)),
+    ).toMatchObject({ kind: 'not-enough-movement', unitId: asUnitId(2) });
+
+    // A unit that dug in cannot attack either: an attack costs the rest of the turn,
+    // and the turn is what fortifying spent.
+    expect(
+      dug === undefined
+        ? undefined
+        : refusal(applyCommand(dug.state, ROME, attack(2, 6, 5), RULESET)),
+    ).toMatchObject({ kind: 'not-enough-movement', unitId: asUnitId(2) });
+
+    // The bonus belongs to the DEFENDING side, so it is measured by digging Carthage's
+    // warrior in and attacking it with Rome's. A warrior's 2 defence at 35% is
+    // floor(2 * 1.35) = 2, so the odds do not move — the +25% is real and it floors away
+    // — while a spearman's floor(3 * 1.35) = 4 against floor(3 * 1.1) = 3 is where the
+    // same fortification is worth five points of chance (the discriminator row above).
+    const entrenched = applyCommand(world, CARTHAGE, fortify(3), RULESET);
+    expect(entrenched.ok).toBe(true);
+    const battle = battles(
+      probe(entrenched.ok ? entrenched.value.state : world, RULESET, attack(2, 6, 5))?.events ?? [],
+    )[0];
+    expect(battle?.attackerWinPct).toBe(33);
+    expect(modifiedDefense(3, 10)).toBe(3);
+    expect(modifiedDefense(3, 35)).toBe(4);
+    expect(winPct(1, modifiedDefense(3, 10))).toBe(25);
+    expect(winPct(1, modifiedDefense(3, 35))).toBe(20);
+  });
+
+  it('the odds assertions fail when the defender is not fortified', () => {
+    const variant: Scenario = {
+      name: 'combat-odds-with-no-fortification',
+      settings: DUEL_SETTINGS,
+      setup: oddsSetup('no-fortify'),
+      assert: assertOf(combatOddsScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/a fortified spearman on grassland/);
+    // ...and the failure is about that row: the bare warrior's case still holds, which
+    // is what makes it a failure of the compound case and not of the whole table.
+    expect(text).not.toMatch(/a bare warrior on grassland/);
+  });
+
+  it('the odds assertions fail when the city has no walls', () => {
+    const variant: Scenario = {
+      name: 'combat-odds-with-no-walls',
+      settings: DUEL_SETTINGS,
+      setup: oddsSetup('no-walls'),
+      assert: assertOf(combatOddsScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/behind walls in its own city/);
+  });
+
+  it('the odds assertions fail when the mountains are plain grassland', () => {
+    const variant: Scenario = {
+      name: 'combat-odds-with-no-mountains',
+      settings: DUEL_SETTINGS,
+      setup: oddsSetup('flat-mountains'),
+      assert: assertOf(combatOddsScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/standing on mountains/);
+  });
+});
+
+/* ---- 17b. A capture halves the city and spares its wonders --------- */
+
+const CAPTURE_CITY = asCityId(0);
+const CAPTURE_TILE: readonly [number, number] = [20, 20];
+const CAPTURE_ATTACKER: readonly [number, number] = [21, 20];
+const CAPTURE_POPULATION = 4;
+const CAPTURE_FOOD_BOX = 5;
+const CAPTURE_SHIELDS = 3;
+
+/**
+ * The capture world: Carthage's city `Ostia` on grassland with four citizens, a
+ * granary, walls and the Pyramids, a queued and an in-progress item, food and shields
+ * in store — and one Roman warrior beside it, with nothing inside to defend it.
+ *
+ * The two weakenings exist for the falsification tests: `no-wonder` takes the Pyramids
+ * out (so "the wonder survived" has nothing to be true about), and `defended` puts a
+ * Carthage warrior inside, which turns the attack into a *battle* and the capture into
+ * an event that never happens.
+ */
+const captureSetup =
+  (weakens: 'nothing' | 'no-wonder' | 'defended') =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    let builder = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, SETTLER, [2, 2])
+      .addUnit(1, SETTLER, [35, 35])
+      .addCity(1, CAPTURE_TILE, {
+        name: 'Ostia',
+        population: CAPTURE_POPULATION,
+        foodBox: CAPTURE_FOOD_BOX,
+        shields: CAPTURE_SHIELDS,
+        production: { kind: 'building', id: TEMPLE },
+        queue: [{ kind: 'building', id: LIBRARY }],
+        buildings: [GRANARY, WALLS, ...(weakens === 'no-wonder' ? [] : [PYRAMIDS])],
+      })
+      .addUnit(0, WARRIOR, CAPTURE_ATTACKER);
+
+    if (weakens === 'defended') builder = builder.addUnit(1, WARRIOR, CAPTURE_TILE);
+    return builder;
+  };
+
+const captureScenario = defineScenario({
+  name: 'capture-takes-half-and-spares-wonders',
+  settings: DUEL_SETTINGS,
+  setup: captureSetup('nothing'),
+  assert: (after, ruleset) => {
+    const before = cityOf(after, CAPTURE_CITY);
+    const outcome = probe(after, ruleset, attack(2, ...CAPTURE_TILE));
+    const event = outcome === undefined ? undefined : captures(outcome.events)[0];
+    const next = outcome?.state;
+    const city = next === undefined ? undefined : cityById(next, CAPTURE_CITY);
+
+    return [
+      // The rule, and both ends of it: half, floored, and never below one.
+      check(
+        capturedPopulation(4) === 2 && capturedPopulation(1) === 1 && capturedPopulation(0) === 1,
+        'a capture halves the population and floors it, but never empties the city: ' +
+          `capturedPopulation(4) = ${String(capturedPopulation(4))}, ` +
+          `capturedPopulation(1) = ${String(capturedPopulation(1))}, ` +
+          `capturedPopulation(0) = ${String(capturedPopulation(0))}`,
+      ),
+      check(
+        before.population === CAPTURE_POPULATION &&
+          before.buildings.includes(PYRAMIDS) &&
+          before.buildings.includes(WALLS) &&
+          before.buildings.includes(GRANARY) &&
+          before.foodBox === CAPTURE_FOOD_BOX &&
+          before.shields === CAPTURE_SHIELDS,
+        `the world really holds a ${String(CAPTURE_POPULATION)}-citizen city with a granary, ` +
+          `walls, the Pyramids, ${String(CAPTURE_FOOD_BOX)} food and ${String(CAPTURE_SHIELDS)} ` +
+          `shields — got population ${String(before.population)}, buildings ` +
+          `[${before.buildings.join(', ')}], box ${String(before.foodBox)}, shields ` +
+          String(before.shields),
+      ),
+      // An undefended city is taken, not fought over.
+      check(
+        outcome !== undefined && battles(outcome.events).length === 0,
+        'a capture is not a battle and reports none: taking an undefended city emits ' +
+          'CityCaptured and no CombatResolved at all',
+      ),
+      check(
+        event !== undefined &&
+          Number(event.cityId) === Number(CAPTURE_CITY) &&
+          event.from === CARTHAGE &&
+          event.to === ROME &&
+          event.name === 'Ostia' &&
+          Number(event.tile) === Number(tileAt(CAPTURE_TILE)) &&
+          event.population === 2,
+        'the capture names Ostia, its tile and both owners, and reports the halved ' +
+          `population 4 -> 2 (got ${
+            event === undefined
+              ? 'no CityCaptured at all'
+              : `${event.name} ${String(event.population)} ${String(event.from)} -> ${String(event.to)}`
+          })`,
+      ),
+      // The exact destruction list, in order, and the wonder absent from it.
+      check(
+        event !== undefined &&
+          event.destroyed.length === 2 &&
+          event.destroyed[0] === WALLS &&
+          event.destroyed[1] === GRANARY,
+        'the sack destroys the non-wonder buildings in maintenance-descending order — walls ' +
+          `(1) then granary (0) — and reports exactly those two, got ` +
+          `[${event === undefined ? '' : event.destroyed.join(', ')}]`,
+      ),
+      check(
+        city !== undefined &&
+          city.buildings.length === 1 &&
+          city.buildings[0] === PYRAMIDS &&
+          !city.buildings.includes(GRANARY) &&
+          !city.buildings.includes(WALLS),
+        'the Pyramids survive a sack (a wonder is never destroyed, because destroying one ' +
+          `would silently make it buildable again): the city holds ` +
+          `[${city === undefined ? '' : city.buildings.join(', ')}]`,
+      ),
+      // The city keeps its identity and changes hands.
+      check(
+        city !== undefined &&
+          city.owner === ROME &&
+          city.name === 'Ostia' &&
+          Number(city.tile) === Number(tileAt(CAPTURE_TILE)) &&
+          Number(city.id) === Number(CAPTURE_CITY) &&
+          city.population === 2,
+        `the captured city is the same city: id ${String(city?.id)}, name "${String(city?.name)}", ` +
+          `tile ${String(city?.tile)}, owner ${String(city?.owner)}, population ` +
+          String(city?.population),
+      ),
+      // What the sack clears, and what it does not touch.
+      check(
+        city !== undefined &&
+          city.queue.length === 0 &&
+          city.workedTiles.length === 0 &&
+          city.production === undefined,
+        'a captured city has no queue, no assignment and nothing in production (found: ' +
+          `queue [${city === undefined ? '' : describeItems(city.queue)}], ` +
+          `${String(city?.workedTiles.length)} worked tiles, production ` +
+          `${city?.production?.kind ?? 'none'})`,
+      ),
+      check(
+        city !== undefined && city.foodBox === CAPTURE_FOOD_BOX && city.shields === CAPTURE_SHIELDS,
+        'the sack does not touch the stores it found: the box is still ' +
+          `${String(CAPTURE_FOOD_BOX)} and the shield pool still ${String(CAPTURE_SHIELDS)} ` +
+          `(got ${String(city?.foodBox)} and ${String(city?.shields)})`,
+      ),
+      // The attacker paid for the attack with its movement, and did not move.
+      check(
+        next !== undefined &&
+          Number(unitOf(next, 2).tile) === Number(tileAt(CAPTURE_ATTACKER)) &&
+          unitOf(next, 2).movementLeft === 0,
+        'taking a city is an action, not a move: the attacker is still on ' +
+          `${label(...CAPTURE_ATTACKER)} with no movement left (tile ` +
+          `${next === undefined ? 'n/a' : String(unitOf(next, 2).tile)}, movement ` +
+          `${next === undefined ? 'n/a' : String(unitOf(next, 2).movementLeft)})`,
+      ),
+    ];
+  },
+});
+
+describe('M6 scenario: a capture halves the city and spares its wonders', () => {
+  it('takes Ostia, and the surviving city is the one the assertions describe', () => {
+    const result = runScenario(captureScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The capture again, from the events, so the exact population and the exact
+    // destruction order are visible here as well as inside the assertions.
+    const world = buildWorld(captureSetup('nothing'));
+    const outcome = probe(world, RULESET, attack(2, ...CAPTURE_TILE));
+    const event = captures(outcome?.events ?? [])[0];
+
+    expect(event?.population).toBe(2);
+    expect(event?.destroyed).toEqual([WALLS, GRANARY]);
+    expect(event?.destroyed).not.toContain(PYRAMIDS);
+    expect(cityById(outcome?.state ?? world, CAPTURE_CITY)?.buildings).toEqual([PYRAMIDS]);
+  });
+
+  it('the capture assertions fail when the city holds no wonder', () => {
+    const variant: Scenario = {
+      name: 'capture-with-no-wonder-to-spare',
+      settings: DUEL_SETTINGS,
+      setup: captureSetup('no-wonder'),
+      assert: assertOf(captureScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/the Pyramids survive a sack/);
+  });
+
+  it('the capture assertions fail when the city is defended', () => {
+    const variant: Scenario = {
+      name: 'capture-of-a-defended-city',
+      settings: DUEL_SETTINGS,
+      setup: captureSetup('defended'),
+      assert: assertOf(captureScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    expect(text).toMatch(/no CityCaptured at all/);
+    expect(text).toMatch(/a capture is not a battle and reports none/);
+  });
+});
+
+/* ---- 17c. A won battle promotes its winner by one level ------------ */
+
+interface PromoCase {
+  readonly level: number;
+  readonly attackerAt: readonly [number, number];
+  readonly defenderAt: readonly [number, number];
+  readonly expectedAttack: number;
+  readonly expectedPct: number;
+}
+
+/**
+ * The ladder, hand-computed from `veteranAttack` and `winPct`: an archer (attack 3)
+ * against a warrior on grassland, whose defence is `floor(2 * 1.1) = 2` at every level
+ * (the *defender* brings no experience bonus, so the rungs are the attacker's alone).
+ *
+ * - level 0: `floor(3 * 1.00) = 3` -> `floor(300 / 5) = 60%`
+ * - level 1: `floor(3 * 1.25) = 3` -> `60%` — the first promotion buys **nothing** at
+ *   attack 3, which is a fact about the shipped numbers and worth pinning
+ * - level 2: `floor(3 * 1.50) = 4` -> `floor(400 / 6) = 66%`
+ * - level 3: `floor(3 * 1.75) = 5` -> `floor(500 / 7) = 71%`, and there is no fourth:
+ *   `MAX_EXPERIENCE` is the cap
+ */
+const PROMO_CASES: readonly PromoCase[] = [
+  { level: 0, attackerAt: [5, 5], defenderAt: [6, 5], expectedAttack: 3, expectedPct: 60 },
+  { level: 1, attackerAt: [5, 10], defenderAt: [6, 10], expectedAttack: 3, expectedPct: 60 },
+  { level: 2, attackerAt: [5, 15], defenderAt: [6, 15], expectedAttack: 4, expectedPct: 66 },
+  { level: 3, attackerAt: [5, 20], defenderAt: [6, 20], expectedAttack: 5, expectedPct: 71 },
+];
+
+/**
+ * The promotion world: four Roman archers, one per experience level, each beside its own
+ * Carthage warrior, so the four battles are independent and the ladder is read off four
+ * separate draws. `clamp-all` is the weakening: every archer starts at the cap, so no
+ * battle can promote anybody and the ladder's expectations have to notice.
+ */
+const promotionSetup =
+  (weakens: 'nothing' | 'clamp-all') =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    let builder = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, SETTLER, [2, 2])
+      .addUnit(1, SETTLER, [35, 35]);
+
+    for (const row of PROMO_CASES) {
+      builder = builder
+        .addUnit(0, ARCHER, row.attackerAt, {
+          experience: weakens === 'clamp-all' ? MAX_EXPERIENCE : row.level,
+        })
+        .addUnit(1, WARRIOR, row.defenderAt);
+    }
+    return builder;
+  };
+
+const promotionScenario = defineScenario({
+  name: 'a-win-promotes-one-level',
+  settings: DUEL_SETTINGS,
+  setup: promotionSetup('nothing'),
+  assert: (after, ruleset) => {
+    const checks: ScenarioAssertion[] = [];
+    const defenderDefense = modifiedDefense(
+      unitDef(ruleset, WARRIOR)?.defense ?? -1,
+      defenderBonusPct({ terrainBonusPct: 10, fortified: false, inCity: false, walls: false }),
+    );
+
+    checks.push(
+      check(
+        MAX_EXPERIENCE === PROMO_CASES.length - 1 && defenderDefense === 2,
+        `the ladder is measured against ${String(MAX_EXPERIENCE)} levels of promotion and a ` +
+          `grassland warrior's ${String(defenderDefense)} defence, which the attacker's levels ` +
+          'do not move (the bonus is the ATTACKER’s)',
+      ),
+    );
+
+    let promotionsSeen = 0;
+    for (const row of PROMO_CASES) {
+      // The units interleave: row `level` adds archer `2 + 2 * level` and then its own
+      // defender `3 + 2 * level`, so the archer is NOT `2 + level`.
+      const unitId = 2 + 2 * row.level;
+      const outcome = probe(after, ruleset, attack(unitId, ...row.defenderAt));
+      const event = outcome === undefined ? undefined : battles(outcome.events)[0];
+      const next = outcome?.state;
+      const promoted = outcome === undefined ? [] : promotions(outcome.events);
+      const survivor = next === undefined ? undefined : unitById(next, asUnitId(unitId));
+      const capped = row.level === MAX_EXPERIENCE;
+      promotionsSeen += promoted.length;
+
+      // The bonus, as arithmetic.
+      checks.push(
+        check(
+          veteranAttack(3, row.level) === row.expectedAttack &&
+            winPct(row.expectedAttack, defenderDefense) === row.expectedPct,
+          `at level ${String(row.level)} an attack-3 unit's bonus is floor(3 * ` +
+            `${String(100 + 25 * row.level)} / 100) = ${String(row.expectedAttack)}, so its ` +
+            `chance is floor(${String(row.expectedAttack)} * 100 / ` +
+            `${String(row.expectedAttack + defenderDefense)}) = ${String(row.expectedPct)}%`,
+        ),
+      );
+
+      // The same bonus, as the engine reported it.
+      checks.push(
+        check(
+          event?.attackerWinPct === row.expectedPct,
+          `the level-${String(row.level)} battle reports the ${String(row.expectedPct)}% the ` +
+            `ladder predicts, got ${
+              event === undefined ? 'no battle' : `${String(event.attackerWinPct)}%`
+            }`,
+        ),
+      );
+
+      if (event?.attackerSurvives === true) {
+        checks.push(
+          check(
+            survivor !== undefined &&
+              experienceOf(survivor) === Math.min(row.level + 1, MAX_EXPERIENCE),
+            `winning raises the winner by exactly one level, to the cap: level ` +
+              `${String(row.level)} becomes ${String(Math.min(row.level + 1, MAX_EXPERIENCE))} ` +
+              `(got ${survivor === undefined ? 'the unit is gone' : String(experienceOf(survivor))})`,
+          ),
+        );
+        checks.push(
+          check(
+            promoted.length === (capped ? 0 : 1) &&
+              (capped || promoted[0]?.experience === row.level + 1),
+            capped
+              ? 'a unit already at the cap wins without a promotion event: there is no level ' +
+                  'left to announce'
+              : `a promotion is announced with the level it reached, ${String(row.level)} -> ` +
+                  `${String(row.level + 1)} (got ${
+                    promoted.length === 0 ? 'no event' : String(promoted[0]?.experience)
+                  })`,
+          ),
+        );
+        checks.push(
+          check(
+            survivor !== undefined && hitPointsLeftOf(survivor) === 3 - event.attackerLost,
+            'a promotion is neither a heal nor a wound: the winner keeps exactly the hit points ' +
+              `the battle left it (3 hp - ${String(event.attackerLost)} lost = ` +
+              `${String(3 - event.attackerLost)}, got ` +
+              `${survivor === undefined ? 'n/a' : String(hitPointsLeftOf(survivor))})`,
+          ),
+        );
+      } else {
+        checks.push(
+          check(
+            survivor === undefined && event?.defenderSurvives === true,
+            `the level-${String(row.level)} archer lost its battle, so it is gone and the ` +
+              'defender is not',
+          ),
+        );
+      }
+    }
+
+    // Non-vacuity: the ladder's upper half is evidence only if a promotion happened.
+    checks.push(
+      check(
+        promotionsSeen > 0,
+        `at least one of the four battles promoted its winner (${String(promotionsSeen)} ` +
+          'promotions in all)',
+      ),
+    );
+
+    return checks;
+  },
+});
+
+describe('M6 scenario: a won battle promotes its winner by one level', () => {
+  it('reads the ladder off four independent battles', () => {
+    const result = runScenario(promotionScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The four battles and their promotions, as the engine's own events.
+    const world = buildWorld(promotionSetup('nothing'));
+    const fought = PROMO_CASES.map((row) =>
+      probe(world, RULESET, attack(2 + 2 * row.level, ...row.defenderAt)),
+    );
+
+    expect(fought.map((outcome) => battles(outcome?.events ?? [])[0]?.attackerWinPct)).toEqual([
+      60, 60, 66, 71,
+    ]);
+    // One promotion for each of the first three levels, none for the capped archer.
+    expect(fought.map((outcome) => promotions(outcome?.events ?? []).length)).toEqual([1, 1, 1, 0]);
+    // ...and the level each archer ended the probe on: `min(level + 1, MAX_EXPERIENCE)`.
+    expect(
+      fought.map((outcome, index) => {
+        const unit =
+          outcome === undefined ? undefined : unitById(outcome.state, asUnitId(2 + 2 * index));
+        return unit === undefined ? 'gone' : experienceOf(unit);
+      }),
+    ).toEqual([1, 2, 3, 3]);
+    // A promotion is not a heal: every winner is at 3 hp minus the rounds it lost.
+    expect(
+      fought.map((outcome) => {
+        const unit =
+          outcome === undefined ? undefined : unitById(outcome.state, asUnitId(2 + 2 * 0));
+        return unit === undefined ? -1 : hitPointsLeftOf(unit);
+      })[0],
+    ).toBe(3 - (battles(fought[0]?.events ?? [])[0]?.attackerLost ?? -1));
+  });
+
+  it('the ladder assertions fail when every archer is already at the cap', () => {
+    const variant: Scenario = {
+      name: 'promotion-ladder-already-at-the-cap',
+      settings: DUEL_SETTINGS,
+      setup: promotionSetup('clamp-all'),
+      assert: assertOf(promotionScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    const text = failures(result.assertions).join('\n');
+    // Every archer is at the cap, so the ladder's own numbers are wrong first: the
+    // level-0 row fights at the level-3 chance, and no battle can raise anybody.
+    expect(text).toMatch(/the level-0 battle reports the 60%/);
+    expect(text).toMatch(/winning raises the winner by exactly one level/);
+    expect(text).toMatch(/level 0 becomes 1 \(got 3\)/);
+  });
+});
+
+/* ---- 17d. A band approaches, then sacks ---------------------------- */
+
+const BAND_START: readonly [number, number] = [5, 5];
+const ROMAN_CITY_TILE: readonly [number, number] = [10, 5];
+const ROMAN_CITY = asCityId(0);
+const BAND_SETTINGS = { mapSize: 'duel', seed: 1 } as const;
+
+/**
+ * A ridge across the band's direct line, so the route is a *route* and not a straight
+ * line: the north-east diagonal out of `(5, 5)` is mountains, so the band is sent east
+ * first and only then cuts the corner.
+ */
+const RIDGE: readonly (readonly [number, number])[] = [
+  [6, 3],
+  [6, 4],
+  [7, 3],
+  [7, 4],
+];
+
+/**
+ * The measured route, turn by turn, on seed 1: three steps east, one north-east, and
+ * then it attacks from `(9, 4)`, which is beside the city.
+ *
+ * `no-ridge` removes the mountains (the band then cuts the corner at `(6, 4)`) and
+ * `closer` starts it two tiles in — both are worlds where this list must be wrong. A
+ * third test runs the same world on a different seed, where the route must be
+ * *unchanged*, because nothing in the approach reads the RNG at all.
+ */
+const BAND_ROUTE: readonly (readonly [number, number])[] = [
+  [6, 5],
+  [7, 5],
+  [8, 4],
+  [9, 4],
+];
+
+const bandSetup =
+  (weakens: 'nothing' | 'no-ridge' | 'closer') =>
+  (b: ScenarioBuilder): ScenarioBuilder => {
+    const start: readonly [number, number] = weakens === 'closer' ? [7, 5] : BAND_START;
+    let builder = b
+      .addPlayer('Rome')
+      .addPlayer('Carthage')
+      .fillTerrain('grassland')
+      .addUnit(0, SETTLER, [2, 2])
+      .addUnit(1, SETTLER, [35, 35])
+      .addCity(0, ROMAN_CITY_TILE, { name: 'Roma', population: 4 })
+      .addBarbarianPlayer();
+
+    if (weakens !== 'no-ridge') {
+      for (const [x, y] of RIDGE) builder = builder.setTile(x, y, 'mountains');
+    }
+    return builder.addUnit(2, WARRIOR, start);
+  };
+
+const bandScenario = defineScenario({
+  name: 'a-band-approaches-and-sacks',
+  settings: BAND_SETTINGS,
+  setup: bandSetup('nothing'),
+  assert: (after, ruleset) => {
+    const checks: ScenarioAssertion[] = [];
+    const startRng = JSON.stringify(after.rng);
+
+    checks.push(
+      check(
+        after.units.filter((unit) => unit.owner === BARBARIANS).length === 1 &&
+          after.units.filter((unit) => unit.owner === BARBARIANS)[0]?.movementLeft === 1 &&
+          after.cities.length === 1 &&
+          after.cities[0]?.owner === ROME &&
+          after.cities[0].population === 4,
+        'the world really holds one movement-1 barbarian warrior and one four-citizen Roman ' +
+          'city for it to walk to',
+      ),
+    );
+
+    // Five turns, walked one at a time so the band's tile is read after each of them.
+    let current = after;
+    const events: GameEvent[] = [];
+    const route: string[] = [];
+    let refused = false;
+    for (let turn = 0; turn < BAND_ROUTE.length + 1; turn += 1) {
+      const outcome = probe(current, ruleset, endTurn());
+      if (outcome === undefined) {
+        refused = true;
+        break;
+      }
+      current = outcome.state;
+      events.push(...outcome.events);
+      const band = current.units.find((unit) => unit.owner === BARBARIANS);
+      route.push(band === undefined ? 'gone' : label(...xyOf(current.map, band.tile)));
+    }
+
+    checks.push(
+      check(!refused, 'every turn of the approach was applied — a refusal would stop it dead'),
+    );
+
+    // The exact tiles, turn by turn, as the band stood on them at the end of each turn.
+    const expectedRoute = BAND_ROUTE.map(([x, y]) => label(x, y));
+    const expectedStanding = expectedRoute[BAND_ROUTE.length - 1] ?? 'nowhere';
+    checks.push(
+      check(
+        route.length === BAND_ROUTE.length + 1 &&
+          expectedRoute.every((seen, index) => route[index] === seen) &&
+          route[BAND_ROUTE.length] === expectedStanding,
+        `the band walks exactly ${String(BAND_ROUTE.length)} tiles and then stands still to ` +
+          `fight: ${expectedRoute.join(' -> ')} (got ${route.join(' -> ')})`,
+      ),
+    );
+
+    // The same route as the engine's own step events, so the claim is about the pipeline
+    // and not only about the two endpoints.
+    const steps = stepsOf(events, 2).map(
+      (event) =>
+        `${label(...xyOf(current.map, event.from))} -> ${label(...xyOf(current.map, event.to))}`,
+    );
+    checks.push(
+      check(
+        steps.length === BAND_ROUTE.length &&
+          steps.every((step, index) => step.endsWith(expectedRoute[index] ?? 'nowhere')),
+        `the band's ${String(BAND_ROUTE.length)} UnitMoved events end on exactly the tiles of ` +
+          `the route, starting from ${label(...BAND_START)}: [${steps.join(', ')}]`,
+      ),
+    );
+
+    // ...and the sack happens on the last of those turns, from the tile beside the city.
+    const event = captures(events)[0];
+    const city = cityById(current, ROMAN_CITY);
+    checks.push(
+      check(
+        event !== undefined &&
+          Number(event.cityId) === Number(ROMAN_CITY) &&
+          event.from === ROME &&
+          event.to === BARBARIANS &&
+          Number(event.tile) === Number(tileAt(ROMAN_CITY_TILE)) &&
+          event.population === capturedPopulation(4),
+        'arriving beside an undefended city, the band takes it: population 4 -> ' +
+          `${String(capturedPopulation(4))}, from Rome to the barbarians (got ${
+            event === undefined
+              ? 'no CityCaptured at all'
+              : `${event.name} ${String(event.population)} ${String(event.from)} -> ${String(event.to)}`
+          })`,
+      ),
+    );
+    checks.push(
+      check(
+        city !== undefined && city.owner === BARBARIANS && city.population === 2,
+        `the city is the barbarians' afterwards, at the halved population (owner ` +
+          `${String(city?.owner)}, population ${String(city?.population)})`,
+      ),
+    );
+    checks.push(
+      check(
+        battles(events).length === 0,
+        'nothing was fought on the way: a band attacks only what the applier accepts, and an ' +
+          'undefended city is a capture rather than a battle',
+      ),
+    );
+
+    // The approach is not a random walk: reaching the city consumes no RNG at all, which
+    // is what makes a pinned route legitimate in the first place.
+    checks.push(
+      check(
+        JSON.stringify(current.rng) === startRng,
+        'the approach and the sack draw NOTHING from the state RNG, so the band is ' +
+          `reproducible from the state alone (rng ${startRng} -> ${JSON.stringify(current.rng)})`,
+      ),
+    );
+
+    return checks;
+  },
+});
+
+describe('M6 scenario: a barbarian band approaches a city and sacks it', () => {
+  it('walks the exact route, drawing nothing, and takes an undefended city', () => {
+    const result = runScenario(bandScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+
+    // The route again, from the engine's events, so the tiles the reply quotes are here.
+    const world = buildWorld(bandSetup('nothing'));
+    const walked = [0, 1, 2, 3, 4].reduce<{ state: GameState; events: readonly GameEvent[] }>(
+      (carry) => {
+        const outcome = probe(carry.state, RULESET, endTurn());
+        return outcome === undefined
+          ? carry
+          : { state: outcome.state, events: [...carry.events, ...outcome.events] };
+      },
+      { state: world, events: [] },
+    );
+
+    expect(stepsOf(walked.events, 2).map((event) => Number(event.to))).toEqual(
+      BAND_ROUTE.map(([x, y]) => Number(at(x, y))),
+    );
+    expect(captures(walked.events).map((event) => event.population)).toEqual([2]);
+    expect(battles(walked.events)).toEqual([]);
+  });
+
+  it('walks the same route on a different seed, because the walk draws nothing', () => {
+    const variant: Scenario = {
+      name: 'a-band-approaches-and-sacks-on-another-seed',
+      settings: { mapSize: 'duel', seed: 987_654 },
+      setup: bandSetup('nothing'),
+      assert: assertOf(bandScenario),
+    };
+
+    const result = runScenario(variant);
+
+    // The same assertions, including the exact route and the "the RNG did not move"
+    // claim: if any step of the approach read a draw, a different seed would move it.
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+  });
+
+  it('the route assertion fails when the ridge is not there', () => {
+    const variant: Scenario = {
+      name: 'a-band-with-no-ridge-in-its-way',
+      settings: BAND_SETTINGS,
+      setup: bandSetup('no-ridge'),
+      assert: assertOf(bandScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/the band walks exactly 4 tiles/);
+  });
+
+  it('the route assertion fails when the band starts two tiles closer', () => {
+    const variant: Scenario = {
+      name: 'a-band-starting-closer-to-the-city',
+      settings: BAND_SETTINGS,
+      setup: bandSetup('closer'),
+      assert: assertOf(bandScenario),
+    };
+
+    const result = runScenario(variant);
+
+    expect(result.passed).toBe(false);
+    expect(failures(result.assertions).join('\n')).toMatch(/the band walks exactly 4 tiles/);
   });
 });

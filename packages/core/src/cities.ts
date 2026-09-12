@@ -48,7 +48,19 @@ import type { BuildingId, CityId, PlayerId, TileIndex, UnitTypeId } from './ids.
 // modules: `buildings.ts` imports `BuildingDef` and `City` from here *type-only*,
 // so the edge runs one way and there is no cycle for `state.ts`' import order to
 // have to survive.
-import { applyEffectPct, buildingRow, cityBuildingEffects } from './buildings.js';
+// `isWonder` and `maintenanceOf` are the M6 capture rule's two reads of a row — a
+// wonder is never destroyed by capture, and the maintenance-descending order is the
+// rule the destruction is reported in. Both are asked of `buildings.ts` (the module
+// that owns what a building costs to keep and what makes one a wonder) rather than
+// re-derived here: `wonder === true` written a second time is a second answer to one
+// question, and the M2 bug class (two writers of the explored layer) is exactly that.
+import {
+  applyEffectPct,
+  buildingRow,
+  cityBuildingEffects,
+  isWonder,
+  maintenanceOf,
+} from './buildings.js';
 import {
   inBounds,
   indexToX,
@@ -446,4 +458,200 @@ export const autoAssignWorkedTiles = (
   });
 
   return candidates.slice(0, want);
+};
+
+/* ------------------------------------------------------------------ *
+ * M6 — capture: what a city becomes when it changes hands
+ *
+ * `commands.ts`' `AttackUnit` decides *when* a city is captured (an undefended
+ * city on an adjacent tile, attacked by a unit with attack left to spend). What a
+ * captured city *is* afterwards is stated here, once, because this module owns the
+ * `City` shape and every field the capture changes: ownership, population, the
+ * building list, the production head, the queue and the worked tiles.
+ *
+ * The rules, in the order the contract states them, and the reading each one takes
+ * of a field the contract does not mention:
+ *
+ * 1. **Ownership changes** to the attacker's player. There is no "no owner" state:
+ *    a city is always somebody's, which is what makes `citiesOf` total.
+ * 2. **Population is halved, floored, at a minimum of 1** — `capturedPopulation`
+ *    below. Placeholder, unsourced, ours.
+ * 3. **Buildings are destroyed deterministically**, and **a wonder is never
+ *    destroyed by capture**: a wonder is globally unique (M4c), so destroying one
+ *    would silently make it buildable again — `production.ts`' completion pass asks
+ *    the same uniqueness rule, and it would find no holder. The *order* the
+ *    destroyed buildings are reported in is maintenance-descending, with ties going
+ *    to the most recently completed (`city.buildings` is append-ordered), which is
+ *    the deterministic ordering M6 names; **which** buildings go is *all* of the
+ *    non-wonder ones, because a capture has no amount to cover — unlike bankruptcy
+ *    demolition, whose order is a *stopping* rule ("take rows until the maintenance
+ *    they cost covers what went unpaid", `buildings.ts`' `disbandBuildings`). Two
+ *    consequences of that difference are stated rather than glossed:
+ *    a zero-maintenance building **is** destroyed by capture (bankruptcy skips such
+ *    a row, because taking a free asset buys no gold — a capture is not buying
+ *    anything), and a wonder **is** kept here while bankruptcy can take one (M4c:
+ *    losing a wonder to bankruptcy is the one way it is lost). The two rules share
+ *    an ordering and a shape; they are not the same rule, and the contract's
+ *    parenthetical "(maintenance-descending)" is the part that is shared.
+ * 4. **The production head and the queue are cleared**, so the captured city builds
+ *    nothing until its new owner says what it should build. `production` is
+ *    *omitted* — never written as `undefined`, the spelling that cannot survive
+ *    canonical JSON (see `City.production`).
+ * 5. **The worked tiles are cleared**: the citizens the old owner assigned are not
+ *    the new owner's, and the tiles are freed for whoever claims them next
+ *    (`autoAssignWorkedTiles` reads claims from `workedTiles` alone, so a stale list
+ *    would keep handing tiles to a city that no longer works them).
+ * 6. **The city is NOT razed.** It keeps its id, its name and its centre tile, and
+ *    it stays in `state.cities` — a city vanishing is a state the engine cannot
+ *    express anyway (`city-food-conservation` in `@civts/sim` says plainly that
+ *    "cities are founded, never removed").
+ * 7. **Tile improvements and roads stay.** Nothing here reads `state.improvements`:
+ *    sacking a city is not a reason for a mine outside it to disappear, and the
+ *    contract says so outright.
+ *
+ * Two fields the contract does not list are deliberately **left alone**, and saying
+ * so is the point of mentioning them: `foodBox` and `shields` are the city's stored
+ * food and its stored production, and both survive the change of hands. A capture is
+ * specified as ownership + population + buildings + queue + worked tiles, and
+ * inventing a sixth change ("the granary is emptied", "the shield pool is looted")
+ * would be inventing a rule rather than implementing one.
+ *
+ * Nothing here reads ambient state: no RNG (a capture is not a random event), no
+ * clock, no I/O. `captureCity` is a pure rebuild of the state it is handed.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The divisor a captured city's population is reduced by. 2 is a **placeholder**:
+ * unsourced, chosen to be playable, and **not** a Civ 3 figure — the M6 contract
+ * states the rule ("halved, floored, minimum 1") without a source, and the real
+ * game's capture losses depend on the city's size and its buildings, which this
+ * engine does not model.
+ */
+export const CAPTURE_POPULATION_DIVISOR = 2;
+
+/**
+ * The population a city of `population` citizens has after being captured:
+ * `max(1, floor(population / CAPTURE_POPULATION_DIVISOR))`.
+ *
+ * Floored **once**, on the halved value (the M4c compounding rule's cousin: two
+ * floors in a row is a different number, and someone will otherwise "simplify"
+ * this). Total on purpose — a hand-built or foreign state can carry a population
+ * that is not a positive whole number, and the answer for such a city is the
+ * minimum rather than a fraction that `canonicalize` would reject.
+ */
+export const capturedPopulation = (population: number): number => {
+  const whole = Number.isInteger(population) && population > 0 ? population : 1;
+  return Math.max(1, Math.floor(whole / CAPTURE_POPULATION_DIVISOR));
+};
+
+/**
+ * The buildings `city` loses when it is captured, in the order they are destroyed:
+ * **every non-wonder row**, ordered by maintenance descending, ties going to the
+ * most recently completed.
+ *
+ * The order is deterministic and is part of the event a capture emits, so the same
+ * capture of the same city reports the same list in the same sequence on every run
+ * — which is what makes it assertable, and what the M6 contract's
+ * "deterministically … (maintenance-descending)" asks for. A row whose maintenance
+ * is zero is not skipped (see the section note: a capture is not paying a bill), and
+ * a row the catalog does not describe is destroyed as well — the city is holding an
+ * entry nothing can keep or apply, and a sack is exactly where such an entry goes;
+ * it orders as maintenance 0.
+ *
+ * A duplicate id in `city.buildings` is destroyed twice, because it *is* two entries
+ * — the same reading `cityMaintenance` takes of a duplicate.
+ */
+export const buildingsLostToCapture = (
+  catalog: readonly BuildingDef[],
+  city: City,
+): readonly BuildingId[] =>
+  city.buildings
+    .map((id, index) => {
+      const def = buildingRow(catalog, id);
+      return {
+        id,
+        index,
+        maintenance: def === undefined ? 0 : maintenanceOf(def),
+        // A wonder is never destroyed by capture: it is globally unique, so losing it
+        // here would make it silently buildable again (M4c's uniqueness rule reads
+        // only the cities that hold it). `isWonder` is `buildings.ts`' read, not a
+        // second one here.
+        kept: def !== undefined && isWonder(def),
+      };
+    })
+    .filter((entry) => !entry.kept)
+    .sort(
+      (a, b) =>
+        // Maintenance descending: the biggest bill goes first. Ties by descending list
+        // position — the most recently completed first — which is deterministic
+        // because `city.buildings` is append-ordered.
+        b.maintenance - a.maintenance || b.index - a.index,
+    )
+    .map((entry) => entry.id);
+
+/** What a capture did: the state after it, the city as it now stands, and what was destroyed. */
+export interface CityCapture {
+  readonly state: GameState;
+  /** The captured city, with its new owner — the same object the state's list holds. */
+  readonly city: City;
+  /** The buildings the sack took, in destruction order. Empty is a legal answer. */
+  readonly destroyed: readonly BuildingId[];
+}
+
+/**
+ * `state` with `cityId` transferred to `owner` — **the whole of M6's capture rule**,
+ * and the one place it is written down.
+ *
+ * `undefined` means the state holds no such city: a caller cannot conquer a city
+ * that is not there, and the honest answer to "what did capturing it do?" is
+ * nothing at all. *Whether* the capture is legal (adjacency, an undefended tile, a
+ * unit with attack left) is not this function's question — it is
+ * `commands.ts`' `planAttackUnit`, and mixing the two would give legality a second
+ * home.
+ *
+ * **It does not bump `revision`.** M2's invariant is that `revision` counts
+ * *applied commands*, and a capture is one step of one command; the command layer
+ * performs the single bump, exactly as it does for a move whose steps and hut reward
+ * are also several state changes under one revision.
+ *
+ * **It does not touch fog.** The captured city appears in the new owner's explored
+ * memory only if that player had already seen the tile — which an attacking unit
+ * standing next to it has, by construction (a unit's visibility is folded into
+ * `explored` when it moves, `commands.ts`' `movedState`). Inventing a second fog
+ * writer here would be the M2 two-writers bug for a third time.
+ */
+export const captureCity = (
+  state: GameState,
+  catalog: readonly BuildingDef[],
+  cityId: CityId,
+  owner: PlayerId,
+): CityCapture | undefined => {
+  const city = cityById(state, cityId);
+  if (city === undefined) return undefined;
+
+  const destroyed = buildingsLostToCapture(catalog, city);
+  const gone = new Set<BuildingId>(destroyed);
+
+  const captured: City = {
+    id: city.id,
+    owner,
+    name: city.name,
+    tile: city.tile,
+    population: capturedPopulation(city.population),
+    // Untouched by design — see the section note: the contract's list of what capture
+    // changes does not include the stored food or the stored shields.
+    foodBox: city.foodBox,
+    shields: city.shields,
+    // The head is *omitted*: the queue is cleared, so nothing is being built, and
+    // `production: undefined` is the one spelling this state cannot represent.
+    queue: [],
+    buildings: city.buildings.filter((id) => !gone.has(id)),
+    workedTiles: [],
+  };
+
+  return {
+    state: { ...state, cities: state.cities.map((each) => (each.id === cityId ? captured : each)) },
+    city: captured,
+    destroyed,
+  };
 };

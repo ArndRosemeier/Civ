@@ -72,6 +72,17 @@
  *   still do nothing until M9, and a header number is a claim that it means
  *   something. The REPL, which can afford the sentence, is where that is spelled
  *   out.
+ * - **A unit's hit points are printed wherever this module names a unit** (M6). The
+ *   `work:` line is the only line here that names one (a job is a fact about a unit,
+ *   see the bullet above), so it carries the figure: `hp 2/3`. Without it a wounded
+ *   worker reads exactly like a whole one, and "a damaged unit must be visible as
+ *   damaged" is the one property of combat a *reader* can check from the map view
+ *   alone. The maximum is asked of the unit's own type through `maxHitPointsOf`, and
+ *   a type this ruleset cannot describe falls back to the unit's own count rather
+ *   than to a guessed maximum — the same "read what is there" rule the terrain and
+ *   improvement fallbacks follow. The *REPL* prints the same figure on the lines and
+ *   in the table where it names units; this module owns no second spelling of it
+ *   (see `hitPointsLabel`).
  */
 
 import type { PlayerId, ResourceId, TerrainId, UnitTypeId } from './ids.js';
@@ -91,7 +102,14 @@ import { civPlayers, type GameState } from './state.js';
 // key's absence-is-idle rule and the "a row with no usable cost is not a price" rule
 // each have one implementation, and this module must not grow a second.
 import { researchingOf, techCostOf } from './tech.js';
-import { unitDef, type UnitWork } from './units.js';
+import {
+  hitPointsLeftOf,
+  maxHitPointsOf,
+  unitDef,
+  type Unit,
+  type UnitDef,
+  type UnitWork,
+} from './units.js';
 
 export interface Viewport {
   readonly x: number;
@@ -482,6 +500,32 @@ const unitTypeName = (ruleset: RulesetView, type: UnitTypeId): string =>
   unitDef(ruleset, type)?.name ?? type;
 
 /**
+ * A unit's hit points as a reader needs them: `2/3 hp`, and **always both numbers**.
+ *
+ * `hitPointsLeftOf` is `units.ts`' own read of the field (an absent, fractional or
+ * zero count is a unit at 1, because a unit in the world is alive), so this line
+ * cannot print a `0` that no live unit can carry. The maximum is
+ * `maxHitPointsOf(def, left)`: the type's own `hitPoints` when the ruleset
+ * describes it, and **the unit's current count when it does not** — a type this
+ * view cannot resolve must not silently heal or wound the unit by inventing a
+ * maximum, which is the exact reason that helper takes a fallback rather than
+ * defaulting to 1.
+ *
+ * `hp` rather than `hit points` because this string rides inside a one-line-per-
+ * fact renderer, and it is spelled the same way by the REPL's `units` line, its
+ * table and its `state` view — the whole point of putting the figure on the line
+ * is that a reader recognises it in every one of them.
+ *
+ * **Exported** for that last reason, exactly as `workSummary` is: the REPL prints the
+ * figure in four places of its own, and one mapping from a hit point count to prose is
+ * the only way those four cannot drift apart (or from this one).
+ */
+export const hitPointsLabel = (unit: Unit, def: UnitDef | undefined): string => {
+  const left = hitPointsLeftOf(unit);
+  return `${String(left)}/${String(maxHitPointsOf(def, left))} hp`;
+};
+
+/**
  * One line naming every unit that is **working**, or `undefined` when none is.
  *
  * `tile` is the job's own tile, which is where the improvement will land — the
@@ -496,6 +540,11 @@ const unitTypeName = (ruleset: RulesetView, type: UnitTypeId): string =>
  * count keeps the line honest about what it left out, and with nothing being
  * worked at all the line is absent entirely — the same rule the `% hut` legend
  * entry follows.
+ *
+ * M6 adds the unit's **hit points** to each entry (`2/3 hp`), because this is the one
+ * line in this module that names a unit and a reader has to be able to see that the
+ * unit is damaged. The figure sits between the position and the job — where it is,
+ * how hurt it is, what it is doing — and it is `hitPointsLabel`'s single spelling.
  */
 const workLine = (
   state: GameState,
@@ -517,6 +566,7 @@ const workLine = (
     parts.push(
       `${String(unit.id)} p${String(unit.owner)} ${unitTypeName(ruleset, unit.type)}` +
         `@${String(indexToX(state.map, work.tile))},${String(indexToY(state.map, work.tile))} ` +
+        `${hitPointsLabel(unit, unitDef(ruleset, unit.type))} ` +
         workSummary(ruleset, work),
     );
   }
@@ -550,10 +600,11 @@ const workLine = (
  * ```
  *
  * A unit in the middle of a job adds one `work:` line under `starts:` (M4a), and
- * only when something is being worked:
+ * only when something is being worked — with the unit's hit points beside its
+ * position, so a damaged worker is visible as damaged (M6):
  *
  * ```
- * work: 3 p0 Worker@2,2 mining, 2 turns left
+ * work: 3 p0 Worker@2,2 2/3 hp mining, 2 turns left
  * ```
  *
  * The gutter is sized to the widest row number, the tens ruler writes a digit

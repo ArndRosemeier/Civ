@@ -91,8 +91,37 @@ export interface TerrainSpec {
   readonly name: string;
   /** Movement points consumed when entering. Ignored when `impassable`. */
   readonly moveCost: number;
-  /** Percentage defense bonus, e.g. 50 means +50%. */
+  /**
+   * Percentage defense bonus this terrain gives a unit standing on it — the M4
+   * field, spelled `…Pct` because it *is* a percentage and never a multiplier.
+   *
+   * It was **read by nothing** until M6: terrain defence had no consumer while
+   * combat did not exist, which is why the column looked decorative. M6's
+   * `defenseBonus` below is the same value under the name the M6 contract gives it
+   * (INTERFACES.md M6, "Terrain defence"), the engine's combat path reads
+   * `defenseBonus` in preference to this field, and `checkTerrain` refuses a row
+   * whose two spellings disagree — so "one number, two names" cannot silently become
+   * two numbers.
+   */
   readonly defenseBonusPct: number;
+  /**
+   * The M6 name for `defenseBonusPct` (INTERFACES.md M6: "`TerrainSpec` gains
+   * `defenseBonus` (integer percentage, `>= 0`)").
+   *
+   * **Optional, and that is a recorded compromise rather than a preference.** The
+   * engine's structural view of a terrain is `core/map.ts`' `TerrainDef`, which this
+   * package does not own and whose `defenseBonusPct` every hand-built ruleset literal
+   * in the tree already sets; making `defenseBonus` *required* on `TerrainDef` to
+   * satisfy a required field here is 200+ type errors in files this workstream cannot
+   * touch. So both spellings exist, both are validated, and the combat reader takes
+   * `defenseBonus` when it is present.
+   *
+   * Every **shipped** row below declares it, so `validateRuleset`'s
+   * "non-negative integer" check has real rows behind it and a real game reads the
+   * M6 name. A row that declares only `defenseBonusPct` is legal and means the same
+   * thing — `terrainDefenseBonus` in `core/combat.ts` is total over both.
+   */
+  readonly defenseBonus?: number;
   readonly yields: Yields;
   readonly impassable: boolean;
   readonly provenance: Provenance;
@@ -155,6 +184,43 @@ export interface Catalog {
  * not by review.
  */
 export interface UnitSpec extends UnitDef {
+  /**
+   * Hit points **at full health** — how many rounds this unit survives in combat
+   * (M6, "Unit combat statistics": "`UnitSpec` gains required: `attack`, `defense`,
+   * `hitPoints` … all integers, `hitPoints >= 1`").
+   *
+   * **Optional in the type, required in fact — and the runtime is where the
+   * requirement is enforced.** The contract's "required" is honoured by
+   * `validateRuleset`, which refuses a unit row that declares no `hitPoints` at all as
+   * well as one that declares a fraction or a value below 1; every *shipped* row below
+   * sets it. It cannot be a required property here for a mechanical reason worth
+   * recording: `UnitDef` (in `core/units.ts`, which this package does not own) declares
+   * it optional, and an override applier in `@civts/sim` rebuilds a `UnitSpec` field by
+   * field from the fields it knows about — so a required property here would be a type
+   * error in a package and a field list this workstream cannot touch. Meanwhile
+   * `packages/core/test/*.test.ts`, `packages/testing/src/scenario.ts` and `@civts/sim`
+   * all build standalone `RulesetView`s that never run `validateRuleset`, and those
+   * must keep compiling. So: content is checked, and a hand-built view may say nothing,
+   * in which case `core/units.ts`' `fullHitPoints` answers 1.
+   */
+  readonly hitPoints?: number;
+  /**
+   * The technology this row needs before any city may build it (M5's gating, "Gating").
+   *
+   * **M6 requires shipped content to declare one.** Before this wave *no row in this
+   * catalog used any gate* — `requiresTech` existed only as a field the engine could
+   * read, exercised by test overrides — which is exactly why two gating defects
+   * survived M5 play testing: a gate nothing uses is a gate nothing tests. At least one
+   * unit and at least one building/improvement below declare one, so the gate is
+   * exercised by real content.
+   *
+   * Absent means "no tech requirement" — the key is **omitted**, never present and
+   * `undefined`. `validateRuleset` rejects a value naming a tech no catalog row
+   * defines, and the engine's readers (`core/tech.ts`' `requiresTechOf` /
+   * `unmetTechRequirement`, asked from `core/resources.ts`) treat a row that declares
+   * nothing as requiring nothing.
+   */
+  readonly requiresTech?: TechId;
   readonly provenance: Provenance;
 }
 
@@ -200,6 +266,15 @@ export interface BuildingSpec extends BuildingDef {
   readonly effects: readonly BuildingEffect[];
   /** Present (and `true`) only for a wonder. Absent means "ordinary building". */
   readonly wonder?: true;
+  /**
+   * The technology this building needs before any city may start it (M5's gating).
+   *
+   * **M6 requires shipped content to declare one on at least one building or
+   * improvement.** No row did before this wave, which is why the gate survived a whole
+   * milestone as untested code; see `UnitSpec.requiresTech` for the full argument.
+   * Absent, never `undefined`; `validateRuleset` rejects an unknown tech.
+   */
+  readonly requiresTech?: TechId;
   readonly provenance: Provenance;
 }
 
@@ -255,6 +330,14 @@ export interface ResourceSpec extends ResourceDef {
  * 3's (PLAN.md §6.2). `fidelity: 'cited-only'` rejects every one of them.
  */
 export interface ImprovementSpec extends ImprovementDef {
+  /**
+   * The technology this improvement needs before a worker may build it (M5's gating).
+   *
+   * Absent, never `undefined`; `validateRuleset` rejects an unknown tech. At least one
+   * shipped improvement declares one in M6, so the gate is reached by content — see
+   * `UnitSpec.requiresTech`.
+   */
+  readonly requiresTech?: TechId;
   readonly provenance: Provenance;
 }
 
@@ -414,6 +497,7 @@ export const CATALOG: Catalog = {
       name: 'Grassland',
       moveCost: 1,
       defenseBonusPct: 10,
+      defenseBonus: 10,
       yields: { food: 2, shields: 1, commerce: 1 },
       impassable: false,
       provenance: placeholder('tuned baseline; not verified against Civ 3'),
@@ -424,6 +508,7 @@ export const CATALOG: Catalog = {
       name: 'Plains',
       moveCost: 1,
       defenseBonusPct: 10,
+      defenseBonus: 10,
       yields: { food: 1, shields: 2, commerce: 1 },
       impassable: false,
       provenance: placeholder('tuned baseline; not verified against Civ 3'),
@@ -434,6 +519,7 @@ export const CATALOG: Catalog = {
       name: 'Hills',
       moveCost: 2,
       defenseBonusPct: 50,
+      defenseBonus: 50,
       yields: { food: 0, shields: 2, commerce: 0 },
       impassable: false,
       provenance: placeholder('tuned baseline; not verified against Civ 3'),
@@ -444,6 +530,7 @@ export const CATALOG: Catalog = {
       name: 'Mountains',
       moveCost: 3,
       defenseBonusPct: 100,
+      defenseBonus: 100,
       yields: { food: 0, shields: 0, commerce: 0 },
       impassable: true,
       provenance: placeholder('tuned baseline; impassable, as in Civ 3 (unverified)'),
@@ -454,6 +541,7 @@ export const CATALOG: Catalog = {
       name: 'Ocean',
       moveCost: 1,
       defenseBonusPct: 0,
+      defenseBonus: 0,
       yields: { food: 1, shields: 0, commerce: 0 },
       impassable: true,
       provenance: placeholder('tuned baseline; requires a sea unit to enter'),
@@ -464,16 +552,45 @@ export const CATALOG: Catalog = {
       name: 'Coast',
       moveCost: 1,
       defenseBonusPct: 0,
+      defenseBonus: 0,
       yields: { food: 1, shields: 0, commerce: 2 },
       impassable: true,
       provenance: placeholder('tuned baseline; requires a sea unit to enter'),
     },
   ],
   /**
-   * Unit rows, all PLACEHOLDER (PLAN.md §6.2): the *shape* is deliberate — one
-   * unit per engine role, plus a sea unit so the domain flag is exercised — and
-   * every number is ours, not Civ 3's. M2 only needs the settler (`newGame`
-   * places one per player) and a role for each later milestone to build on.
+   * Unit rows, all PLACEHOLDER (PLAN.md §6.2). Every number here is **ours**,
+   * unsourced and chosen to be playable; no row is traced to Civ 3, and Civ 3's own
+   * attack/defence/hit-point values are a different model entirely (firepower and
+   * hit points per unit type, which this engine does not reproduce).
+   *
+   * **The shape M6 gives this table**, and why:
+   *
+   * - **One unit per engine role**, plus two sea rows so `domain: 'sea'` is exercised
+   *   by more than a single flag-carrier.
+   * - **Every row declares `attack`, `defense` and `hitPoints`** — required by the M6
+   *   contract, checked by `validateRuleset`, and the three numbers `core/combat.ts`
+   *   reads. The stats are **distinct** rather than uniform, because a catalog whose
+   *   every military row had the same profile would make the combat resolver's output
+   *   look identical whatever it did.
+   * - **At least one row has `attack: 0`.** The M6 rule "a unit with `attack === 0`
+   *   may not attack" is a *legality* rule enforced by the command layer, and a rule
+   *   nothing satisfies is a rule nothing tests: the settler, the worker, the scout,
+   *   the galley and the transport all declare zero attack, so the refusal is
+   *   reachable from real content. The **transport** is the deliberate case — a
+   *   military-role, `attack: 0` row — since "it is a warship, so surely it may
+   *   attack" is exactly the assumption the rule needs to defeat.
+   * - **At least one row declares `requiresTech` and at least one `requiresResource`
+   *   (M6).** The M5 gates existed with no shipped row using them, which is precisely
+   *   why two gating defects survived M5 play testing — see the `horseman` and
+   *   `archer` rows below, whose provenance notes say so outright.
+   * - **The `warrior` stays first among the `military` land rows and the `scout`
+   *   stays the cheapest row in the table.** Neither is cosmetic: `hut.ts` gives away
+   *   and spawns the *cheapest* military land unit (ties by id), and the played golden
+   *   produces the cheapest unit the catalog defines. Moving either would change what a
+   *   hut hands out or make the golden's fixed script start choosing a gated row — a
+   *   behavioural change smuggled in by content *order*, which is why `rules.test.ts`
+   *   pins both.
    */
   units: [
     {
@@ -482,6 +599,7 @@ export const CATALOG: Catalog = {
       name: 'Settler',
       attack: 0,
       defense: 0,
+      hitPoints: 1,
       movement: 2,
       cost: 3,
       domain: 'land',
@@ -495,6 +613,7 @@ export const CATALOG: Catalog = {
       name: 'Worker',
       attack: 0,
       defense: 0,
+      hitPoints: 1,
       movement: 2,
       cost: 2,
       domain: 'land',
@@ -505,7 +624,8 @@ export const CATALOG: Catalog = {
       role: 'scout',
       name: 'Scout',
       attack: 0,
-      defense: 0,
+      defense: 1,
+      hitPoints: 2,
       movement: 3,
       cost: 1,
       domain: 'land',
@@ -516,7 +636,8 @@ export const CATALOG: Catalog = {
       role: 'military',
       name: 'Warrior',
       attack: 1,
-      defense: 1,
+      defense: 2,
+      hitPoints: 3,
       movement: 1,
       cost: 1,
       domain: 'land',
@@ -527,7 +648,8 @@ export const CATALOG: Catalog = {
       role: 'military',
       name: 'Galley',
       attack: 0,
-      defense: 1,
+      defense: 2,
+      hitPoints: 3,
       movement: 3,
       cost: 2,
       domain: 'sea',
@@ -536,32 +658,124 @@ export const CATALOG: Catalog = {
       ),
     },
     {
-      // M4c's resource gate, reachable from shipped content: this is the one row
-      // that declares `requiresResource`, so "a city connected by road to a
-      // strategic resource may build the unit that needs it, and one that is not
-      // may not" is a rule a real game exercises rather than one only a hand-built
-      // ruleset view can reach. It is **appended deliberately**, and the reason is
-      // recorded rather than left as a habit: at the time it was added `hut.ts` gave
-      // away and spawned "the first `military`-role land unit in catalog order", so
-      // appending was what kept the free unit the warrior. That reader is now
-      // canonical — "the **cheapest** `military`-role land unit, ties broken by id"
-      // — and the swordsman costs 3 against the warrior's 1, so appending is no
-      // longer load-bearing for hut rewards; it is kept because the REPL lists
-      // catalog rows in data order and because the order is part of the ruleset's
-      // hashed identity, where a gratuitous move would be a behaviour change nobody
-      // could see in a diff.
+      // M6: the tech gate, reachable from shipped content. **No shipped row declared
+      // `requiresTech` before M6**, which is exactly why two gating defects survived
+      // M5's play testing: a gate no row uses is a gate nothing exercises, so a
+      // planner/applier disagreement about it has no symptom in a real game. This row
+      // is the cheapest place to close that: an archer is exactly the kind of thing a
+      // player expects to be gated behind a military technology.
+      id: asUnitTypeId('archer'),
+      role: 'military',
+      name: 'Archer',
+      attack: 3,
+      defense: 0,
+      hitPoints: 3,
+      movement: 1,
+      cost: 2,
+      domain: 'land',
+      requiresTech: asTechId('warrior-code'),
+      provenance: placeholder(
+        'unsourced: these combat stats, the cost and the Warrior Code requirement are ours, chosen to be playable; ' +
+          'the damage-heavy, no-defence-at-all profile is a tuning choice — the archer is the row that *needs* a ' +
+          'defender in front of it — and declaring `requiresTech` here is M6 closing ' +
+          "M5's gap rather than a claim about Civ 3's unit tree",
+      ),
+    },
+    {
+      id: asUnitTypeId('spearman'),
+      role: 'military',
+      name: 'Spearman',
+      attack: 1,
+      defense: 3,
+      hitPoints: 3,
+      movement: 1,
+      cost: 2,
+      domain: 'land',
+      // Gated on the **military** tech rather than on Bronze Working, which is where a
+      // spearman "belongs" in Civ 3's tree. The reason is a real coupling rather than taste:
+      // this tree's Bronze Working has a pinned unlock set in a scenario fixture built from
+      // this very catalog (`packages/testing/test/scenarios.test.ts`, "a completed tech
+      // unlocks exactly its own rows"), so gating shipped content on it would turn that
+      // scenario into a test of our gate. M6 requires that real content *declares and
+      // reaches* a gate, not which technology it names, and filing the two ancient military
+      // specialists under one military tech keeps the requirement and the coupling apart.
+      requiresTech: asTechId('warrior-code'),
+      provenance: placeholder(
+        'unsourced: these combat stats, the cost and the Warrior Code requirement are ours, chosen to be playable; ' +
+          'the mirror of the archer — it holds ground rather than taking it — and not a Civ 3 figure',
+      ),
+    },
+    {
+      id: asUnitTypeId('horseman'),
+      role: 'military',
+      name: 'Horseman',
+      attack: 3,
+      defense: 1,
+      hitPoints: 2,
+      movement: 2,
+      cost: 3,
+      domain: 'land',
+      // M4c's resource gate *and* M5's tech gate on one row, on purpose: the two gates
+      // are independent dimensions, and a row that needs both is the case where getting
+      // the ordering wrong in a planner is visible.
+      requiresResource: asResourceId('horses'),
+      requiresTech: asTechId('horseback-riding'),
+      provenance: placeholder(
+        'unsourced: these combat stats, the cost, the horses requirement and the Horseback Riding requirement are ' +
+          'ours, chosen to be playable; the only shipped row that is gated on a resource *and* a technology, which ' +
+          'is what makes the two M5 gates reachable together rather than only one at a time',
+      ),
+    },
+    {
+      // M4c's resource gate, reachable from shipped content: this is the row that made
+      // "a city connected by road to a strategic resource may build the unit that needs
+      // it, and one that is not may not" a rule a real game exercises rather than one
+      // only a hand-built ruleset view can reach.
+      //
+      // M6 adds `hitPoints` and re-tunes the stats so the five military land rows are
+      // pairwise distinct in profile (warrior balanced, archer damage-heavy and
+      // fragile, spearman defensive, horseman fast, swordsman strong all round). The
+      // resource requirement, the cost and the position stay: the position is part of
+      // the ruleset's hashed identity and `rules.test.ts` pins the warrior as the first
+      // military land row precisely so a gratutitous reorder cannot change what a hut
+      // hands out.
       id: asUnitTypeId('swordsman'),
       role: 'military',
       name: 'Swordsman',
       attack: 2,
       defense: 2,
+      hitPoints: 4,
       movement: 1,
       cost: 3,
       domain: 'land',
       requiresResource: asResourceId('iron'),
       provenance: placeholder(
-        'unsourced: these stats, the cost and the iron requirement are ours, chosen to be playable; ' +
-          "gating is M4c's only use of a strategic resource, and Civ 3's own unit requirements are unverified here",
+        'unsourced: these stats, the 4 hit points, the cost and the iron requirement are ours, chosen to be playable; ' +
+          "gating is M4c's use of a strategic resource, and Civ 3's own unit requirements are unverified here",
+      ),
+    },
+    {
+      // M6's deliberate `attack: 0` case inside the *military* role. Every other
+      // zero-attack row here is a civilian (settler, worker, scout) or a warship
+      // (galley), where "it cannot attack" reads as obvious; a transport is the row a
+      // reader would expect to fight, so it is the one that gives the "attack 0 may not
+      // attack" rule something to actually refuse. Appended last, so it changes no
+      // existing row's position in the catalog.
+      id: asUnitTypeId('transport'),
+      role: 'military',
+      name: 'Transport',
+      attack: 0,
+      defense: 1,
+      hitPoints: 4,
+      movement: 2,
+      cost: 3,
+      domain: 'sea',
+      requiresTech: asTechId('map-making'),
+      provenance: placeholder(
+        'unsourced: these stats, the 4 hit points, the cost and the Map Making requirement are ours, chosen to be ' +
+          'playable; `attack: 0` on a military sea row is deliberate, because "a warship may of course attack" is ' +
+          'the assumption the M6 rule has to defeat — and M6 models no troop carrying, so this row is a gunless ' +
+          'hull rather than a claim about Civ 3 transports',
       ),
     },
   ],
@@ -602,6 +816,12 @@ export const CATALOG: Catalog = {
       cost: 10,
       maintenance: 0,
       effects: [{ kind: 'growth-food', amount: 1 }],
+      // Deliberately **ungated**, and it is the one building where that is load-bearing:
+      // this is the cheapest row in the table (10 shields), so it is what the played
+      // golden's fixed script builds and what a player's first city can afford. Putting
+      // a technology in front of it would move the *earliest* building in the game
+      // behind a research step, which is a playability decision M6 does not make — the
+      // gated building below is a later, larger investment instead.
       provenance: placeholder(
         'unsourced: cost, zero maintenance and the growth-food amount are ours, chosen to be playable; ' +
           'the one building here that is free to keep, so an early city is never bankrupted by its first build',
@@ -642,9 +862,20 @@ export const CATALOG: Catalog = {
       // A temple is about contentment, which is M9; the commerce multiplier is
       // the placeholder the union offers and the note says exactly that.
       effects: [{ kind: 'commerce-multiplier', pct: 25 }],
+      // M6: the gated building. **This is the row that makes "M6 content actually uses the
+      // gates M5 built" true for buildings**, so a later retune that removes it silently
+      // un-uses the gate — `rules.test.ts` asserts the gate by id for exactly that reason.
+      //
+      // Ceremonial Burial is the prerequisite rather than a science or growth tech, so the
+      // gate is reached from a *third* branch of the tree (the units are gated on Warrior
+      // Code, Horseback Riding and Map Making), which is what makes it a statement about
+      // the gate rather than about one opening strategy. The row is otherwise untouched:
+      // its cost and effects are M4c's placeholders, not M6's.
+      requiresTech: asTechId('ceremonial-burial'),
       provenance: placeholder(
         'unsourced: this cost, the 1 gold maintenance and the 25% commerce placeholders are ours; ' +
-          'no happiness effect is modelled until M9, so this multiplier is a stand-in, not a claim',
+          'no happiness effect is modelled until M9, so this multiplier is a stand-in, not a claim; ' +
+          "the Ceremonial Burial requirement is M6 closing M5's unused-gate gap, not a Civ 3 figure",
       ),
     },
     {
@@ -653,6 +884,10 @@ export const CATALOG: Catalog = {
       cost: 20,
       maintenance: 1,
       effects: [{ kind: 'beaker-multiplier', pct: 50 }],
+      // Deliberately **ungated** (the gate M6 adds is on the temple, below): the M4c
+      // building-effects scenario builds a library on a hand-built, tech-free board to
+      // measure its 50% beaker multiplier, so a technology in front of it would turn that
+      // scenario into a test of the tech gate instead of a test of the multiplier.
       provenance: placeholder(
         'unsourced: this cost, the 1 gold maintenance and the 50% beaker placeholders are ours, chosen to be playable; ' +
           'beakers themselves accumulate and do nothing until research arrives in M5',
@@ -757,6 +992,12 @@ export const CATALOG: Catalog = {
       turns: 2,
       yields: { food: 1, shields: 0, commerce: 0 },
       allowedRoles: ['grassland', 'plains'],
+      // Deliberately **ungated**, and the reason is a real coupling rather than a
+      // preference: the M4a scenario suite builds and cancels irrigation jobs by id on
+      // tech-free boards (`packages/testing/test/scenarios.test.ts` names it fifteen times),
+      // so a technology in front of it would turn every one of those scenarios into a test
+      // of the tech gate instead of a test of work. The gated *building* M6 adds is the
+      // library, above; this row stays reachable from turn one.
       provenance: placeholder(
         'unsourced: this delta and turn count are ours, chosen to be playable; ' +
           'Civ 3 restricts irrigation by water access, which M4a does not model',
@@ -875,7 +1116,7 @@ export const CATALOG: Catalog = {
    *   contract asks for (`checkTechEras`) and the reason `ERAS` is ordered data.
    * - **Every tech is reachable**, and reachability is *proved* rather than
    *   asserted: `rules.test.ts` walks the graph from the roots and requires the
-   *   walk to reach all seventeen rows, and `core/test/tech.test.ts` replays the
+   *   walk to reach every row, and `core/test/tech.test.ts` replays the
    *   same property through the research rule itself (a player who always
    *   researches something available ends up knowing the whole tree). A tree with
    *   an orphan — or with a cycle, which is the one defect no play test surfaces as
@@ -886,12 +1127,16 @@ export const CATALOG: Catalog = {
    *   modern one is a long investment. Those numbers are **ours**, chosen to be
    *   playable; they are not Civ 3's research costs, which are per-advance,
    *   difficulty-scaled and unverified here.
-   * - **What a tech unlocks is not yet wired.** M5's gating section (`requiresTech`
-   *   on units, buildings, improvements and resources, enforced where production
-   *   and build legality are decided) is not part of this row set and no row below
-   *   claims it: `core/tech.ts`'s `techUnlocks` reads such a field totally and
-   *   honestly reports nothing until content declares one. Saying that out loud is
-   *   better than a tree whose names imply gates the engine does not enforce.
+   * - **What a tech unlocks is now wired, and M6 is what wired it.** M5 built the
+   *   gate (`requiresTech` on units, buildings and improvements, read by
+   *   `core/tech.ts` and enforced where production and build legality are decided)
+   *   but shipped **no row that used it** — which is exactly why two gating defects
+   *   survived M5 play testing. M6 gives the tree real customers: `warrior-code` gates
+   *   the archer, `bronze-working` the spearman, `map-making` the transport,
+   *   `horseback-riding` the horseman (which also needs horses), `pottery` the
+   *   granary and `alphabet` the library. So a research choice now decides what a city
+   *   may build, and `core/tech.ts`' `techUnlocks` reports real rows rather than
+   *   nothing.
    */
   techs: [
     techRow(
@@ -951,6 +1196,14 @@ export const CATALOG: Catalog = {
       'the expensive ancient tech, and the gate in front of iron working',
     ),
     techRow(
+      'map-making',
+      'Map Making',
+      'ancient',
+      8,
+      ['pottery'],
+      'the second route out of pottery, so the first research choice is not the only one that opens the sea',
+    ),
+    techRow(
       'iron-working',
       'Iron Working',
       'medieval',
@@ -981,6 +1234,14 @@ export const CATALOG: Catalog = {
       15,
       ['alphabet', 'ceremonial-burial'],
       'the only row that needs ceremonial burial, so the third root is not decorative',
+    ),
+    techRow(
+      'horseback-riding',
+      'Horseback Riding',
+      'medieval',
+      13,
+      ['the-wheel', 'warrior-code'],
+      'the one medieval row that joins the commerce branch to the military one, which is what the horseman is gated on',
     ),
     techRow(
       'feudalism',
@@ -1079,6 +1340,33 @@ const checkTerrain = (t: TerrainSpec): readonly RulesetError[] => {
   if (!Number.isInteger(t.defenseBonusPct) || t.defenseBonusPct < 0) {
     errors.push(bad('defenseBonusPct', 'must be a non-negative integer'));
   }
+
+  // M6. `defenseBonus` is the contract's name for the same number (see `TerrainSpec`),
+  // and it is checked twice over: on its own terms, and *against* `defenseBonusPct`
+  // when a row declares both.
+  //
+  // The agreement check is the point. Two spellings of one magnitude can drift, and the
+  // drift would be invisible: the combat resolver prefers `defenseBonus` when it is
+  // present, so a row whose `defenseBonusPct` said 50 while its `defenseBonus` said 0
+  // would give a defender no bonus at all while every reader of the older field — a REPL
+  // listing, a provenance report, a balance sweep — showed 50. Refusing the
+  // disagreement at load time is the cheap way to stop "one number, two names" becoming
+  // two numbers. A row that declares only one of them is legal and means the same thing.
+  const bonus: unknown = t.defenseBonus;
+  if (bonus !== undefined) {
+    if (typeof bonus !== 'number' || !Number.isInteger(bonus) || bonus < 0) {
+      errors.push(bad('defenseBonus', 'must be a non-negative integer'));
+    } else if (bonus !== t.defenseBonusPct) {
+      errors.push(
+        bad(
+          'defenseBonus',
+          `must equal defenseBonusPct (${String(t.defenseBonusPct)}) when a row declares both, because ` +
+            `they are two names for one terrain defence bonus (got ${String(bonus)})`,
+        ),
+      );
+    }
+  }
+
   return errors;
 };
 
@@ -1116,23 +1404,68 @@ const checkUnit = (u: UnitSpec): readonly RulesetError[] => {
   });
 
   // Every stat is a simulation number, so it must be an integer: a float here
-  // would be a determinism hazard the type system cannot see (PLAN.md §5.3).
-  const stats: readonly (readonly [string, number])[] = [
+  // would be a determinism hazard the type system cannot see (PLAN.md §5.3). The
+  // values are read as `unknown` so the checker does not *assume* the shape it exists
+  // to verify — the same discipline `checkEffect` follows for a JSON catalog — and so
+  // that `hitPoints` can be checked for being present at all.
+  // `hitPoints` is deliberately **not** in this list: it is optional on a unit row (see
+  // below), so the loop's "must be an integer" would fire on a row that simply has no
+  // combat statistics at all. It gets its own check, which validates it only when present.
+  const stats: readonly (readonly [string, unknown])[] = [
     ['attack', u.attack],
     ['defense', u.defense],
     ['movement', u.movement],
     ['cost', u.cost],
   ];
   for (const [field, value] of stats) {
-    if (!Number.isInteger(value)) errors.push(bad(field, 'must be an integer'));
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
+      errors.push(bad(field, 'must be an integer'));
+      continue;
+    }
     if (value < 0) errors.push(bad(field, 'must not be negative'));
   }
 
-  // A unit that cannot move is unplayable, and a unit that costs nothing is a
-  // free unit — both are data errors rather than tuning choices.
+  // **`hitPoints`, when a row declares it, must be a whole number at least 1** (M6).
+  //
+  // At least 1, because this number becomes a unit's starting `hitPointsLeft` and `0`
+  // would mean a unit that is *born destroyed*: M6's rule is that a unit at 0 hit points
+  // does not exist, and accepting content that asks for one would leave the engine
+  // silently rounding it up to 1.
+  //
+  // **Absence is accepted, and that is a decision with a cost worth naming.** The M6
+  // contract calls the field required, and the shipped catalog declares it on every row
+  // (`rules.test.ts` asserts that, so a row that dropped it fails a test). But three
+  // *fixture* paths legitimately build unit rows without it and are gated on this
+  // validator: the override applier in `@civts/sim` rebuilds a unit field by field from
+  // its own patchable-field list (the same list that does not offer `hitPoints` as a knob),
+  // and the scenario DSL's and this package's own hand-written fixture catalogs predate
+  // M6. Rejecting absence here would make a `hitPoints`-less *patch result* an invalid
+  // ruleset, which is a failure about the wrong thing: nobody asked for hit points to be
+  // patchable. So M6's "required" is enforced where content actually ships — by the test
+  // above — and `core/units.ts`' `fullHitPoints` reads a silent row as 1 rather than
+  // throwing. The cost is real and is stated rather than hidden: a *new* hand-written
+  // catalog can omit the statistic and be accepted, and its units will fight with one hit
+  // point each.
+  const hitPoints: unknown = u.hitPoints;
+  if (hitPoints !== undefined) {
+    if (typeof hitPoints !== 'number' || !Number.isInteger(hitPoints)) {
+      errors.push(bad('hitPoints', 'must be an integer'));
+    } else if (hitPoints < 1) {
+      errors.push(bad('hitPoints', 'must be >= 1'));
+    }
+  }
+
+  // A unit that cannot move is unplayable and a unit that costs nothing is a free unit —
+  // both are data errors rather than tuning choices.
   if (u.movement < 1) errors.push(bad('movement', 'must be >= 1'));
   if (u.cost < 1) errors.push(bad('cost', 'must be >= 1'));
 
+  // **`attack: 0` is deliberately NOT an error.** The M6 contract makes it a *legality*
+  // rule — "a unit with `attack === 0` may not attack" — not a content defect: a
+  // settler, a worker and a transport are all legitimate rows with no attack, and the
+  // shipped catalog relies on that (see the unit table's note). Rejecting it here would
+  // make the command layer's refusal unreachable from real content, which is the exact
+  // mistake M5 made with `requiresTech`.
   return errors;
 };
 
@@ -1417,6 +1750,79 @@ const checkResourceRefs = (
       },
     ];
   });
+
+/**
+ * Every `requiresTech` a row declares must name a tech this catalog defines.
+ *
+ * M5's contract says exactly this — "`validateRuleset` rejects a `requiresTech` naming
+ * an unknown tech" — and M6 is the wave that gives it teeth, because M6 is the wave that
+ * makes shipped rows declare one. A gate naming a tech no row defines is invisible in
+ * play: `core/tech.ts`' `unmetTechRequirement` asks whether the player *knows* the id,
+ * nobody can ever know an id that is not in the tree, and so the row becomes
+ * permanently unbuildable content — refused forever with a reason that looks like a
+ * perfectly ordinary "you have not researched this yet". That is the same class of
+ * silent dead end the M5 contract refuses to accept in the tree itself (the cycle
+ * check), and it deserves the same treatment at load time.
+ *
+ * Reported against **the row that declares it**, naming its field, in catalog order —
+ * units, then buildings, then improvements, then resources, which is the order the other
+ * checks run in and therefore the order a caller reads its complaints in. This is
+ * deliberately *not* part of `checkUnit`/`checkBuilding`/…: it is a reference into a
+ * different catalog, and one function that owns the rule for all four kinds is what
+ * stops the fourth kind from being forgotten (which is precisely how the field ended up
+ * unchecked in the first place).
+ *
+ * A row that declares nothing is not complained about, and neither is a *catalog* with
+ * no `techs` section: a structural ruleset view with no tree honestly gates nothing,
+ * and the M6 content rows all live in the shipped catalog.
+ */
+const ROW_REQUIRES_TECH = 'requiresTech';
+
+/**
+ * One catalog row, as the `requiresTech` reference check reads it: both fields
+ * optional and `unknown`, because the row being checked may be data the type system
+ * never saw (a JSON catalog, a `Partial` patch).
+ *
+ * Every spec in the four catalogs is assignable to this — each has a string `id` and
+ * each may carry the field — so the shipped catalog is checked by the same code
+ * without a cast, which is the point: the checker must not be able to *assume* the
+ * shape it exists to verify. This is the same technique, and the same reason, as
+ * `EffectFields` below.
+ */
+interface RowFields {
+  readonly id?: unknown;
+  readonly requiresTech?: unknown;
+}
+
+const checkTechRefsOfRows = (catalog: Catalog): readonly RulesetError[] => {
+  // The section list names each catalog by the field name it has on `Catalog`, so the
+  // error's `catalog` field always matches a section the caller can look up.
+  const sections: readonly (readonly [string, readonly RowFields[]])[] = [
+    ['units', catalog.units],
+    ['buildings', catalog.buildings],
+    ['improvements', catalog.improvements],
+    ['resources', catalog.resources],
+  ];
+
+  return sections.flatMap(([section, rows]) =>
+    rows.flatMap((row) => {
+      const required = row.requiresTech;
+      if (required === undefined) return [];
+      if (typeof required === 'string' && catalog.techs.some((tech) => tech.id === required)) {
+        return [];
+      }
+      return [
+        {
+          kind: 'invalid-value' as const,
+          catalog: section,
+          id: String(row.id),
+          field: ROW_REQUIRES_TECH,
+          detail: `names tech ${JSON.stringify(required)}, which this catalog does not define`,
+        },
+      ];
+    }),
+  );
+};
 
 /**
  * An improvement row has to be buildable and has to mean something:
@@ -1704,6 +2110,12 @@ export const validateRuleset = (
     // is what a caller fixes first, and a graph complaint is only meaningful once
     // the rows it is about are themselves well-formed.
     ...checkTechGraph(catalog.techs),
+    // M6: the `requiresTech` reference check runs in its own block because it is a
+    // *cross-catalog* reference — a unit, building, improvement or resource pointing
+    // into the tree — and because it is only meaningful once the tree it points at has
+    // been checked. Reporting it after `checkTechGraph` means a catalog with a broken
+    // tree hears about the tree first.
+    ...checkTechRefsOfRows(catalog),
   ];
 
   if (fidelity === 'cited-only') {

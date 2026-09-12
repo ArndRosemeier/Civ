@@ -157,7 +157,11 @@ import {
   unmetTechFor,
   unitActions,
   unitCatalog,
+  // M6: the shipped gates are asserted row by row, so the test reads the rows — through
+  // the engine's own readers (`unitDef` for the row, `requiresTechOf` for its gate).
+  unitDef,
   unitMoveOptions,
+  requiresTechOf,
   type City,
   type Command,
   type GameError,
@@ -322,6 +326,19 @@ const cmdKey = (cmd: Command): string => {
       return `SetResearch ${String(cmd.tech)}`;
     case 'EndTurn':
       return 'EndTurn';
+    // M6's two combat commands, keyed by their payload for the M4a reason: two
+    // `AttackUnit`s naming different targets are different commands, and a key that
+    // dropped the target would call them equal — the exact false equivalence this
+    // comparator exists to prevent. `FortifyUnit` carries only its unit, so the unit
+    // is the whole key. Both are keyed although `actions.ts` yields only
+    // `AttackUnit` (`FortifyUnit` is a setting, reachable through `planFortifyUnit`):
+    // the switch is exhaustive on purpose, so a `Command` variant this comparator
+    // cannot name would be a typecheck failure rather than two different commands
+    // comparing equal.
+    case 'AttackUnit':
+      return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
+    case 'FortifyUnit':
+      return `FortifyUnit ${String(cmd.unitId)}`;
   }
 };
 
@@ -1172,7 +1189,35 @@ describe('2. the tech tree — reachability, cycles, eras', () => {
       }
     }
     const all = techCatalog(RULESET).map((tech) => String(tech.id));
-    expect(all.length).toBe(17);
+    // **The count is pinned, and from M6 so is the set.** It was 17 through M5 and is 19
+    // from M6, which added `map-making` and `horseback-riding` so the M6 contract's
+    // requirement — "at least one new gated unit and one gated building/improvement must
+    // declare `requiresTech`, and at least one unit must declare `requiresResource`" —
+    // could be met by *content* rather than by a test override. A count alone would let one
+    // tech be renamed into another's place, so the ids are compared too: a row added,
+    // removed or renamed has to come here and say so.
+    expect([...all].sort()).toEqual([
+      'alphabet',
+      'banking',
+      'bronze-working',
+      'ceremonial-burial',
+      'currency',
+      'education',
+      'electricity',
+      'engineering',
+      'feudalism',
+      'horseback-riding',
+      'iron-working',
+      'literature',
+      'map-making',
+      'masonry',
+      'mathematics',
+      'pottery',
+      'steam-power',
+      'the-wheel',
+      'warrior-code',
+    ]);
+    expect(all.length).toBe(19);
     expect([...reached].sort()).toEqual([...all].sort());
   });
 
@@ -1961,11 +2006,24 @@ describe('5. the two gates compose, and neither masks the other', () => {
 
   it('the resource gate alone still works, on the shipped catalog', () => {
     // The M4c rule, re-checked here so that "the tech gate was wired" cannot have been
-    // bought by weakening the resource gate: on the SHIPPED catalog (no tech gates at
-    // all) the swordsman is refused for want of a connection, with the resource named.
+    // bought by weakening the resource gate: on the shipped catalog the swordsman —
+    // a row that declares a resource and **no** tech — is refused for want of a
+    // connection, with the resource named.
+    //
+    // M6 sharpened this case from "the shipped catalog has no tech gates" to "this row has
+    // none": shipped content does declare tech gates from M6 on (the whole point of that
+    // milestone's gating evidence), and the swordsman is the shipped row that isolates the
+    // resource dimension, so the assertion below still fails if the resource gate is
+    // weakened and cannot be satisfied by the tech gate answering instead — the refusal
+    // kind and the named resource are both pinned.
     const world = shippedWorld();
     const city = cityOf(world, ROME);
     if (city === undefined) throw new Error('no Roman city');
+    // The row's *own* gate is absent — read through the engine's one reader of the field
+    // (`UnitDef` does not declare `requiresTech`; M5 reads it structurally).
+    const swordsmanRow = unitDef(RULESET, SWORDSMAN.id);
+    expect(swordsmanRow).toBeDefined();
+    expect(requiresTechOf(swordsmanRow)).toBeUndefined();
     const gate = productionGate(world, RULESET, ROME, SWORDSMAN);
     expect(gate).toEqual({ kind: 'blocked', resource: asResourceId('iron') });
     const applied = applyCommand(
@@ -1984,14 +2042,66 @@ describe('5. the two gates compose, and neither masks the other', () => {
   });
 
   it('a resource row’s own tech gates its own visibility, and never the tile', () => {
-    // The unimplemented-looking corner: `techUnlocks` reads the four catalogs and reports
-    // what a tech unlocks. On the shipped catalog no row declares a gate, so it reports
-    // nothing — and this asserts that the *honest* empty answer is still total rather
-    // than throwing, because a reader is entitled to ask.
-    for (const tech of techCatalog(RULESET)) {
-      expect(techUnlocks(RULESET, tech.id)).toEqual([]);
+    // `techUnlocks` reads the four catalogs and reports what a tech unlocks.
+    //
+    // **M6 inverted the shipped half of this test, and the new assertion is stronger than
+    // the old one.** M5 could only say "on the shipped catalog no row declares a gate, so
+    // the answer is an honest empty list". M6 requires shipped content to *use* the gates,
+    // so the empty list is now false by construction; what replaces it is the claim the
+    // old one was standing in for — that `techUnlocks` agrees, row for row, with the gates
+    // the catalog really declares. The expected answer is re-derived here from
+    // `CATALOG`'s own rows (every row of every gated section that names a `requiresTech`),
+    // so the test cannot be satisfied by editing both sides together, and it is checked
+    // for every tech in the tree: a row whose gate names a tech that does not exist, a gate
+    // `techUnlocks` forgets to report, and a reported gate no row declares all fail.
+    const declared = new Map<string, string[]>();
+    const note = (tech: string, entry: string): void => {
+      const list = declared.get(tech);
+      if (list === undefined) declared.set(tech, [entry]);
+      else list.push(entry);
+    };
+    for (const row of CATALOG.units) {
+      if (row.requiresTech !== undefined) note(String(row.requiresTech), `unit:${String(row.id)}`);
     }
-    // On the gated fixture it reports the four rows this file gated, each named.
+    for (const row of CATALOG.buildings) {
+      if (row.requiresTech !== undefined) {
+        note(String(row.requiresTech), `building:${String(row.id)}`);
+      }
+    }
+    for (const row of CATALOG.improvements) {
+      if (row.requiresTech !== undefined) {
+        note(String(row.requiresTech), `improvement:${String(row.id)}`);
+      }
+    }
+
+    // Non-vacuity first: M6's whole claim is that shipped content exercises the gate, so a
+    // catalog that declared none would fail here rather than pass by agreeing about nothing.
+    expect(declared.size).toBeGreaterThan(0);
+    for (const tech of techCatalog(RULESET)) {
+      const reported = techUnlocks(RULESET, tech.id)
+        .map((entry) => `${entry.kind}:${entry.id}`)
+        .sort();
+      expect(reported, `techUnlocks disagrees about ${String(tech.id)}`).toEqual(
+        (declared.get(String(tech.id)) ?? []).sort(),
+      );
+    }
+
+    // And the shipped gates are the M6 ones, named: the gate that is really read by play
+    // rather than only reported. `ceremonial-burial` unlocks the temple, `warrior-code` the
+    // archer and the spearman, `map-making` the transport, `horseback-riding` the horseman
+    // (which also declares a resource requirement — one row, two gates; see
+    // `m6-adversarial.test.ts` for the through-play assertions).
+    const shippedUnlocks = (id: string): readonly string[] =>
+      techUnlocks(RULESET, TECH(id))
+        .map((entry) => `${entry.kind}:${entry.id}`)
+        .sort();
+    expect(shippedUnlocks('ceremonial-burial')).toEqual(['building:temple']);
+    expect(shippedUnlocks('warrior-code')).toEqual(['unit:archer', 'unit:spearman']);
+    expect(shippedUnlocks('map-making')).toEqual(['unit:transport']);
+    expect(shippedUnlocks('horseback-riding')).toEqual(['unit:horseman']);
+    expect(shippedUnlocks('pottery')).toEqual([]);
+
+    // The GATED fixture's four rows are still reported, each named — the M5 half, unchanged.
     const unlocks = techUnlocks(GATED, TECH('bronze-working'));
     expect(unlocks.map((entry) => `${entry.kind}:${entry.id}`)).toEqual(['resource:iron']);
     expect(techUnlocks(GATED, TECH('alphabet')).map((e) => `${e.kind}:${e.id}`)).toEqual([
@@ -2295,22 +2405,27 @@ describe('8. what the goldens actually gate, measured', () => {
       expect(entry.hash).toMatch(/^[0-9a-f]{16}$/);
       expect(entry.name.length).toBeGreaterThan(0);
     }
-    expect(file.entries.length).toBe(4);
+    // Five from M6: the three fresh worlds, the played world, and the played world with a
+    // battle applied (`played-civs2-seed42-combat`) — the entry M6's acceptance list asks
+    // for, named rather than counted so a replacement cannot pass.
+    expect(file.entries.length).toBe(5);
     // The Node major is pinned, so a hash moving because the *runtime* moved is reported
     // as such rather than as a game change.
     expect(file.nodeMajor).toBe(24);
   });
 
   it('gates semantics too: a played entry is pinned, not only fresh worlds', () => {
-    // The measurement behind "a real gate": three of the four entries are `newGame`
-    // output (generation and assembly), and the fourth is a played state — so a change
-    // to a *rule the script exercises* moves the file. Item 6 measures the movement; this
-    // states the coverage.
+    // The measurement behind "a real gate": three of the five entries are `newGame`
+    // output (generation and assembly), one is a played state, and — from M6 — one is a
+    // played state with a battle applied through the applier, so a change to a *rule the
+    // script or the resolver exercises* moves the file. Item 6 measures the movement; this
+    // states the coverage, and the whole list is named.
     const file = loadGoldens();
     if (file === undefined) throw new Error('no golden file');
     const names = file.entries.map((entry) => entry.name).sort();
     expect(names).toEqual([
       'played-civs2-seed42',
+      'played-civs2-seed42-combat',
       'tiny-civs2-seed1',
       'tiny-civs2-seed1337',
       'tiny-civs2-seed42',
@@ -2319,6 +2434,13 @@ describe('8. what the goldens actually gate, measured', () => {
     const fresh = file.entries.find((entry) => entry.name === 'tiny-civs2-seed42');
     if (played === undefined || fresh === undefined) throw new Error('entries missing');
     expect(played.hash).not.toBe(fresh.hash);
+    // …and the combat entry is a third distinct value, derived from the played one: a
+    // battle that changed nothing would hash as the played world, which is exactly the
+    // failure this entry exists to make impossible.
+    const combat = file.entries.find((entry) => entry.name === 'played-civs2-seed42-combat');
+    if (combat === undefined) throw new Error('the combat entry is missing');
+    expect(combat.hash).not.toBe(played.hash);
+    expect(combat.hash).not.toBe(fresh.hash);
   });
 
   it('does NOT gate behaviour — and here are the measurements, not an opinion', () => {

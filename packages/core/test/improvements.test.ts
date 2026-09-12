@@ -344,7 +344,7 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
  * ------------------------------------------------------------------ */
 
 describe('GameState.improvements at setup', () => {
-  it('starts empty, as an array, at schema version 7', () => {
+  it('starts empty, as an array, at schema version 8', () => {
     // A fifth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b -> M4c -> M5): the
     // field is empty here, and the version moved with it, so a save from the previous
     // shape is recognisable rather than silently misread. M4b moved it because
@@ -365,7 +365,7 @@ describe('GameState.improvements at setup', () => {
     expect(game.value.improvements).toEqual([]);
     expect(Array.isArray(game.value.improvements)).toBe(true);
     expect(game.value.schemaVersion).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(7);
+    expect(SCHEMA_VERSION).toBe(8);
 
     // M4c's map key, read the same way and for the same reason: a fresh game's map
     // always *carries* `resources`, and this stand-in catalog ships no resource row,

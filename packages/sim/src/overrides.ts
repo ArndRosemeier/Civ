@@ -154,12 +154,26 @@ export const OVERRIDE_SECTIONS: readonly OverrideSection[] = [
  * runtime against the keys a patch really carries — so a mangled JSON patch cannot
  * silently no-op. Widening each list to `readonly string[]` (below) is an ordinary
  * widening assignment, not a cast: the typed list stays the source of truth.
+ *
+ * **Every field of every patch type belongs in the list it is typed against, and
+ * M6 is where that stopped being a formality.** The unit list had no `hitPoints`, so
+ * `mergeUnit` — which rebuilds each row field by field — dropped it: a patch naming
+ * any *other* unit field silently reset the world's hit points, and a patch naming
+ * `hitPoints` was refused as an unknown field, which made M6's combat statistics
+ * unsweepable exactly where M6 asks for a combat balance sweep. The lists below are
+ * the patch types' own `keyof` sets, so a field added to a patch type without a
+ * matching list entry fails the compile rather than going quietly unsweepable.
  */
 const TERRAIN_FIELDS: readonly (keyof TerrainPatch)[] = [
   'role',
   'name',
   'moveCost',
   'defenseBonusPct',
+  // M6's name for the same magnitude. Both are patchable, and `mergeTerrain` sets
+  // both, because `core/combat.ts` reads `defenseBonus` in preference to the older
+  // spelling — a patch that moved only one of the two would change nothing a battle
+  // can see.
+  'defenseBonus',
   'impassable',
 ];
 const UNIT_FIELDS: readonly (keyof UnitPatch)[] = [
@@ -171,6 +185,11 @@ const UNIT_FIELDS: readonly (keyof UnitPatch)[] = [
   'cost',
   'domain',
   'requiresResource',
+  // M6.
+  'hitPoints',
+  // M5, unwired until M6: a tech-gated row has to be sweepable, and a rebuild that
+  // dropped `requiresTech` would silently un-gate a gated unit.
+  'requiresTech',
 ];
 const BUILDING_FIELDS: readonly (keyof BuildingPatch)[] = [
   'name',
@@ -178,12 +197,14 @@ const BUILDING_FIELDS: readonly (keyof BuildingPatch)[] = [
   'maintenance',
   'effects',
   'wonder',
+  'requiresTech',
 ];
 const IMPROVEMENT_FIELDS: readonly (keyof ImprovementPatch)[] = [
   'kind',
   'name',
   'turns',
   'allowedRoles',
+  'requiresTech',
 ];
 const RESOURCE_FIELDS: readonly (keyof ResourcePatch)[] = ['name', 'kind', 'allowedRoles'];
 
@@ -347,18 +368,30 @@ const mergeTerrain = (
     ['name', row.name, patch.name],
     ['moveCost', row.moveCost, patch.moveCost],
     ['defenseBonusPct', row.defenseBonusPct, patch.defenseBonusPct],
+    // M6's spelling of the same magnitude, recorded separately when a patch names it:
+    // the record is about what a sweep said, and "defenseBonus" and "defenseBonusPct"
+    // are different keys even though the merge treats them as one number.
+    ['defenseBonus', row.defenseBonus, patch.defenseBonus],
     ['impassable', row.impassable, patch.impassable],
   ]);
   recordYields(notes, 'terrains', id, row.yields, patch.yields);
+
+  // One magnitude, two names: whichever the patch named is written to **both**, so the
+  // engine's two readers (`terrainDefenseBonus` prefers `defenseBonus`; `validateRuleset`
+  // refuses a row whose spellings disagree) cannot end up looking at different numbers.
+  const nextDefenseBonus = patch.defenseBonus ?? patch.defenseBonusPct ?? row.defenseBonus;
 
   return ok({
     id: row.id,
     role: patch.role ?? row.role,
     name: patch.name ?? row.name,
     moveCost: patch.moveCost ?? row.moveCost,
-    defenseBonusPct: patch.defenseBonusPct ?? row.defenseBonusPct,
+    defenseBonusPct: patch.defenseBonus ?? patch.defenseBonusPct ?? row.defenseBonusPct,
     yields: mergeYields(row.yields, patch.yields),
     impassable: patch.impassable ?? row.impassable,
+    // Absent stays absent: a hand-built row that declares only the older spelling comes
+    // back declaring only the older spelling, never a key holding `undefined`.
+    ...(nextDefenseBonus === undefined ? {} : { defenseBonus: nextDefenseBonus }),
     provenance: row.provenance,
   });
 };
@@ -381,9 +414,15 @@ const mergeUnit = (
     ['cost', row.cost, patch.cost],
     ['domain', row.domain, patch.domain],
     ['requiresResource', row.requiresResource, patch.requiresResource],
+    // M6: hit points, and M5's tech gate. Both are recorded like every other field, and
+    // both are carried across below — the rebuild is explicit, so a field this list
+    // forgets is a field the override *deletes*.
+    ['hitPoints', row.hitPoints, patch.hitPoints],
+    ['requiresTech', row.requiresTech, patch.requiresTech],
   ]);
 
   const requiresResource = patch.requiresResource ?? row.requiresResource;
+  const requiresTech = patch.requiresTech ?? row.requiresTech;
   return ok({
     id: row.id,
     role: patch.role ?? row.role,
@@ -393,9 +432,16 @@ const mergeUnit = (
     movement: patch.movement ?? row.movement,
     cost: patch.cost ?? row.cost,
     domain: patch.domain ?? row.domain,
+    // M6's combat statistics are part of the row, not a fixture of the combat module:
+    // dropping `hitPoints` here would reset every unit's health to the reader's
+    // fallback, and dropping `requiresTech` would silently un-gate a gated row.
+    ...(row.hitPoints === undefined && patch.hitPoints === undefined
+      ? {}
+      : { hitPoints: patch.hitPoints ?? row.hitPoints }),
     // Absent stays absent — never a key holding `undefined`, which no JSON round trip
     // and no hash would survive (`canonicalize` rejects it by design).
     ...(requiresResource === undefined ? {} : { requiresResource }),
+    ...(requiresTech === undefined ? {} : { requiresTech }),
     provenance: row.provenance,
   });
 };
@@ -415,9 +461,11 @@ const mergeBuilding = (
     ['maintenance', row.maintenance, patch.maintenance],
     ['effects', row.effects, patch.effects],
     ['wonder', row.wonder, patch.wonder],
+    ['requiresTech', row.requiresTech, patch.requiresTech],
   ]);
 
   const wonder = patch.wonder ?? row.wonder;
+  const requiresTech = patch.requiresTech ?? row.requiresTech;
   return ok({
     id: row.id,
     name: patch.name ?? row.name,
@@ -425,6 +473,7 @@ const mergeBuilding = (
     maintenance: patch.maintenance ?? row.maintenance,
     effects: patch.effects ?? row.effects,
     ...(wonder === undefined ? {} : { wonder }),
+    ...(requiresTech === undefined ? {} : { requiresTech }),
     provenance: row.provenance,
   });
 };
@@ -448,9 +497,11 @@ const mergeImprovement = (
     ['name', row.name, patch.name],
     ['turns', row.turns, patch.turns],
     ['allowedRoles', row.allowedRoles, patch.allowedRoles],
+    ['requiresTech', row.requiresTech, patch.requiresTech],
   ]);
   recordYields(notes, 'improvements', id, row.yields, patch.yields);
 
+  const requiresTech = patch.requiresTech ?? row.requiresTech;
   return ok({
     id: row.id,
     kind: patch.kind ?? row.kind,
@@ -458,6 +509,7 @@ const mergeImprovement = (
     turns: patch.turns ?? row.turns,
     yields: mergeYields(row.yields, patch.yields),
     allowedRoles: patch.allowedRoles ?? row.allowedRoles,
+    ...(requiresTech === undefined ? {} : { requiresTech }),
     provenance: row.provenance,
   });
 };

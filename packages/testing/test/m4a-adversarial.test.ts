@@ -318,6 +318,19 @@ const cmdKey = (cmd: Command): string => {
     // reason the M4a work keys carry the improvement kind.
     case 'SetResearch':
       return `SetResearch ${String(cmd.tech)}`;
+    // M6's two combat commands, keyed by their payload for the M4a reason: two
+    // `AttackUnit`s naming different targets are different commands, and a key that
+    // dropped the target would call them equal — the exact false equivalence this
+    // comparator exists to prevent. `FortifyUnit` carries only its unit, so the unit
+    // is the whole key. Both are keyed although `actions.ts` yields only
+    // `AttackUnit` (`FortifyUnit` is a setting, reachable through `planFortifyUnit`):
+    // the switch is exhaustive on purpose, so a `Command` variant this comparator
+    // cannot name would be a typecheck failure rather than two different commands
+    // comparing equal.
+    case 'AttackUnit':
+      return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
+    case 'FortifyUnit':
+      return `FortifyUnit ${String(cmd.unitId)}`;
   }
 };
 
@@ -2086,6 +2099,10 @@ describe('6. goldens: what they cover, and what they do not', () => {
     // script. So the entries this file owns are compared value for value, and the file's
     // *whole* scenario list is pinned below: a missing scenario or a stray one fails
     // here exactly as it did when the file held three.
+    //
+    // M6 adds a fifth entry, `played-civs2-seed42-combat` (the played world plus one
+    // `AttackUnit` applied through the applier), which this file cannot recompute either and
+    // therefore pins by name — the three fresh worlds are still compared value for value.
     const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
     expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
@@ -2093,6 +2110,7 @@ describe('6. goldens: what they cover, and what they do not', () => {
       'tiny-civs2-seed42',
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
+      'played-civs2-seed42-combat',
     ]);
 
     const state = goldenState(42);

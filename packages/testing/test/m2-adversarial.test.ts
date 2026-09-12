@@ -331,6 +331,19 @@ const cmdKey = (cmd: Command): string => {
     // generator's output and the sweeps below are unaffected by its addition.
     case 'SetResearch':
       return `SetResearch ${String(cmd.tech)}`;
+    // M6's two combat commands, keyed by their payload for the M4a reason: two
+    // `AttackUnit`s naming different targets are different commands, and a key that
+    // dropped the target would call them equal — the exact false equivalence this
+    // comparator exists to prevent. `FortifyUnit` carries only its unit, so the unit
+    // is the whole key. Both are keyed although `actions.ts` yields only
+    // `AttackUnit` (`FortifyUnit` is a setting, reachable through `planFortifyUnit`):
+    // the switch is exhaustive on purpose, so a `Command` variant this comparator
+    // cannot name would be a typecheck failure rather than two different commands
+    // comparing equal.
+    case 'AttackUnit':
+      return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
+    case 'FortifyUnit':
+      return `FortifyUnit ${String(cmd.unitId)}`;
   }
 };
 
@@ -2116,6 +2129,12 @@ describe('goldens — still a real, non-vacuous gate', () => {
     // which is therefore not this file's to judge. So the entries this file owns are
     // compared value for value, and the file's whole scenario list is pinned below:
     // neither a missing scenario nor a stray one can pass.
+    //
+    // M6 adds a **fifth**: `played-civs2-seed42-combat`, the played world with one
+    // `AttackUnit` applied through the applier. This file cannot recompute that either (it
+    // holds neither the played script nor a battle), so it is pinned by name only — and the
+    // three fresh worlds, which are this file's whole subject, are still compared value for
+    // value under the same assertion as before.
     const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
     expect(newGameEntries).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
@@ -2123,8 +2142,9 @@ describe('goldens — still a real, non-vacuous gate', () => {
       'tiny-civs2-seed42',
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
+      'played-civs2-seed42-combat',
     ]);
-    expect(new Set(stored.entries.map((entry) => entry.hash)).size).toBe(GOLDEN_SEEDS.length + 1);
+    expect(new Set(stored.entries.map((entry) => entry.hash)).size).toBe(GOLDEN_SEEDS.length + 2);
     expect(
       stored.entries.every((entry) => /^[0-9a-f]{16}$/.test(entry.hash)),
       'every hash is a 16-character FNV-1a 64 digest',

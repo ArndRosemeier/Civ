@@ -111,11 +111,18 @@ const GRID: readonly TerrainRole[] = [
   'grassland',
 ];
 
+/**
+ * A hand-built unit row. M6 makes `hitPoints` part of what a row declares, so this
+ * fixture states it: a row that stayed silent would make `fullHitPoints` answer 1 for
+ * every unit, and the reward assertions below — which pin the health of units the
+ * *engine* spawns — would be pinning that fallback instead of the rule.
+ */
 const unitDefOf = (
   id: string,
   role: UnitRole,
   domain: 'land' | 'sea',
   movement: number,
+  hitPoints: number,
 ): UnitDef => ({
   id: asUnitTypeId(id),
   role,
@@ -125,11 +132,12 @@ const unitDefOf = (
   movement,
   cost: 1,
   domain,
+  hitPoints,
 });
 
-const SETTLER = unitDefOf('settler', 'settler', 'land', 2);
-const WARRIOR = unitDefOf('warrior', 'military', 'land', 2);
-const GALLEY = unitDefOf('galley', 'military', 'sea', 3);
+const SETTLER = unitDefOf('settler', 'settler', 'land', 2, 1);
+const WARRIOR = unitDefOf('warrior', 'military', 'land', 2, 3);
+const GALLEY = unitDefOf('galley', 'military', 'sea', 3, 3);
 
 /**
  * The REWARD rule is canonical, not positional (see the describe block at the foot of
@@ -201,6 +209,11 @@ const unit = (id: number, type: UnitTypeId, owner: number, tile: number): Unit =
   owner: asPlayerId(owner),
   tile: asTileIndex(tile),
   movementLeft: unitDef(RULESET, type)?.movement ?? 0,
+  // M6: a unit in a real state carries its health — `newGame` and `spawnUnit` both
+  // write it — so the fixture does too, at full, from the row it names. A fixture that
+  // left it absent would make the reward comparisons below silent about health, and the
+  // engine's own spawns would then be compared against a unit shape nothing produces.
+  hitPointsLeft: unitDef(RULESET, type)?.hitPoints ?? 1,
 });
 
 /** A civilization's settler standing **on** the hut — the post-move state. */
@@ -341,7 +354,9 @@ describe('hut.ts — the three rewards', () => {
 
     // The reward unit is the cheapest military **land** row — here the warrior, the
     // only one — at full movement, standing on the hut tile with the mover: M2 lets a
-    // player's own units stack.
+    // player's own units stack. M6: both units are at **full health**, which is what
+    // `spawnUnit` grants a unit that has just come into being — the warrior's three hit
+    // points are its row's, not the 1 a silent row would have produced.
     expect(outcome.state.units).toStrictEqual([
       {
         id: asUnitId(0),
@@ -349,6 +364,7 @@ describe('hut.ts — the three rewards', () => {
         owner: asPlayerId(0),
         tile: asTileIndex(5),
         movementLeft: 2,
+        hitPointsLeft: 1,
       },
       {
         id: asUnitId(1),
@@ -356,6 +372,7 @@ describe('hut.ts — the three rewards', () => {
         owner: asPlayerId(0),
         tile: asTileIndex(5),
         movementLeft: 2,
+        hitPointsLeft: 3,
       },
     ]);
     expect(outcome.state.nextUnitId).toBe(2);
@@ -391,7 +408,8 @@ describe('hut.ts — the three rewards', () => {
     ]);
 
     // The band belongs to the barbarian player and are ordinary `Unit`s: full
-    // movement, a type the ruleset describes, and no special-casing anywhere.
+    // movement, a type the ruleset describes, and no special-casing anywhere. M6: full
+    // health too, like every unit the engine spawns — barbarians are not spawned wounded.
     expect(BARBARIAN_BAND_SIZE).toBe(2);
     expect(idsOf(outcome.state, Number(BARBARIANS.id))).toEqual([1, 2]);
     expect(outcome.state.units.slice(1)).toStrictEqual([
@@ -401,6 +419,7 @@ describe('hut.ts — the three rewards', () => {
         owner: BARBARIANS.id,
         tile: asTileIndex(1),
         movementLeft: 2,
+        hitPointsLeft: 3,
       },
       {
         id: asUnitId(2),
@@ -408,6 +427,7 @@ describe('hut.ts — the three rewards', () => {
         owner: BARBARIANS.id,
         tile: asTileIndex(2),
         movementLeft: 2,
+        hitPointsLeft: 3,
       },
     ]);
 
@@ -641,9 +661,16 @@ describe('hut.ts — totality', () => {
  *   when it is a measurement instead of a hope.
  */
 describe('hut.ts — the reward unit is a canonical pick, not a row position', () => {
-  /** A military land row with a chosen price: the two keys of the canonical rule. */
+  /**
+   * A military land row with a chosen price: the two keys of the canonical rule.
+   *
+   * The hit points are the fixture's `1` rather than anything the pick reads: M6 made a
+   * row's health part of the row, but the reward rule is still "cheapest, ties by id",
+   * and a row that declared no health at all would only be exercising the reader's
+   * fallback. What this test is about is that *price* and *id* decide, never position.
+   */
   const row = (id: string, cost: number, spec: readonly [UnitRole, 'land' | 'sea']): UnitDef => ({
-    ...unitDefOf(id, spec[0], spec[1], 2),
+    ...unitDefOf(id, spec[0], spec[1], 2, 1),
     cost,
   });
 

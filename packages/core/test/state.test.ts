@@ -42,7 +42,10 @@ import {
   type GameState,
   type SetupError,
 } from '../src/state.js';
-import { unitById, unitsOnTile, type UnitDef, type UnitRole } from '../src/units.js';
+import { unitById, unitDef, unitsOnTile, type UnitDef, type UnitRole } from '../src/units.js';
+// M6: the hasher is the judge of "no key holds `undefined`", because that is the
+// condition that makes a state unhashable rather than merely untidy.
+import { canonicalize, hashValue } from '@civts/testing';
 
 const ROLES: readonly TerrainRole[] = TERRAIN_ROLES;
 const IMPASSABLE_ROLES: readonly TerrainRole[] = ['ocean', 'mountains'];
@@ -536,6 +539,98 @@ describe('starting units', () => {
 });
 
 /**
+ * M6's starting state: `hitPointsLeft` on every unit, and the two optional keys that
+ * `newGame` must **not** write.
+ *
+ * The distinction this block exists for is the one the whole project keeps paying for:
+ * "a starting unit has no promotions and is not fortified" is spelled by the key being
+ * *absent*, never by `experience: 0` or `fortified: false` and never by a key holding
+ * `undefined`. The last of those cannot survive a JSON round trip and is exactly what
+ * `canonicalize` rejects, so the state would stop being hashable.
+ */
+describe('starting units — M6 puts hit points on the board', () => {
+  /**
+   * A stand-in ruleset whose units declare **no** `hitPoints`, which is the shape every
+   * `UnitDef` literal in this suite has. It is here so the totality rule is proved rather
+   * than assumed: a view that says nothing must yield 1 hit point, never 0 — a starting
+   * unit at 0 would be a live unit at zero hit points, the state M6 forbids.
+   */
+  const NO_HIT_POINTS: RulesetView = {
+    ...RULESET,
+    units: [SETTLER, makeUnit('worker', 'worker', 1)],
+  };
+
+  /** The same rows, but declaring their maximum health — what shipped content looks like. */
+  const WITH_HIT_POINTS: RulesetView = {
+    ...RULESET,
+    units: [
+      { ...SETTLER, hitPoints: 3 },
+      { ...makeUnit('worker', 'worker', 1), hitPoints: 2 },
+    ],
+  };
+
+  it('gives every unit a hitPointsLeft inside 1..hitPoints', () => {
+    const state = mustGame(5, SETTINGS, WITH_HIT_POINTS);
+    expect(state.units.length).toBeGreaterThan(0);
+
+    for (const unit of state.units) {
+      const def = unitDef(WITH_HIT_POINTS, unit.type);
+      expect(def).toBeDefined();
+      const maximum = def?.hitPoints ?? 1;
+
+      expect(unit.hitPointsLeft).toBeDefined();
+      expect(Number.isInteger(unit.hitPointsLeft)).toBe(true);
+      expect(unit.hitPointsLeft).toBeGreaterThanOrEqual(1);
+      expect(unit.hitPointsLeft).toBeLessThanOrEqual(maximum);
+      // A fresh game has taken no damage, so it is *at* the maximum, not merely within it.
+      expect(unit.hitPointsLeft).toBe(maximum);
+    }
+  });
+
+  it('never places a unit at 0 hit points, even when the ruleset declares none', () => {
+    // Every unit's type in this view omits `hitPoints`, so this is the totality path: the
+    // answer must be 1, because 0 is the one value that would mean "already destroyed".
+    const state = mustGame(5, SETTINGS, NO_HIT_POINTS);
+    for (const unit of state.units) {
+      expect(unit.hitPointsLeft).toBe(1);
+      expect(unit.hitPointsLeft).not.toBe(0);
+    }
+  });
+
+  it('omits experience and fortified — absence is what "none" means', () => {
+    const state = mustGame(5, SETTINGS, WITH_HIT_POINTS);
+    expect(state.units.length).toBeGreaterThan(0);
+
+    for (const unit of state.units) {
+      expect('experience' in unit).toBe(false);
+      expect('fortified' in unit).toBe(false);
+      expect(Object.keys(unit)).not.toContain('experience');
+      expect(Object.keys(unit)).not.toContain('fortified');
+    }
+
+    // The hasher is the real judge: `canonicalize` throws on any `undefined` it meets, so
+    // it would reject a state whose units carried a present-but-`undefined` key.
+    expect(() => canonicalize(state)).not.toThrow();
+    expect(JSON.stringify(state)).not.toContain('undefined');
+  });
+
+  it('is schema version 8 and says so on every unit, at a seed that reproduces', () => {
+    const first = mustGame(11, SETTINGS, WITH_HIT_POINTS);
+    const second = mustGame(11, SETTINGS, WITH_HIT_POINTS);
+
+    expect(first.schemaVersion).toBe(8);
+    expect(second).toEqual(first);
+    // The hit points are inside the hashed JSON, so two games that differed only there
+    // would be two different states.
+    const wounded: GameState = {
+      ...first,
+      units: first.units.map((unit, index) => (index === 0 ? { ...unit, hitPointsLeft: 1 } : unit)),
+    };
+    expect(hashValue(wounded)).not.toBe(hashValue(first));
+  });
+});
+
+/**
  * M4b's starting army: a settler **and a worker** per civilization. Without the
  * worker the improvement system is unreachable at setup — a player would have to
  * found a city and produce one before it could build anything — which is why the
@@ -802,19 +897,25 @@ describe('starting fog', () => {
  * it is the contract a save file and a golden file are read under. M4c moved it
  * 5 → 6 because `GameMap` gained the sparse resource list, which changes every
  * state hash exactly as a new `GameState` key would (INTERFACES.md M4c,
- * "Resources" and "Migration owners"). M5 moves it 6 → 7 because `PlayerState`
+ * "Resources" and "Migration owners"). M5 moved it 6 → 7 because `PlayerState`
  * gained `techs` and the optional `researching` — two new keys inside the hashed
- * JSON, so every stored hash moves again (INTERFACES.md M5, "Research").
+ * JSON, so every stored hash moved again (INTERFACES.md M5, "Research").
+ *
+ * M6 moves it 7 → 8 because `Unit` gained `hitPointsLeft` (written on every unit
+ * `newGame` places) plus the two omitted-when-default keys `experience` and
+ * `fortified`, which `newGame` deliberately does **not** write. One new key per
+ * starting unit inside the hashed JSON, so every stored hash moves once more
+ * (INTERFACES.md M6, "Units in play").
  */
 describe('the persisted state shape', () => {
-  it('is schema version 7 — M5 put the tech list and the research choice on the player', () => {
+  it('is schema version 8 — M6 put hit points on the unit and combat on the board', () => {
     // Pinned by *value*, not by `toBe(SCHEMA_VERSION)`. A test that agrees with
     // whatever the constant says cannot notice a shape change that was never
     // recorded, and recording it is the whole point of the number: the comment
     // above `SCHEMA_VERSION` is where the history is written down, this is where it
     // is enforced. When the shape moves again, this line moves with it — in the
     // same commit as the golden regeneration, which is what a rehash is.
-    expect(SCHEMA_VERSION).toBe(7);
+    expect(SCHEMA_VERSION).toBe(8);
   });
 
   it('gives every player a tech list, and gives nobody a research choice', () => {

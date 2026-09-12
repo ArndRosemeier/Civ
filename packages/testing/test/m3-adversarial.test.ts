@@ -200,6 +200,10 @@ import {
   unitById,
   unitDef,
   unitMoveOptions,
+  // M6: the engine's own verdict on the third gating dimension, so the long economy
+  // sweep below can name the *tech* refusal it now legitimately meets (shipped content
+  // declares `requiresTech` from M6 on) without inventing a second reading of the rule.
+  unmetItemTech,
   visibleTiles,
   type BuildingId,
   type City,
@@ -339,6 +343,19 @@ const cmdKey = (cmd: Command): string => {
     // commands.
     case 'SetResearch':
       return `SetResearch ${String(cmd.tech)}`;
+    // M6's two combat commands, keyed by their payload for the M4a reason: two
+    // `AttackUnit`s naming different targets are different commands, and a key that
+    // dropped the target would call them equal — the exact false equivalence this
+    // comparator exists to prevent. `FortifyUnit` carries only its unit, so the unit
+    // is the whole key. Both are keyed although `actions.ts` yields only
+    // `AttackUnit` (`FortifyUnit` is a setting, reachable through `planFortifyUnit`):
+    // the switch is exhaustive on purpose, so a `Command` variant this comparator
+    // cannot name would be a typecheck failure rather than two different commands
+    // comparing equal.
+    case 'AttackUnit':
+      return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
+    case 'FortifyUnit':
+      return `FortifyUnit ${String(cmd.unitId)}`;
   }
 };
 
@@ -1348,17 +1365,43 @@ describe('hut honesty — consumed once, drawn exactly once, never on water or u
   it('draws exactly one RNG value per entry, and nothing for a move that enters no hut', () => {
     const rec = recorder();
     let state = generatedFor(1);
-    const walkerId = state.units[0]?.id;
-    if (walkerId === undefined) throw new Error('seed 1 has no units');
+    const firstWalker = state.units[0];
+    if (firstWalker === undefined) throw new Error('seed 1 has no units');
+    /** The player whose units carry the sweep, so a replacement is one of its own. */
+    const ownerId = firstWalker.owner;
+    let walkerId = firstWalker.id;
 
     let entries = 0;
     let plainMoves = 0;
+    /** Battles the barbarian step fought inside an `EndTurn` — M6's one new RNG reason. */
+    let battlesFought = 0;
+    /** Unit ids that disappeared together with a `UnitDestroyed` event naming them. */
+    const explainedDeaths = new Set<number>();
+    let handovers = 0;
 
     // One unit, many huts: the point is that the draw is per *entry*, not per
     // unit, per turn or per hut-consuming command.
     for (let step = 0; step < 80; step += 1) {
-      const walker = unitById(state, walkerId);
-      if (walker === undefined) throw new Error('the walker vanished');
+      // **M6 changed what can happen to the walker mid-sweep.** A hut's barbarian band is
+      // no longer inert scenery: `advanceTurn`'s barbarian step attacks what stands beside
+      // it, and the walker can be killed — so "the walker vanished" is no longer a bug, it
+      // is Tuesday. The sweep therefore hands the job to the next unit of the same player
+      // (id order, i.e. the state's own order) and *records the handover*: a walker that
+      // disappears with no `UnitDestroyed` event naming it is still a hard failure, because
+      // that is a phantom unit rather than a casualty. The alternative — throwing — would
+      // make this test's pass depend on a barbarian's dice.
+      let walker = unitById(state, walkerId);
+      if (walker === undefined) {
+        rec.check(
+          explainedDeaths.has(Number(walkerId)),
+          `step ${String(step)}: the walker (unit ${String(walkerId)}) vanished with no UnitDestroyed event naming it`,
+        );
+        const replacement = state.units.find((candidate) => candidate.owner === ownerId);
+        if (replacement === undefined) break;
+        walker = replacement;
+        walkerId = replacement.id;
+        handovers += 1;
+      }
       const to = greedyTowardHut(state, Number(walker.id));
       const cmd: Command =
         to === undefined ? { type: 'EndTurn' } : { type: 'MoveUnit', unitId: walker.id, to };
@@ -1377,13 +1420,41 @@ describe('hut honesty — consumed once, drawn exactly once, never on water or u
       if (!outcome.ok) break;
       const after = outcome.value.state;
 
+      // Every death of the unit we were walking, recorded with its reason: this is what
+      // turns "the walker vanished" from an unreachable branch into a stated rule.
+      for (const event of outcome.value.events) {
+        if (event.type === 'UnitDestroyed' && event.unitId === walker.id) {
+          explainedDeaths.add(Number(event.unitId));
+        }
+      }
+
       const entered = hutEntriesOf(outcome.value.events);
+      // **M6 adds exactly one allowed reason for the world's RNG to move, and it has to
+      // be stated by an event.** A battle draws its dice from the state RNG — that is what
+      // makes a fight reproducible from the seed (`resolveCombat` is handed the stream) —
+      // and the barbarian step runs inside `advanceTurn`, so an `EndTurn` in which a band
+      // attacks is a command that enters no hut and still advances the stream.
+      //
+      // The exemption is therefore keyed on `CombatResolved` and nothing else: present ⇒
+      // the stream must have moved (a battle that drew no dice would be a battle decided
+      // by nothing); absent ⇒ the stream must not have, which is M3's property verbatim.
+      // Reading it off anything weaker — the unit count, the turn number, "an EndTurn may
+      // do what it likes" — would turn this check into a hole with a comment on it.
+      const battles = outcome.value.events.filter((event) => event.type === 'CombatResolved');
       if (entered.length === 0) {
         if (cmd.type === 'MoveUnit') plainMoves += 1;
-        rec.check(
-          sameJson(after.rng, state.rng),
-          `step ${String(step)}: a command that entered no hut advanced the RNG`,
-        );
+        if (battles.length > 0) {
+          battlesFought += battles.length;
+          rec.check(
+            !sameJson(after.rng, state.rng),
+            `step ${String(step)}: a CombatResolved was reported but the state RNG did not move`,
+          );
+        } else {
+          rec.check(
+            sameJson(after.rng, state.rng),
+            `step ${String(step)}: a command that entered no hut and resolved no combat advanced the RNG`,
+          );
+        }
       }
       for (const event of entered) {
         entries += 1;
@@ -1411,10 +1482,29 @@ describe('hut honesty — consumed once, drawn exactly once, never on water or u
       state = after;
     }
 
-    console.log('hut draw sweep:', JSON.stringify({ entries, plainMoves }));
+    console.log(
+      'hut draw sweep:',
+      JSON.stringify({
+        entries,
+        plainMoves,
+        battlesFought,
+        handovers,
+        explainedDeaths: explainedDeaths.size,
+      }),
+    );
     expect(rec.problems).toEqual([]);
     expect(entries).toBeGreaterThan(2);
     expect(plainMoves).toBeGreaterThan(2);
+    // **M6 non-vacuity, asserted here because this is where it is guaranteed.** A battle
+    // raised by the barbarian step inside `advanceTurn` cannot happen without barbarian
+    // units, and a band cannot appear except from a hut's reward — so these two counts are
+    // a witness that the hut→band→fight path really is walked on this seed, and that the
+    // handovers above are casualties rather than phantoms. (The long economy sweep used to
+    // carry the "barbarians exist" claim; M6 made its bands die too often for a
+    // final-state count to mean anything, so the claim moved here, where the band's own
+    // battles are visible. See that test's note.)
+    expect(battlesFought).toBeGreaterThan(0);
+    expect(explainedDeaths.size).toBeGreaterThan(0);
   });
 });
 
@@ -1542,6 +1632,19 @@ interface RunTotals {
   readonly starved: number;
   readonly produced: number;
   readonly huts: number;
+  /**
+   * Barbarians the runs **saw**, counted from the `BarbariansSpawned` events a hut draw
+   * produces, and the ones still standing at the end.
+   *
+   * M6 is why these are two fields. Before it, a band spawned beside a hut simply stood
+   * there, so "the barbarian player really exists" could be read off the final state.
+   * From M6 the barbarian step inside `advanceTurn` makes a band **attack what is beside
+   * it**, and bands routinely lose those fights — so a final-state count would say
+   * "no barbarians" about runs that were full of them. The observation (`…Units`) is kept
+   * and the claim moved to the count of appearances (`…Spawned`), which is what the
+   * non-vacuity argument actually needs.
+   */
+  readonly barbariansSpawned: number;
   readonly barbarianUnits: number;
   readonly maxPopulation: number;
   readonly maxCities: number;
@@ -2104,9 +2207,28 @@ const checkTurn = (
 
   for (const city of after.cities) {
     const owner = after.players.find((player) => player.id === city.owner);
+    // **M6 rewrote what this check means, and it is worth being exact about it.**
+    // In M3 a barbarian-owned city was impossible, so this was an invariant of the game.
+    // M6 makes capture legal — "barbarians may capture cities; that is the point of
+    // barbarians" — so it is no longer an invariant, and the assertion below is now a
+    // **guard on the oracle** rather than a rule of the engine: this sweep's food and
+    // shield bookkeeping reproduces growth, starvation and production, and does not model
+    // a capture (which halves population and clears the queue). A capture on these seeds
+    // therefore has to be a hard failure with its reason spelled out — the fix is to
+    // extend the transcription, not to teach this check to tolerate the event.
+    //
+    // Measured rather than assumed: on the three seeds below the sweep enters huts
+    // (`huts` in its log) and, at this file's walk intensity, no band captures a city —
+    // with the walk tripled during M6 integration the same seeds produced 47 oracle
+    // failures, every one of them a capture, which is how this branch was shown to be
+    // reachable. The capture *rules* themselves are asserted where capture is the subject
+    // (`packages/core/test/cities.test.ts`, `packages/core/test/commands.test.ts` and
+    // `packages/testing/test/m6-adversarial.test.ts`).
     rec.check(
       owner !== undefined && owner.kind !== 'barbarian',
-      `${label}: city ${String(city.id)} is owned by the barbarian player`,
+      `${label}: city ${String(city.id)} is owned by the barbarian player — legal since M6, ` +
+        'but this sweep’s oracle does not model a capture (halved population, cleared queue), ' +
+        'so the transcription must be extended rather than this check relaxed',
     );
     rec.check(
       citiesSeen.has(Number(city.id)),
@@ -2147,6 +2269,7 @@ const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
     starved: 0,
     produced: 0,
     huts: 0,
+    barbariansSpawned: 0,
     barbarianUnits: 0,
     maxPopulation: 1,
     maxCities: 0,
@@ -2250,14 +2373,28 @@ const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
           // exception named, asserted two ways: the kind is exactly that one, and the
           // item really is a wonder another city holds. Any other refusal — a resource
           // gate, a malformed row, a phantom `already-built` — still fails here.
+          //
+          // MIGRATED AGAIN for M6, for the same reason and in the same shape. M6 requires
+          // shipped content to *use* the gates M5 built, so the temple now declares
+          // `requiresTech: ceremonial-burial` and this sweep's random building choice can
+          // legitimately meet `tech-required`. The second exception is named by the
+          // engine's own verdict — `unmetItemTech` reports the tech this player is missing
+          // for this item — and asserted to be the very tech the refusal names, so "a gate
+          // refused it" is proven rather than assumed. A `tech-required` for a tech the
+          // player already knows, or for an item that declares no gate at all, still fails
+          // here, which is the property that keeps this from becoming a blanket.
           const heldByAnother =
             item.kind === 'building' &&
             wonderRow(item.id) &&
             citiesHolding(state, item.id).some((holder) => holder !== Number(current.id));
+          const missingTech = unmetItemTech(state, RULESET, playerId, item);
+          const refusedByTechGate =
+            queued.error.kind === 'tech-required' && missingTech === queued.error.tech;
           rec.check(
-            queued.error.kind === 'wonder-already-built' && heldByAnother,
+            (queued.error.kind === 'wonder-already-built' && heldByAnother) || refusedByTechGate,
             `seed ${String(seed)}: queuing ${JSON.stringify(item)} was refused: ` +
-              `${JSON.stringify(queued.error)} (wonder held elsewhere: ${String(heldByAnother)})`,
+              `${JSON.stringify(queued.error)} (wonder held elsewhere: ${String(heldByAnother)}, ` +
+              `unmet tech for the item: ${String(missingTech)})`,
           );
         }
       }
@@ -2282,6 +2419,12 @@ const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
               break;
             }
             totals.huts += hutEntriesOf(outcome.value.events).length;
+            // M6: the band a hut pays out with, counted where it is announced. This is
+            // the observation the non-vacuity assertion below is built on, because from
+            // M6 a band can be destroyed in the very turn it appears.
+            totals.barbariansSpawned += outcome.value.events.filter(
+              (event) => event.type === 'BarbariansSpawned',
+            ).length;
             state = outcome.value.state;
           }
         }
@@ -2345,7 +2488,25 @@ describe('economy conservation — 110 turns, real cities, real starvation', () 
       expect(sum((run) => run.starved)).toBeGreaterThan(0);
       expect(sum((run) => run.produced)).toBeGreaterThan(10);
       expect(sum((run) => run.huts)).toBeGreaterThan(0);
-      expect(sum((run) => run.barbarianUnits)).toBeGreaterThan(0);
+      // **What is no longer asserted here, and why — stated rather than deleted.**
+      // M3 asserted "barbarian units are still standing at the end", as the non-vacuity
+      // witness for the turn check that no city is barbarian-owned. M6 removes both halves
+      // of that argument: barbarians now *attack* inside `advanceTurn` (so a band that
+      // appears usually dies — `barbarianUnits` is 0 here, and the effect is the game's,
+      // not a bug), and barbarian capture is legal, which is why the turn check above was
+      // re-stated as a guard on this sweep's oracle rather than as a rule of the engine.
+      // Barbarian existence is therefore asserted where it is *guaranteed* rather than
+      // hoped for: the hut-draw sweep above reports the battles a band fights, and
+      // `packages/testing/test/m6-adversarial.test.ts` builds bands directly and drives
+      // them. The counts below stay in the log as observations, and the hut path they
+      // witness is still required to have been walked (`huts > 0`, asserted above).
+      console.log(
+        'm3 economy barbarians (observation, not an assertion):',
+        JSON.stringify({
+          spawned: sum((run) => run.barbariansSpawned),
+          standingAtEnd: sum((run) => run.barbarianUnits),
+        }),
+      );
       // The two M4c branches the conservation sweep now transcribes (a queue entry
       // dropped because a wonder was finished elsewhere, and a produced unit disbanded
       // by the same turn's money step) must really be taken on these seeds — otherwise
@@ -2721,14 +2882,22 @@ const runGoldenHarness = (corrupt: boolean): GoldenHarnessRun => {
  * harness's own opt-in path; the M5 values below are the ones
  * `packages/testing/goldens/state.json` now stores.
  *
+ * **M6 moved them a sixth time** (`SCHEMA_VERSION` 7 -> 8): `Unit` gains
+ * `hitPointsLeft`, which `newGame` writes on every starting unit, so every stored state
+ * has one more key per unit. The values below are the ones the file stores after that
+ * rehash, and the values it stored before were `7f8b0949114fe6f3`, `acc2e281926ead8f`
+ * and `659c0d9dd790708d` — quoted here so a reader can see the movement was a *shape*
+ * change rather than a re-pin that hid a semantic one. `golden.test.ts` owns the played
+ * entry; this file owns the three fresh ones.
+ *
  * A hash that moves *without* a shape change is a semantic bug and must not be
  * re-pinned — that is the whole point of writing the digits down rather than
  * comparing the file against itself.
  */
 const PINNED_GOLDENS: readonly { readonly name: string; readonly hash: string }[] = [
-  { name: 'tiny-civs2-seed1', hash: '7f8b0949114fe6f3' },
-  { name: 'tiny-civs2-seed42', hash: 'acc2e281926ead8f' },
-  { name: 'tiny-civs2-seed1337', hash: '659c0d9dd790708d' },
+  { name: 'tiny-civs2-seed1', hash: '0fcbdf5564556c3a' },
+  { name: 'tiny-civs2-seed42', hash: '9209534b36689b8a' },
+  { name: 'tiny-civs2-seed1337', hash: '0bebdfa8140c8168' },
 ];
 
 describe('goldens — still a gate, still refusing to auto-write', () => {
@@ -2746,22 +2915,27 @@ describe('goldens — still a gate, still refusing to auto-write', () => {
     // money fields plus M4b's starting worker, SCHEMA_VERSION 5), M4c changed it
     // a fourth time (`GameMap.resources`, SCHEMA_VERSION 6), and **M5 changed it a fifth
     // time** (`PlayerState.techs`, required on every player row and empty for a fresh
-    // game, SCHEMA_VERSION 7). All five moved every hash deliberately, through the
-    // harness's own opt-in path, and each is recorded in its milestone's `rehash:` note.
-    // Nothing else may move them.
+    // game, SCHEMA_VERSION 7). **M6 changed it a sixth time** (`Unit.hitPointsLeft`,
+    // written on every starting unit, SCHEMA_VERSION 8). All six moved every hash
+    // deliberately, through the harness's own opt-in path, and each is recorded in its
+    // milestone's `rehash:` note. Nothing else may move them.
     expect(computed).toEqual(PINNED_GOLDENS.map((entry) => entry.hash));
     // Named as well as positional: a pin is only meaningful if the hash is the one
     // the scenario the name describes produces. M5 also added a **fourth** entry — the
     // played golden, which this file cannot recompute (it holds no command script) and
     // which is `golden.test.ts`'s to judge — so the file is compared as "exactly the
-    // three scenarios this file owns, plus exactly the one it does not", which is as
+    // three scenarios this file owns, plus exactly the ones it does not", which is as
     // strong as the old whole-file equality: a missing entry and a stray entry both fail.
+    //
+    // M6 adds one more entry this file cannot recompute —
+    // `played-civs2-seed42-combat`, the played world with one applied `AttackUnit` — so the
+    // "not this file's" list is two names rather than one, and both are named here.
     expect(stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'))).toEqual(
       PINNED_GOLDENS,
     );
     expect(
       stored.entries.filter((entry) => !entry.name.startsWith('tiny-civs2-')).map((e) => e.name),
-    ).toEqual(['played-civs2-seed42']);
+    ).toEqual(['played-civs2-seed42', 'played-civs2-seed42-combat']);
     // And the store agrees with the build, which is the gate the harness runs.
     expect(
       stored.entries

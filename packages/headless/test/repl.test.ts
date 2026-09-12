@@ -28,6 +28,15 @@
  *   pools are then shown in the banner, under every view and in `state`, and every
  *   one of the four money events has its own pinned line — including which units
  *   bankruptcy disbanded and why.
+ * - **M6: `attack` and `fortify` are the same arrangement a fourth time.** `attack
+ *   <unitId> <x> <y>` builds one `AttackUnit` — a battle against one adjacent enemy
+ *   unit, or an outright capture of an undefended adjacent city — and `fortify
+ *   <unitId>` builds one `FortifyUnit`, which is the one applied command in the whole
+ *   language that emits no event. A unit's hit points are shown **wherever a unit is
+ *   shown** (the `units` table's `hp` column, the `units:` line under every view, and
+ *   the prose of a refusal about it), the city view states what its tile and walls are
+ *   worth to a defender, and the four new events each have a pinned line — including
+ *   *why* a unit was destroyed and who killed it.
  *
  * The synthetic 4x4 map is deliberate: small enough that the expected transcript
  * stays readable, and it puts every interesting case next to the unit —
@@ -57,6 +66,7 @@ import {
   cityById,
   cityRadius,
   foodBoxSize,
+  hitPointsLabel,
   indexToX,
   indexToY,
   newGame,
@@ -64,6 +74,7 @@ import {
   playerUpkeep,
   seedRng,
   tileIndex,
+  unitDef,
   unitSupport,
   type BuildingDef,
   type BuildingId,
@@ -632,7 +643,7 @@ const EXPECTED_TRANSCRIPT = [
   '  luxuries DO NOTHING yet: nothing reads them until M9 (happiness).',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -644,16 +655,16 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
   'units: 2 of 2 visible for Player 1 (p0)',
-  'm  id  type        owner        at        move     terrain      job                         legal',
-  '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
-  '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
+  'm  id  type        owner        at        move     hp      terrain      job                         legal',
+  '*  0   Settler     Player 1     0,0       2/2      1/1 hp  Grassland    (idle)                      1',
+  '   1   Settler     Player 2     0,1       2/2      1/1 hp  Grassland    (idle)                      3',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -664,7 +675,7 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -682,14 +693,14 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 2 2',
-  'error: not-enough-movement - unit 0 (Settler at 1,1, 1/2 per turn movement left) needs 2 movement for the step onto that tile, but only 1 is left. "end" refills movement.',
-  '  legal: unit 0 (Settler at 1,1, 1/2 per turn movement left) can move to (0,0) (2,0) (2,1) (0,2) (1,2).',
+  'error: not-enough-movement - unit 0 (Settler at 1,1, 1/2 per turn movement left, 1/1 hp) needs 2 movement for the step onto that tile, but only 1 is left. "end" refills movement.',
+  '  legal: unit 0 (Settler at 1,1, 1/2 per turn movement left, 1/1 hp) can move to (0,0) (2,0) (2,1) (0,2) (1,2).',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -700,7 +711,7 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -718,14 +729,14 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> wibble',
   'error: unknown command "wibble" - no such command.',
-  '  commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
+  '  commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
   '  type "help" for what each one does.',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -737,7 +748,7 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @1,1 (1/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -759,7 +770,7 @@ const EXPECTED_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @1,1 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)',
+  'units: *0 p0 Settler @1,1 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -801,7 +812,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '  luxuries DO NOTHING yet: nothing reads them until M9 (happiness).',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'commands: move <unitId> <x> <y> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -813,17 +824,17 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
   'units: 3 of 3 visible for Player 1 (p0)',
-  'm  id  type        owner        at        move     terrain      job                         legal',
-  '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
-  '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
-  '*  2   Worker      Player 1     2,2       2/2      Hills        (idle)                      8',
+  'm  id  type        owner        at        move     hp      terrain      job                         legal',
+  '*  0   Settler     Player 1     0,0       2/2      1/1 hp  Grassland    (idle)                      1',
+  '   1   Settler     Player 2     0,1       2/2      1/1 hp  Grassland    (idle)                      3',
+  '*  2   Worker      Player 1     2,2       2/2      1/1 hp  Hills        (idle)                      8',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -834,7 +845,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -852,14 +863,14 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'work: 2 p0 Worker@2,2 mining, 3 turns left',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
+  'work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> state',
-  'state: seed=7 turn=1 revision=1 schema=7 map=tiny(4x4) civs=2',
+  'state: seed=7 turn=1 revision=1 schema=8 map=tiny(4x4) civs=2',
   'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, 0 luxuries',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
   '  luxuries DO NOTHING yet: nothing reads them until M9 (happiness): they only pile up, and this build neither spends nor reads them.',
@@ -869,13 +880,13 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '  from 0 cities, and owes 0 gold of upkeep (0 maintenance + 0 unit support for 2 unit(s), 4 free)',
   '  - a projection from this state, because growth and production run before the bill is drawn.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'tech: 0/17 known (none yet)',
-  'tech: 3 researchable now, 14 blocked; "tech" prints the tree with costs and prerequisites',
+  'tech: 0/19 known (none yet)',
+  'tech: 3 researchable now, 16 blocked; "tech" prints the tree with costs and prerequisites',
   'you: 2 unit(s), explored 16/16 tiles, 16 visible right now',
   'jobs: 2 Worker@2,2 mining, 3 turns left',
   'civs: Player 1 (p0) <- you, Player 2 (p1)',
   'rng: a=-456573687 b=-84222363 c=801465066 d=1648156487',
-  'hash: 8061a654660a2775',
+  'hash: 07fda6ec366add66',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -886,8 +897,8 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'work: 2 p0 Worker@2,2 mining, 3 turns left',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
+  'work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -909,8 +920,8 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'work: 2 p0 Worker@2,2 mining, 2 turns left',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement) mining, 2 turns left',
+  'work: 2 p0 Worker@2,2 1/1 hp mining, 2 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp) mining, 2 turns left',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -928,7 +939,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -946,8 +957,8 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'work: 2 p0 Worker@2,2 building a road, 2 turns left',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (0/2 movement) building a road, 2 turns left',
+  'work: 2 p0 Worker@2,2 1/1 hp building a road, 2 turns left',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) building a road, 2 turns left',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -969,8 +980,8 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'work: 2 p0 Worker@2,2 building a road, 1 turn left',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement) building a road, 1 turn left',
+  'work: 2 p0 Worker@2,2 1/1 hp building a road, 1 turn left',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp) building a road, 1 turn left',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -993,17 +1004,17 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
   'units: 3 of 3 visible for Player 1 (p0)',
-  'm  id  type        owner        at        move     terrain      job                         legal',
-  '*  0   Settler     Player 1     0,0       2/2      Grassland    (idle)                      1',
-  '   1   Settler     Player 2     0,1       2/2      Grassland    (idle)                      3',
-  '*  2   Worker      Player 1     2,2       2/2      Hills        (idle)                      8',
+  'm  id  type        owner        at        move     hp      terrain      job                         legal',
+  '*  0   Settler     Player 1     0,0       2/2      1/1 hp  Grassland    (idle)                      1',
+  '   1   Settler     Player 2     0,1       2/2      1/1 hp  Grassland    (idle)                      3',
+  '*  2   Worker      Player 1     2,2       2/2      1/1 hp  Hills        (idle)                      8',
   'CivTS state: seed=7 turn=4 revision=6 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -1014,7 +1025,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '3 |,,,,',
   'legend: ~ ocean  : coast  , grassland  - plains  h hills  ^ mountains',
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
-  'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  *2 p0 Worker @2,2 (2/2 movement)',
+  'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
   'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -1061,11 +1072,21 @@ describe('the REPL transcript', () => {
     // actually do now. That is the milestone's UI half, and the pinned text below is
     // the assertion that it landed.
     //
+    // Rehashed for M6 (SCHEMA_VERSION 7 -> 8): `Unit` gained the optional
+    // `hitPointsLeft`/`experience`/`fortified` keys and `UnitSpec` gained attack,
+    // defence and hit points. This board's two settlers carry **no** optional key at
+    // all (absence is "a unit at full health, with no promotions and not dug in"), so
+    // 6904c721ca6625e9 -> 68f146af88de5f28 is the schema-version bump alone. The
+    // transcript below moved with it, and this time in the milestone's own right:
+    // every unit line gained its hit points (`1/1 hp`), which is exactly M6's
+    // requirement that a damaged unit be visible as damaged.
+    //
     // This is a test-local pin, not a golden: it rehashes because the state *shape*
     // moved, and it is updated in the same wave as the shape change. (The
     // `packages/testing` goldens were regenerated once for M4c; nothing here
     // regenerates or re-derives them.)
-    expect(hashValue(syntheticState())).toBe('6904c721ca6625e9');
+
+    expect(hashValue(syntheticState())).toBe('68f146af88de5f28');
 
     const capture = open();
     runScript(capture.session, SCRIPT.join('\n'), capture.write);
@@ -1110,7 +1131,10 @@ describe('the REPL transcript', () => {
     // on both of this board's players. c2e1360531cae92c -> 1ca22df3412b4ceb. This
     // time the transcript *did* move with it, because the rehash and the `research:`
     // line under every view are the same milestone.
-    expect(hashValue(capture.session.state)).toBe('1ca22df3412b4ceb');
+    //
+    // Rehashed for M6 (SCHEMA_VERSION 7 -> 8): M6's unit shape, the same bump the pin
+    // above records. 1ca22df3412b4ceb -> 854c8039fe812a82.
+    expect(hashValue(capture.session.state)).toBe('854c8039fe812a82');
     // The `end` in this script banked a turn of a *cityless* economy: no city, so no
     // commerce and no income — the treasury is exactly the starting 10. A money loop
     // that invented income for a player with nothing built would move this.
@@ -1233,7 +1257,9 @@ describe('a command that does not apply', () => {
     capture.clear();
     capture.session.run('move 9 1 1');
     expect(capture.text()).toContain('unknown-unit');
-    expect(capture.text()).toContain('your units: 0 Settler at 1,1 (1 movement left)');
+    // M6: the prose of a refusal carries the unit's hit points too, so a lesson about a
+    // wounded unit cannot read as a lesson about a whole one.
+    expect(capture.text()).toContain('your units: 0 Settler at 1,1 (1 movement left, 1/1 hp)');
 
     capture.clear();
     capture.session.run('move 1 1 1');
@@ -1309,7 +1335,9 @@ describe('commands', () => {
     // and it is worth restating because research is the first step that *writes a
     // player* on behalf of nobody: the frozen state still hashes to itself, and a
     // research step that edited its input in place would move this line.
-    expect(hashValue(state)).toBe('6904c721ca6625e9');
+    // Rehashed for M6 (SCHEMA_VERSION 7 -> 8) with every other pin in this file; the
+    // M6 annotation on the synthetic-state pin above states why.
+    expect(hashValue(state)).toBe('68f146af88de5f28');
 
     // Same input, same result: the session holds no hidden state of its own.
     const fresh = open();
@@ -1960,9 +1988,24 @@ describe('a build the tech gate holds back', () => {
     const error = refusal(capture.session.run('build 0 unit:swordsman'));
     expect(error.kind).toBe('resource-not-connected');
     const text = capture.text();
-    expect(text).toContain(
-      'legal: locked behind a tech you have not researched: unit "Legionary" needs ' +
-        '"Iron Working" (iron-working) ("research iron-working")',
+    // The line is a *list*, so it is read as one: every item this ruleset gates on a tech
+    // is named, each with its tech and the command that lifts it. M6's combat units put
+    // five more rows on it (archer, spearman, horseman, transport, legionary) plus the
+    // temple, and a lesson that named only the first of them would be the same bug the
+    // line exists to prevent. Asserting the first item alone is what would break here.
+    const locked = text
+      .split('\n')
+      .find((line) => line.includes('legal: locked behind a tech you have not researched:'))
+      ?.trim();
+    expect(locked).toBe(
+      'legal: locked behind a tech you have not researched: unit "Archer" needs ' +
+        '"Warrior Code" (warrior-code) ("research warrior-code"); unit "Spearman" needs ' +
+        '"Warrior Code" (warrior-code) ("research warrior-code"); unit "Horseman" needs ' +
+        '"Horseback Riding" (horseback-riding) ("research horseback-riding"); unit ' +
+        '"Transport" needs "Map Making" (map-making) ("research map-making"); unit ' +
+        '"Legionary" needs "Iron Working" (iron-working) ("research iron-working"); ' +
+        'building "Temple" needs "Ceremonial Burial" (ceremonial-burial) ' +
+        '("research ceremonial-burial").',
     );
     // The menu above that line is the engine's own (`cityProductionOptions`, which
     // asks `productionGate`), so the gated unit is *not* in the "may be set to build"
@@ -2562,9 +2605,11 @@ describe('inspectors', () => {
 
     const text = capture.text();
     expect(text).toContain('units: 2 of 2 visible for Player 1 (p0)');
-    expect(text).toContain('*  0   Settler     Player 1     0,0       2/2');
+    // M6's `hp` column sits between the movement and the terrain: a damaged unit has to
+    // be *visible as damaged* in the table as well as on the line under every view.
+    expect(text).toContain('*  0   Settler     Player 1     0,0       2/2      1/1 hp');
     expect(text).toContain('Grassland');
-    expect(text).toContain('units: *0 p0 Settler @0,0 (2/2 movement)');
+    expect(text).toContain('units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)');
   });
 
   it('hides units standing outside the fog, and says how many', () => {
@@ -2859,18 +2904,20 @@ describe('the worker verbs', () => {
     // sit *after* the movement it spent rather than replacing it.
     const unitsLine = text.split('\n').find((line) => line.startsWith('units: ')) ?? '';
     expect(unitsLine).toBe(
-      'units: *0 p0 Settler @0,0 (2/2 movement)   1 p1 Settler @0,1 (2/2 movement)  ' +
-        '*2 p0 Worker @2,2 (0/2 movement) mining, 3 turns left',
+      'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   ' +
+        '1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  ' +
+        '*2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
     );
-    // `describe`'s own line (see textview.test.ts): the agent's eyes on the map.
-    expect(text).toContain('work: 2 p0 Worker@2,2 mining, 3 turns left');
+    // `describe`'s own line (see textview.test.ts): the agent's eyes on the map, with the
+    // same hit points the units line carries (one spelling, `@civts/core`'s).
+    expect(text).toContain('work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left');
 
     capture.clear();
     capture.session.run('units');
     expect(capture.text()).toContain('job');
     expect(capture.text()).toContain('mining, 3 turns left');
     expect(capture.text()).toContain(
-      'Settler     Player 2     0,1       2/2      Grassland    (idle)',
+      'Settler     Player 2     0,1       2/2      1/1 hp  Grassland    (idle)',
     );
 
     capture.clear();
@@ -2896,7 +2943,9 @@ describe('the worker verbs', () => {
     expect(capture.text()).toContain('mining, 3 turns left');
     capture.clear();
     capture.session.run('move 9 1 1');
-    expect(capture.text()).toContain('2 Worker at 2,2 (0 movement left, mining, 3 turns left)');
+    expect(capture.text()).toContain(
+      '2 Worker at 2,2 (0 movement left, 1/1 hp, mining, 3 turns left)',
+    );
   });
 
   it('renders every work event as a real line, never a blank one', () => {
@@ -2946,7 +2995,12 @@ describe('the worker verbs', () => {
     // 3b83f6a9d4c11384 -> d25659e4bfc2a50b. This transcript did move with the
     // milestone, unlike the M4c one: every view in it gained a `research:` line, and
     // its `state` view gained the same line plus the tech summary beneath it.
-    expect(hashValue(first.session.state)).toBe('d25659e4bfc2a50b');
+    //
+    // Rehashed for M6 (SCHEMA_VERSION 7 -> 8): M6's unit shape, the same bump the
+    // synthetic-state pin records. d25659e4bfc2a50b -> 9787f054e1c300ea. The transcript
+    // moved with it in every line that names a unit — hit points, as above — and in the
+    // `state` view's `schema=8`.
+    expect(hashValue(first.session.state)).toBe('9787f054e1c300ea');
   });
 
   it('documents the worker verbs in help and in the command summary', () => {
@@ -3215,10 +3269,14 @@ describe('the research verbs', () => {
     const text = capture.text();
 
     // The header counts the catalog for the *player*, not the catalog's size alone.
-    expect(text).toContain('tech: 17 tech(s) in this ruleset; Player 1 (p0) knows 0 of them');
+    // The header counts the catalog, so M6's two new techs (ceremonial-burial, which
+    // gates the temple, and map-making, which gates the transport) move it from 17 to 19
+    // and move `blocked` from 14 to 16. `available now` stays at 3: both new techs have a
+    // prerequisite, so neither is available to a player who knows nothing.
+    expect(text).toContain('tech: 19 tech(s) in this ruleset; Player 1 (p0) knows 0 of them');
     expect(text).toContain(`known (0): none yet`);
     expect(text).toContain('available now (3):');
-    expect(text).toContain('blocked (14):');
+    expect(text).toContain('blocked (16):');
 
     // Every row is `<id> "<Name>" (<era>, <cost> beakers, <prerequisites>)`, and the
     // prerequisite is named on the row itself — the whole point of the view.
@@ -3276,13 +3334,17 @@ describe('the research verbs', () => {
     funded.session.run('tech');
     expect(funded.text()).toContain('known (1):');
     expect(funded.text()).toContain('  pottery "Pottery" (ancient, 5 beakers, no prerequisites)');
-    // …and the tree grew by exactly the rows the new tech unlocked: `alphabet` and
-    // `the-wheel` both want pottery, so "available now" goes from 3 to 4 and the two
-    // rows that were blocked with a reason are rows an agent can now choose.
-    expect(funded.text()).toContain('available now (4):');
+    // …and the tree grew by exactly the rows the new tech unlocked: `alphabet`,
+    // `the-wheel` and M6's `map-making` all want pottery, so "available now" goes from
+    // the 3 a player who knows nothing is offered to 5 — pottery itself moved into
+    // `known`, so the count is read as a whole rather than assumed.
+    expect(funded.text()).toContain('available now (5):');
     expect(funded.text()).toContain('  alphabet "Alphabet" (ancient, 7 beakers, requires pottery)');
     expect(funded.text()).toContain(
       '  the-wheel "The Wheel" (ancient, 8 beakers, requires pottery)',
+    );
+    expect(funded.text()).toContain(
+      '  map-making "Map Making" (ancient, 8 beakers, requires pottery)',
     );
     expect(funded.text()).not.toContain('- needs "Pottery" (pottery)');
     expect(funded.text()).toContain('research: nothing being researched');
@@ -3484,9 +3546,9 @@ describe('the economy the reader is shown', () => {
     // figures (`researchStep`, the step the pipeline runs), and counts the tree the
     // same way `tech` does — known, researchable now, blocked.
     expect(text).toContain('research: nothing being researched - 0 beakers banked');
-    expect(text).toContain('tech: 0/17 known (none yet)');
+    expect(text).toContain('tech: 0/19 known (none yet)');
     expect(text).toContain(
-      'tech: 3 researchable now, 14 blocked; "tech" prints the tree with costs and prerequisites',
+      'tech: 3 researchable now, 16 blocked; "tech" prints the tree with costs and prerequisites',
     );
     // The per-turn projection, from `playerIncome`/`playerUpkeep` — the same
     // evaluators the money loop runs — and labelled as a projection, because growth
@@ -3605,7 +3667,7 @@ describe('flags', () => {
   it('--player decides who the session acts as', () => {
     const capture = open({ playerIndex: 1 });
     expect(capture.text()).toContain('you are Player 2 (p1)');
-    expect(capture.text()).toContain('*1 p1 Settler @0,1 (2/2 movement)');
+    expect(capture.text()).toContain('*1 p1 Settler @0,1 (2/2 movement, 1/1 hp)');
 
     expect(refusal(capture.session.run('move 0 1 1')).kind).toBe('not-your-unit');
     expect(capture.session.run('move 1 0 2').kind).toBe('applied');
@@ -3817,10 +3879,17 @@ describe('the play command', () => {
         const afterFounding = first.stdout.slice(first.stdout.indexOf('p0> found'));
         expect(afterFounding).not.toContain('units: none visible');
         expect(afterFounding).not.toContain(`*${String(settler.id)} p0 Settler`);
+        // CORRECTED for M6. The line used to end at `(2/2 movement)`; M6 prints a unit's
+        // hit points wherever it is named ("a wounded unit must be visible as wounded"),
+        // so the `units:` list now carries `2/3 hp` as well. The figure is asked of the
+        // engine's own reader — `hitPointsLabel`, the single spelling `textview` and the
+        // REPL both use — rather than written here as a second mapping, and the maximum
+        // comes with it.
         expect(afterFounding).toContain(
           `units: *${String(startingWorker.id)} p0 Worker ` +
             `@${String(indexToX(state.map, startingWorker.tile))},` +
-            `${String(indexToY(state.map, startingWorker.tile))} (2/2 movement)`,
+            `${String(indexToY(state.map, startingWorker.tile))} ` +
+            `(2/2 movement, ${hitPointsLabel(startingWorker, unitDef(RULESET, startingWorker.type))})`,
         );
         expect(first.stdout).toContain('cities: 1 for Player 1 (p0)');
         expect(first.stdout).toContain('id  name');
@@ -3902,7 +3971,20 @@ describe('the play command', () => {
         // summary lines the `state` view prints beneath them. Nothing about the city
         // view's own numbers moved: this script never researches anything, which is
         // what makes the *idle* form of the field the one pinned here.
-        expect(first.stdout).toContain('hash: 0e2e17c80d8447a8');
+        //
+        // Rehashed for M6 (SCHEMA_VERSION 7 -> 8): `newGame` writes `hitPointsLeft` on
+        // every unit it places (full health for a unit that has taken no damage), so
+        // every state holding a unit moves — the same "one new key" reason as M5's
+        // `techs`, and the reason every golden moved in this milestone too. The two
+        // omitted-when-default keys M6 adds (`experience`, `fortified`) are written by
+        // neither pass and so contribute nothing: a fresh settler is not promoted and
+        // not dug in. 0e2e17c80d8447a8 -> 97b02fcaa6e3716b. The transcript moved with it
+        // in two visible ways: `schema=8`, and the hit points M6 prints wherever a unit
+        // is named — the `units:` list under each view now reads
+        // `(2/2 movement, 1/1 hp)`, which the assertion above derives from the engine's
+        // own `hitPointsLabel` rather than restating. The city view's own numbers are
+        // unchanged.
+        expect(first.stdout).toContain('hash: 97b02fcaa6e3716b');
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -3984,7 +4066,8 @@ describe('the play command', () => {
       // of entries, and asserting the whole line would pin the *other* worker's
       // presence too, which is a different claim (the CLI test above makes it).
       expect(first.stdout).toContain(
-        `*${workerId} p0 Worker @${at.slice(1, -1)} (0/2 movement) building a road, 2 turns left`,
+        `*${workerId} p0 Worker @${at.slice(1, -1)} (0/2 movement, 1/1 hp) ` +
+          'building a road, 2 turns left',
       );
       expect(first.stdout).toContain(
         `jobs: ${workerId} Worker@${at.slice(1, -1)} building a road, 2 turns left`,
@@ -4265,4 +4348,513 @@ describe('the map command', () => {
     expect(run.stdout).toContain('legend:');
     expect(run.stdout).toContain(`state hash: ${hashValue(setup.value)}`);
   }, 120_000);
+});
+
+/* ------------------------------------------------------------------ *
+ * M6 — the combat verbs: `attack`, `fortify`, the hit points every unit
+ * is shown with, and the four events a battle and a capture emit.
+ *
+ * The board below is the M2 one plus the four warriors, the stack and
+ * the enemy city a battle and a capture need. It is arranged rather than
+ * found, for the reason every fixture in this file is: the REPL's
+ * surface is what is under test, so the world has to be exact.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The M6 combat board.
+ *
+ * Player 0's warrior 2 stands on (1,1) — one step from an enemy settler at (0,1), an
+ * enemy warrior at (1,2), a *stack* of two enemy warriors at (0,2) and the empty
+ * hills at (2,2) — and player 0's warrior 4 stands beside the enemy city on (3,3),
+ * which holds a granary, the Pyramids and city walls.
+ *
+ * Every unit carries `hitPointsLeft` **explicitly**, and that is not a detail:
+ * `units.ts` reads a *missing* field as `DEFAULT_HIT_POINTS` (1), so a fixture that
+ * left it out would be a board of units one hit from death, and every number below
+ * would describe that board rather than a full-strength one. `spawnUnit` always
+ * writes the field, so an explicit 3 is what a real board looks like; the
+ * `attackerHitPoints` option is how a *damaged* board is built, which is the state
+ * the "a damaged unit must be visible as damaged" tests need.
+ *
+ * The three optional keys a unit can carry are spread conditionally, so a key that
+ * was not asked for is **absent** rather than present-and-`undefined` — the same
+ * rule the engine's own writers follow, and the reason `syntheticState` spells it
+ * out at length.
+ */
+const combatState = (options?: {
+  readonly attackerHitPoints?: number;
+  readonly attackerExperience?: number;
+  readonly attackerFortified?: boolean;
+  /** Put a defender inside the city, so a target there is a battle rather than a capture. */
+  readonly garrison?: boolean;
+  /** Give the city its walls. On by default: the wall bonus is half its defence. */
+  readonly walls?: boolean;
+}): GameState => {
+  const base = syntheticState();
+  const attacker: Unit = {
+    id: asUnitId(2),
+    type: asUnitTypeId('warrior'),
+    owner: asPlayerId(0),
+    tile: tileIndex(WIDTH, 1, 1),
+    movementLeft: 1,
+    hitPointsLeft: options?.attackerHitPoints ?? 3,
+    ...(options?.attackerExperience === undefined
+      ? {}
+      : { experience: options.attackerExperience }),
+    ...(options?.attackerFortified === true ? { fortified: true } : {}),
+  };
+  const warrior = (id: number, owner: number, x: number, y: number): Unit => ({
+    id: asUnitId(id),
+    type: asUnitTypeId('warrior'),
+    owner: asPlayerId(owner),
+    tile: tileIndex(WIDTH, x, y),
+    movementLeft: 1,
+    hitPointsLeft: 3,
+  });
+
+  return {
+    ...base,
+    nextUnitId: 8,
+    nextCityId: 1,
+    units: [
+      ...base.units,
+      attacker,
+      warrior(3, 1, 1, 2),
+      warrior(4, 0, 2, 3),
+      // Two enemy warriors on one tile: the one target `planAttackUnit` refuses to aim
+      // at, because which of them a battle would resolve against is a rule the engine
+      // deliberately does not have (M2 lets units stack).
+      warrior(5, 1, 0, 2),
+      warrior(6, 1, 0, 2),
+      ...(options?.garrison === true ? [warrior(7, 1, 3, 3)] : []),
+    ],
+    cities: [
+      {
+        id: asCityId(0),
+        name: 'Enemy Town',
+        owner: asPlayerId(1),
+        tile: tileIndex(WIDTH, 3, 3),
+        population: 4,
+        foodBox: 5,
+        shields: 3,
+        queue: [],
+        buildings: [
+          asBuildingId('granary'),
+          asBuildingId('pyramids'),
+          ...(options?.walls === false ? [] : [asBuildingId('walls')]),
+        ],
+        workedTiles: [],
+      },
+    ],
+  };
+};
+
+/** `attack <unitId> <x> <y>` and `fortify <unitId>`, in the order a session would type them. */
+const COMBAT_SCRIPT = [
+  'attack 2 0 2', // refused: the target is a stack of two, so no defender can be chosen
+  'attack 2 1 2', // a battle the attacker loses, which kills it and promotes the defender
+  'fortify 0', // no event, so the state's flag and the applied line are the record
+  'attack 4 3 3', // an undefended city is not a battle: it is captured
+  'units', // the gone and the damaged, on the line under every view
+];
+
+describe('the combat verbs', () => {
+  it('turns `attack` into one AttackUnit, and prints every number the resolver produced', () => {
+    const capture = open({ state: combatState() });
+    capture.clear();
+    const rngBefore = hashValue(capture.session.state.rng);
+
+    const outcome = capture.session.run('attack 2 1 2');
+    expect(outcome).toMatchObject({
+      kind: 'applied',
+      command: { type: 'AttackUnit', unitId: asUnitId(2), target: tileIndex(WIDTH, 1, 2) },
+    });
+
+    // The battle drew its rounds from the *state's* own RNG — the one field a save
+    // carries — rather than from a stream invented in the resolver.
+    expect(hashValue(capture.session.state.rng)).not.toBe(rngBefore);
+
+    // Three events, three real lines, in the order they happened, and the odds before
+    // the outcome they were drawn against.
+    const block = expectEveryEventRendered(outcome, capture.text());
+    expect(block).toEqual([
+      'ok: COMBAT - unit 2 (Player 1 (p0)) attacked unit 3 (Player 2 (p1)) at (1,2): ' +
+        '33% per-round odds for the attacker (a draw below that wins, and a tie goes to ' +
+        'the defender), 3 round(s) fought, the attacker lost 3 hit point(s) and the ' +
+        'defender lost 0 - defender-wins: the defender holds the field and unit 2 is destroyed',
+      'ok: unit 2 (Warrior, Player 1 (p0)) is GONE from (1,1): it lost the battle it was ' +
+        'fighting, and killed by unit 3 (Player 2 (p1))',
+      'ok: unit 3 (Player 2 (p1)) won at (1,2) and was promoted to veteran level 1 of 3; ' +
+        'each level is +25% attack, and experience is never lost',
+    ]);
+
+    // The odds on the line are the resolver's own number, not a second calculation
+    // here: 1 attack against 2 defence on grassland (+10%) is 1/3 of the roll space.
+    expect(appliedEvents(outcome)[0]).toMatchObject({
+      type: 'CombatResolved',
+      attackerWinPct: 33,
+      rounds: 3,
+      attackerLost: 3,
+      defenderLost: 0,
+      outcome: 'defender-wins',
+      attackerSurvives: false,
+      defenderSurvives: true,
+    });
+
+    // The state agrees with the lines: the loser is gone, the winner stands where it
+    // was with its new promotion, and the command is one revision.
+    const state = capture.session.state;
+    expect(state.units.map((unit) => Number(unit.id))).toEqual([0, 1, 3, 4, 5, 6]);
+    const winner = state.units.find((unit) => Number(unit.id) === 3);
+    expect(winner?.tile).toBe(tileIndex(WIDTH, 1, 2));
+    expect(winner?.experience).toBe(1);
+    expect(state.revision).toBe(1);
+  });
+
+  it('shows the tile and the walls in the odds: the same warrior is harder to kill inside a city', () => {
+    // Same attacker type, same seed, same map — the *defender's tile* is the only
+    // difference. On grassland the defender's 2 defence gains the terrain's +10%, so the
+    // attacker's odds are 1 in 3; inside a city with walls the same defender gains
+    // +10% terrain, +50% city and +50% walls, which floors to 4 defence and 1-in-5.
+    const field = open({ state: combatState() });
+    field.clear();
+    field.session.run('attack 2 1 2');
+    expect(field.text()).toContain('33% per-round odds');
+
+    const city = open({ state: combatState({ garrison: true }) });
+    city.clear();
+    const outcome = city.session.run('attack 4 3 3');
+    expect(outcome.kind).toBe('applied');
+    expect(city.text()).toContain('20% per-round odds');
+    expect(appliedEvents(outcome)[0]).toMatchObject({
+      type: 'CombatResolved',
+      attackerWinPct: 20,
+      outcome: 'defender-wins',
+    });
+    // A garrison is a *battle*, not a capture: the city changes hands only when nobody
+    // is standing in it, which is the one line of the capture rule worth pinning here.
+    expect(cityById(city.session.state, asCityId(0))?.owner).toBe(asPlayerId(1));
+  });
+
+  it('fortifies where the unit stands: the flag in the state, a real line, and no event', () => {
+    const capture = open({ state: combatState() });
+    capture.clear();
+
+    const outcome = capture.session.run('fortify 2');
+    expect(outcome).toMatchObject({
+      kind: 'applied',
+      command: { type: 'FortifyUnit', unitId: asUnitId(2) },
+    });
+    // The frozen M6 event list has no member for "the unit is dug in", so this command
+    // emits nothing: the line below is `appliedCommandText`'s report, not an event's.
+    expect(appliedEvents(outcome)).toEqual([]);
+    expect(capture.text()).toContain(
+      'ok: unit 2 is dug in where it stands; fortifying spends its remaining movement ' +
+        '(0 left), and a unit that moves away is no longer fortified. It is worth ' +
+        '+25% defence, and it emits no event, so this line is the record of it',
+    );
+
+    const unit = capture.session.state.units.find((each) => Number(each.id) === 2);
+    expect(unit?.fortified).toBe(true);
+    expect(unit?.movementLeft).toBe(0);
+    expect(capture.session.state.revision).toBe(1);
+
+    // Fortifying again is refused rather than repeated: with no movement left, the
+    // engine's own `planFortifyUnit` is what says so.
+    capture.clear();
+    const again = capture.session.run('fortify 2');
+    expect(refusal(again).kind).toBe('not-enough-movement');
+    expect(capture.session.state.revision).toBe(1);
+  });
+
+  it('captures an undefended city: the exact population, the buildings the sack destroyed, the wonder it kept', () => {
+    const capture = open({ state: combatState() });
+    capture.clear();
+
+    const outcome = capture.session.run('attack 4 3 3');
+    expect(outcome).toMatchObject({
+      kind: 'applied',
+      command: { type: 'AttackUnit', unitId: asUnitId(4), target: tileIndex(WIDTH, 3, 3) },
+    });
+
+    // One event, and it is the capture: no battle happened, because there was nobody
+    // in the city to fight. The battle it is *not* is worth asserting: a capture that
+    // emitted a `CombatResolved` would be reporting a fight that did not occur.
+    const block = expectEveryEventRendered(outcome, capture.text());
+    expect(appliedEvents(outcome).map((event) => event.type)).toEqual(['CityCaptured']);
+    expect(block).toEqual([
+      'ok: Enemy Town (city 0) at (3,3) was CAPTURED by Player 1 (p0) from ' +
+        'Player 2 (p1); population is now 2 and the sack destroyed 2 building(s) ' +
+        '(building "City Walls", building "Granary") - a wonder is never destroyed by ' +
+        'capture, the city is not razed, and its tile improvements stay',
+    ]);
+
+    // The state, item by item: half of population 4 (rounded down, floored once), the
+    // wonder kept, the two ordinary buildings destroyed in maintenance-descending
+    // order, the queue and the work cleared, and the id, name and tile untouched.
+    const city = cityById(capture.session.state, asCityId(0));
+    expect(city?.owner).toBe(asPlayerId(0));
+    expect(city?.population).toBe(2);
+    expect(city?.name).toBe('Enemy Town');
+    expect(city?.tile).toBe(tileIndex(WIDTH, 3, 3));
+    expect(city?.buildings).toEqual([asBuildingId('pyramids')]);
+    expect(city?.queue).toEqual([]);
+    expect(city?.workedTiles).toEqual([]);
+    // The attacker spent its movement taking the city, and is standing outside it:
+    // a capture does not move the unit.
+    const attacker = capture.session.state.units.find((each) => Number(each.id) === 4);
+    expect(attacker?.tile).toBe(tileIndex(WIDTH, 2, 3));
+    expect(attacker?.movementLeft).toBe(0);
+
+    // And the same city, read back through the view, says whose it is now.
+    capture.clear();
+    capture.session.run('city 0');
+    expect(capture.text()).toContain('city 0 "Enemy Town" (Player 1 (p0) at 3,3)');
+    expect(capture.text()).toContain('population 2;');
+    expect(capture.text()).toContain('buildings: Pyramids (wonder, 2 gold/turn)');
+    expect(capture.text()).not.toContain('City Walls');
+  });
+
+  it('shows a city’s defence, and says what the number is made of', () => {
+    const walled = open({ state: combatState() });
+    walled.clear();
+    walled.session.run('city 0');
+    // The city view's line is the *city's* half of the combat story: the attacker's user
+    // needs to know that taking this tile costs more than taking the field beside it.
+    expect(walled.text()).toContain(
+      '  defence: +110% to a unit defending this tile (terrain +10%, city +50%, ' +
+        'walls +50% (it holds defensive walls)), plus +25% if that unit is fortified. ' +
+        'The city has no defence of its own: an undefended city is captured outright, ' +
+        'so what defends it is a unit standing here.',
+    );
+    // Without walls the same city is worth 60%, so the line is reading the building
+    // list rather than printing a constant.
+    const openCity = open({ state: combatState({ walls: false }) });
+    openCity.clear();
+    openCity.session.run('city 0');
+    expect(openCity.text()).toContain(
+      '  defence: +60% to a unit defending this tile (terrain +10%, city +50%, ' +
+        'walls +0% (no "walls" building here, so no wall bonus))',
+    );
+    expect(openCity.text()).not.toContain('City Walls');
+  });
+
+  it('shows a damaged unit as damaged wherever a unit is shown', () => {
+    const capture = open({
+      state: combatState({ attackerHitPoints: 1, attackerExperience: 2 }),
+    });
+    capture.clear();
+    capture.session.run('units');
+
+    const text = capture.text();
+    // The table's own column, and the two spellings the session uses elsewhere: the
+    // line under every view, and the prose of a refusal about the unit.
+    expect(text).toContain('move     hp      terrain');
+    expect(text).toContain('*  2   Warrior     Player 1     1,1       1/1      1/3 hp');
+    // The whole units on the same board read `3/3 hp`, so the `1/3` above is a wound
+    // rather than the format: a view that printed a constant would fail this pair.
+    expect(text).toContain('   3   Warrior     Player 2     1,2       1/1      3/3 hp');
+    expect(text).toContain('*2 p0 Warrior @1,1 (1/1 movement, 1/3 hp)');
+    expect(text).toContain('3 p1 Warrior @1,2 (1/1 movement, 3/3 hp)');
+
+    capture.clear();
+    capture.session.run('attack 2 2 2');
+    expect(capture.text()).toContain('unit 2 (Warrior at 1,1, 1/1 per turn movement left, 1/3 hp)');
+  });
+
+  it('is deterministic: the same board fights the same battle twice', () => {
+    const first = open({ state: combatState() });
+    const second = open({ state: combatState() });
+    runScript(first.session, `${COMBAT_SCRIPT.join('\n')}\nquit\n`, first.write);
+    runScript(second.session, `${COMBAT_SCRIPT.join('\n')}\nquit\n`, second.write);
+
+    // A battle is the one place the engine's RNG is read for a *decision* rather than
+    // for map generation, so byte-identity here is the determinism requirement on the
+    // new surface: same seed, same board, same transcript, same final hash.
+    expect(first.text()).toBe(second.text());
+    expect(hashValue(first.session.state)).toBe(hashValue(second.session.state));
+  });
+
+  it('documents the two verbs in help and in the command summary', () => {
+    expect(COMMAND_SUMMARY).toContain('attack <unitId> <x> <y>');
+    expect(COMMAND_SUMMARY).toContain('fortify <unitId>');
+
+    const capture = open();
+    capture.clear();
+    capture.session.run('help');
+    const text = capture.text();
+    expect(text).toContain('attack <unitId> <x> <y>');
+    expect(text).toContain('fortify <unitId>');
+    // The three rules a player cannot guess from the verb: the tie goes to the
+    // defender, a city with nobody in it is captured rather than fought for, and
+    // fortifying is worth a stated percentage.
+    expect(text).toContain('A tie in a round goes to the DEFENDER');
+    expect(text).toContain('CAPTURED');
+    expect(text).toContain('+25% defence');
+  });
+});
+
+describe('an attack that does not apply', () => {
+  it('refuses a unit that cannot attack, and offers what it can do instead', () => {
+    const capture = open({ state: combatState() });
+    capture.clear();
+
+    const outcome = capture.session.run('attack 0 1 2');
+    const error = refusal(outcome);
+    expect(error.kind).toBe('unit-cannot-attack');
+    if (error.kind !== 'unit-cannot-attack') throw new Error('unreachable');
+    expect(error.unitId).toBe(asUnitId(0));
+    expect(error.attack).toBe(0);
+
+    const text = capture.text();
+    expect(text).toContain("cannot attack: its type's attack is 0");
+    // The lesson is about the unit, not about the target: what a settler *can* do is
+    // move, so the legal moves are printed under the refusal.
+    expect(text).toContain('legal: unit 0 (Settler at 0,0');
+    expect(capture.session.state.revision).toBe(0);
+  });
+
+  it('names exactly the tiles the engine would accept — the lesson is the applier’s own answer', () => {
+    // The keystone invariant, on the new surface: the `legal:` line under a refusal is
+    // produced by asking `planAttackUnit` one tile at a time (`legalAttackLines`), so
+    // the tiles it prints and the tiles `attack` accepts must be the same set. This
+    // walks all eight neighbours of (1,1) in a fresh session each, which is the only
+    // way to see the *accepted* commands without killing the board.
+    const neighbours: readonly (readonly [number, number])[] = [
+      [0, 0],
+      [1, 0],
+      [2, 0],
+      [0, 1],
+      [2, 1],
+      [0, 2],
+      [1, 2],
+      [2, 2],
+    ];
+    const accepted: string[] = [];
+    for (const [x, y] of neighbours) {
+      const probe = open({ state: combatState() });
+      probe.clear();
+      if (probe.session.run(`attack 2 ${String(x)} ${String(y)}`).kind === 'applied') {
+        accepted.push(`${String(x)},${String(y)}`);
+      }
+    }
+    // (0,1) holds player 1's settler and (1,2) its warrior: the two enemy units this
+    // warrior stands beside. (0,2) holds *two* enemies, which is refused; (2,2) holds
+    // nothing; (0,0) holds player 0's own settler; (1,0) is impassable mountains.
+    expect(accepted).toEqual(['0,1', '1,2']);
+
+    const capture = open({ state: combatState() });
+    capture.clear();
+    capture.session.run('attack 2 2 2');
+    const lesson =
+      capture
+        .text()
+        .split('\n')
+        .find((line) => line.includes('can attack ')) ?? '';
+    expect(lesson).toContain('legal: unit 2 (Warrior at 1,1');
+    expect(lesson).toContain('can attack (0,1) (1,2) - each is adjacent and holds one');
+    // …and neither of the two tiles it leaves out appears on the line.
+    expect(lesson).not.toContain('(0,2)');
+    expect(lesson).not.toContain('(2,2)');
+  });
+
+  it('refuses a stacked target rather than choosing a defender', () => {
+    const capture = open({ state: combatState() });
+    capture.clear();
+
+    const outcome = capture.session.run('attack 2 0 2');
+    const error = refusal(outcome);
+    expect(error.kind).toBe('target-stacked');
+    if (error.kind !== 'target-stacked') throw new Error('unreachable');
+    expect(error.defenders).toBe(2);
+
+    const text = capture.text();
+    expect(text).toContain('error: target-stacked - (0,2) holds 2 enemy units,');
+    expect(text).toContain('rule this engine does not have (M2 lets units stack)');
+    // Both defenders are untouched: a refused attack is inert.
+    expect(capture.session.state.revision).toBe(0);
+    for (const id of [5, 6]) {
+      expect(
+        capture.session.state.units.find((unit) => Number(unit.id) === id)?.hitPointsLeft,
+      ).toBe(3);
+    }
+  });
+
+  it('refuses a target that is not adjacent, an unknown unit and a malformed line', () => {
+    const capture = open({ state: combatState() });
+
+    const notAdjacent = (line: string): GameError => {
+      capture.clear();
+      const error = refusal(capture.session.run(line));
+      expect(error.kind).toBe('invalid-argument');
+      return error;
+    };
+    // The unit's own tile (0 steps) and a tile two away: a unit attacks what it stands
+    // beside, and the rule is the engine's, not the REPL's.
+    expect(notAdjacent('attack 2 1 1').kind).toBe('invalid-argument');
+    expect(capture.text()).toContain('is 0 tiles from tile 5');
+    expect(notAdjacent('attack 2 3 3').kind).toBe('invalid-argument');
+    expect(capture.text()).toContain('ranged and multi-tile attacks are not part of M6');
+
+    capture.clear();
+    expect(refusal(capture.session.run('attack 9 1 2')).kind).toBe('unknown-unit');
+    expect(refusal(capture.session.run('fortify 9')).kind).toBe('unknown-unit');
+
+    // The REPL's own argument checks, which never reach the engine: a wrong count, a
+    // non-numeric id and an off-map coordinate are all `malformed`.
+    for (const line of [
+      'attack 2 1',
+      'attack 2 1 2 3',
+      'attack x 1 2',
+      'attack 2 x 2',
+      'attack 2 9 9',
+      'fortify',
+      'fortify 2 3',
+      'fortify x',
+    ]) {
+      capture.clear();
+      expect(capture.session.run(line).kind, line).toBe('malformed');
+    }
+    expect(capture.session.state.revision).toBe(0);
+  });
+
+  it('renders every combat event as a real line, and never a blank one', () => {
+    const capture = open({ state: combatState() });
+    const seen = new Set<string>();
+    let refusedLines = 0;
+    for (const line of COMBAT_SCRIPT) {
+      const outcome = capture.session.run(line);
+      if (outcome.kind !== 'applied') {
+        if (outcome.kind === 'refused') refusedLines += 1;
+        continue;
+      }
+      for (const event of appliedEvents(outcome)) seen.add(event.type);
+    }
+    // One line of the script is the refusal (the stacked target): a refused command
+    // emits nothing, so it is the *absence* of a block that has to stay blank-line-free
+    // too — `expectNoBlankEventLines` checks the line above each block is the echoed
+    // command, and a refusal that wrote a stray blank line would break that as well.
+    expect(refusedLines).toBe(1);
+    // The helper wants the *whole* session text: it anchors each block on the revision
+    // line and checks the line above it is the echoed command, which a cleared capture
+    // no longer carries.
+    expectNoBlankEventLines(capture.text());
+
+    // The regression is only worth anything if the script reached all four of M6's
+    // events: a blank line is what an unrendered member leaves behind, so a script that
+    // skipped one would leave nothing to catch.
+    expect([...seen].sort()).toEqual([
+      'CityCaptured',
+      'CombatResolved',
+      'UnitDestroyed',
+      'UnitPromoted',
+    ]);
+
+    // And the same session is one blocking regression over all of them, with the
+    // rendered content asserted line by line rather than only counted.
+    expect(capture.text()).toContain('ok: COMBAT - unit 2');
+    expect(capture.text()).toContain('is GONE from (1,1)');
+    expect(capture.text()).toContain('CAPTURED by Player 1 (p0)');
+    expect(capture.text()).toContain('ok: unit 0 is dug in where it stands');
+  });
 });

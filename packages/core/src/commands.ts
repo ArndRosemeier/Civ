@@ -179,6 +179,72 @@
  *   asked only the resource gate, so `applyCommand` accepted orders that
  *   `cityProductionOptions` refused. Both now ask the one verdict, because the
  *   keystone invariant is BOTH directions.
+ *
+ * M6 adds two commands — `AttackUnit` and `FortifyUnit` — and city capture, and with
+ * them:
+ *
+ * - **One evaluator, two callers, an eighth time.** `planAttackUnit` is where "may
+ *   this unit attack that tile, and what will it meet?" is decided once. The applier
+ *   refuses with it and `actions.ts`' `unitActions`/`legalActions` advertise with it,
+ *   so the keystone invariant (both directions) spans an eighth generator without a
+ *   second opinion about adjacency, ownership, attack strength, movement or what
+ *   "exactly one enemy-occupied thing" means. `planFortifyUnit` is the ninth
+ *   evaluator and is deliberately on the *queried* side of that property, for the
+ *   reason the three setters are: the M6 event list names no "the unit dug in" event,
+ *   and every action a generator advertises must be observable in the event stream
+ *   (the committed adversarial sweeps assert exactly that) — so `legalActions` yields
+ *   no `FortifyUnit` and `actions.test.ts` sweeps the planner against the applier
+ *   instead. Stated here rather than discovered by a reviewer.
+ * - **The plan decides, the applier resolves — in that order, and the plan draws
+ *   nothing.** `planAttackUnit` answers "legal, and this is what is on the tile" (a
+ *   battle against one defender, or an undefended city to capture) and is a pure read.
+ *   The *battle* is resolved afterwards, by the applier, through `combat.ts`'
+ *   `resolveCombat` — never inside the plan, because legality is asked by generators
+ *   the AI and the UI call once per unit per frame, and a legality check that consumed
+ *   the world's RNG would make "what can I do now?" change the game. That is the same
+ *   split M3 drew between `planFoundCity` and founding.
+ * - **Combat randomness is the state's, and the resolver stays pure.** The applier
+ *   hands `resolveCombat` the state's `rng` and stores the state it returns, so a
+ *   battle is reproducible from the seed alone: the same state and the same command
+ *   give the same result, the same events and the same next `rng` (pinned by
+ *   `commands.test.ts`). `combat.ts` reaches into nothing, which is why
+ *   `resolveCombat` takes and returns the RNG rather than reading `GameState`.
+ * - **An attack spends the unit's whole turn, whether or not it succeeds.** The
+ *   attacker's `movementLeft` is set to 0 by the attack itself — not by the damage it
+ *   took, and not by the outcome — so a failed assault is as expensive as a
+ *   successful one (M6: "The attack consumes ALL remaining movement … whether or not
+ *   it succeeds"). It is therefore legal exactly when there is movement to spend,
+ *   which is the same affordability test `planStartWork` applies and the same error
+ *   (`not-enough-movement`, `needed: 1`).
+ * - **The defender wins ties, and that rule is not re-derived here.** The odds, the
+ *   modifier list (terrain + fortify + city + walls), the single floor and the tie
+ *   rule all live in `combat.ts`; this file supplies the *inputs* — the two units'
+ *   statistics, the defender's bonuses, their current hit points and the RNG state —
+ *   and applies the *outcome* through `units.ts`' `woundUnit`, which removes a unit
+ *   that reaches 0 hit points. No battle arithmetic is written here, so there is no
+ *   second statement of the odds to disagree with the first.
+ * - **A capture does not relocate the attacker.** M6's capture section lists what
+ *   changes (ownership, population, buildings, queue, worked tiles) and does not
+ *   include the attacker's tile; an attack already spends the unit's whole turn, and
+ *   moving the winner in would be an unstated extra step with its own rules (stacking,
+ *   what happens to a boat, whether the move is paid for twice). The city changes
+ *   hands and is left undefended for whoever reaches it next, which is a *consequence*
+ *   a player can see rather than a rule nobody wrote down. The captured city is built
+ *   by `cities.ts`' `captureCity` — this file says *when*, that module says *what*.
+ * - **A city of another player is not enterable (M6's completion of M2's rule).** M2
+ *   refused to let a unit walk onto a tile held by another player's unit and said
+ *   outright that an enemy tile is simply not enterable; a city is the other half of
+ *   that statement, and without it a unit could stand inside an enemy city it does not
+ *   own — the state M6 names as an invariant ("no unit inside an enemy city it does
+ *   not own"). So `planMove` refuses it with the same `occupied-by-enemy`, and the way
+ *   to take that tile is `AttackUnit`, which is what makes ownership change at all.
+ * - **The new events say *why*.** `UnitDestroyed` carries a `reason` and the unit that
+ *   caused it, because a unit vanishing with no reason is indistinguishable from a
+ *   bug; `CombatResolved` carries the odds, the rounds and each side's losses, so a
+ *   consumer cannot disagree with the resolver about what happened; `UnitPromoted`
+ *   names the new level and the cap; `CityCaptured` names the old owner, the new one
+ *   and every building the sack took. `FortifyUnit` emits **nothing** — which is the
+ *   whole reason it is not advertised (see above).
  */
 
 // `buildingCatalog` here, with `buildings.ts`' rule, because `planSetProduction` is
@@ -186,12 +252,28 @@
 import {
   autoAssignWorkedTiles,
   buildingCatalog,
+  captureCity,
+  cityAt,
   cityById,
   cityRadius,
   MIN_CITY_DISTANCE,
   type City,
   type ProductionItem,
 } from './cities.js';
+// M6: the ONE statement of the odds, asked for its resolver and for the two helpers
+// that turn a unit's experience and its tile into the modifiers the resolver reads.
+// Nothing about combat's arithmetic is written in this file: `resolveCombat` takes
+// the RNG state and returns the next one, so the battle is reproducible from the
+// seed, and `defenderBonusPct`/`terrainDefenseBonus`/`veteranBonusPct` are the
+// module's own readers so a caller cannot re-derive a modifier (and floor it early,
+// which is the M4c compounding rule's failure mode).
+import {
+  defenderBonusPct,
+  MAX_EXPERIENCE,
+  resolveCombat,
+  terrainDefenseBonus,
+  veteranBonusPct,
+} from './combat.js';
 // M4c: the *building* half of production legality, asked of the module that states
 // it. `buildings.ts` says outright that its `mayStartBuilding` is the one rule the
 // planner, the option list and `production.ts`' completion path all apply; the
@@ -213,6 +295,7 @@ import { resolveHutEntry, type HutRewardKind } from './hut.js';
 // growing a second opinion about what is built where.
 import { hasImprovement, improvementDef, type ImprovementId } from './improvements.js';
 import {
+  asBuildingId,
   asCityId,
   asPlayerId,
   asTileIndex,
@@ -261,12 +344,21 @@ import type { GameState, PlayerState, Rates } from './state.js';
 import { researchProblem, withResearching } from './tech.js';
 import { advanceTurn } from './turn.js';
 import {
+  clearFortified,
+  experienceOf,
+  hitPointsLeftOf,
+  isFortified,
+  promoteUnit,
   unitById,
   unitDef,
   unitsOnTile,
+  withFortified,
+  withUnits,
   withWork,
   withoutWork,
+  woundUnit,
   type Unit,
+  type UnitDef,
   type UnitWork,
 } from './units.js';
 
@@ -327,7 +419,37 @@ export type Command =
    * action list and a generator that yielded it would be advertising a choice board
    * as if it were the player's whole move set.
    */
-  | { readonly type: 'SetResearch'; readonly tech: TechId };
+  | { readonly type: 'SetResearch'; readonly tech: TechId }
+  /**
+   * Attack the tile `target` with `unitId` (M6). One command for both shapes of
+   * combat, because a player does the same thing either way — "take that tile":
+   *
+   * - a tile holding exactly one enemy unit resolves a **battle** against it (and
+   *   that unit defends a city it is standing in, with the city's bonuses);
+   * - a tile holding an enemy city and no enemy unit is **captured**.
+   *
+   * `planAttackUnit` decides which, and refuses everything else — the tile must be
+   * adjacent, the unit must be the actor's own and have `attack > 0`, there must be
+   * movement left to spend, and the tile must hold *exactly one* enemy-occupied thing
+   * (`target-stacked` otherwise: two enemy units on one tile is a state M2's stacking
+   * rule allows, and picking one arbitrarily would be this command inventing a rule).
+   *
+   * The attack spends **all** of the unit's remaining movement whether or not it
+   * succeeds (M6), and it does not relocate the unit — see the module note on why the
+   * capture leaves the attacker where it stands.
+   */
+  | { readonly type: 'AttackUnit'; readonly unitId: UnitId; readonly target: TileIndex }
+  /**
+   * Dig in where the unit stands (M6). Sets `fortified`, costs the unit's remaining
+   * movement, and is cleared by `MoveUnit` — a unit that walks away is not dug in
+   * anywhere. No `tile` parameter, for the reason `StartWork` has none: the position
+   * *is* the unit's own, and a parameter could only disagree with it.
+   *
+   * Legal exactly when the unit is the actor's, exists and has movement left to
+   * spend (`planFortifyUnit`); it emits no event, and `legalActions` therefore does
+   * not advertise it — see the module note.
+   */
+  | { readonly type: 'FortifyUnit'; readonly unitId: UnitId };
 
 /**
  * Every way a command can be refused, as a *reason* rather than a message
@@ -567,6 +689,46 @@ export type GameError =
       readonly kind: 'tech-prerequisites-unmet';
       readonly tech: TechId;
       readonly missing: readonly TechId[];
+    }
+  /**
+   * M6: the unit may not attack — its type declares no usable attack strength
+   * (`attack === 0`, or a row whose `attack` is not a whole number above zero), or the
+   * type is one the ruleset does not describe at all, in which case the engine cannot
+   * see an attack there and reports `attack: 0`.
+   *
+   * M6 says it in as many words — "A unit with `attack === 0` may not attack; that is
+   * a legality rule, not a footnote" — and `attack` travels with the refusal so a UI
+   * can render "settlers cannot attack" rather than "illegal". A distinct member
+   * rather than `invalid-argument`, because the *fix* is distinct: this unit is not
+   * the one to attack with, whatever tile was named.
+   */
+  | { readonly kind: 'unit-cannot-attack'; readonly unitId: UnitId; readonly attack: number }
+  /**
+   * M6: there is nothing at `target` to attack — the tile holds no enemy unit and no
+   * enemy city (only the actor's own units, an empty tile, or a city the actor already
+   * owns).
+   *
+   * Distinct from `occupied-by-enemy`, which is `MoveUnit`'s refusal and means the
+   * opposite thing ("that tile *is* held by another player — attack it"), and distinct
+   * from `target-stacked` below (there is a fight there, just not a legal one).
+   */
+  | { readonly kind: 'nothing-to-attack'; readonly unitId: UnitId; readonly target: TileIndex }
+  /**
+   * M6: the tile holds **more than one** enemy unit. M6 requires the target to hold
+   * "exactly one enemy-occupied thing", and this is the other side of that rule: two
+   * enemy units on one tile is legal stacking (M2 sets no stacking limit), so the
+   * command refuses rather than choosing a victim — choosing is a *rule* ("attack the
+   * lowest-id defender"), and inventing one here would silently decide every stacked
+   * battle in the game.
+   *
+   * `defenders` is the count, so the refusal says what was found rather than only that
+   * something was wrong.
+   */
+  | {
+      readonly kind: 'target-stacked';
+      readonly unitId: UnitId;
+      readonly target: TileIndex;
+      readonly defenders: number;
     }
   | { readonly kind: 'invalid-argument'; readonly detail: string };
 
@@ -821,7 +983,134 @@ export type GameEvent =
       readonly cost: number;
       /** Beakers left in the pool afterwards: the remainder carried forward. */
       readonly beakers: number;
+    }
+  /**
+   * M6: one battle was fought. Emitted by `AttackUnit` for the unit-vs-unit half of
+   * its two shapes — a *capture* is not a battle and emits `CityCaptured` alone,
+   * because reporting a "combat" that nobody fought would put a fiction in the event
+   * stream.
+   *
+   * Every number `combat.ts`' resolver produced travels with the event — the odds
+   * (`attackerWinPct`, the same figure the resolver compared its draw against), the
+   * `rounds`, and each side's losses — so a consumer (the REPL, a balance sweep, a
+   * test) reads what happened instead of re-resolving the battle to find out. That is
+   * the reading M4b's `UpkeepPaid` takes of a bill: the derived numbers exist so the
+   * formula can be re-checked rather than trusted.
+   *
+   * `attackerSurvives`/`defenderSurvives` are part of the resolver's answer and are
+   * carried rather than inferred from the losses, because the *reason* a unit is gone
+   * arrives in the `UnitDestroyed` event that follows this one, and a consumer that
+   * had to derive one from the other could derive it differently.
+   */
+  | {
+      readonly type: 'CombatResolved';
+      readonly attackerId: UnitId;
+      readonly attackerOwner: PlayerId;
+      readonly defenderId: UnitId;
+      readonly defenderOwner: PlayerId;
+      /** The tile fought over: the defender's, which is adjacent to the attacker's. */
+      readonly target: TileIndex;
+      /** `attacker-wins` when the defender was destroyed, `defender-wins` otherwise. */
+      readonly outcome: 'attacker-wins' | 'defender-wins';
+      readonly rounds: number;
+      /** Hit points the attacker lost. */
+      readonly attackerLost: number;
+      /** Hit points the defender lost. */
+      readonly defenderLost: number;
+      /** The attacker's per-round win chance, in whole percent. */
+      readonly attackerWinPct: number;
+      readonly attackerSurvives: boolean;
+      readonly defenderSurvives: boolean;
+    }
+  /**
+   * M6: a unit left the world, and **why** — which is the whole reason this event
+   * carries a `reason` rather than being four fields of "it is gone now". A unit that
+   * vanishes with no stated cause is indistinguishable from a bug, so the reason is
+   * part of the payload and the type admits exactly the two ways a unit dies in this
+   * engine:
+   *
+   * - `combat` — resolved by `AttackUnit`, emitted with `byUnitId`/`byOwner`, naming
+   *   the unit that killed it (so a kill can be credited without replaying the battle);
+   * - `bankruptcy` — the money loop taking a unit it can no longer support. That path
+   *   currently reports itself as M4b's `UnitDisbanded` (which says why in its own
+   *   name); the union admits `bankruptcy` here so the two events are one fact
+   *   described once, and the migration of the disband path onto this member is
+   *   reported as owed by the M6 workstream rather than smuggled in behind a test.
+   *
+   * `byUnitId`/`byOwner` are **omitted** — never present-and-`undefined` — for a death
+   * that had no killer, which is the same rule every optional field of this state
+   * follows (`exactOptionalPropertyTypes`, and a present-but-`undefined` key cannot
+   * survive canonical JSON).
+   */
+  | {
+      readonly type: 'UnitDestroyed';
+      readonly unitId: UnitId;
+      readonly owner: PlayerId;
+      readonly unitType: UnitTypeId;
+      readonly tile: TileIndex;
+      readonly reason: UnitDestroyedReason;
+      readonly byUnitId?: UnitId;
+      readonly byOwner?: PlayerId;
+    }
+  /**
+   * M6: `unitId` won a battle and earned a promotion. Emitted only when the level
+   * actually rose — a unit already at `MAX_EXPERIENCE` wins without one, and an event
+   * for a promotion that did not happen would be a lie in the stream.
+   *
+   * `experience` is the level **after** the promotion and `maxExperience` is the cap
+   * it was clamped against, both carried so a consumer can render "veteran 2/3" and
+   * check the clamp from the event alone. Experience never decreases and is never lost
+   * by moving (`MoveUnit` does not touch the field); losing a battle a unit *survives*
+   * grants nothing, and the loser of a battle in this engine does not survive it —
+   * `combat.ts` resolves until a side has no hit points left.
+   */
+  | {
+      readonly type: 'UnitPromoted';
+      readonly unitId: UnitId;
+      readonly owner: PlayerId;
+      readonly tile: TileIndex;
+      /** The unit's experience **after** this promotion: 1..`maxExperience`. */
+      readonly experience: number;
+      /** The cap the level was clamped against (`combat.ts`' `MAX_EXPERIENCE`). */
+      readonly maxExperience: number;
+    }
+  /**
+   * M6: `cityId` changed hands. `from` is the owner that lost it and `to` the one that
+   * took it, both named, because "the city is now yours" without saying whose it was is
+   * not enough to reconcile an event log against a state.
+   *
+   * `population` is the population **after** the capture (the placeholder rule halves
+   * it, floored, at a minimum of 1) and `destroyed` names every building the sack took
+   * **in destruction order** (maintenance-descending). A wonder is never in that list:
+   * wonders are globally unique, so destroying one would silently make it buildable
+   * again — `cities.ts`' `captureCity` states the rule and this event is where a
+   * consumer can see it hold.
+   *
+   * The city is **not** razed: it keeps its id, its name and its tile, and the tile's
+   * improvements and roads are untouched.
+   */
+  | {
+      readonly type: 'CityCaptured';
+      readonly cityId: CityId;
+      /** The player that lost the city. */
+      readonly from: PlayerId;
+      /** The player that took it. */
+      readonly to: PlayerId;
+      readonly tile: TileIndex;
+      readonly name: string;
+      /** Population after the capture. */
+      readonly population: number;
+      /** Buildings destroyed, in destruction order; wonders are never among them. */
+      readonly destroyed: readonly BuildingId[];
     };
+
+/**
+ * Why a unit left the world (M6). Two members because the *caller's* reading differs:
+ * `combat` is a battle this command resolved, `bankruptcy` is the money loop taking a
+ * unit its owner could not pay for — the same distinction `WorkCancelledReason` draws
+ * between what a player asked for and what happened to it.
+ */
+export type UnitDestroyedReason = 'combat' | 'bankruptcy';
 
 /**
  * Why a job ended without producing anything. Two members rather than one because
@@ -979,11 +1268,23 @@ const planMoveFor = (
   }
   if (terrain.impassable) return err({ kind: 'impassable', unitId, to });
 
-  // Any unit of another player blocks the tile: with combat arriving in M6, an
-  // enemy tile is simply not enterable, and M2 must not half-implement an attack.
+  // Any unit of another player blocks the tile: an enemy tile is not enterable, and
+  // M2 must not half-implement an attack — `AttackUnit` is the way to take it.
   // A tile holding only this player's units is enterable (Civ 3 stacks).
   const enemy = unitsOnTile(state, to).find((other) => other.owner !== unit.owner);
   if (enemy !== undefined) return err({ kind: 'occupied-by-enemy', unitId, to });
+
+  // M6 completes that rule for the other half of "an enemy tile": a **city** of
+  // another player is not enterable either, and it is refused with the same error
+  // because it is the same fact — the tile is held by somebody else, and the command
+  // that answers it is `AttackUnit`. M2 left cities out only because nothing could
+  // take one yet, and the state it allowed is exactly the one M6 names as an
+  // invariant: *no unit inside an enemy city it does not own*. A city the unit's own
+  // player owns is, of course, enterable — that is the reinforcing move.
+  const cityThere = cityAt(state, to);
+  if (cityThere !== undefined && cityThere.owner !== unit.owner) {
+    return err({ kind: 'occupied-by-enemy', unitId, to });
+  }
 
   // `validateRuleset` guarantees an integer `moveCost >= 1` on passable terrain;
   // a hand-built view can still carry a broken one, and paying a NaN would put a
@@ -1791,6 +2092,267 @@ const workCancelledEvent = (unit: Unit, reason: WorkCancelledReason): readonly G
   ];
 };
 
+/* ------------------------------------------------------------------ *
+ * M6 — attacking, fortifying and capturing
+ * ------------------------------------------------------------------ */
+
+/**
+ * The building row id this engine reads as **defensive walls** (M6: the defender's
+ * `+WALLS_BONUS_PCT` "if that city holds defensive walls").
+ *
+ * **This is a placeholder convention of ours, and it is stated rather than hidden.**
+ * The engine has no vocabulary for "a building that defends its city": M4c's
+ * `BuildingEffect` union is closed and has no defence member, and `combat.ts` takes
+ * the answer as a boolean precisely so that it owns no catalog. So the wall bonus is
+ * keyed on the content row's well-known id — the shipped catalog names it `walls`
+ * (`@civts/rules`) — and a ruleset that names its walls row something else gets no
+ * wall bonus. That limitation is reported by this workstream rather than papered
+ * over: the correct fix is a `city-defense` member in `BuildingEffect` (declared in
+ * `map.ts`, validated in `rules/`), which is content vocabulary this file does not
+ * own and cannot add.
+ */
+export const WALLS_BUILDING: BuildingId = asBuildingId('walls');
+
+/**
+ * A unit's attack strength as the engine reads it, or `undefined` when this ruleset
+ * cannot read one.
+ *
+ * M6's legality rule is that a unit with `attack === 0` may not attack; a row whose
+ * `attack` is fractional, negative or missing is not a unit that may attack either,
+ * and `validateRuleset` rejects such a row rather than this file trusting it. The
+ * `undefined` answer is what `unit-cannot-attack` reports as `attack: 0` — "the engine
+ * can see no attack here" — the same reading `planFoundCity` takes of a type whose
+ * role cannot be resolved.
+ */
+const attackStrength = (def: UnitDef | undefined): number | undefined => {
+  const declared = def?.attack;
+  return declared !== undefined && Number.isInteger(declared) && declared > 0
+    ? declared
+    : undefined;
+};
+
+/**
+ * A combat statistic as `combat.ts` needs it: a whole number, never negative, and
+ * `0` for a value this engine cannot read.
+ *
+ * The engine's own rows come through `validateRuleset`, but a foreign or hand-built
+ * view can carry a fraction, a negative or a `NaN`, and `combat.ts`' `winPct` treats a
+ * zero-strength side as the *attacker's* worst case rather than inventing a bonus. So
+ * a unit whose defence cannot be read defends as 0 rather than crashing a battle —
+ * M4b's reading of an unreadable treasury, applied to a unit's statistics.
+ */
+const combatStat = (value: number | undefined): number =>
+  value !== undefined && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+
+/**
+ * What `planAttackUnit` decided: the *shape* of the attack, which is exactly the
+ * contract's "the target holds exactly one enemy-occupied thing (a unit, or a city)".
+ *
+ * A tagged union rather than a plan with an optional defender, because the two cases
+ * are handled differently end to end — one resolves a battle, the other transfers a
+ * city — and a shape that allowed "no defender and no city" would make the applier
+ * invent a third behaviour for a state legality forbids. With this type, adding a case
+ * without handling it is a compile error.
+ */
+export type AttackPlan =
+  | {
+      readonly kind: 'battle';
+      readonly unit: Unit;
+      readonly target: TileIndex;
+      /** The single enemy unit on the target tile: the defender. */
+      readonly defender: Unit;
+    }
+  | {
+      readonly kind: 'capture';
+      readonly unit: Unit;
+      readonly target: TileIndex;
+      /** The enemy city on the target tile, with no enemy unit defending it. */
+      readonly city: City;
+    };
+
+/**
+ * Decide whether `unitId` may attack `target`, and what it will meet — **the one
+ * place `AttackUnit`'s legality is stated**, used by `applyCommand` to refuse and by
+ * `actions.ts` to advertise. That sharing is the keystone invariant, both directions,
+ * on the eighth generator.
+ *
+ * The checks, in the order they run, and why that order:
+ *
+ * 1. the actor exists, the unit exists, the actor owns it (`unknown-player`,
+ *    `unknown-unit`, `not-your-unit`) — the opening every unit command has, so a
+ *    wrong-owner command is refused before anything else is read;
+ * 2. the unit may attack at all: its type resolves to a usable `attack > 0`
+ *    (`unit-cannot-attack`), M6's "that is a legality rule, not a footnote";
+ * 3. the unit stands on a whole tile index and `target` is one too, on the map
+ *    (`invalid-argument` / `out-of-bounds`) — a branded id is a number, and a client
+ *    can hand over `1.5` or `NaN`;
+ * 4. `target` is **adjacent** (`invalid-argument`, exactly the message `planMove`
+ *    uses for a non-adjacent step: path movement is not in the engine);
+ * 5. the target holds **at most one** enemy unit (`target-stacked` when it holds
+ *    more) — M6's "exactly one enemy-occupied thing", and this is the half of it that
+ *    refuses rather than guesses;
+ * 6. what is there: one enemy unit ⇒ a battle; otherwise an enemy city ⇒ a capture;
+ *    otherwise `nothing-to-attack`;
+ * 7. the unit has movement left to spend (`not-enough-movement`, `needed: 1`) —
+ *    affordability last, as `planMove` and `planStartWork` both do, so the reason
+ *    reported is about the target rather than about the turn's movement when both are
+ *    wrong.
+ *
+ * **What is deliberately not checked.** Terrain: an attack crosses water or a
+ * mountain ridge, because M6 names no domain rule for it and the engine has no
+ * "adjacent but unreachable" concept — a unit attacks what it can see next to it.
+ * Fog: whether the actor has explored the target is not a legality rule anywhere in
+ * this engine (M2 says so for movement, M4a for work), and M6 does not change that.
+ * The *walls* of a city the defender stands in are not a legality question either:
+ * they are a modifier, read by the applier where the battle is built, and a player may
+ * attack a walled city — it is simply harder.
+ *
+ * `attackStrength` and `combatStat` are the only readings of a unit's statistics in
+ * this file, and `combat.ts` is the only place they are turned into odds.
+ */
+export const planAttackUnit = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  unitId: UnitId,
+  target: TileIndex,
+): Result<AttackPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const unit = unitById(state, unitId);
+  if (unit === undefined) return err({ kind: 'unknown-unit', unitId });
+  if (unit.owner !== playerId) return err({ kind: 'not-your-unit', unitId, owner: unit.owner });
+
+  const def = unitDef(ruleset, unit.type);
+  if (attackStrength(def) === undefined) {
+    // `combatStat`'s reading, reported as the refusal's own field: a unit type the
+    // ruleset does not describe has no attack the engine can see, which is `0`.
+    return err({ kind: 'unit-cannot-attack', unitId, attack: combatStat(def?.attack) });
+  }
+
+  const from = Number(unit.tile);
+  if (!Number.isInteger(from)) {
+    return err({
+      kind: 'invalid-argument',
+      detail: `AttackUnit needs a unit standing on an integer tile index (unit ${String(unitId)} is on ${String(unit.tile)})`,
+    });
+  }
+
+  const index = Number(target);
+  if (!Number.isInteger(index)) {
+    return err({
+      kind: 'invalid-argument',
+      detail: `AttackUnit takes an integer tile index (got ${String(target)})`,
+    });
+  }
+
+  const x = indexToX(state.map, index);
+  const y = indexToY(state.map, index);
+  if (!inBounds(state.map, x, y)) return err({ kind: 'out-of-bounds', to: target });
+
+  const steps = distance8(state.map, unit.tile, target);
+  if (steps !== 1) {
+    return err({
+      kind: 'invalid-argument',
+      detail:
+        `AttackUnit targets one of the 8 adjacent tiles: tile ${String(index)} is ` +
+        `${String(steps)} tiles from tile ${String(from)}. A unit attacks what it stands beside; ` +
+        'ranged and multi-tile attacks are not part of M6.',
+    });
+  }
+
+  // Enemy *units*, in `state.units` order (sorted by id), so the reported count and the
+  // chosen defender are both functions of the state rather than of iteration luck. A
+  // unit of the attacker's own player is not an enemy and is not counted: stacking
+  // one's own units is legal (M2), and a stack of friendly units on the target tile
+  // does not make the enemy standing there harder to reach.
+  const enemies = unitsOnTile(state, target).filter((other) => other.owner !== unit.owner);
+  if (enemies.length > 1) {
+    return err({ kind: 'target-stacked', unitId, target, defenders: enemies.length });
+  }
+
+  const defender = enemies[0];
+  if (defender !== undefined) {
+    // Affordability is checked *after* the target, so the reported reason is about the
+    // target when both are wrong (see the order note above).
+    if (!Number.isInteger(unit.movementLeft) || unit.movementLeft <= 0) {
+      return err({
+        kind: 'not-enough-movement',
+        unitId,
+        needed: 1,
+        available: unit.movementLeft,
+      });
+    }
+    return ok({ kind: 'battle', unit, target, defender });
+  }
+
+  const city = cityAt(state, target);
+  if (city === undefined || city.owner === unit.owner) {
+    return err({ kind: 'nothing-to-attack', unitId, target });
+  }
+
+  if (!Number.isInteger(unit.movementLeft) || unit.movementLeft <= 0) {
+    return err({
+      kind: 'not-enough-movement',
+      unitId,
+      needed: 1,
+      available: unit.movementLeft,
+    });
+  }
+  return ok({ kind: 'capture', unit, target, city });
+};
+
+/** What `planFortifyUnit` decided: the unit that will dig in. */
+export interface FortifyPlan {
+  readonly unit: Unit;
+}
+
+/**
+ * Decide whether `unitId` may fortify — the one place `FortifyUnit`'s legality is
+ * stated, and the ninth evaluator in the keystone sweep (on the *queried* side: see
+ * the module note on why this command is not advertised).
+ *
+ * Three checks and one rule, the same opening every unit command has: the actor
+ * exists, the unit exists, the actor owns it, and the unit has movement left to spend
+ * (the fortification costs the unit's remaining movement, so `needed: 1` is the
+ * smallest amount that would have made it legal).
+ *
+ * **Fortifying twice in one turn is refused by the movement rule, not by a special
+ * case**: the first fortification spends the movement, so the second finds none. That
+ * is the same shape `planStartWork` has, and it means there is no "already fortified"
+ * refusal — a re-fortify of a unit that somehow still had movement (a hand-built
+ * state, a save) is legal and writes the same flag.
+ *
+ * It emits no event, and that is a *stated* decision rather than an omission: the M6
+ * event list names `CombatResolved`, `UnitDestroyed`, `UnitPromoted` and
+ * `CityCaptured`, and the committed adversarial sweeps treat "an advertised action
+ * that emits no event" as a generator that has drifted. So `legalActions` yields no
+ * `FortifyUnit` — exactly as it yields no `SetRates`/`SetResearch` — and
+ * `actions.test.ts` sweeps the planner against the applier instead. Advertising it
+ * would need a `GameEvent` member the frozen list does not have.
+ */
+export const planFortifyUnit = (
+  state: GameState,
+  playerId: PlayerId,
+  unitId: UnitId,
+): Result<FortifyPlan, GameError> => {
+  if (playerById(state, playerId) === undefined) {
+    return err({ kind: 'unknown-player', playerId });
+  }
+
+  const unit = unitById(state, unitId);
+  if (unit === undefined) return err({ kind: 'unknown-unit', unitId });
+  if (unit.owner !== playerId) return err({ kind: 'not-your-unit', unitId, owner: unit.owner });
+
+  if (!Number.isInteger(unit.movementLeft) || unit.movementLeft <= 0) {
+    return err({ kind: 'not-enough-movement', unitId, needed: 1, available: unit.movementLeft });
+  }
+
+  return ok({ unit });
+};
+
 /**
  * Apply a decided move: a new `units` array with the mover replaced (in place,
  * so the array stays sorted by id), `revision` bumped once, and the mover's new
@@ -1815,6 +2377,14 @@ const workCancelledEvent = (unit: Unit, reason: WorkCancelledReason): readonly G
  * event stream — not a diff of the unit — is how a consumer learns about it. A
  * step to the tile the unit already occupies would leave it alone; `planMove`
  * refuses non-adjacent destinations, so that case exists only for totality.
+ *
+ * M6: **a relocated unit is no longer fortified.** "Fortified" means "dug in *here*"
+ * — the same reading the job above takes of a tile-bound state — so walking away drops
+ * it, and it is dropped through `clearFortified` (the field is removed rather than set
+ * to `false`, because that is the spelling this state uses for "not fortified" and the
+ * one `canonicalize` accepts). Both clears are skipped for a step that does not move
+ * the unit at all, which keeps this function total for a plan no legality rule can
+ * produce.
  */
 const movedState = (state: GameState, plan: MovePlan): GameState => {
   const units = state.units.map((unit) => {
@@ -1824,11 +2394,252 @@ const movedState = (state: GameState, plan: MovePlan): GameState => {
       tile: plan.to,
       movementLeft: unit.movementLeft - plan.cost,
     };
-    return unit.tile === plan.to ? moved : withoutWork(moved);
+    return unit.tile === plan.to ? moved : clearFortified(withoutWork(moved));
   });
 
   const moved: GameState = { ...state, revision: state.revision + 1, units };
   return withExplored(moved, plan.unit.owner, visibleTiles(moved, plan.unit.owner));
+};
+
+/* ------------------------------------------------------------------ *
+ * M6 — applying an attack
+ * ------------------------------------------------------------------ */
+
+/**
+ * The `UnitDestroyed` event for a unit that left the world in combat, with the unit
+ * that killed it named.
+ *
+ * One helper rather than two inline literals (the attacker may die as easily as the
+ * defender), because both deaths must report the *same* facts in the same shape —
+ * and `byUnitId`/`byOwner` are added only when there is a killer, so the optional pair
+ * is **omitted** rather than written as `undefined` (the spelling that cannot survive
+ * canonical JSON, and the bug class this project has paid for three times).
+ */
+const unitDestroyedInCombat = (victim: Unit, killer: Unit): GameEvent => ({
+  type: 'UnitDestroyed',
+  unitId: victim.id,
+  owner: victim.owner,
+  unitType: victim.type,
+  tile: victim.tile,
+  reason: 'combat',
+  byUnitId: killer.id,
+  byOwner: killer.owner,
+});
+
+/** `state` with one unit rebuilt by `update`; unchanged if the state does not hold it. */
+const withUnitChange = (
+  state: GameState,
+  unitId: UnitId,
+  update: (unit: Unit) => Unit,
+): GameState =>
+  withUnits(
+    state,
+    state.units.map((unit) => (unit.id === unitId ? update(unit) : unit)),
+    0,
+  );
+
+/**
+ * `state` with `lost` hit points taken off a unit, through `units.ts`' `woundUnit` —
+ * which is the *only* thing in the engine that turns a loss into state, and which
+ * removes the unit when the loss reaches its hit points. A loss of zero (or a value
+ * that is not a positive whole number) writes nothing at all, so a survivor is not
+ * rebuilt for nothing and an unreadable resolver answer cannot put a fraction into
+ * the state.
+ */
+const woundIn = (state: GameState, unitId: UnitId, lost: number): GameState => {
+  if (!Number.isInteger(lost) || lost <= 0) return state;
+  const wounded = woundUnit(state, unitId, lost);
+  return wounded === undefined ? state : wounded.state;
+};
+
+/**
+ * Apply one unit-vs-unit battle: resolve it, apply both sides' losses, spend the
+ * attacker's whole turn, promote the winner, and report all of it.
+ *
+ * The battle itself is `combat.ts`' `resolveCombat`, handed the **state's** RNG and the
+ * inputs it cannot look up for itself — the two units' statistics, the defender's
+ * pre-summed bonuses and both units' current hit points. Nothing here re-derives an
+ * odds figure: the modifier list is `defenderBonusPct` and the veteran bonus is
+ * `veteranBonusPct`, both read from that module, and the only arithmetic in this file
+ * is "which unit is still here afterwards".
+ *
+ * The order of the writes is the order of the events, and it matters:
+ *
+ * 1. the state's `rng` becomes the state `resolveCombat` returned, so the battle is
+ *    reproducible from the seed and the *next* battle starts where this one stopped;
+ * 2. both losses are applied (the loser is removed, the winner is wounded) — a
+ *    survivor fights wounded next time, because `units.ts` writes the new hit point
+ *    count rather than a flag;
+ * 3. the attacker's remaining movement is set to **0**, whether or not it won (M6);
+ * 4. the winner — the side still standing when the other is not — gains exactly one
+ *    experience level, capped at `MAX_EXPERIENCE`, and `UnitPromoted` is emitted only
+ *    if the level actually rose. A unit at the cap wins without an event, because an
+ *    event for a promotion that did not happen would be a lie in the stream.
+ *
+ * Exactly one side dies in a battle this engine can produce (`DAMAGE_PER_ROUND` is 1
+ * and the loop runs until a side has nothing left), but the code does not assume it:
+ * if both survived or both died, no unit *won* anything and nothing is promoted.
+ */
+const applyBattle = (
+  state: GameState,
+  ruleset: RulesetView,
+  plan: Extract<AttackPlan, { kind: 'battle' }>,
+): CommandOutcome => {
+  const attackerDef = unitDef(ruleset, plan.unit.type);
+  const defenderDef = unitDef(ruleset, plan.defender.type);
+  const experience = experienceOf(plan.unit);
+
+  // The defender's modifiers. The city bonus is the *defender's own* city: a unit of a
+  // third player standing in somebody else's streets is not defending that city's
+  // walls, which is the reading `combat.ts` states ("walls are a property of a city")
+  // taken one step further, and it is stated here because the contract does not say.
+  const city = cityAt(state, plan.target);
+  const inCity = city !== undefined && city.owner === plan.defender.owner;
+  const walls = city !== undefined && inCity && city.buildings.includes(WALLS_BUILDING);
+
+  const outcome = resolveCombat({
+    // The attacker's statistics with its *own* bonus in `bonusPct` — experience, via
+    // `veteranBonusPct`, which is that module's statement of the rule — and the level
+    // passed separately as `experience`, which is the field `resolveCombat` reads. The
+    // two are the same number by construction and are both supplied so that a reader
+    // cannot get a battle without the veteran bonus by filling in only one of them.
+    attacker: {
+      attack: combatStat(attackerDef?.attack),
+      defense: combatStat(attackerDef?.defense),
+      bonusPct: veteranBonusPct(experience),
+    },
+    defender: {
+      attack: combatStat(defenderDef?.attack),
+      defense: combatStat(defenderDef?.defense),
+      bonusPct: defenderBonusPct({
+        terrainBonusPct: terrainDefenseBonus(terrainDefAt(state, ruleset, plan.target) ?? {}),
+        fortified: isFortified(plan.defender),
+        inCity,
+        walls,
+      }),
+    },
+    attackerHitPoints: hitPointsLeftOf(plan.unit),
+    defenderHitPoints: hitPointsLeftOf(plan.defender),
+    rng: state.rng,
+    experience,
+  });
+
+  const { result } = outcome;
+  let next: GameState = { ...state, rng: outcome.rng };
+  next = woundIn(next, plan.unit.id, result.attackerLost);
+  next = woundIn(next, plan.defender.id, result.defenderLost);
+
+  const attackerSurvives = unitById(next, plan.unit.id) !== undefined;
+  const defenderSurvives = unitById(next, plan.defender.id) !== undefined;
+
+  const events: GameEvent[] = [
+    {
+      type: 'CombatResolved',
+      attackerId: plan.unit.id,
+      attackerOwner: plan.unit.owner,
+      defenderId: plan.defender.id,
+      defenderOwner: plan.defender.owner,
+      target: plan.target,
+      outcome: result.outcome,
+      rounds: result.rounds,
+      attackerLost: result.attackerLost,
+      defenderLost: result.defenderLost,
+      attackerWinPct: result.attackerWinPct,
+      // Read from the state rather than copied from the resolver's flags: they are the
+      // same answer (the losses applied *are* the resolver's losses), and the state is
+      // the thing a consumer can check the event against.
+      attackerSurvives,
+      defenderSurvives,
+    },
+  ];
+
+  if (!attackerSurvives) events.push(unitDestroyedInCombat(plan.unit, plan.defender));
+  if (!defenderSurvives) events.push(unitDestroyedInCombat(plan.defender, plan.unit));
+
+  // Step 3: the whole turn, spent — on a survivor. A dead unit has no movement to
+  // spend and rebuilding it would re-add it to the world.
+  if (attackerSurvives) {
+    next = withUnitChange(next, plan.unit.id, (unit) => ({ ...unit, movementLeft: 0 }));
+  }
+
+  // Step 4: the winner promotes, once, clamped. `attackerSurvives === defenderSurvives`
+  // means nobody lost, so nobody won a combat.
+  const winner =
+    attackerSurvives === defenderSurvives
+      ? undefined
+      : unitById(next, attackerSurvives ? plan.unit.id : plan.defender.id);
+
+  if (winner !== undefined) {
+    const promoted = promoteUnit(winner, MAX_EXPERIENCE);
+    if (experienceOf(promoted) > experienceOf(winner)) {
+      next = withUnitChange(next, winner.id, () => promoted);
+      events.push({
+        type: 'UnitPromoted',
+        unitId: promoted.id,
+        owner: promoted.owner,
+        tile: promoted.tile,
+        experience: experienceOf(promoted),
+        maxExperience: MAX_EXPERIENCE,
+      });
+    }
+  }
+
+  return { state: { ...next, revision: state.revision + 1 }, events };
+};
+
+/**
+ * Apply the capture half of `AttackUnit`: hand the city to the attacker's player and
+ * report what the sack took.
+ *
+ * **Nothing is promoted.** A capture is not a battle — no shot was fired, no round was
+ * lost — and M6 grants a level for *winning a combat*, so an undefended city taken by a
+ * scout is not a promotion. The capture itself is `cities.ts`' `captureCity`: this
+ * function only says *when* it happens (here), spends the attacker's movement (the
+ * attack costs the unit's whole turn whether or not it succeeds, and whether or not it
+ * met anyone) and turns its answer into the `CityCaptured` event, with the old owner,
+ * the new one, the population afterwards and every building destroyed in destruction
+ * order.
+ *
+ * The `undefined` branch is unreachable — the plan read this city out of this very
+ * state, and nothing between the two calls can change it. It is answered with a typed
+ * refusal rather than a silent no-op, so that a future refactor which *does* make it
+ * reachable fails loudly instead of reporting an attack that took nothing.
+ */
+const applyCapture = (
+  state: GameState,
+  ruleset: RulesetView,
+  plan: Extract<AttackPlan, { kind: 'capture' }>,
+): Result<CommandOutcome, GameError> => {
+  const capture = captureCity(state, buildingCatalog(ruleset), plan.city.id, plan.unit.owner);
+  if (capture === undefined) {
+    return err({
+      kind: 'invalid-argument',
+      detail:
+        `city ${String(plan.city.id)} was in the attack plan but not in the state; ` +
+        'a capture is applied to the city the plan named',
+    });
+  }
+
+  const spent = withUnitChange(capture.state, plan.unit.id, (unit) => ({
+    ...unit,
+    movementLeft: 0,
+  }));
+
+  return ok({
+    state: { ...spent, revision: state.revision + 1 },
+    events: [
+      {
+        type: 'CityCaptured',
+        cityId: capture.city.id,
+        from: plan.city.owner,
+        to: capture.city.owner,
+        tile: capture.city.tile,
+        name: capture.city.name,
+        population: capture.city.population,
+        destroyed: capture.destroyed,
+      },
+    ],
+  });
 };
 
 /**
@@ -2067,6 +2878,37 @@ export const applyCommand = (
       );
 
       return ok({ state: { ...state, revision: state.revision + 1, players }, events: [] });
+    }
+
+    // M6: one command, two shapes — a battle against the single enemy unit on the
+    // target tile, or the capture of an undefended enemy city. `planAttackUnit` has
+    // already decided which, so the applier cannot pick differently from the generator
+    // that advertised it, and the plan is a pure read: no draw from `state.rng` happens
+    // until the battle is actually resolved below.
+    case 'AttackUnit': {
+      const plan = planAttackUnit(state, ruleset, playerId, cmd.unitId, cmd.target);
+      if (!plan.ok) return err(plan.error);
+
+      if (plan.value.kind === 'capture') return applyCapture(state, ruleset, plan.value);
+      return ok(applyBattle(state, ruleset, plan.value));
+    }
+
+    // M6: dig in. Legal where `planFortifyUnit` says so — the unit is the actor's and
+    // has movement to spend — and the fortification costs *all* of it, which is what
+    // makes "fortify twice in one turn" impossible without a special case.
+    //
+    // No event, which is why `legalActions` does not advertise it: the committed
+    // adversarial sweeps require every advertised action to be observable in the event
+    // stream, and the M6 `GameEvent` list names no member for "the unit is dug in". The
+    // state itself is the record (`Unit.fortified`), the same way `SetWorkedTiles` and
+    // `SetRates` are recorded by their own payload.
+    case 'FortifyUnit': {
+      const plan = planFortifyUnit(state, playerId, cmd.unitId);
+      if (!plan.ok) return err(plan.error);
+
+      const fortified = withFortified(plan.value.unit);
+      const dug: Unit = { ...fortified, movementLeft: 0 };
+      return ok({ state: { ...withUnit(state, dug), revision: state.revision + 1 }, events: [] });
     }
   }
 };

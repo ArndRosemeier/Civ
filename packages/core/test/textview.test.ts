@@ -222,6 +222,21 @@ const NO_UNITS: RulesetView = {
   fidelity: 'tuned',
 };
 
+/**
+ * The same view with the worker row given M6's `hitPoints: 3`.
+ *
+ * `UnitDef.hitPoints` is optional **on the view** — a ruleset written before M6 is
+ * still one the engine can run a game from, and `textview` is handed whatever the
+ * caller has — so the tests below exercise both shapes: the pre-M6 row (no declared
+ * maximum, where the honest maximum is the unit's own count, `1/1`) and this one
+ * (a declared maximum of 3, where a wounded unit renders `1/3`). A variant rather
+ * than a second catalog, so nothing else in this file moves.
+ */
+const HIT_POINT_RULESET: RulesetView = {
+  ...RULESET,
+  units: [SETTLER, { ...WORKER, hitPoints: 3 }],
+};
+
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
 /** Terrain grid of the synthetic 4x4 map, in reading order. */
@@ -835,10 +850,15 @@ const job = (kind: string, turnsLeft: number, tile = WORKER_TILE): UnitWork => (
  * standing on `tile`, doing `work` when one is given. `work` is attached through
  * `withWork`, the only writer of the field — an idle unit carries no `work` key at
  * all, never a key holding `undefined`.
+ *
+ * M6 adds `hitPointsLeft`: an explicit count is written **only when a test asks for
+ * one**, so every other fixture here stays exactly the unit the M4a wave built (no key
+ * at all, which `hitPointsLeftOf` reads as a unit at 1) and the damaged-unit case below
+ * is the only one that carries the field.
  */
 const withWorkOn = (
   work: UnitWork | undefined,
-  options?: { type?: string; tile?: number },
+  options?: { type?: string; tile?: number; hitPointsLeft?: number },
 ): GameState => {
   const base: Unit = {
     id: asUnitId(2),
@@ -846,6 +866,7 @@ const withWorkOn = (
     owner: asPlayerId(0),
     tile: asTileIndex(options?.tile ?? WORKER_TILE),
     movementLeft: 0,
+    ...(options?.hitPointsLeft === undefined ? {} : { hitPointsLeft: options.hitPointsLeft }),
   };
   return {
     ...STATE_4x4,
@@ -882,18 +903,48 @@ describe('describe and work in progress', () => {
     expect(idle).not.toContain('mining');
 
     // A job in progress is a line of its own, under `starts:`, naming the unit by
-    // id, its owner, its type, the tile the job is on and how long it has left.
+    // id, its owner, its type, the tile the job is on, its hit points (M6) and how
+    // long it has left.
     const working = describeState(withWorkOn(job('mine', 2)), RULESET);
     const lines = working.split('\n').filter((line) => line !== '');
-    expect(lines[lines.length - 1]).toBe('work: 2 p0 Worker@2,3 mining, 2 turns left');
+    expect(lines[lines.length - 1]).toBe('work: 2 p0 Worker@2,3 1/1 hp mining, 2 turns left');
     // …and the rest of the picture is untouched: the grid, the legend and the
     // starts line are byte-for-byte what the same board renders with no job.
-    expect(working.replace('work: 2 p0 Worker@2,3 mining, 2 turns left\n', '')).toBe(idle);
+    expect(working.replace('work: 2 p0 Worker@2,3 1/1 hp mining, 2 turns left\n', '')).toBe(idle);
+  });
+
+  it('shows a damaged unit as damaged, with its maximum asked of its own type', () => {
+    // M6: the one property of combat a reader can check from this view. A wounded
+    // worker must not render like a whole one — the counts differ, and the *maximum*
+    // is the row's own `hitPoints` (3 in this fixture), not the unit's current count.
+    const hurt = describeState(withWorkOn(job('mine', 2), { hitPointsLeft: 1 }), HIT_POINT_RULESET);
+    expect(hurt).toContain('work: 2 p0 Worker@2,3 1/3 hp mining, 2 turns left');
+
+    // The whole figure, not just the numerator: the same unit at full health on the
+    // same board differs *only* in that field, which is what makes the line a
+    // measurement rather than a decoration.
+    const whole = describeState(
+      withWorkOn(job('mine', 2), { hitPointsLeft: 3 }),
+      HIT_POINT_RULESET,
+    );
+    expect(whole).toContain('work: 2 p0 Worker@2,3 3/3 hp mining, 2 turns left');
+    expect(whole).not.toBe(hurt);
+
+    // A *type* this ruleset cannot describe is the case the fallback exists for: the
+    // maximum is then the unit's own count, because inventing one would be a claim
+    // about a row the catalog does not have (and would render `1/1` for a unit the
+    // state says has taken two hits out of three).
+    const unknown = describeState(
+      withWorkOn(job('mine', 2), { type: 'ghost', hitPointsLeft: 2 }),
+      HIT_POINT_RULESET,
+    );
+    expect(unknown).toContain('work: 2 p0 ghost@2,3 2/2 hp mining, 2 turns left');
+    expect(unknown).not.toMatch(/NaN|undefined/);
   });
 
   it('says one turn when one turn is left, and names every job on one line', () => {
     expect(describeState(withWorkOn(job('mine', 1)), RULESET)).toContain(
-      'work: 2 p0 Worker@2,3 mining, 1 turn left',
+      'work: 2 p0 Worker@2,3 1/1 hp mining, 1 turn left',
     );
 
     // Two workers on two tiles: both jobs, two spaces apart, in `units` order.
@@ -907,7 +958,8 @@ describe('describe and work in progress', () => {
       ],
     };
     expect(describeState(pair, RULESET)).toContain(
-      'work: 2 p0 Worker@1,2 building a road, 2 turns left  3 p1 Worker@1,3 mining, 3 turns left',
+      'work: 2 p0 Worker@1,2 1/1 hp building a road, 2 turns left  ' +
+        '3 p1 Worker@1,3 1/1 hp mining, 3 turns left',
     );
   });
 
@@ -917,7 +969,7 @@ describe('describe and work in progress', () => {
     const view = describeState(withWorkOn(job('mine', 2)), RULESET, { showStarts: false });
 
     expect(view).not.toContain('starts:');
-    expect(view).toContain('work: 2 p0 Worker@2,3 mining, 2 turns left');
+    expect(view).toContain('work: 2 p0 Worker@2,3 1/1 hp mining, 2 turns left');
   });
 
   it('falls back to the raw ids for a job the ruleset cannot describe', () => {
@@ -925,18 +977,18 @@ describe('describe and work in progress', () => {
     // says so — and the renderer must not pretend the worker is idle. The id is
     // all that is known, so the id is what is printed.
     expect(describeState(withWorkOn(job('quarry', 2)), RULESET)).toContain(
-      'work: 2 p0 Worker@2,3 quarry, 2 turns left',
+      'work: 2 p0 Worker@2,3 1/1 hp quarry, 2 turns left',
     );
 
     // …and a unit type the ruleset cannot name is printed as its raw id, the same
     // rule the rest of this file applies to an unknown terrain id.
     expect(describeState(withWorkOn(job('mine', 2), { type: 'ghost' }), RULESET)).toContain(
-      'work: 2 p0 ghost@2,3 mining, 2 turns left',
+      'work: 2 p0 ghost@2,3 1/1 hp mining, 2 turns left',
     );
     // A ruleset with no catalogs at all is the same case twice over: no crash, and
     // both the type and the job are named by their ids.
     expect(describeState(withWorkOn(job('mine', 2)), NO_UNITS)).toContain(
-      'work: 2 p0 worker@2,3 mine, 2 turns left',
+      'work: 2 p0 worker@2,3 1/1 hp mine, 2 turns left',
     );
   });
 
@@ -950,11 +1002,14 @@ describe('describe and work in progress', () => {
 
     // The *existence* of unseen work is counted, exactly as an unexplored start is
     // (`starts: … (+1 unexplored)`): the count is a number, and it is the only
-    // thing about the hidden job that reaches the screen.
+    // thing about the hidden job that reaches the screen. The hit points added in M6
+    // are behind the same fog rule as the rest of the entry — a wounded worker the
+    // viewer cannot see is not a fact the viewer has.
     expect(seen).toContain('work: (+1 unexplored)');
     expect(seen).not.toContain('Worker@');
     expect(seen).not.toContain('mining');
     expect(seen).not.toContain('2,3');
+    expect(seen).not.toContain('hp');
 
     // The strongest form of "does not leak the content": two *different* hidden
     // jobs, on two different unexplored tiles, render the same bytes — so nothing
@@ -965,7 +1020,7 @@ describe('describe and work in progress', () => {
     // …and the same job, on a tile the viewer *has* explored, is shown in full.
     const inSight = foggedAs(withWorkOn(job('mine', 2, 9), { tile: 9 }), [4, 5, 6, 9]);
     expect(describeState(inSight, RULESET, { viewer: asPlayerId(0) })).toContain(
-      'work: 2 p0 Worker@1,2 mining, 2 turns left',
+      'work: 2 p0 Worker@1,2 1/1 hp mining, 2 turns left',
     );
   });
 

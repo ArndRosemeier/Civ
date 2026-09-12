@@ -48,6 +48,7 @@ import {
 import type { TechDef } from '../src/tech.js';
 import {
   UNIT_ROLES,
+  hitPointsLeftOf,
   unitById,
   unitCatalog,
   unitDef,
@@ -324,8 +325,11 @@ describe('withWork / withoutWork — a unit’s job, in M4a’s shape', () => {
     if (idle === undefined) throw new Error('the fixture has no unit 0');
     const busy = withWork(idle, WORK);
 
-    expect(busy).toStrictEqual({ ...idle, work: WORK });
+    expect(busy).toStrictEqual({ ...idle, hitPointsLeft: hitPointsLeftOf(idle), work: WORK });
+    // M6 adds `hitPointsLeft` to every unit, and `withWork` carries it — a rebuild that
+    // dropped it would silently heal a wounded unit the moment it took a job.
     expect(Object.keys(busy).sort()).toEqual([
+      'hitPointsLeft',
       'id',
       'movementLeft',
       'owner',
@@ -333,6 +337,7 @@ describe('withWork / withoutWork — a unit’s job, in M4a’s shape', () => {
       'type',
       'work',
     ]);
+    expect(busy.hitPointsLeft).toBe(hitPointsLeftOf(idle));
     expect(busy.work).toStrictEqual({
       kind: asImprovementId('mine'),
       tile: asTileIndex(5),
@@ -348,10 +353,19 @@ describe('withWork / withoutWork — a unit’s job, in M4a’s shape', () => {
     const released = withoutWork(busy);
 
     expect('work' in released).toBe(false);
-    expect(Object.keys(released).sort()).toEqual(['id', 'movementLeft', 'owner', 'tile', 'type']);
+    expect(Object.keys(released).sort()).toEqual([
+      'hitPointsLeft',
+      'id',
+      'movementLeft',
+      'owner',
+      'tile',
+      'type',
+    ]);
     // Every other field survives untouched, including the movement the job did not
-    // refund: releasing a unit is not a state the caller has to repair.
-    expect(released).toStrictEqual(idle);
+    // refund and M6's hit points: releasing a unit is not a state the caller has to
+    // repair. `hitPointsLeft` is written from `hitPointsLeftOf(idle)`, so this holds
+    // even for a fixture that predates the field.
+    expect(released).toStrictEqual({ ...idle, hitPointsLeft: hitPointsLeftOf(idle) });
   });
 
   it('is idempotent in both directions and never mutates the unit handed in', () => {
@@ -362,7 +376,10 @@ describe('withWork / withoutWork — a unit’s job, in M4a’s shape', () => {
     const busy = withWork(frozen, WORK);
 
     expect(withWork(busy, WORK)).toStrictEqual(busy); // attaching the same job again
-    expect(withoutWork(withoutWork(busy))).toStrictEqual(idle); // releasing twice
+    expect(withoutWork(withoutWork(busy))).toStrictEqual({
+      ...idle,
+      hitPointsLeft: hitPointsLeftOf(idle),
+    }); // releasing twice
     expect(frozen).toStrictEqual(idle); // the input is untouched
     expect('work' in frozen).toBe(false);
   });

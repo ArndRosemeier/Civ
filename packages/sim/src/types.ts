@@ -47,6 +47,7 @@ import type {
   RngState,
   RulesetView,
   Settings,
+  TechId,
   TerrainRole,
   TerrainYields,
   UnitDomain,
@@ -336,6 +337,17 @@ export interface TerrainPatch {
   readonly defenseBonusPct?: number;
   readonly yields?: YieldsPatch;
   readonly impassable?: boolean;
+  /**
+   * The M6 spelling of `defenseBonusPct` — terrain defence (INTERFACES.md M6,
+   * "Terrain defence").
+   *
+   * Both spellings are patchable, and the applier treats them as **one magnitude**:
+   * naming either sets both, because `core/combat.ts`' `terrainDefenseBonus` reads
+   * `defenseBonus` in preference to `defenseBonusPct`. A patch that moved only the
+   * older name would therefore change nothing a battle can see — a sweep that reports
+   * "no effect" for a reason that is not the game's is worse than no sweep at all.
+   */
+  readonly defenseBonus?: number;
 }
 
 export interface UnitPatch {
@@ -354,6 +366,24 @@ export interface UnitPatch {
    * spelling for clearing it.
    */
   readonly requiresResource?: ResourceId;
+  /**
+   * Hit points at full health (M6, "Unit combat statistics").
+   *
+   * It is here because a combat balance sweep is exactly what M6 asks for, and hit
+   * points are the magnitude that decides how long a battle runs: without this field a
+   * sweep could vary attack and defence but not the one number that changes the
+   * *distribution* rather than the odds. The applier carries the row's value across
+   * when a patch names something else — see `overrides.ts`' `mergeUnit`, where a
+   * rebuild that forgot this field would silently reset every unit in the world to one
+   * hit point.
+   */
+  readonly hitPoints?: number;
+  /**
+   * The technology this row needs before any city may build it (M5's gating).
+   *
+   * Set or changed, never removed, for the reason `requiresResource` states.
+   */
+  readonly requiresTech?: TechId;
 }
 
 export interface BuildingPatch {
@@ -365,6 +395,8 @@ export interface BuildingPatch {
   readonly effects?: readonly BuildingEffect[];
   /** `true` only. A `false` is not how this project spells "not a wonder". */
   readonly wonder?: true;
+  /** The technology a city must know before it may build this (M5's gating). */
+  readonly requiresTech?: TechId;
 }
 
 export interface ImprovementPatch {
@@ -374,6 +406,8 @@ export interface ImprovementPatch {
   readonly turns?: number;
   readonly yields?: YieldsPatch;
   readonly allowedRoles?: readonly TerrainRole[];
+  /** The technology a worker must know before it may build this (M5's gating). */
+  readonly requiresTech?: TechId;
 }
 
 export interface ResourcePatch {
