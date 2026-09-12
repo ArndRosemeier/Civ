@@ -70,6 +70,14 @@ import {
   type RulesetView,
   type TerrainYields,
 } from './map.js';
+// M6b: a capture folds fog for the city's new owner, exactly as a move folds it for the
+// unit that moved. `visibleTiles` is the one statement of what a player can see and
+// `withExplored` the one writer of the explored layer (fog.ts' own rule), so this module
+// *asks* for the fold rather than re-implementing one — the same discipline the M2
+// two-writers bug taught, and the reason `commands.ts`' `movedState` reads these two as
+// well. Type-only in the other direction: `fog.ts` imports `GameState` from `state.ts`,
+// which does not import this module at runtime.
+import { visibleTiles, withExplored } from './fog.js';
 // The tile read a *worked* tile gets: terrain plus improvements plus bonus
 // resources. This module is the one that composes a city out of tiles, so it is
 // the place that asks for the whole of a tile's worth; `improvements.ts` owns the
@@ -609,16 +617,28 @@ export interface CityCapture {
  * `commands.ts`' `planAttackUnit`, and mixing the two would give legality a second
  * home.
  *
- * **It does not bump `revision`.** M2's invariant is that `revision` counts
- * *applied commands*, and a capture is one step of one command; the command layer
- * performs the single bump, exactly as it does for a move whose steps and hut reward
- * are also several state changes under one revision.
+ * **It bumps `revision`, and folds fog. Both were M6 review findings, and both are
+ * repairs rather than features.**
  *
- * **It does not touch fog.** The captured city appears in the new owner's explored
- * memory only if that player had already seen the tile — which an attacking unit
- * standing next to it has, by construction (a unit's visibility is folded into
- * `explored` when it moves, `commands.ts`' `movedState`). Inventing a second fog
- * writer here would be the M2 two-writers bug for a third time.
+ * `revision` exists to say *"the state changed"*, and a sack changes it more than most
+ * commands: a city changes hands, a population drops, buildings are destroyed. M6 left
+ * the bump to `commands.ts`' `applyCapture` — which is correct for a player's command
+ * but means a capture applied by the *engine* (the barbarian step inside `advanceTurn`)
+ * changed the world without moving the counter. Two sacks can land in one turn (a
+ * civilization's `AttackUnit`, then the barbarian step), so the counter has to be able
+ * to move twice, and the fact "this state changed" belongs to the rule that changes it.
+ * **One bump, exactly**, which is why `applyCapture` no longer adds its own: a capture
+ * that bumped twice would make `revision` disagree with the number of things applied.
+ *
+ * Fog is folded the way every other state change folds it — `visibleTiles` for the new
+ * owner, through `withExplored`, the single writer of the explored layer. The reading is
+ * the one `movedState` takes: a capture is not a *fog* question (whether the attacker
+ * could see the city is not a legality rule, and never has been), it is a *memory*
+ * question — the conqueror now holds a city there, so what its units can see from where
+ * they stand is folded in exactly as a step folds it. M6 argued that the attacker's
+ * adjacent unit had already folded its own sight; that is true for the *attacker* and
+ * not for the engine's own captures, and "the tile changed hands but nobody recorded it"
+ * is not a state this project wants to be able to reach.
  */
 export const captureCity = (
   state: GameState,
@@ -649,8 +669,17 @@ export const captureCity = (
     workedTiles: [],
   };
 
+  const sacked: GameState = {
+    ...state,
+    revision: state.revision + 1,
+    cities: state.cities.map((each) => (each.id === cityId ? captured : each)),
+  };
+
+  // The fold reads the *post-capture* state: the city's new owner is what `visibleTiles`
+  // filters on now, and a capture that moves the city to a player whose units are
+  // standing there is exactly the case this records.
   return {
-    state: { ...state, cities: state.cities.map((each) => (each.id === cityId ? captured : each)) },
+    state: withExplored(sacked, owner, visibleTiles(sacked, owner)),
     city: captured,
     destroyed,
   };

@@ -311,7 +311,14 @@ export interface BatchResult {
  * ------------------------------------------------------------------ */
 
 /** The catalog sections a patch may address, by the catalog's own field names. */
-export type OverrideSection = 'terrains' | 'units' | 'buildings' | 'improvements' | 'resources';
+export type OverrideSection =
+  | 'terrains'
+  | 'units'
+  | 'buildings'
+  | 'improvements'
+  | 'resources'
+  /** M6b: the combat globals — one section, not a record of rows. See `CombatPatch`. */
+  | 'combat';
 
 /** A partial of a yield triple: a patch may set one channel without the others. */
 export type YieldsPatch = Partial<TerrainYields>;
@@ -418,6 +425,60 @@ export interface ResourcePatch {
 }
 
 /**
+ * What may be overridden on the catalog's **`combat` section** (M6b, "The combat
+ * section of the catalog").
+ *
+ * ## Why this is a section of fields and not a record of rows
+ *
+ * Every other section here is `Record<id, Patch>` because a catalog row is addressed by
+ * an id. The combat globals are a **singleton**: nine magnitudes that describe one
+ * model, with no id to key them by (`@civts/rules`' `CombatSpec` has no `id` field —
+ * its provenance is filed under the section's own name). So the patch is one flat
+ * `Partial<CombatSpec>`, and `overrides.ts` reports an unknown key here exactly as it
+ * reports an unknown field inside a row: naming `wallsBonusPCT` (a capital T) must be a
+ * *report*, never a silent no-op — a sweep whose knob was never applied reports "no
+ * effect", which is the single most expensive wrong answer this package can give.
+ *
+ * ## What each field is for, and what it is *not*
+ *
+ * These nine numbers decide every battle (see `core/combat.ts`). They arrive here as
+ * one section because M6 buried them in that module as constants, which made them
+ * unsweepable; `scripts/combat-balance-sweep.ts` sweeps them, and its report names
+ * which one it moved. **None of them is a Civ 3 figure** — the catalog's own provenance
+ * note says so, and the veteran asymmetry (`veteranAttackPct` applies to attackers only,
+ * where Civ 3 gives veterans extra hit points) is documented where the odds are
+ * computed.
+ *
+ * ## The one field with a rule attached
+ *
+ * `minWinPct`/`maxWinPct`/`rollBound` are one clamp, and `validateRuleset` checks
+ * `1 <= minWinPct <= maxWinPct <= rollBound`. A patch that moves `rollBound` below
+ * `maxWinPct` therefore produces a catalog that **fails validation**, exactly as a
+ * hand-edited catalog would: overrides are applied *before* `validateRuleset` on
+ * purpose, so an impossible sweep value is refused rather than blessed.
+ */
+export interface CombatPatch {
+  /** Percent added to a fortified defender's defence. */
+  readonly fortifyBonusPct?: number;
+  /** Percent added to a defender's defence when it stands in its own city. */
+  readonly cityDefenseBonusPct?: number;
+  /** Percent added on top of that when that city holds defensive walls. */
+  readonly wallsBonusPct?: number;
+  /** Percent added to an attacker's attack for each experience level. */
+  readonly veteranAttackPct?: number;
+  /** The highest `experience` a unit may reach; `0` disables promotion. */
+  readonly maxExperience?: number;
+  /** How many equally likely outcomes a per-round draw has. */
+  readonly rollBound?: number;
+  /** Hit points a round winner takes off the loser; must be `>= 1`. */
+  readonly damagePerRound?: number;
+  /** The lowest a per-round win chance may be. */
+  readonly minWinPct?: number;
+  /** The highest a per-round win chance may be. */
+  readonly maxWinPct?: number;
+}
+
+/**
  * A **deep-partial of the catalog, addressed by id** — the balance knob the
  * standing requirement asks for ("every magnitude it introduces lives in the rules
  * catalog … or an explicit override").
@@ -441,4 +502,33 @@ export interface RulesetPatch {
   readonly buildings?: Readonly<Record<string, BuildingPatch>>;
   readonly improvements?: Readonly<Record<string, ImprovementPatch>>;
   readonly resources?: Readonly<Record<string, ResourcePatch>>;
+  /**
+   * The combat globals (M6b) — **partial**, so a sweep moves one magnitude at a time and
+   * leaves the rest exactly as the catalog declares them.
+   *
+   * A partial of the section rather than a whole replacement, and that is the same rule
+   * every other field here follows: a patch that had to restate all nine numbers would
+   * make "move `wallsBonusPct` and change nothing else" impossible to write down, and a
+   * sweep built on it would be measuring its own boilerplate as much as the knob.
+   *
+   * ## Every field of the section is patchable, and that is checked
+   *
+   * M6's review found the same class of bug twice in the row merges — `mergeUnit` dropped
+   * `hitPoints` and `mergeTerrain` dropped `defenseBonus`, so a patch naming any *other*
+   * field of those rows silently reset the dropped one. The rule this package now holds
+   * itself to is stated in `overrides.ts`: **a field a patch does not name keeps the value
+   * the row has**, every patchable field is written out explicitly in the merge, and a
+   * field the surface does not support is *reported*. `CombatPatch` names all nine, and
+   * `overrides.test.ts` asserts field by field that moving one leaves the other eight
+   * untouched.
+   *
+   * ## What is still unsupported, reported rather than ignored
+   *
+   * The catalog's **`techs`** section has no patch surface at all (M5's tree is not
+   * sweepable here; `scripts/tech-balance-sweep.ts` measures that gap and prints it), and
+   * overrides.ts reports a patch that names it instead of dropping it on the floor. That
+   * is the one remaining hole in "every catalog magnitude is reachable from a patch", and
+   * it is named rather than left for a sweep to discover as a zero.
+   */
+  readonly combat?: CombatPatch;
 }

@@ -63,18 +63,25 @@
  * magnitude of its own**. The only numbers written here are the grid and the default
  * experiment size, which are experiment parameters rather than claims about the game.
  *
- * Two combat knobs are reachable today:
+ * Four combat knobs are reachable today:
  *
  * - `warrior-attack` — `units.warrior.attack`;
- * - `grassland-defense` — `terrains.grassland.defenseBonusPct`.
+ * - `grassland-defense` — `terrains.grassland.defenseBonusPct`;
+ * - `walls-bonus` — `combat.wallsBonusPct`, the city-wall defence bonus;
+ * - `damage-per-round` — `combat.damagePerRound`, the hit points one won round costs.
  *
- * **The rest of M6's combat surface is not reachable, and the report says so** rather
- * than sweeping a knob that cannot move. `RulesetPatch` has no `combat` section, and
- * `UnitPatch` carries no `hitPoints`, so the constants below are unreachable *by
- * construction*: they are read from `@civts/core` and printed with the section that
- * would have to grow to hold them. This is the same gap `scripts/tech-balance-sweep.ts`
- * measures for tech prices; it is reported here in the same way, and closing it is a
- * change to `packages/sim/src/types.ts` rather than to this script.
+ * **M6b closed the gap this file used to report.** Until then M6's nine combat magnitudes
+ * were module constants in `@civts/core` with no `combat` section in `RulesetPatch`, so
+ * this sweep could only say that they were unreachable *by construction* — the same
+ * finding `scripts/tech-balance-sweep.ts` reports for tech prices. They now live in the
+ * catalog, the applier merges them field by field, and two of them are swept below end to
+ * end: the report prints the shipped value, the value each variant actually reads inside
+ * the patched ruleset, and what moved.
+ *
+ * What remains unreachable is reported rather than swept (see `UNREACHABLE`), and it is
+ * now a short list of things that are genuinely not numbers in this engine: the id
+ * convention that decides which building carries walls, and the capture population
+ * divisor, which is still a literal in `core/cities.ts`.
  *
  * ## Policy dependence, stated because it is load-bearing
  *
@@ -100,15 +107,12 @@
  */
 
 import {
-  CITY_DEFENSE_BONUS_PCT,
-  DAMAGE_PER_ROUND,
+  // M6b: the nine combat magnitudes this file used to import as `@civts/core` constants
+  // are read from the *ruleset* below (`ruleset.combat.*`), through `applyOverrides` like
+  // every other swept number. Importing them here would be the dual-source bug in the one
+  // program whose job is to prove there is no second source.
+  CAPTURE_POPULATION_DIVISOR,
   DEFAULT_SETTINGS,
-  FORTIFY_BONUS_PCT,
-  MAX_EXPERIENCE,
-  MAX_WIN_PCT,
-  MIN_WIN_PCT,
-  ROLL_BOUND,
-  VETERAN_ATTACK_PCT,
   advanceTurn,
   applyCommand,
   civPlayers,
@@ -178,69 +182,63 @@ const KNOBS: readonly Knob[] = [
     meaning:
       'the terrain defence bonus on grassland — the tile most battles in this fixture happen on',
   },
+  {
+    // M6b's first combat global. It is the bonus a defender inside a city with walls gets
+    // *on top of* the city bonus, so it is the knob for "how much does fortifying a city
+    // matter" — and, because the policy decides to attack on the odds the applier reports
+    // (`SIMPLE_POLICY_TUNING.attackOddsFloorPct`), raising it can also change *which*
+    // attacks happen at all.
+    id: 'walls-bonus',
+    path: 'combat.wallsBonusPct',
+    values: [0, 25, 50, 100],
+    patchFor: (value) => ({ combat: { wallsBonusPct: value } }),
+    read: (ruleset) => ruleset.combat.wallsBonusPct,
+    meaning: 'the defence bonus a city wall adds, in whole percent',
+  },
+  {
+    // M6b's second, and the one that moves the *shape* of a battle rather than its odds:
+    // one won round costs the loser this many hit points, so raising it shortens every
+    // battle. It is also the magnitude whose absence validation refuses outright, because
+    // a round that costs nothing can never end a fight.
+    id: 'damage-per-round',
+    path: 'combat.damagePerRound',
+    values: [1, 2, 3, 4],
+    patchFor: (value) => ({ combat: { damagePerRound: value } }),
+    read: (ruleset) => ruleset.combat.damagePerRound,
+    meaning: 'the hit points one won combat round costs the loser',
+  },
 ];
 
 /**
- * The combat magnitudes **the override surface cannot move**, read from `@civts/core`
- * so the report cannot drift from the code.
+ * The combat-adjacent magnitudes **the override surface still cannot move**, read from
+ * `@civts/core` so the report cannot drift from the code.
  *
- * Named with the section that would have to exist to hold them, because the point of
- * printing them is to make the gap actionable rather than to apologise for it.
+ * M6b shrank this list from ten entries to two. The nine `combat` magnitudes and
+ * `units.*.hitPoints` left it because `RulesetPatch` can now address them — and a list
+ * that kept claiming they were unreachable would be this report lying about its own
+ * surface, which is worse than not reporting at all. What is left is genuinely not a
+ * number a patch could carry, and each row says what would have to change for it to be
+ * one.
  */
 const UNREACHABLE: readonly {
   readonly name: string;
-  readonly value: number;
+  /** The shipped magnitude, where there is one to read; omitted where the gap is a shape. */
+  readonly value?: number;
   readonly needs: string;
 }[] = [
   {
-    name: 'FORTIFY_BONUS_PCT',
-    value: FORTIFY_BONUS_PCT,
-    needs: 'a `combat` section in `RulesetPatch`',
+    name: 'buildings.walls (the id that decides which building carries walls)',
+    needs:
+      'nothing can move it, and nothing should: which *building* grants the wall bonus is a ' +
+      'rows-level convention (`defenderBonusPct` reads the id "walls"), while the bonus itself ' +
+      'is the swept `combat.wallsBonusPct`',
   },
   {
-    name: 'CITY_DEFENSE_BONUS_PCT',
-    value: CITY_DEFENSE_BONUS_PCT,
-    needs: 'a `combat` section in `RulesetPatch`',
-  },
-  {
-    name: 'VETERAN_ATTACK_PCT',
-    value: VETERAN_ATTACK_PCT,
-    needs: 'a `combat` section in `RulesetPatch`',
-  },
-  {
-    name: 'DAMAGE_PER_ROUND',
-    value: DAMAGE_PER_ROUND,
-    needs: 'a `combat` section in `RulesetPatch`',
-  },
-  {
-    name: 'ROLL_BOUND',
-    value: ROLL_BOUND,
-    needs: 'a `combat` section in `RulesetPatch` (and it is the draw, not a rule)',
-  },
-  {
-    name: 'MIN_WIN_PCT',
-    value: MIN_WIN_PCT,
-    needs: 'a `combat` section in `RulesetPatch`',
-  },
-  {
-    name: 'MAX_WIN_PCT',
-    value: MAX_WIN_PCT,
-    needs: 'a `combat` section in `RulesetPatch`',
-  },
-  {
-    name: 'MAX_EXPERIENCE',
-    value: MAX_EXPERIENCE,
-    needs: 'a `combat` section in `RulesetPatch`',
-  },
-  {
-    name: 'units.*.hitPoints',
-    value: 0,
-    needs: 'a `hitPoints` field on `UnitPatch` (`ruleset` rows carry it; the patch does not)',
-  },
-  {
-    name: 'buildings.walls (its walls bonus is a building id, not a number)',
-    value: 0,
-    needs: 'nothing — it is already a rows-level fact, and `WALLS_BONUS_PCT` is the knob',
+    name: 'CAPTURE_POPULATION_DIVISOR',
+    value: CAPTURE_POPULATION_DIVISOR,
+    needs:
+      'a catalog row: this one magnitude of the capture rule is still a literal in ' +
+      '`packages/core/src/cities.ts`, so no patch can reach it',
   },
 ];
 
@@ -720,10 +718,11 @@ interface CombatSweepReport {
   readonly policy: string;
   readonly attackOddsFloorPct: number;
   readonly variants: readonly Variant[];
-  /** The runaway knobs the override surface cannot express, with what would be needed. */
+  /** The magnitudes the override surface cannot express, with what would be needed. */
   readonly unreachable: readonly {
     readonly name: string;
-    readonly value: number;
+    /** Absent where the gap is a *shape* rather than a number (see `UNREACHABLE`). */
+    readonly value?: number;
     readonly needs: string;
   }[];
   /** Where the replay disagreed with the harness — fatal, and reported as such. */
@@ -965,7 +964,7 @@ const renderReport = (report: CombatSweepReport): string => {
 
   lines.push('combat magnitudes this override surface CANNOT move (reported, not swept)');
   for (const row of report.unreachable) {
-    const value = row.value === 0 ? '' : ` = ${String(row.value)}`;
+    const value = row.value === undefined ? '' : ` = ${String(row.value)}`;
     lines.push(`  ${row.name}${value}  — needs ${row.needs}`);
   }
   lines.push('');

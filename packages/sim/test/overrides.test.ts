@@ -380,3 +380,199 @@ describe('an override that breaks the rules fails validation', () => {
     expect(row.cost).toBe(UNIT.cost + 9);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * 5. M6b — the combat globals, and the sections no patch may address
+ * ------------------------------------------------------------------ */
+
+/** The shipped `combat` section, and the patch type that addresses it. */
+const COMBAT = CATALOG.combat;
+type CombatPatch = NonNullable<RulesetPatch['combat']>;
+
+const COMBAT_FIELDS: readonly (keyof CombatPatch)[] = [
+  'fortifyBonusPct',
+  'cityDefenseBonusPct',
+  'wallsBonusPct',
+  'veteranAttackPct',
+  'maxExperience',
+  'rollBound',
+  'damagePerRound',
+  'minWinPct',
+  'maxWinPct',
+];
+
+describe('the combat section is a patchable section (M6b)', () => {
+  it('moves exactly the magnitude the patch names, and leaves the other eight alone', () => {
+    // Field by field, the same discipline the row merges hold themselves to — and the
+    // reason it matters here is M6's own finding: `mergeUnit` and `mergeTerrain` used to
+    // *drop* `hitPoints` and `defenseBonus`, so a patch naming any other field silently
+    // reset the dropped one. Nine fields are nine chances to repeat that, so each one is
+    // walked rather than trusted.
+    for (const field of COMBAT_FIELDS) {
+      const patched = applyOverrides(CATALOG, { combat: { [field]: COMBAT[field] + 1 } });
+      const changed: readonly (keyof CombatPatch)[] = COMBAT_FIELDS.filter(
+        (each) => each === field,
+      );
+      expect(changed).toHaveLength(1);
+
+      expect(patched.combat[field]).toBe(COMBAT[field] + 1);
+      for (const other of COMBAT_FIELDS) {
+        if (other === field) continue;
+        expect(patched.combat[other]).toBe(COMBAT[other]);
+      }
+      // The provenance is carried, not rewritten: authorship is not a balance knob, and a
+      // patch that could rewrite it could promote a placeholder to a claim of accuracy.
+      expect(patched.combat.provenance).toBe(COMBAT.provenance);
+    }
+  });
+
+  it('CARRIES the section through a patch that does not name it — it can never be dropped', () => {
+    // The bug this pins is the expensive one: if `tryApplyOverrides` rebuilt the catalog
+    // without carrying `combat`, every swept game would fight under `NO_COMBAT_RULES`,
+    // every battle would look like a massacre, and a sweep would report a huge effect for
+    // whichever knob it was turning — measured on a ruleset that never applied it.
+    const patched = applyOverrides(CATALOG, { units: { [UNIT_ID]: { cost: UNIT.cost + 1 } } });
+    expect(patched.combat).toBe(COMBAT);
+    expect(patched.combat.rollBound).toBe(100);
+
+    // ...and it is carried even when the patch is empty, which is the same claim without
+    // any other section in the way.
+    expect(applyOverrides(CATALOG, {}).combat).toBe(COMBAT);
+  });
+
+  it('records the nine fields it names, in the section’s own declared order', () => {
+    const outcome = tryApplyOverrides(CATALOG, {
+      combat: { wallsBonusPct: 100, damagePerRound: 2 },
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.applied).toEqual([
+      `combat.combat.wallsBonusPct: ${String(COMBAT.wallsBonusPct)} -> 100`,
+      `combat.combat.damagePerRound: ${String(COMBAT.damagePerRound)} -> 2`,
+    ]);
+    expect(canonicalize(outcome.value.catalog).length).toBeGreaterThan(0);
+  });
+
+  it('reports a misspelled magnitude instead of applying nothing', () => {
+    // A capital T, the sort of thing a hand-written sweep file contains. Silence here
+    // would be a sweep reporting "no effect" for a knob that was never applied — the M6b
+    // contract's motivating failure mode, one level below the section check.
+    const error = errorOf(jsonPatch('{ "combat": { "wallsBonusPCT": 100 } }'));
+    expect(error.kind).toBe('unknown-field');
+    if (error.kind !== 'unknown-field') return;
+    expect(error.section).toBe('combat');
+    expect(error.id).toBe('combat');
+    expect(error.field).toBe('wallsBonusPCT');
+    expect(error.known).toContain('wallsBonusPct');
+    expect(error.known).toHaveLength(9);
+
+    const message = formatOverrideError(error);
+    expect(message).toContain('wallsBonusPCT');
+    expect(message).toContain('wallsBonusPct');
+  });
+
+  it('fails validation exactly like a hand-edited section when the clamp is broken', () => {
+    // The override path is *not* a way to bless a value validation would refuse: the patch
+    // is applied before `validateRuleset`, so a sweep that pushes `rollBound` under the
+    // ceiling hears the same complaint a hand-edited catalog would produce.
+    const overridden = applyOverrides(CATALOG, { combat: { rollBound: 50 } });
+    const byHand: Catalog = { ...CATALOG, combat: { ...COMBAT, rollBound: 50 } };
+
+    const fromOverride = validateRuleset(overridden, 'tuned');
+    const fromHand = validateRuleset(byHand, 'tuned');
+    expect(fromOverride.ok).toBe(false);
+    expect(fromHand.ok).toBe(false);
+    if (fromOverride.ok || fromHand.ok) return;
+    expect(fromOverride.error).toEqual(fromHand.error);
+    expect(fromOverride.error.some((issue) => issue.kind === 'invalid-value')).toBe(true);
+
+    // A legal override still validates, and reaches the validated ruleset.
+    const legal = applyOverrides(CATALOG, { combat: { damagePerRound: 3 } });
+    const validated = validateRuleset(legal, 'tuned');
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    expect(validated.value.combat.damagePerRound).toBe(3);
+    expect(validated.value.combat.wallsBonusPct).toBe(COMBAT.wallsBonusPct);
+  });
+});
+
+describe('every catalog section is either patchable or reported', () => {
+  /**
+   * The sections a patch may address, and the one it may not.
+   *
+   * Written here as well as in `overrides.ts` on purpose: two lists that must agree are
+   * only useful if something *checks* that they do. The assertions below compare this list
+   * against the catalog's own keys and against the applier's behaviour, so a section added
+   * to `Catalog` without a decision about patching fails here rather than becoming a
+   * silently unpatchable — or silently droppable — part of every sweep.
+   */
+  const PATCHABLE: readonly string[] = [
+    'terrains',
+    'units',
+    'buildings',
+    'improvements',
+    'resources',
+    'combat',
+  ];
+  const UNPATCHABLE: readonly string[] = ['techs'];
+
+  it('classifies every key of the shipped catalog, with nothing left over', () => {
+    expect([...PATCHABLE, ...UNPATCHABLE].sort()).toEqual([...Object.keys(CATALOG)].sort());
+    // The two lists are disjoint: a section in both would be a section whose behaviour
+    // depended on which check ran first.
+    expect(PATCHABLE.filter((name) => UNPATCHABLE.includes(name))).toEqual([]);
+  });
+
+  it('accepts an empty patch for every patchable section', () => {
+    for (const name of PATCHABLE) {
+      const outcome = tryApplyOverrides(CATALOG, jsonPatch(`{ "${name}": {} }`));
+      expect(outcome.ok, `${name} should be patchable`).toBe(true);
+    }
+  });
+
+  it('REPORTS a patch naming the tech tree rather than ignoring it', () => {
+    // M5's tree has no patch surface. Before this check, `{ techs: {...} }` — which a
+    // hand-written or model-written sweep file can easily contain — was *accepted and
+    // ignored*: a sweep would then have reported the tech prices as unmovable when the
+    // truth was that the patch never reached them.
+    for (const name of UNPATCHABLE) {
+      const error = errorOf(jsonPatch(`{ "${name}": { "pottery": { "cost": 1 } } }`));
+      expect(error.kind).toBe('unknown-section');
+      if (error.kind !== 'unknown-section') return;
+      expect(error.section).toBe(name);
+      expect(error.known).toContain('combat');
+      expect(error.known).not.toContain(name);
+
+      const message = formatOverrideError(error);
+      expect(message).toContain(name);
+      expect(message).toContain('techs');
+    }
+  });
+
+  it('reports a misspelled section too, naming the sections that would have worked', () => {
+    const error = errorOf(jsonPatch('{ "unit": { "warrior": { "cost": 1 } } }'));
+    expect(error.kind).toBe('unknown-section');
+    if (error.kind !== 'unknown-section') return;
+    expect(error.section).toBe('unit');
+    expect(error.known).toEqual([
+      'buildings',
+      'combat',
+      'improvements',
+      'resources',
+      'terrains',
+      'units',
+    ]);
+  });
+
+  it('is checked before anything is merged, so a bad section cannot be half-applied', () => {
+    // Deterministic and total: the unknown section is reported even when the rest of the
+    // patch is perfectly good, and the record that comes back is empty rather than a
+    // partial list beside an error.
+    const mixture = errorOf(jsonPatch(`{ "units": { "${UNIT_ID}": { "cost": 5 } }, "techs": {} }`));
+    expect(mixture.kind).toBe('unknown-section');
+    expect(canonicalize(applyOverrides(CATALOG, { units: { [UNIT_ID]: { cost: 5 } } }))).not.toBe(
+      canonicalize(CATALOG),
+    );
+  });
+});

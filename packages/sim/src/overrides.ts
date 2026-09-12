@@ -52,6 +52,7 @@ import { err, ok, type Result, type TerrainYields } from '@civts/core';
 import type {
   BuildingSpec,
   Catalog,
+  CombatSpec,
   ImprovementSpec,
   ResourceSpec,
   TerrainSpec,
@@ -60,6 +61,7 @@ import type {
 
 import type {
   BuildingPatch,
+  CombatPatch,
   ImprovementPatch,
   OverrideSection,
   ResourcePatch,
@@ -97,6 +99,24 @@ export type OverrideError =
       readonly field: string;
       /** The fields a patch may set on this row, ascending. */
       readonly known: readonly string[];
+    }
+  /**
+   * The patch names a *section* this surface cannot patch at all — `techs`, or a typo
+   * such as `unit`.
+   *
+   * **This variant exists because silence was the alternative**, and silence is the
+   * failure this package cares most about: a patch carrying `{ techs: { pottery: {...} } }`
+   * (a JSON file written by hand or by a model) used to be accepted and *ignored*, because
+   * the applier only ever read the five keys it knew about. A sweep built on such a patch
+   * would report "no effect" for a knob that was never applied — the M6b contract's own
+   * motivating failure mode, one level up from the field checks below.
+   */
+  | {
+      readonly kind: 'unknown-section';
+      /** The key the patch carried. */
+      readonly section: string;
+      /** The sections a patch may address, ascending. */
+      readonly known: readonly string[];
     };
 
 /** The one rendering of an `OverrideError`, shared by the throw path and any report. */
@@ -111,6 +131,11 @@ export const formatOverrideError = (error: OverrideError): string => {
       return (
         `override addresses ${error.section}.${error.id}.${error.field}, which is not a field a ` +
         `patch may set (patchable fields: ${error.known.join(', ') || 'none'})`
+      );
+    case 'unknown-section':
+      return (
+        `override addresses the section "${error.section}", which this surface cannot patch ` +
+        `(patchable sections: ${error.known.join(', ')}). ${UNPATCHABLE_SECTIONS_NOTE}`
       );
   }
 };
@@ -138,7 +163,16 @@ export interface OverrideOutcome {
  * Field lists — the one place "what may be patched" is written
  * ------------------------------------------------------------------ */
 
-/** The catalog sections, in the order a patch is walked and a record is written. */
+/**
+ * The catalog sections **whose rows** a patch addresses by id, in the order a patch is
+ * walked and a record is written.
+ *
+ * `combat` is deliberately absent: it is a section a patch may address (see
+ * `PATCH_SECTIONS`) but it is *one row of nine numbers with no id*, so walking it as a
+ * `Record<id, Patch>` would be walking a shape it does not have. It is merged after these
+ * five, which is also the order the catalog declares its sections in and the order
+ * `provenanceSections` reports them.
+ */
 export const OVERRIDE_SECTIONS: readonly OverrideSection[] = [
   'terrains',
   'units',
@@ -146,6 +180,50 @@ export const OVERRIDE_SECTIONS: readonly OverrideSection[] = [
   'improvements',
   'resources',
 ];
+
+/**
+ * **The one id the combat section is recorded under.**
+ *
+ * The section has no id of its own (see `@civts/rules`' `CombatSpec`), but the override
+ * *record* is a list of `section.id.field` lines, so a section that filed its changes
+ * under no name would print lines like `combat..wallsBonusPct: 50 -> 100`. The catalog's
+ * own field name is the honest id, and it is the same string `@civts/rules` files the
+ * section's provenance under.
+ */
+const COMBAT_ROW_ID = 'combat';
+
+/**
+ * Every section a patch may address, ascending — the *whole* surface, row sections and
+ * the singleton together.
+ *
+ * It exists to be compared against the keys a patch really carries. That comparison is
+ * M6b's other half of "reported, never ignored": the field-level checks below catch a
+ * mangled key inside a row, and this one catches a mangled *section* — `{ techs: {...} }`,
+ * `{ unit: {...} }` — which used to be accepted silently, because the applier only ever
+ * read the keys it knew about.
+ */
+export const PATCH_SECTIONS: readonly OverrideSection[] = [...OVERRIDE_SECTIONS, 'combat'];
+
+/**
+ * The catalog sections **no patch can address**, named rather than left implicit.
+ *
+ * `techs` is the only one: M5's tree is not sweepable through `RulesetPatch`, which
+ * `scripts/tech-balance-sweep.ts` measures and prints. Every other catalog section is
+ * reachable — including M6b's combat globals, which is the point of this wave. A section
+ * in neither list would be a section a patch could name and silently drop, so the two
+ * lists are asserted to partition the catalog in `overrides.test.ts`.
+ */
+export const UNPATCHABLE_SECTIONS: readonly string[] = ['techs'];
+
+/**
+ * What `formatOverrideError` appends to an `unknown-section` complaint, so the one caller
+ * that has to guess why its patch was refused hears the *known* reason as well: `techs` is
+ * a real catalog section, and the answer to "why can I not patch it?" is "because nothing
+ * implements it yet", not "because you spelled it wrong".
+ */
+const UNPATCHABLE_SECTIONS_NOTE =
+  `The catalog also carries ${UNPATCHABLE_SECTIONS.join(', ')}, which no patch can move: ` +
+  'that gap is measured and reported rather than papered over';
 
 /**
  * Field lists, typed against their patch so a typo in a name is a **compile error**.
@@ -207,6 +285,27 @@ const IMPROVEMENT_FIELDS: readonly (keyof ImprovementPatch)[] = [
   'requiresTech',
 ];
 const RESOURCE_FIELDS: readonly (keyof ResourcePatch)[] = ['name', 'kind', 'allowedRoles'];
+/**
+ * M6b's combat globals — **all nine**, and the `keyof` typing is what keeps it all nine.
+ *
+ * The section is a singleton, so its fields are addressed without an id; see `CombatPatch`
+ * in `types.ts` for why. What matters here is the same rule every other list follows: a
+ * magnitude this surface can move is named *explicitly*, and a magnitude it cannot move is
+ * reported rather than dropped. M6's review found `mergeUnit` and `mergeTerrain` silently
+ * resetting `hitPoints` and `defenseBonus` because their field lists were incomplete; a
+ * `keyof` list makes that a compile error next time.
+ */
+const COMBAT_FIELDS: readonly (keyof CombatPatch)[] = [
+  'fortifyBonusPct',
+  'cityDefenseBonusPct',
+  'wallsBonusPct',
+  'veteranAttackPct',
+  'maxExperience',
+  'rollBound',
+  'damagePerRound',
+  'minWinPct',
+  'maxWinPct',
+];
 
 /** The three channels of a yield partial, in the order a record writes them. */
 const YIELDS_FIELDS: readonly (keyof YieldsPatch)[] = ['food', 'shields', 'commerce'];
@@ -545,6 +644,85 @@ const mergeResource = (
   });
 };
 
+/**
+ * M6b: the combat globals, merged **field by field** like every row above.
+ *
+ * The section is written out rather than spread for the reason the module note gives at
+ * the top: a generic merge over an index signature needs a cast to put the result back
+ * into a typed value, and a cast is where a renamed catalog field goes unnoticed. Every
+ * field of `CombatSpec` except `provenance` appears below, `provenance` is carried through
+ * untouched (authorship is not a magnitude — see the module note), and a patch key that is
+ * not one of the nine is **reported** with the nine named. That last part is what makes a
+ * sweep trustworthy: a knob whose name was misspelled is an error, never a measured
+ * "no effect".
+ *
+ * The record lines use `COMBAT_ROW_ID` for the id half, so a reader of the override record
+ * sees `combat.combat.wallsBonusPct: 50 -> 100` — section, the section's own id, field —
+ * which is the same shape every other section's lines have and is what
+ * `scripts/combat-balance-sweep.ts` prints as the knob's receipt.
+ */
+const mergeCombat = (
+  row: CombatSpec,
+  patch: CombatPatch,
+  notes: string[],
+): Result<CombatSpec, OverrideError> => {
+  const bad = unknownFieldOf('combat', COMBAT_ROW_ID, Object.keys(patch), COMBAT_FIELDS);
+  if (bad !== undefined) return err(bad);
+
+  recordFields(notes, 'combat', COMBAT_ROW_ID, [
+    ['fortifyBonusPct', row.fortifyBonusPct, patch.fortifyBonusPct],
+    ['cityDefenseBonusPct', row.cityDefenseBonusPct, patch.cityDefenseBonusPct],
+    ['wallsBonusPct', row.wallsBonusPct, patch.wallsBonusPct],
+    ['veteranAttackPct', row.veteranAttackPct, patch.veteranAttackPct],
+    ['maxExperience', row.maxExperience, patch.maxExperience],
+    ['rollBound', row.rollBound, patch.rollBound],
+    ['damagePerRound', row.damagePerRound, patch.damagePerRound],
+    ['minWinPct', row.minWinPct, patch.minWinPct],
+    ['maxWinPct', row.maxWinPct, patch.maxWinPct],
+  ]);
+
+  return ok({
+    fortifyBonusPct: patch.fortifyBonusPct ?? row.fortifyBonusPct,
+    cityDefenseBonusPct: patch.cityDefenseBonusPct ?? row.cityDefenseBonusPct,
+    wallsBonusPct: patch.wallsBonusPct ?? row.wallsBonusPct,
+    veteranAttackPct: patch.veteranAttackPct ?? row.veteranAttackPct,
+    maxExperience: patch.maxExperience ?? row.maxExperience,
+    rollBound: patch.rollBound ?? row.rollBound,
+    damagePerRound: patch.damagePerRound ?? row.damagePerRound,
+    minWinPct: patch.minWinPct ?? row.minWinPct,
+    maxWinPct: patch.maxWinPct ?? row.maxWinPct,
+    // Not patchable, and carried through by name so the omission is visible: a patch that
+    // could rewrite provenance could promote a placeholder to a claim of Civ 3 accuracy
+    // with nobody noticing.
+    provenance: row.provenance,
+  });
+};
+
+/** The combat section merged, or the catalog's own section when the patch says nothing. */
+const mergeCombatSection = (
+  row: CombatSpec,
+  patch: CombatPatch | undefined,
+  notes: string[],
+): Result<CombatSpec, OverrideError> =>
+  patch === undefined ? ok(row) : mergeCombat(row, patch, notes);
+
+/**
+ * The first section a patch names that this surface cannot address, if any.
+ *
+ * Sorted, so a patch with two bad keys always reports the same one — the same determinism
+ * argument `unknownFieldOf` and `patchSection` make for their own orders. A section that is
+ * *known but unpatchable* (`techs`) is reported here like any other unknown key, with
+ * `UNPATCHABLE_SECTIONS_NOTE` explaining that it is a real catalog section with no patch
+ * support yet, so the caller is not left guessing whether a typo or a gap refused the patch.
+ */
+const firstUnknownSection = (patch: RulesetPatch): OverrideError | undefined => {
+  const known: readonly string[] = stringNames(PATCH_SECTIONS);
+  for (const key of Object.keys(patch).sort()) {
+    if (!known.includes(key)) return { kind: 'unknown-section', section: key, known };
+  }
+  return undefined;
+};
+
 /* ------------------------------------------------------------------ *
  * The entry points
  * ------------------------------------------------------------------ */
@@ -561,6 +739,15 @@ export const tryApplyOverrides = (
   patch: RulesetPatch,
 ): Result<OverrideOutcome, OverrideError> => {
   const notes: string[] = [];
+
+  // M6b: **the first thing checked, and the reason it is first.** A patch that names a
+  // section this surface cannot address (`techs`, or a typo) must be *reported* rather than
+  // half-applied: reporting it before any merge means a caller never sees a partial record
+  // beside an error, and the message names every section that *is* patchable so the fix is
+  // in the error itself. The check is over the keys the patch really carries, which is what
+  // catches data the type system never saw — a JSON file written by hand or by a model.
+  const unknownSection = firstUnknownSection(patch);
+  if (unknownSection !== undefined) return err(unknownSection);
 
   const terrains = patchSection('terrains', catalog.terrains, patch.terrains, mergeTerrain, notes);
   if (!terrains.ok) return terrains;
@@ -595,6 +782,16 @@ export const tryApplyOverrides = (
   );
   if (!resources.ok) return resources;
 
+  // M6b: the combat globals last, matching the catalog's own section order. An absent
+  // `patch.combat` returns the catalog's **same object**, so a patch that does not mention
+  // the section cannot be observed to have touched it — and, crucially, cannot *drop* it:
+  // the section is carried onto the rebuilt catalog below whatever the patch says. That is
+  // the bug this wire is here to avoid: a rebuild that forgot a section would leave every
+  // battle in a swept game fighting under `NO_COMBAT_RULES`, and the sweep would report a
+  // large effect from a knob that was never applied.
+  const combat = mergeCombatSection(catalog.combat, patch.combat, notes);
+  if (!combat.ok) return combat;
+
   return ok({
     catalog: {
       terrains: terrains.value,
@@ -602,6 +799,7 @@ export const tryApplyOverrides = (
       buildings: buildings.value,
       improvements: improvements.value,
       resources: resources.value,
+      combat: combat.value,
       // M5's tech tree is carried through **unchanged**, and that is stated rather
       // than left to look like an oversight: `RulesetPatch` has no `techs` section yet,
       // so no patch can move a tech's price through this surface. The catalog is still

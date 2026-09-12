@@ -170,7 +170,6 @@ import {
   DEFAULT_SETTINGS,
   FREE_UNITS_BASE,
   FREE_UNITS_PER_CITY,
-  MAX_EXPERIENCE,
   MIN_GROWTH_FOOD,
   RATE_TOTAL,
   UNIT_SUPPORT_COST,
@@ -1376,7 +1375,13 @@ const corruptions = (clean: GameState): readonly Corruption[] => {
       expected: 'unit-experience-in-range',
       kind: 'shape',
       corrupt: (state) =>
-        withUnit(state, 0, (unit) => ({ ...unit, experience: MAX_EXPERIENCE + 1 })),
+        // One above the cap this fixture's ruleset declares — the bound is the catalog's
+        // `combat.maxExperience` since M6b moved it out of `core/combat.ts`, so this
+        // corruption is written against the ruleset rather than against a constant.
+        withUnit(state, 0, (unit) => ({
+          ...unit,
+          experience: RULESET.combat.maxExperience + 1,
+        })),
     },
     {
       label: 'a unit standing on the tile of a city it does not own',

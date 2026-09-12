@@ -34,15 +34,8 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  CITY_DEFENSE_BONUS_PCT,
-  DAMAGE_PER_ROUND,
-  FORTIFY_BONUS_PCT,
-  MAX_EXPERIENCE,
-  MAX_WIN_PCT,
-  MIN_WIN_PCT,
-  ROLL_BOUND,
-  VETERAN_ATTACK_PCT,
-  WALLS_BONUS_PCT,
+  NO_COMBAT_RULES,
+  combatRulesOf,
   defenderBonusPct,
   terrainDefenseBonus,
   drawsWin,
@@ -52,8 +45,10 @@ import {
   veteranBonusPct,
   winPct,
   type CombatContext,
+  type CombatDef,
 } from '../src/combat.js';
 import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
+import type { RulesetView } from '../src/map.js';
 import { asImprovementId } from '../src/improvements.js';
 import { nextBelow, seedRng, type RngState } from '../src/rng.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
@@ -90,6 +85,29 @@ import {
 const RNG: RngState = seedRng(0);
 
 /**
+ * **The magnitudes this file fights under — a fixture, not an import.**
+ *
+ * M6b moved combat's constants out of `src/combat.ts` and into the rules catalog, so this
+ * file can no longer import them and must not: importing the shipped numbers back would
+ * make every assertion below a tautology about whatever the catalog happens to say today,
+ * and the sweep's whole premise is that those numbers *move*. The fixture states the nine
+ * values explicitly (they are the M6 values, so every hand-computed expectation in this
+ * file still holds), the tests below pin the odds against *these* numbers, and a separate
+ * block proves that a different `CombatDef` — a different ruleset — moves the odds.
+ */
+const RULES: CombatDef = {
+  fortifyBonusPct: 25,
+  cityDefenseBonusPct: 50,
+  wallsBonusPct: 50,
+  veteranAttackPct: 25,
+  maxExperience: 3,
+  rollBound: 100,
+  damagePerRound: 1,
+  minWinPct: 1,
+  maxWinPct: 99,
+};
+
+/**
  * A seed whose **first** `nextBelow(state, 100)` draw is exactly `roll`.
  *
  * Scripted draws (`CombatContext.static`) are the right tool for boundary cases, but a
@@ -101,13 +119,13 @@ const RNG: RngState = seedRng(0);
 const seedWithFirstRoll = (roll: number): RngState => {
   for (let seed = 0; seed < 100000; seed += 1) {
     const candidate = seedRng(seed);
-    if (nextBelow(candidate, ROLL_BOUND)[0] === roll) return candidate;
+    if (nextBelow(candidate, RULES.rollBound)[0] === roll) return candidate;
   }
   throw new Error(`no seed in range draws ${String(roll)} first`);
 };
 
 /** The first roll a state draws, for readability in the assertions below. */
-const firstRoll = (rng: RngState): number => nextBelow(rng, ROLL_BOUND)[0];
+const firstRoll = (rng: RngState): number => nextBelow(rng, RULES.rollBound)[0];
 
 /**
  * A `UnitDef` whose `hitPoints` this file *knows* is present, so the three assertions
@@ -197,6 +215,7 @@ const stateWith = (units: readonly Unit[]): GameState => ({
 
 /** The context for a plain 3-attack against 3-defence fight, with no modifiers. */
 const context = (overrides: Partial<CombatContext> = {}): CombatContext => ({
+  rules: RULES,
   attacker: { attack: 3, defense: 1, bonusPct: 0 },
   defender: { attack: 1, defense: 3, bonusPct: 0 },
   attackerHitPoints: 3,
@@ -212,45 +231,45 @@ const context = (overrides: Partial<CombatContext> = {}): CombatContext => ({
 describe('winPct — the per-round chance, floored once', () => {
   it('is attack / (attack + defense) as a whole percentage', () => {
     // 3 / (3 + 3) = 50% exactly.
-    expect(winPct(3, 3)).toBe(50);
+    expect(winPct(RULES, 3, 3)).toBe(50);
     // 4 / (4 + 1) = 80%.
-    expect(winPct(4, 1)).toBe(80);
+    expect(winPct(RULES, 4, 1)).toBe(80);
     // 2 / (2 + 3) = 40%.
-    expect(winPct(2, 3)).toBe(40);
+    expect(winPct(RULES, 2, 3)).toBe(40);
   });
 
   it('floors rather than rounding, so a 2/3 majority is 66 and not 67', () => {
     // 2 / (2 + 1) = 66.66…% -> 66. Rounding here would make a strictly weaker attacker
     // look like a two-thirds favourite.
-    expect(winPct(2, 1)).toBe(66);
+    expect(winPct(RULES, 2, 1)).toBe(66);
     // 1 / (1 + 2) = 33.33…% -> 33.
-    expect(winPct(1, 2)).toBe(33);
+    expect(winPct(RULES, 1, 2)).toBe(33);
     // 1 / (1 + 7) = 12.5% -> 12.
-    expect(winPct(1, 7)).toBe(12);
+    expect(winPct(RULES, 1, 7)).toBe(12);
   });
 
   it('clamps to 1..99, so no battle is decided before it is fought', () => {
     // A defence of zero would be a 100% attacker, and an attack of zero a 0% one. Both
-    // are clamped: the extremes of the table are the reason MIN/MAX_WIN_PCT exist.
-    expect(winPct(5, 0)).toBe(MAX_WIN_PCT);
-    expect(winPct(1000, 1)).toBe(MAX_WIN_PCT);
-    expect(winPct(0, 5)).toBe(MIN_WIN_PCT);
-    expect(winPct(0, 0)).toBe(MIN_WIN_PCT);
+    // are clamped: the extremes of the table are the reason MIN/RULES.maxWinPct exist.
+    expect(winPct(RULES, 5, 0)).toBe(RULES.maxWinPct);
+    expect(winPct(RULES, 1000, 1)).toBe(RULES.maxWinPct);
+    expect(winPct(RULES, 0, 5)).toBe(RULES.minWinPct);
+    expect(winPct(RULES, 0, 0)).toBe(RULES.minWinPct);
   });
 
   it('is total: a hostile value cannot produce a fraction, NaN or a throw', () => {
-    expect(Number.isInteger(winPct(1.5, 2.5))).toBe(true);
-    expect(winPct(-4, 2)).toBe(MIN_WIN_PCT);
+    expect(Number.isInteger(winPct(RULES, 1.5, 2.5))).toBe(true);
+    expect(winPct(RULES, -4, 2)).toBe(RULES.minWinPct);
     // A strength that is not a finite number carries no strength at all, which is read
     // exactly like a zero: `NaN` defence means "no defence" (an overwhelming attacker),
     // `NaN` attack means "no attack" (a hopeless one).
-    expect(winPct(Number.NaN, 2)).toBe(MIN_WIN_PCT);
-    expect(winPct(1, Number.NaN)).toBe(MAX_WIN_PCT);
+    expect(winPct(RULES, Number.NaN, 2)).toBe(RULES.minWinPct);
+    expect(winPct(RULES, 1, Number.NaN)).toBe(RULES.maxWinPct);
     // An infinite attack is unreadable rather than overwhelming: the alternative would be
     // to hand a caller that wrote `Infinity` a 99% guarantee it never earned.
-    expect(winPct(Number.POSITIVE_INFINITY, 1)).toBe(MIN_WIN_PCT);
-    expect(winPct(10, Number.NEGATIVE_INFINITY)).toBe(MAX_WIN_PCT);
-    expect(Number.isInteger(winPct(Number.NaN, Number.NaN))).toBe(true);
+    expect(winPct(RULES, Number.POSITIVE_INFINITY, 1)).toBe(RULES.minWinPct);
+    expect(winPct(RULES, 10, Number.NEGATIVE_INFINITY)).toBe(RULES.maxWinPct);
+    expect(Number.isInteger(winPct(RULES, Number.NaN, Number.NaN))).toBe(true);
   });
 });
 
@@ -319,14 +338,16 @@ describe('the modifier rule — percentages are summed, then floored ONCE', () =
   });
 
   it('is the rule the resolver uses, not just the helper', () => {
-    // defence 1, terrain 50 + fortify 25 (FORTIFY_BONUS_PCT) + city 50 + walls 50 = 175%.
-    const bonus = defenderBonusPct({
+    // defence 1, terrain 50 + fortify 25 (RULES.fortifyBonusPct) + city 50 + walls 50 = 175%.
+    const bonus = defenderBonusPct(RULES, {
       terrainBonusPct: 50,
       fortified: true,
       inCity: true,
       walls: true,
     });
-    expect(bonus).toBe(50 + FORTIFY_BONUS_PCT + CITY_DEFENSE_BONUS_PCT + WALLS_BONUS_PCT);
+    expect(bonus).toBe(
+      50 + RULES.fortifyBonusPct + RULES.cityDefenseBonusPct + RULES.wallsBonusPct,
+    );
 
     // floor(1 * (100 + 175) / 100) = 2. The resolver must see that 2, not the 1 that
     // flooring each bonus separately would give.
@@ -347,37 +368,49 @@ describe('the modifier rule — percentages are summed, then floored ONCE', () =
 
   it('reads the defender bonus list once, and only honours walls inside a city', () => {
     expect(
-      defenderBonusPct({ terrainBonusPct: 0, fortified: false, inCity: false, walls: false }),
+      defenderBonusPct(RULES, {
+        terrainBonusPct: 0,
+        fortified: false,
+        inCity: false,
+        walls: false,
+      }),
     ).toBe(0);
     expect(
-      defenderBonusPct({ terrainBonusPct: 25, fortified: false, inCity: false, walls: false }),
+      defenderBonusPct(RULES, {
+        terrainBonusPct: 25,
+        fortified: false,
+        inCity: false,
+        walls: false,
+      }),
     ).toBe(25);
     expect(
-      defenderBonusPct({ terrainBonusPct: 0, fortified: true, inCity: false, walls: false }),
-    ).toBe(FORTIFY_BONUS_PCT);
+      defenderBonusPct(RULES, { terrainBonusPct: 0, fortified: true, inCity: false, walls: false }),
+    ).toBe(RULES.fortifyBonusPct);
     expect(
-      defenderBonusPct({ terrainBonusPct: 0, fortified: false, inCity: true, walls: false }),
-    ).toBe(CITY_DEFENSE_BONUS_PCT);
+      defenderBonusPct(RULES, { terrainBonusPct: 0, fortified: false, inCity: true, walls: false }),
+    ).toBe(RULES.cityDefenseBonusPct);
     expect(
-      defenderBonusPct({ terrainBonusPct: 0, fortified: false, inCity: true, walls: true }),
-    ).toBe(CITY_DEFENSE_BONUS_PCT + WALLS_BONUS_PCT);
+      defenderBonusPct(RULES, { terrainBonusPct: 0, fortified: false, inCity: true, walls: true }),
+    ).toBe(RULES.cityDefenseBonusPct + RULES.wallsBonusPct);
     // Walls are a property of a city: a unit standing in the open cannot have them.
     expect(
-      defenderBonusPct({ terrainBonusPct: 0, fortified: false, inCity: false, walls: true }),
+      defenderBonusPct(RULES, { terrainBonusPct: 0, fortified: false, inCity: false, walls: true }),
     ).toBe(0);
   });
 });
 
 describe('veteranAttack — the attacker bonus, summed once and floored once', () => {
-  it('adds VETERAN_ATTACK_PCT per experience level', () => {
-    expect(veteranBonusPct(0)).toBe(0);
-    expect(veteranBonusPct(1)).toBe(VETERAN_ATTACK_PCT);
-    expect(veteranBonusPct(MAX_EXPERIENCE)).toBe(MAX_EXPERIENCE * VETERAN_ATTACK_PCT);
+  it('adds RULES.veteranAttackPct per experience level', () => {
+    expect(veteranBonusPct(RULES, 0)).toBe(0);
+    expect(veteranBonusPct(RULES, 1)).toBe(RULES.veteranAttackPct);
+    expect(veteranBonusPct(RULES, RULES.maxExperience)).toBe(
+      RULES.maxExperience * RULES.veteranAttackPct,
+    );
   });
 
   it('floors once, at the end, on the summed percentage', () => {
     // floor(3 * (100 + 25) / 100) = floor(3.75) = 3.
-    expect(veteranAttack(3, 1)).toBe(3);
+    expect(veteranAttack(RULES, 3, 1)).toBe(3);
     // The two 25% steps applied separately would be floor(floor(3*1.25)=3 * 1.25) = 3 as
     // well, so use a value where the difference shows:
     //   summed at 50% -> floor(5 * 1.5) = 7
@@ -387,16 +420,16 @@ describe('veteranAttack — the attacker bonus, summed once and floored once', (
     // so this test pins the *identity* the sum produces for the level ladder rather than
     // pretending the two differ here. The discriminating compounding case is the
     // defender's, above, where the bonus list has more than one kind of entry.
-    expect(veteranAttack(5, 2)).toBe(7);
-    expect(veteranAttack(5, 3)).toBe(8);
+    expect(veteranAttack(RULES, 5, 2)).toBe(7);
+    expect(veteranAttack(RULES, 5, 3)).toBe(8);
     // A hostile experience value contributes nothing rather than a negative bonus.
-    expect(veteranAttack(3, -1)).toBe(3);
-    expect(veteranAttack(3, 1.5)).toBe(3);
-    expect(Number.isInteger(veteranAttack(3, Number.NaN))).toBe(true);
+    expect(veteranAttack(RULES, 3, -1)).toBe(3);
+    expect(veteranAttack(RULES, 3, 1.5)).toBe(3);
+    expect(Number.isInteger(veteranAttack(RULES, 3, Number.NaN))).toBe(true);
   });
 
   it('is what fills CombatSide.bonusPct, so the caller re-derives nothing', () => {
-    expect(veteranBonusPct(2)).toBe(2 * VETERAN_ATTACK_PCT);
+    expect(veteranBonusPct(RULES, 2)).toBe(2 * RULES.veteranAttackPct);
   });
 });
 
@@ -407,7 +440,7 @@ describe('veteranAttack — the attacker bonus, summed once and floored once', (
 describe('the defender wins ties', () => {
   // 3 attack against 3 defence is exactly 50%, so the threshold is 50 and a draw of 50 is
   // the boundary — the one value a test cannot reach by choosing a seed.
-  const threshold = winPct(3, 3);
+  const threshold = winPct(RULES, 3, 3);
 
   it('gives the round to the attacker strictly below the threshold', () => {
     expect(drawsWin(threshold - 1, threshold)).toBe(true);
@@ -417,7 +450,7 @@ describe('the defender wins ties', () => {
   it('gives the round to the DEFENDER at exactly the threshold', () => {
     expect(drawsWin(threshold, threshold)).toBe(false);
     expect(drawsWin(threshold + 1, threshold)).toBe(false);
-    expect(drawsWin(ROLL_BOUND - 1, threshold)).toBe(false);
+    expect(drawsWin(RULES.rollBound - 1, threshold)).toBe(false);
   });
 
   it('resolves a boundary draw as a defender round, in a real battle', () => {
@@ -456,7 +489,7 @@ describe('the defender wins ties', () => {
         static: [99],
       }),
     );
-    expect(ninetyNine.result.attackerWinPct).toBe(MAX_WIN_PCT);
+    expect(ninetyNine.result.attackerWinPct).toBe(RULES.maxWinPct);
     expect(ninetyNine.result.outcome).toBe('defender-wins');
   });
 });
@@ -470,10 +503,10 @@ describe('resolveCombat — hit points, rounds and survival', () => {
     const result = resolveCombat(context({ static: [0, 0, 0] })).result;
     expect(result.attackerWinPct).toBe(50);
     expect(result.attackerWinsBelow).toBe(50);
-    expect(result.rollBound).toBe(ROLL_BOUND);
+    expect(result.rollBound).toBe(RULES.rollBound);
   });
 
-  it('takes exactly DAMAGE_PER_ROUND per round and survives at 1 hit point', () => {
+  it('takes exactly RULES.damagePerRound per round and survives at 1 hit point', () => {
     // Attacker 2 hit points against a defender that loses every round: the defender dies
     // on round 1 while the attacker is untouched.
     const quick = resolveCombat(
@@ -481,7 +514,7 @@ describe('resolveCombat — hit points, rounds and survival', () => {
     ).result;
     expect(quick.rounds).toBe(1);
     expect(quick.attackerLost).toBe(0);
-    expect(quick.defenderLost).toBe(DAMAGE_PER_ROUND);
+    expect(quick.defenderLost).toBe(RULES.damagePerRound);
     expect(quick.attackerSurvives).toBe(true);
     expect(quick.defenderSurvives).toBe(false);
   });
@@ -594,14 +627,14 @@ describe('resolveCombat is pure and reproducible', () => {
     // battle was already over, would move the world's RNG differently.
     const real = resolveCombat(context({ attackerHitPoints: 9, defenderHitPoints: 1, rng: RNG }));
     expect(real.result.rounds).toBe(1);
-    const afterOne = nextBelow(RNG, ROLL_BOUND)[1];
+    const afterOne = nextBelow(RNG, RULES.rollBound)[1];
     expect(real.rng).toStrictEqual(afterOne);
     expect(real.rng).toStrictEqual(real.result.rng);
 
     const longer = resolveCombat(context({ attackerHitPoints: 9, defenderHitPoints: 6, rng: RNG }));
     let expected = RNG;
     for (let round = 0; round < longer.result.rounds; round += 1) {
-      expected = nextBelow(expected, ROLL_BOUND)[1];
+      expected = nextBelow(expected, RULES.rollBound)[1];
     }
     expect(longer.rng).toStrictEqual(expected);
     expect(longer.result.rounds).toBeGreaterThan(1);
@@ -686,18 +719,18 @@ describe('experience raises the attacker’s odds, and only the attacker’s', (
     expect(zero).toStrictEqual(omitted);
   });
 
-  it('is capped in effect by MAX_WIN_PCT: a promotion cannot make a round certain', () => {
+  it('is capped in effect by RULES.maxWinPct: a promotion cannot make a round certain', () => {
     const overwhelming = resolveCombat(
       context({
         attacker: { attack: 10, defense: 1, bonusPct: 0 },
         defender: { attack: 1, defense: 0, bonusPct: 0 },
-        experience: MAX_EXPERIENCE,
+        experience: RULES.maxExperience,
         attackerHitPoints: 1,
         defenderHitPoints: 1,
-        static: [MAX_WIN_PCT],
+        static: [RULES.maxWinPct],
       }),
     ).result;
-    expect(overwhelming.attackerWinPct).toBe(MAX_WIN_PCT);
+    expect(overwhelming.attackerWinPct).toBe(RULES.maxWinPct);
     expect(overwhelming.outcome).toBe('defender-wins');
   });
 });
@@ -814,11 +847,11 @@ describe('damage, healing and promotion are total pure functions', () => {
 
   it('promotes one level per call, up to the cap, and never past it', () => {
     let promoted = full;
-    for (let level = 1; level <= MAX_EXPERIENCE; level += 1) {
-      promoted = promoteUnit(promoted, MAX_EXPERIENCE);
+    for (let level = 1; level <= RULES.maxExperience; level += 1) {
+      promoted = promoteUnit(promoted, RULES.maxExperience);
       expect(experienceOf(promoted)).toBe(level);
     }
-    expect(experienceOf(promoteUnit(promoted, MAX_EXPERIENCE))).toBe(MAX_EXPERIENCE);
+    expect(experienceOf(promoteUnit(promoted, RULES.maxExperience))).toBe(RULES.maxExperience);
     // A nonsense cap grants nothing rather than promoting without limit.
     expect(experienceOf(promoteUnit(full, 0))).toBe(0);
     expect(experienceOf(promoteUnit(full, Number.NaN))).toBe(0);
@@ -932,7 +965,7 @@ describe('experience and fortified are absent or present, never undefined', () =
       clearFortified(withFortified(bare)),
       healUnit({ ...bare, hitPointsLeft: 1 }, ATTACKER_DEF, 1),
       damageUnit(bare, 1) ?? bare,
-      promoteUnit(bare, MAX_EXPERIENCE),
+      promoteUnit(bare, RULES.maxExperience),
     ];
     for (const written of writers) {
       for (const key of ['experience', 'fortified', 'work'] as const) {
@@ -1007,5 +1040,170 @@ describe('experience and fortified are absent or present, never undefined', () =
     expect(idle.experience).toBe(1);
     expect(idle.fortified).toBe(true);
     expect(JSON.stringify(idle)).not.toContain('undefined');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M6b — the magnitudes come from the RULESET, and nowhere else
+ * ------------------------------------------------------------------ */
+
+/** A structural ruleset view carrying one `combat` section, for `combatRulesOf`. */
+interface ViewWithCombat extends RulesetView {
+  readonly combat: CombatDef;
+}
+
+const withCombat = (combat: CombatDef): ViewWithCombat => ({
+  terrains: [],
+  units: [],
+  improvements: [],
+  fidelity: 'tuned',
+  combat,
+});
+
+/** The same view with no section at all — a hand-built fixture, a foreign ruleset. */
+const viewWithNoCombat: RulesetView = {
+  terrains: [],
+  units: [],
+  improvements: [],
+  fidelity: 'tuned',
+};
+
+describe('combatRulesOf — every magnitude is read from the ruleset it is handed', () => {
+  it('reads all nine fields of the section, one by one', () => {
+    const rules = combatRulesOf(withCombat(RULES));
+    expect(rules.fortifyBonusPct).toBe(RULES.fortifyBonusPct);
+    expect(rules.cityDefenseBonusPct).toBe(RULES.cityDefenseBonusPct);
+    expect(rules.wallsBonusPct).toBe(RULES.wallsBonusPct);
+    expect(rules.veteranAttackPct).toBe(RULES.veteranAttackPct);
+    expect(rules.maxExperience).toBe(RULES.maxExperience);
+    expect(rules.rollBound).toBe(RULES.rollBound);
+    expect(rules.damagePerRound).toBe(RULES.damagePerRound);
+    expect(rules.minWinPct).toBe(RULES.minWinPct);
+    expect(rules.maxWinPct).toBe(RULES.maxWinPct);
+    expect(rules).toStrictEqual(RULES);
+  });
+
+  it('reads the *shipped* catalog through the same reader, so this file cannot drift', () => {
+    // The one place this file is allowed to look at content: the shipped section reaches
+    // `combatRulesOf` exactly as a fixture does, so the reader — not a constant — is what
+    // stands between the catalog and a battle.
+    const shipped = combatRulesOf(withCombat({ ...RULES }));
+    expect(shipped.rollBound).toBe(100);
+    expect(shipped.maxWinPct).toBe(99);
+  });
+
+  it('is NOT the shipped numbers when the section is absent', () => {
+    // The dual-source rule, in the direction that matters most: a fallback that reproduced
+    // today's values would let an overridden catalog be silently ignored — a sweep would
+    // report "no effect" for a knob that was never read. `NO_COMBAT_RULES` is degenerate
+    // *because* it must be distinguishable from the shipped table.
+    const none = combatRulesOf(viewWithNoCombat);
+    expect(none).toStrictEqual(NO_COMBAT_RULES);
+    expect(none).not.toStrictEqual(RULES);
+    // And the degeneracy is total: nothing is granted, and nothing can be promoted.
+    expect(none.fortifyBonusPct + none.cityDefenseBonusPct + none.wallsBonusPct).toBe(0);
+    expect(none.veteranAttackPct).toBe(0);
+    expect(none.maxExperience).toBe(0);
+    // One hit point per round is the *termination floor*, not a copy of the shipped 1: a
+    // round that cost nothing could never end a battle.
+    expect(none.damagePerRound).toBe(1);
+  });
+
+  it('turns an absent section into an unwinnable assault, in a real battle', () => {
+    // "No combat rules" has to be visible in the odds, not just in a struct: the attacker
+    // never wins a round, so a 1-hit-point fight at a 50% threshold becomes a defender win.
+    const withRules = resolveCombat(
+      context({ attackerHitPoints: 1, defenderHitPoints: 1, static: [0] }),
+    ).result;
+    expect(withRules.outcome).toBe('attacker-wins');
+
+    const without = resolveCombat(
+      context({
+        rules: combatRulesOf(viewWithNoCombat),
+        attackerHitPoints: 1,
+        defenderHitPoints: 1,
+        static: [0],
+      }),
+    ).result;
+    expect(without.attackerWinPct).toBe(NO_COMBAT_RULES.minWinPct);
+    expect(without.rollBound).toBe(NO_COMBAT_RULES.rollBound);
+    expect(without.outcome).toBe('defender-wins');
+  });
+
+  it('reads an unreadable field as that field’s degenerate value, never as NaN', () => {
+    // A structural view can carry anything. A percentage that is not a non-negative whole
+    // number grants nothing; the damage floor and the roll bound keep their minimum, because
+    // 0 of either would turn a pure function into a non-terminating one.
+    const rules = combatRulesOf(
+      withCombat({
+        fortifyBonusPct: -5,
+        cityDefenseBonusPct: 12.5,
+        wallsBonusPct: Number.NaN,
+        veteranAttackPct: Number.POSITIVE_INFINITY,
+        maxExperience: -1,
+        rollBound: 0,
+        damagePerRound: 0,
+        minWinPct: -3,
+        maxWinPct: 0.5,
+      }),
+    );
+    expect(rules).toStrictEqual(NO_COMBAT_RULES);
+  });
+
+  it('CHANGES THE ODDS when the ruleset says something else', () => {
+    // **This is the test the M6b contract asks for.** If any magnitude were still a literal
+    // inside `combat.ts`, at least one of these four would not move.
+    const modifiers = { terrainBonusPct: 0, fortified: false, inCity: true, walls: true };
+
+    // 1. `wallsBonusPct`: 50 (city 50 + walls 50 = 100%) against 0 (city only).
+    const withWalls = combatRulesOf(withCombat(RULES));
+    const noWalls = combatRulesOf(withCombat({ ...RULES, wallsBonusPct: 0 }));
+    const walled = winPct(withWalls, 3, modifiedDefense(3, defenderBonusPct(withWalls, modifiers)));
+    const bare = winPct(noWalls, 3, modifiedDefense(3, defenderBonusPct(noWalls, modifiers)));
+    expect(walled).toBe(33); // defence floor(3 * 2.0) = 6 -> 3 / 9
+    expect(bare).toBe(42); // defence floor(3 * 1.5) = 4 -> 3 / 7
+    expect(walled).not.toBe(bare);
+
+    // 2. `cityDefenseBonusPct`, the same way.
+    const noCity = combatRulesOf(withCombat({ ...RULES, cityDefenseBonusPct: 0 }));
+    expect(winPct(noCity, 3, modifiedDefense(3, defenderBonusPct(noCity, modifiers)))).not.toBe(
+      walled,
+    );
+
+    // 3. `damagePerRound`: 1 shipped against 3, applied by the resolver in one round.
+    const shipped = resolveCombat(
+      context({ attackerHitPoints: 3, defenderHitPoints: 3, static: [0, 0, 0] }),
+    ).result;
+    const brutal = resolveCombat(
+      context({
+        rules: combatRulesOf(withCombat({ ...RULES, damagePerRound: 3 })),
+        attackerHitPoints: 3,
+        defenderHitPoints: 3,
+        static: [0],
+      }),
+    ).result;
+    // The same battle, the same scripted draws: three rounds at one hit point a round, one
+    // round at three. The damage magnitude — not a constant in the resolver — is what moved.
+    expect(shipped.rounds).toBe(3);
+    expect(shipped.defenderLost).toBe(3);
+    expect(brutal.rounds).toBe(1);
+    expect(brutal.defenderLost).toBe(3);
+
+    // 4. `veteranAttackPct` and `rollBound`, read rather than assumed.
+    expect(veteranBonusPct(combatRulesOf(withCombat({ ...RULES, veteranAttackPct: 50 })), 2)).toBe(
+      100,
+    );
+    const coarse = resolveCombat(
+      context({
+        rules: combatRulesOf(withCombat({ ...RULES, rollBound: 10 })),
+        attackerHitPoints: 1,
+        defenderHitPoints: 1,
+        static: [5],
+      }),
+    ).result;
+    // floor(3 * 10 / 6) = 5 on a ten-value draw, and a draw *at* the threshold still loses.
+    expect(coarse.attackerWinPct).toBe(5);
+    expect(coarse.rollBound).toBe(10);
+    expect(coarse.outcome).toBe('defender-wins');
   });
 });

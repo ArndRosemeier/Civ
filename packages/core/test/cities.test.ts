@@ -36,12 +36,14 @@ import {
   type CityYields,
   type ProductionItem,
 } from '../src/cities.js';
+import { isExplored } from '../src/fog.js';
 import {
   asBuildingId,
   asCityId,
   asPlayerId,
   asTerrainId,
   asTileIndex,
+  asUnitId,
   asUnitTypeId,
 } from '../src/ids.js';
 import { indexToX, indexToY, tileIndex, type RulesetView, type TerrainDef } from '../src/map.js';
@@ -1052,18 +1054,22 @@ describe('captureCity', () => {
     expect(capture.state.improvements).toHaveLength(2);
   });
 
-  it('bumps neither the revision nor the turn, and writes nothing else', () => {
+  it('bumps the revision by exactly one, and leaves the turn alone', () => {
     const before = board();
     const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
-    // M2's invariant: `revision` counts applied *commands*, and a capture is one step of
-    // one `AttackUnit`. The command layer bumps it once, like every other command.
-    expect(capture.state.revision).toBe(before.revision);
+    // **M6b's repair.** M6 left the bump to `commands.ts`' `applyCapture`, which is right
+    // for a player's command and silently wrong for the engine's own sack: the barbarian
+    // step applies a capture through the same command path and hands the state on as a
+    // *step*, so the counter was the caller's to drop. "The state changed" belongs to the
+    // rule that changes it, and the delta is exactly one — not two, which a command layer
+    // that also bumped would have produced, and not zero, which is what a caller that
+    // forgot produced.
+    expect(capture.state.revision).toBe(before.revision + 1);
     expect(capture.state.turn).toBe(before.turn);
-    // Fog, the map, the players, the RNG and the units are the same objects: a capture is
-    // a change to one city, and every other part of the state is passed through.
-    expect(capture.state.explored).toBe(before.explored);
+    // Everything else is the same object: a capture is a change to one city (plus the
+    // memory fold below), and every other part of the state is passed through.
     expect(capture.state.map).toBe(before.map);
     expect(capture.state.players).toBe(before.players);
     expect(capture.state.rng).toBe(before.rng);
@@ -1073,6 +1079,64 @@ describe('captureCity', () => {
     // two.
     expect(cityById(capture.state, asCityId(1))).toBe(BYSTANDER);
     expect(capture.state.cities).not.toBe(before.cities);
+  });
+
+  it('folds fog for the new owner, through the same writers every other change uses', () => {
+    // The second half of the repair. A capture is an *ownership* change, so the tiles the
+    // new owner's units can see from where they stand are folded into its memory — exactly
+    // what a move folds (`commands.ts`' `movedState`), through `fog.ts`' `visibleTiles`
+    // and `withExplored` rather than through a second writer of the explored layer. The
+    // fixture board has no units, so nothing can see anything: the fold is a *no-op in
+    // content* here, which is why the rows are compared entry by entry.
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    expect(capture.state.explored).toStrictEqual(before.explored);
+    // A new outer array (the one writer always rebuilds it), the same rows.
+    expect(capture.state.explored).not.toBe(before.explored);
+    for (const [index, row] of capture.state.explored.entries()) {
+      expect(row).toBe(before.explored[index]);
+    }
+
+    // And with a unit of the *capturing* player on the board, the fold is visible: the
+    // tiles that unit sees become explored for that player, and only for that player.
+    const withUnit: GameState = {
+      ...before,
+      units: [
+        {
+          id: asUnitId(0),
+          type: asUnitTypeId('warrior'),
+          owner: asPlayerId(0),
+          tile: asTileIndex(at(1, 2)),
+          movementLeft: 1,
+          hitPointsLeft: 1,
+        },
+      ],
+    };
+    const sacked = captureCity(withUnit, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    if (sacked === undefined) throw new Error('the fixture holds a city with id 0');
+
+    expect(isExplored(sacked.state, asPlayerId(0), asTileIndex(CENTRE))).toBe(true);
+    expect(isExplored(sacked.state, asPlayerId(0), asTileIndex(at(0, 0)))).toBe(true);
+    // Player 1 remembers nothing new: the fold is the *new owner's* sight, not a
+    // divination about the city.
+    expect(sacked.state.explored[1]?.some((seen) => seen)).toBe(false);
+    // A capture does not heal the conqueror's unit or move it: the fold reads the units,
+    // it does not write them.
+    expect(sacked.state.units).toBe(withUnit.units);
+  });
+
+  it('writes nothing else: fog is folded, and the rest of the state is passed through', () => {
+    const before = board();
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(2));
+    if (capture === undefined) throw new Error('the fixture holds a city with id 0');
+
+    // A barbarian sack of a *hand-built* state: the same rule, the same one-revision
+    // delta, and the same fold. (`barbarians.test.ts` owns the engine-driven half.)
+    expect(capture.state.revision).toBe(before.revision + 1);
+    expect(capture.state.explored).toStrictEqual(before.explored);
+    expect(capture.city.owner).toBe(asPlayerId(2));
   });
 
   it('is pure: the state it is handed is not modified', () => {

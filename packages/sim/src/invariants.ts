@@ -84,12 +84,12 @@
 import {
   CAPTURE_POPULATION_DIVISOR,
   IMPROVEMENT_KINDS,
-  MAX_EXPERIENCE,
   MIN_GROWTH_FOOD,
   UNIT_SUPPORT_COST,
   cityAt,
   cityRadius,
   cityYields,
+  combatRulesOf,
   compareTileResources,
   foodBoxSize,
   hitPointsLeftOf,
@@ -984,11 +984,13 @@ const unitMovementInRange = (ctx: InvariantContext): readonly string[] => {
  * opinion, and a paired claim about the **event stream** where the property is a
  * transition rather than a state (a capture, a battle's hit points).
  *
- * The measured magnitudes are *not* restated here: `MAX_EXPERIENCE` and
- * `CAPTURE_POPULATION_DIVISOR` come from `@civts/core` (`combat.ts` and `cities.ts`),
- * so a knob that moves moves these checks with it. Nothing below is a balance claim,
- * and nothing here is a Civ 3 number — the same provenance rule the module doc states
- * for the whole file.
+ * The measured magnitudes are *not* restated here: the promotion cap comes from the
+ * ruleset's `combat` section through `combatRulesOf` — the same reader `commands.ts` asks
+ * before it clamps a promotion, and M6b's home for the number that was the `MAX_EXPERIENCE`
+ * constant of `core/combat.ts` — and `CAPTURE_POPULATION_DIVISOR` comes from `@civts/core`
+ * (`cities.ts`), so a knob that moves moves these checks with it. Nothing below is a
+ * balance claim, and nothing here is a Civ 3 number — the same provenance rule the module
+ * doc states for the whole file.
  *
  * Two readings are deliberately **not** made, and both for the same reason (see the
  * module doc's "reading the context honestly"): a turn's boundary is not the moment a
@@ -1175,24 +1177,30 @@ const unitHitPointsAboveZero = (ctx: InvariantContext): readonly string[] => {
 
 /**
  * `unit-experience-in-range` — a stored promotion level is a whole number in
- * `0..MAX_EXPERIENCE`.
+ * `0..maxExperience`.
  *
- * `MAX_EXPERIENCE` is the cap `combat.ts` states and `promoteUnit` clamps to, imported
- * rather than restated. Absence means zero (`experienceOf`) and is not a violation;
- * a value *above* the cap means a promotion that outran the cap.
+ * The cap is read from the ruleset's `combat` section through `combatRulesOf` — the reader
+ * `commands.ts` clamps a promotion with, and M6b's home for the number that was a module
+ * constant in `core/combat.ts` until this wave. Reading it rather than importing a
+ * constant is what makes the predicate follow a balance sweep: an overridden
+ * `maxExperience` moves the bound this check enforces in the same run, instead of the
+ * check going on policing a number the engine no longer uses. Absence means zero
+ * (`experienceOf`) and is not a violation; a value *above* the cap means a promotion that
+ * outran the cap.
  */
 const unitExperienceInRange = (ctx: InvariantContext): readonly string[] => {
   const problems: string[] = [];
+  const { maxExperience } = combatRulesOf(ctx.rulesetView);
 
   for (const unit of ctx.state.units) {
     const stored = unit.experience;
     if (stored === undefined) continue;
 
     const earned = wholeNumber(stored);
-    if (earned === undefined || earned < 0 || earned > MAX_EXPERIENCE) {
+    if (earned === undefined || earned < 0 || earned > maxExperience) {
       problems.push(
         `unit ${String(unit.id)} (${String(unit.type)}) has ${describeValue(stored)} experience; ` +
-          `a stored level is a whole number in 0..${String(MAX_EXPERIENCE)}, the cap ` +
+          `a stored level is a whole number in 0..${String(maxExperience)}, the cap ` +
           '`promoteUnit` clamps a promotion to',
       );
     }

@@ -118,7 +118,6 @@ import {
   asUnitTypeId,
   buildingCatalog,
   buildingDef,
-  CITY_DEFENSE_BONUS_PCT,
   citiesOf,
   cityById,
   cityGrowthTarget,
@@ -127,12 +126,12 @@ import {
   cityRadius,
   cityYields,
   civPlayers,
+  combatRulesOf,
   connected,
   defenderBonusPct,
   describe,
   err,
   foodBoxSize,
-  FORTIFY_BONUS_PCT,
   hitPointsLabel,
   improvementCatalog,
   improvementDef,
@@ -145,7 +144,6 @@ import {
   itemCostOf,
   knownTechs,
   maintenanceOf,
-  MAX_EXPERIENCE,
   neighbors8,
   ok,
   planAttackUnit,
@@ -175,11 +173,10 @@ import {
   unitsOnTile,
   unitSupport,
   unmetTechFor,
-  VETERAN_ATTACK_PCT,
   visibleTiles,
-  WALLS_BONUS_PCT,
   WALLS_BUILDING,
   workSummary,
+  type CombatDef,
   type Command,
   type CommandOutcome,
   type BuildingId,
@@ -415,13 +412,20 @@ const unitHitPoints = (ruleset: RulesetView, unit: Unit): string =>
  * answer to "how hard is this city to take?", which is a question about the
  * *modifiers* the engine will sum.
  *
- * Every figure is read from `combat.ts`: `terrainDefenseBonus` for the terrain part and
- * `defenderBonusPct` for the sum (terrain + `CITY_DEFENSE_BONUS_PCT` + `WALLS_BONUS_PCT`
- * when the city holds `WALLS_BUILDING`), so the number a player reads here is the number
- * the applier will put into a battle — it cannot drift from the resolver, because no
- * arithmetic is repeated here. `defenderBonusPct` is handed `fortified: false` on
- * purpose: whether the defender is dug in is a fact about *that unit*, not about this
- * city, and the line says so rather than assuming one.
+ * Every figure is read from `combat.ts` **through the ruleset**: `terrainDefenseBonus` for
+ * the terrain part and `defenderBonusPct` for the sum (terrain + the ruleset's
+ * `cityDefenseBonusPct` + its `wallsBonusPct` when the city holds `WALLS_BUILDING`), so
+ * the number a player reads here is the number the applier will put into a battle — it
+ * cannot drift from the resolver, because no arithmetic is repeated here.
+ * `defenderBonusPct` is handed `fortified: false` on purpose: whether the defender is dug
+ * in is a fact about *that unit*, not about this city, and the line says so rather than
+ * assuming one.
+ *
+ * **The three bonuses and the fortify figure come from `combatRulesOf(ruleset)`**, which
+ * is the same reader `commands.ts` asks before it resolves a battle (M6b): before that
+ * wave they were constants exported by `combat.ts`, and a screen that restated them would
+ * have gone on printing the old numbers after a balance sweep moved them. Reading them
+ * here means this line reports the game being played, not the game that was compiled.
  *
  * **The line also has to say what the city does NOT have**, because the honest answer to
  * "what defends this city?" is "a unit, and nothing else": an undefended city is
@@ -430,24 +434,25 @@ const unitHitPoints = (ruleset: RulesetView, unit: Unit): string =>
  * describing a mechanic the engine does not have.
  */
 const cityDefenceLine = (state: GameState, ruleset: RulesetView, city: City): string => {
+  const rules = combatRulesOf(ruleset);
   const terrain = terrainDefenseBonus(terrainDefAt(state, ruleset, city.tile) ?? {});
   const walls = city.buildings.includes(WALLS_BUILDING);
-  const total = defenderBonusPct({
+  const total = defenderBonusPct(rules, {
     terrainBonusPct: terrain,
     fortified: false,
     inCity: true,
     walls,
   });
 
-  const parts = [`terrain +${String(terrain)}%`, `city +${String(CITY_DEFENSE_BONUS_PCT)}%`];
+  const parts = [`terrain +${String(terrain)}%`, `city +${String(rules.cityDefenseBonusPct)}%`];
   parts.push(
     walls
-      ? `walls +${String(WALLS_BONUS_PCT)}% (it holds defensive walls)`
+      ? `walls +${String(rules.wallsBonusPct)}% (it holds defensive walls)`
       : `walls +0% (no "${String(WALLS_BUILDING)}" building here, so no wall bonus)`,
   );
   return (
     `  defence: +${String(total)}% to a unit defending this tile (${parts.join(', ')}), plus ` +
-    `+${String(FORTIFY_BONUS_PCT)}% if that unit is fortified. ` +
+    `+${String(rules.fortifyBonusPct)}% if that unit is fortified. ` +
     'The city has no defence of its own: an undefended city is captured outright, so what ' +
     'defends it is a unit standing here.'
   );
@@ -2265,7 +2270,7 @@ export interface ReplSession {
  * Every verb, for the banner and for the "unknown command" reply — so a mistyped
  * word is answered with the list it should have come from. Exported because the
  * transcript fixture prints it: a new verb has to show up here as well as in
- * `HELP`.
+ * `helpText`.
  */
 export const COMMAND_SUMMARY =
   'move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | ' +
@@ -2275,7 +2280,18 @@ export const COMMAND_SUMMARY =
   'rates <tax> <science> <luxury> | research <techId> | tech | ' +
   'end | units | state | save <path> | help | quit';
 
-const HELP = `commands:
+/**
+ * The help text, as a **function of the combat rules** (M6b).
+ *
+ * It used to be a module-level constant that interpolated `MAX_EXPERIENCE`,
+ * `VETERAN_ATTACK_PCT` and `FORTIFY_BONUS_PCT` from `core/combat.ts`. Those are catalog
+ * magnitudes now, so a constant computed at import time would freeze whatever the module
+ * was compiled against and go on printing it after a balance sweep moved the real number —
+ * a help screen that documents a game nobody is playing. Taking `rules` and being called
+ * where the session knows its ruleset is the whole fix, and the printed text is
+ * byte-identical to what the constants produced.
+ */
+const helpText = (rules: CombatDef): string => `commands:
   move <unitId> <x> <y>   step one unit onto an adjacent tile (8-way). The cost is the
                           destination tile's move cost, paid from that unit's movement.
   attack <unitId> <x> <y> attack one of the 8 adjacent tiles with that unit. The unit must
@@ -2287,12 +2303,12 @@ const HELP = `commands:
                           and worked tiles are cleared, and it is not razed). Attacking
                           spends ALL of the unit's remaining movement whether it wins or
                           loses. The winner of a battle gains one experience level
-                          (capped at ${String(MAX_EXPERIENCE)}), worth +${String(VETERAN_ATTACK_PCT)}% attack each;
+                          (capped at ${String(rules.maxExperience)}), worth +${String(rules.veteranAttackPct)}% attack each;
                           a battle ends when one side is destroyed, so a unit is never left
                           standing at 0 hit points. A tie in a round goes to the DEFENDER.
                           "units" shows every unit's hit points; a city's "defence:" line
                           shows what its tile and walls are worth to a defender.
-  fortify <unitId>        dig that unit in where it stands: +${String(FORTIFY_BONUS_PCT)}% defence until it moves.
+  fortify <unitId>        dig that unit in where it stands: +${String(rules.fortifyBonusPct)}% defence until it moves.
                           It requires movement left and costs the rest of the turn, and it
                           prints a line because (unlike an attack) it emits no event.
   found <unitId>          found a city with that unit, which must be a settler standing on
@@ -2449,6 +2465,12 @@ const outcomeText = (
   ruleset: RulesetView,
   playerId: PlayerId,
 ): string => {
+  // M6b: the two combat magnitudes this renderer prints — the per-level attack bonus and
+  // the fortify bonus — are read from the ruleset the session is playing, the same way
+  // `commands.ts` reads them before it resolves a battle. They were module constants in
+  // `combat.ts` before this wave; reading them here is what keeps the event prose from
+  // reporting a number the engine no longer uses.
+  const rules = combatRulesOf(ruleset);
   const lines = outcome.events.map((event): string => {
     switch (event.type) {
       case 'UnitMoved':
@@ -2674,14 +2696,14 @@ const outcomeText = (
 
       // Promotion is the reward for winning, so the line names the level it reached, the
       // cap it was clamped against and what the level is *worth* — the bonus percentage
-      // read from `combat.ts` (`VETERAN_ATTACK_PCT`) rather than restated here, because
+      // read from the ruleset through `combatRulesOf` rather than restated here, because
       // "veteran 2" with no magnitude is a number a player cannot act on.
       case 'UnitPromoted':
         return (
           `ok: unit ${String(event.unitId)} (${playerLabel(outcome.state, event.owner)}) won at ` +
           `${eventPlace(outcome, event.tile)} and was promoted to veteran level ` +
           `${String(event.experience)} of ${String(event.maxExperience)}; each level is ` +
-          `+${String(VETERAN_ATTACK_PCT)}% attack, and experience is never lost`
+          `+${String(rules.veteranAttackPct)}% attack, and experience is never lost`
         );
 
       // A capture is not a battle, so this line reports what the *sack* did: the old
@@ -2830,6 +2852,11 @@ const appliedCommandText = (
     case 'FortifyUnit': {
       const unit = unitById(outcome.state, command.unitId);
       const dug = unit !== undefined && isFortified(unit);
+      // M6b: the figure quoted below is the catalog's `fortifyBonusPct`, read from the
+      // same ruleset the applier summed it out of — it was a constant of `combat.ts`
+      // before this wave, and a line that restated it would go on printing the old
+      // number after a sweep moved the real one.
+      const { fortifyBonusPct } = combatRulesOf(ruleset);
       return (
         `ok: unit ${String(command.unitId)} is ${
           dug ? 'dug in where it stands' : 'NOT recorded as fortified'
@@ -2838,7 +2865,7 @@ const appliedCommandText = (
           ? ' (it is no longer in the state, so there is nothing left to fortify)'
           : `; fortifying spends its remaining movement (${String(unit.movementLeft)} left), ` +
             'and a unit that moves away is no longer fortified. It is worth ' +
-            `+${String(FORTIFY_BONUS_PCT)}% defence, and it emits no event, so this line is ` +
+            `+${String(fortifyBonusPct)}% defence, and it emits no event, so this line is ` +
             'the record of it')
       );
     }
@@ -3174,7 +3201,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
         return { kind: 'quit' };
 
       case 'help':
-        write(HELP);
+        write(helpText(combatRulesOf(ruleset)));
         return { kind: 'inspected', command: word };
 
       case 'units':

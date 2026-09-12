@@ -24,15 +24,14 @@
 
 import { describe, expect, it } from 'vitest';
 import { canonicalize, hashValue } from '@civts/testing';
-// M6's combat constants, **read** rather than copied: the battle sections below assert
-// the odds `combat.ts` computes, so a retune of a bonus has to move this file's
-// assertions on purpose instead of passing them silently.
-import {
-  CITY_DEFENSE_BONUS_PCT,
-  FORTIFY_BONUS_PCT,
-  MAX_EXPERIENCE,
-  WALLS_BONUS_PCT,
-} from '../src/combat.js';
+// M6b: the battle sections below assert the odds `combat.ts` computes, and those odds are
+// now a function of the **ruleset's** `combat` section rather than of a module constant —
+// so this file states the section its battles are fought under (`M6_COMBAT`, below) and
+// asks the engine's own reader for it. The fixture carries the shipped catalog's nine
+// values, which is why every hand-computed expectation in this file still holds; a
+// retune of the shipped table is felt here as a *failed odds assertion* rather than as a
+// silently changed import.
+import { combatRulesOf, type CombatDef } from '../src/combat.js';
 import {
   MIN_CITY_DISTANCE,
   cityById,
@@ -3946,9 +3945,9 @@ describe('planSetResearch agrees with the applier, over the whole catalog and be
  *
  * Every number asserted here is either a **placeholder** of ours (the halved, floored,
  * minimum-1 capture population; which buildings a sack takes and in what order) or a
- * constant `combat.ts` declares and this file *reads* rather than re-derives
- * (`VETERAN_ATTACK_PCT`, `FORTIFY_BONUS_PCT`, `CITY_DEFENSE_BONUS_PCT`,
- * `WALLS_BONUS_PCT`, `MAX_EXPERIENCE`). None of it is Civ 3's, and the odds quoted in
+ * magnitude the *ruleset* declares and this file states as a fixture rather than
+ * re-deriving (`M6_COMBAT`: the veteran, fortify, city and wall percentages and the
+ * promotion cap). None of it is Civ 3's, and the odds quoted in
  * the comments are the *engine's* arithmetic — `floor(attack * 100 / (attack + defense))`
  * with the defender's summed modifiers floored once — not a claim about the real game.
  * ------------------------------------------------------------------ */
@@ -4014,11 +4013,45 @@ const M6_BUILDINGS: readonly BuildingDef[] = [
   },
 ];
 
-/** The M2 fixture view plus M6's unit and building rows — nothing else moved. */
-const M6_RULESET: TechView = {
+/**
+ * **The combat magnitudes this file's battles are fought under** — the nine values the
+ * shipped `@civts/rules` catalog declares, written out here because `@civts/core` cannot
+ * depend on the content package (`rules` depends on `core`).
+ *
+ * They are a *fixture*, not an import: M6b moved these numbers out of `combat.ts`, and a
+ * test that read them back from the engine would assert nothing about what the engine
+ * does with them. Every hand-computed odds figure below (42 / 33 / 27 / 25) is the
+ * arithmetic of *these* numbers, and the last test in the M6 block asserts that
+ * `combatRulesOf(M6_RULESET)` really is this section — so a change to either side shows up
+ * as a failure rather than as two answers quietly agreeing to disagree.
+ */
+const M6_COMBAT: CombatDef = {
+  fortifyBonusPct: 25,
+  cityDefenseBonusPct: 50,
+  wallsBonusPct: 50,
+  veteranAttackPct: 25,
+  maxExperience: 3,
+  rollBound: 100,
+  damagePerRound: 1,
+  minWinPct: 1,
+  maxWinPct: 99,
+};
+
+/**
+ * The same escape hatch `TechView` above uses, for the same reason: `RulesetView` (the
+ * engine's structural view) does not declare `combat`, so a fixture that carries one says
+ * so in its own type rather than casting the section in.
+ */
+interface CombatView extends TechView {
+  readonly combat: CombatDef;
+}
+
+/** The M2 fixture view plus M6's unit and building rows and M6b's combat section. */
+const M6_RULESET: CombatView = {
   ...RULESET,
   units: [...RULESET.units, LEGION, PHALANX, CIVILIAN],
   buildings: M6_BUILDINGS,
+  combat: M6_COMBAT,
 };
 
 /**
@@ -4195,7 +4228,7 @@ describe('applyCommand — AttackUnit resolves a battle through combat.ts', () =
         owner: P0,
         tile: asTileIndex(5),
         experience: 1,
-        maxExperience: MAX_EXPERIENCE,
+        maxExperience: M6_COMBAT.maxExperience,
       },
     ]);
 
@@ -4237,7 +4270,7 @@ describe('applyCommand — AttackUnit resolves a battle through combat.ts', () =
       owner: P1,
       tile: asTileIndex(6),
       experience: 1,
-      maxExperience: MAX_EXPERIENCE,
+      maxExperience: M6_COMBAT.maxExperience,
     });
     expect(outcome.state.units.map((each) => Number(each.id))).toEqual([DEFENDER]);
     // Being attacked costs the defender nothing but hit points: M6 makes an attack spend
@@ -4287,11 +4320,14 @@ describe('applyCommand — AttackUnit resolves a battle through combat.ts', () =
     expect(combatEvent(withWalls.events).attackerWinPct).toBe(27);
     expect(combatEvent(dugIn.events).attackerWinPct).toBe(25);
 
-    // The same four steps against the constants rather than the arithmetic, so a retune
-    // of a bonus has to change this test on purpose instead of silently passing.
-    expect(CITY_DEFENSE_BONUS_PCT).toBe(50);
-    expect(WALLS_BONUS_PCT).toBe(50);
-    expect(FORTIFY_BONUS_PCT).toBe(25);
+    // The same four steps against the *ruleset* rather than the arithmetic, so a fixture
+    // whose section is not the one the odds came from fails here instead of convincing a
+    // reader that the engine read it: this is the engine's own reader, on this file's own
+    // view, and the numbers are the ones the four assertions above were computed from.
+    expect(combatRulesOf(M6_RULESET)).toStrictEqual(M6_COMBAT);
+    expect(M6_COMBAT.cityDefenseBonusPct).toBe(50);
+    expect(M6_COMBAT.wallsBonusPct).toBe(50);
+    expect(M6_COMBAT.fortifyBonusPct).toBe(25);
   });
 
   it('gives the city and wall bonuses only to the city’s own defender', () => {
@@ -4611,6 +4647,26 @@ describe('applyCommand — an attack on an undefended city captures it', () => {
     expect(experienceOf(attacker)).toBe(0);
     // A capture is not random, so it draws nothing from the world's stream.
     expect(outcome.state.rng).toEqual(board.rng);
+  });
+
+  it('bumps the revision by EXACTLY one, and folds the conqueror’s fog', () => {
+    // M6b's repair, pinned at the command layer. M6 bumped the revision in `applyCapture`
+    // and folded no fog at all; a capture is a state change of the same rank as a move, so
+    // it bumps once (not twice — the double bump a command layer that also bumped would
+    // produce) and folds what the new owner's units can see, through `fog.ts`' one writer.
+    // `cities.test.ts` pins the rule itself; this pins what a player's `AttackUnit` does
+    // with it, which is the path a save, a replay and a golden hash all see.
+    const board = siegeBoard();
+    const outcome = mustOk(apply(board, P0, attack(ATTACKER, 6), M6_RULESET));
+
+    expect(outcome.state.revision).toBe(board.revision + 1);
+    // Fog: the legion stands on tile 5 and the city it took is tile 6, one step away, so
+    // the tile it conquered is now in its owner's memory — and it was not before.
+    expect(isExplored(board, P0, asTileIndex(6))).toBe(false);
+    expect(isExplored(outcome.state, P0, asTileIndex(6))).toBe(true);
+    expect(isExplored(outcome.state, P0, asTileIndex(5))).toBe(true);
+    // The defeated owner learns nothing: the fold is the conqueror's sight.
+    expect(isExplored(outcome.state, P1, asTileIndex(5))).toBe(false);
   });
 
   it('turns a defended city into a battle, and the city stays its owner’s when the guard dies', () => {

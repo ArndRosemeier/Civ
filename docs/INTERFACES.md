@@ -1514,3 +1514,73 @@ This must be deterministic and must not draw from any policy's RNG stream.
   HP, experience in range, no unit inside an enemy city it does not own), each with a
   fire case.
 - A played golden that INCLUDES combat, so battles are covered at hash level.
+
+---
+
+# M6b contracts — FROZEN (making combat actually tunable)
+
+Found by inspection while reviewing M6, and it is a violation of the standing
+simulation-first requirement rather than a missing feature: **requirement 3 says
+every magnitude a system introduces lives in the rules catalog or an explicit
+override, never as a literal buried in logic.** M6 put combat's most important
+numbers in `packages/core/src/combat.ts` as module constants:
+`FORTIFY_BONUS_PCT`, `CITY_DEFENSE_BONUS_PCT`, `WALLS_BONUS_PCT`,
+`VETERAN_ATTACK_PCT`, `MAX_EXPERIENCE`, `ROLL_BOUND`, `DAMAGE_PER_ROUND`, and the
+win-percentage clamps. The combat balance sweep then had to *report* that it could
+not move them. A system whose balance knobs cannot be swept cannot be balanced.
+
+## The combat section of the catalog
+
+The catalog gains a required `combat` section:
+
+```ts
+export interface CombatSpec {
+  readonly fortifyBonusPct: number;
+  readonly cityDefenseBonusPct: number;
+  readonly wallsBonusPct: number;
+  readonly veteranAttackPct: number;
+  readonly maxExperience: number;
+  readonly rollBound: number;
+  readonly damagePerRound: number;
+  readonly minWinPct: number;
+  readonly maxWinPct: number;
+  readonly provenance: Provenance;
+}
+```
+
+Same values as today — this is a RELOCATION, not a rebalance, so behaviour must not
+change and **the stored golden hashes must not move**. Validate every field as an
+integer with the bounds each one needs (`rollBound >= 1`, `maxExperience >= 0`,
+`1 <= minWinPct <= maxWinPct <= rollBound`, `damagePerRound >= 1`, the percentages
+`>= 0`). `core/combat.ts` reads them **from the ruleset** and keeps NO module-level
+copies; a literal left behind is exactly the bug this contract exists to prevent, so
+leave nothing dual-sourced.
+
+`RulesetPatch` gains a `combat` section (partial), so every one of these becomes
+sweepable through `applyOverrides`. `scripts/combat-balance-sweep.ts` must then
+demonstrate sweeping **at least one combat global** — the report currently lists
+these as unsweepable, and that list should shrink to whatever genuinely cannot move.
+
+## Two consistency repairs found during M6 review
+
+1. **A capture does not bump `revision` and does not fold fog.** `revision` exists to
+   say "the state changed"; a sack changes it more than most commands. Two sacks can
+   land in one turn (a civilization's command, then the barbarian step), so this is
+   reachable rather than theoretical.
+2. **A veteran defender gets no bonus.** M6's contract specified
+   `VETERAN_ATTACK_PCT` on the attacker only, so the implementation is correct to the
+   contract — but the asymmetry is currently undocumented and a reader will assume it
+   is a bug. It is a deliberate placeholder: keep the behaviour, document it where the
+   odds are computed, and note what Civ 3 actually does instead (veterans get extra
+   hit points, not an attack bonus) so a later reader can judge it.
+
+## Acceptance evidence
+
+- The golden hashes are UNCHANGED (a relocation, not a rebalance). If one moves,
+  something else moved with it — report that, do not re-pin it.
+- The ruleset identity hash DOES change (the catalog gained a section), so identity
+  pins move deliberately and are called out.
+- A combat-global sweep runs end to end and shows a measured effect, or reports
+  "this proves nothing" if the knob genuinely does not matter.
+- Removing the catalog values and leaving a literal in `combat.ts` must fail a test —
+  prove the dual-source rule is enforced rather than merely stated.

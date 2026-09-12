@@ -39,6 +39,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { Result } from '@civts/core';
+import { CATALOG } from '@civts/rules';
 import { CORE_INVARIANTS } from '@civts/sim';
 import { describe, expect, it } from 'vitest';
 // The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
@@ -54,6 +55,7 @@ import {
   parseSeedSpec,
   parseSimArgs,
   parseSweepArgs,
+  readKnob,
   runSimCommand,
   runSweepCommand,
   type SimReport,
@@ -311,6 +313,88 @@ describe('the sim command parses its flags, and refuses what it cannot mean', ()
     expect(wonder.ok).toBe(false);
     if (!wonder.ok) expect(wonder.error).toContain('may only be set to true');
   });
+
+  it("addresses M6b's singleton combat section, in both of its spellings", () => {
+    // The section is one row of nine numbers, so the flag names no id — and the long
+    // spelling (`combat.combat.<field>`, the way the provenance report prints the row) is
+    // accepted too, because a reader who copies a printed name should get what they copied.
+    const short = okOrThrow(parseOverrideText('combat.wallsBonusPct=100'));
+    expect(short.section).toBe('combat');
+    expect(short.id).toBe('combat');
+    expect(short.field).toBe('wallsBonusPct');
+    expect(short.value).toStrictEqual({ kind: 'integer', value: 100 });
+
+    const long = okOrThrow(parseOverrideText('combat.combat.rollBound=10'));
+    expect(long.field).toBe('rollBound');
+
+    const patch = okOrThrow(
+      buildRulesetPatch([
+        okOrThrow(parseOverrideText('combat.wallsBonusPct=100')),
+        okOrThrow(parseOverrideText('combat.combat.damagePerRound=3')),
+      ]),
+    );
+    expect(patch.combat?.wallsBonusPct).toBe(100);
+    expect(patch.combat?.damagePerRound).toBe(3);
+    // The sections the flag did not name stay absent rather than becoming empty claims.
+    expect(patch.units).toBeUndefined();
+    expect(patch.terrains).toBeUndefined();
+  });
+
+  it("reads a combat global as a sweepable knob, with the catalog's own value", () => {
+    // `readKnob` is what a `--knob combat.<field>` sweep goes through, and it reads the
+    // shipped value *out of* the catalog: before M6b there was no such knob, and a sweep
+    // that wanted one had to restate the number, which is a second source.
+    const knob = okOrThrow(readKnob(CATALOG, 'combat.wallsBonusPct'));
+    expect(knob.section).toBe('combat');
+    expect(knob.id).toBe('combat');
+    expect(knob.setting).toBe('wallsBonusPct');
+    expect(knob.shipped).toBe(CATALOG.combat.wallsBonusPct);
+    expect(knob.provenanceKind).toBe('placeholder');
+    expect(knob.provenanceDetail).toBe(CATALOG.combat.provenance.note);
+
+    // An unknown magnitude and an unknown row are both refused rather than read as zero:
+    // a knob that silently became `0` would sweep a ruleset nobody wrote.
+    expect(readKnob(CATALOG, 'combat.wallsBonusPCT').ok).toBe(false);
+    expect(readKnob(CATALOG, 'combat.walls.rollBound').ok).toBe(false);
+
+    // The two fields this CLI used to refuse with "not settable from the CLI" while the
+    // applier would have honoured them.
+    const hitPoints = okOrThrow(readKnob(CATALOG, 'units.warrior.hitPoints'));
+    expect(hitPoints.setting).toBe('hitPoints');
+    expect(hitPoints.shipped).toBe(CATALOG.units.find((row) => row.id === 'warrior')?.hitPoints);
+    // M6's second spelling of the terrain bonus reads the same magnitude through the
+    // engine's own reader, so the two names cannot report different numbers.
+    const defense = okOrThrow(readKnob(CATALOG, 'terrains.grassland.defenseBonus'));
+    expect(defense.setting).toBe('defenseBonus');
+    expect(defense.shipped).toBe(
+      okOrThrow(readKnob(CATALOG, 'terrains.grassland.defenseBonusPct')).shipped,
+    );
+    expect(okOrThrow(parseOverrideText('units.warrior.hitPoints=4')).field).toBe('hitPoints');
+    expect(okOrThrow(parseOverrideText('units.warrior.requiresTech=pottery')).value).toStrictEqual({
+      kind: 'text',
+      value: 'pottery',
+    });
+  });
+
+  it('refuses a misspelled combat magnitude, listing the nine that would work', () => {
+    // A patch that named nothing would be a sweep reporting "no effect" for a knob that
+    // was never applied, so the field is checked here and the nine names are the answer.
+    const typo = buildRulesetPatch([okOrThrow(parseOverrideText('combat.wallsBonusPCT=100'))]);
+    expect(typo.ok).toBe(false);
+    if (!typo.ok) {
+      expect(typo.error).toContain('wallsBonusPCT');
+      expect(typo.error).toContain('wallsBonusPct');
+    }
+
+    // A row id is not a thing this section has, and saying so is better than looking for
+    // a row called `walls` and failing with "unknown id".
+    const noSuchRow = parseOverrideText('combat.walls.rollBound=10');
+    expect(noSuchRow.ok).toBe(false);
+    if (!noSuchRow.ok) expect(noSuchRow.error).toContain('no id to name');
+
+    // A path with no field at all is the same complaint, not a crash.
+    expect(parseOverrideText('combat.=10').ok).toBe(false);
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -492,6 +576,33 @@ describe('the sim report is one structured value, rendered', () => {
     if (refused.ok) return;
     expect(refused.error.exitCode).toBe(2);
     expect(refused.error.lines[0]).toContain('expects <section>.<id>.<field>=<value>');
+  });
+
+  it('counts a combat override into the report, so a swept battle figure has provenance', () => {
+    // M6b's claim, at the CLI: a combat global is a knob like any other — it goes through
+    // `applyOverrides`, it appears in the receipt, and it moves the ruleset hash the runs
+    // are pinned to. Before M6b there was no way to say this on the command line at all.
+    const shipped = simReportOf(SMALL);
+    const overridden = simReportOf([...SMALL, '--override', 'combat.damagePerRound=3']);
+
+    expect(overridden.ruleset.overrideCount).toBe(1);
+    expect(overridden.ruleset.applied[0]).toContain('combat.combat.damagePerRound');
+    expect(overridden.ruleset.patch.combat?.damagePerRound).toBe(3);
+    expect(overridden.ruleset.hash).not.toBe(shipped.ruleset.hash);
+
+    // The patch names one field, and the other eight keep the catalog's own values.
+    expect(overridden.ruleset.patch.combat?.wallsBonusPct).toBeUndefined();
+  });
+
+  it('refuses a combat override that would break the odds clamp, and exits 1', () => {
+    // Validation is the same function a hand-edited catalog goes through: a `rollBound`
+    // under the ceiling is refused by name rather than producing a ruleset whose clamp has
+    // no room.
+    const refused = runSimCommand([...SMALL, '--override', 'combat.rollBound=10']);
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.error.exitCode).toBe(1);
+    expect(refused.error.lines.join('\n')).toContain('combat');
   });
 });
 

@@ -168,6 +168,19 @@ export interface Catalog {
    * (PLAN.md §6.2).
    */
   readonly techs: readonly TechSpec[];
+  /**
+   * The combat globals — M6b's section, and the *only* home of the magnitudes M6
+   * wrote as module constants in `core/combat.ts`.
+   *
+   * **Required, like `units`, and required in fact rather than by convention**: the
+   * engine's combat resolver reads every one of these numbers from the ruleset it is
+   * handed and keeps no copy of them (`combat.ts`' `combatRulesOf`), so a catalog
+   * without the section is a game whose battles have no rules at all. `validateRuleset`
+   * refuses such a catalog, which is why this is a *section* rather than an optional
+   * field: a game is fought under a stated set of numbers, not under whatever default
+   * the resolver happened to carry.
+   */
+  readonly combat: CombatSpec;
 }
 
 /**
@@ -392,6 +405,72 @@ export interface TechSpec extends TechDef {
   readonly provenance: Provenance;
 }
 
+/**
+ * **The combat globals** (INTERFACES.md M6b, "The combat section of the catalog") —
+ * the nine magnitudes that decide how a battle goes.
+ *
+ * ## Why this section exists at all
+ *
+ * M6 put these numbers in `packages/core/src/combat.ts` as module-level constants. That
+ * violates the standing requirement's third clause — *every magnitude a system
+ * introduces lives in the rules catalog (or an explicit override), never as a literal
+ * buried in logic* — and it had a consequence the project had to report rather than
+ * fix: the M6 combat balance sweep (`scripts/combat-balance-sweep.ts`) could vary a
+ * unit's `attack` and a terrain's `defenseBonusPct`, but had to print this whole block
+ * under "combat magnitudes this override surface CANNOT move". **A system whose knobs
+ * cannot be swept cannot be balanced**, so the numbers belong to content, where
+ * `RulesetPatch.combat` can move them one at a time and a sweep can measure what moved.
+ *
+ * ## This is a RELOCATION, not a rebalance
+ *
+ * Every value below is **exactly the number M6 shipped**, so the engine's behaviour —
+ * and therefore every stored golden hash — is unchanged by the move. If a golden moves
+ * after this section appears, something other than this section moved with it.
+ *
+ * ## Provenance: placeholder, all nine
+ *
+ * The five bonus percentages, the roll bound, the damage-per-round rule, the promotion
+ * ladder and the odds clamp are **unsourced values of ours, chosen to be playable**.
+ * None is traced to Civ 3, and none is presented as Civ 3's: the real game's
+ * firepower/hit-point model, its terrain bonuses and its combat resolution are
+ * different and are unverified here. `fidelity: 'cited-only'` refuses this section like
+ * every other placeholder row.
+ *
+ * ## The one asymmetry a reader should not mistake for a bug
+ *
+ * `veteranAttackPct` is applied **to the attacker only** — M6's contract says so, the
+ * engine does so, and it is deliberate. Civ 3 does something else instead: its veterans
+ * gain extra *hit points* rather than an attack bonus. `core/combat.ts` states this
+ * where the odds are computed, so a reader can judge the placeholder rather than assume
+ * it is a defect. This field is the sweepable knob for that placeholder.
+ */
+export interface CombatSpec {
+  /** Percent added to a fortified defender's defence. Integer `>= 0`. */
+  readonly fortifyBonusPct: number;
+  /** Percent added to a defender's defence when it stands in its own city. Integer `>= 0`. */
+  readonly cityDefenseBonusPct: number;
+  /** Percent added on top of that when the city holds defensive walls. Integer `>= 0`. */
+  readonly wallsBonusPct: number;
+  /** Percent added to an attacker's attack for **each** experience level. Integer `>= 0`. */
+  readonly veteranAttackPct: number;
+  /** The highest `experience` a unit may reach. Integer `>= 0`. */
+  readonly maxExperience: number;
+  /** The number of equally likely per-round draw outcomes. Integer `>= 1`. */
+  readonly rollBound: number;
+  /** Hit points a round winner takes off the loser. Integer `>= 1`. */
+  readonly damagePerRound: number;
+  /**
+   * The lowest a per-round win chance may be. Integer, and the contract's chain
+   * `1 <= minWinPct <= maxWinPct <= rollBound` is checked as one statement rather than
+   * three independent bounds, because the three are one rule: the clamp has to be a
+   * range the draw can express.
+   */
+  readonly minWinPct: number;
+  /** The highest a per-round win chance may be. Integer, `<= rollBound`. */
+  readonly maxWinPct: number;
+  readonly provenance: Provenance;
+}
+
 export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
@@ -452,6 +531,19 @@ export interface Ruleset {
    * shape of bug the "no adapter" rule exists to make impossible.
    */
   readonly techs: readonly TechSpec[];
+  /**
+   * The combat globals, carried through validation unchanged — and **present on the
+   * validated ruleset**, not only on the catalog.
+   *
+   * That is load-bearing, not tidiness: `core/combat.ts` reads every one of these
+   * magnitudes *from the ruleset it is handed* and keeps no module-level copy of any of
+   * them, so a validated ruleset that dropped this section would leave every battle
+   * with no rules to fight under — the shape of bug the M6b contract exists to make
+   * impossible. (`RulesetView` in `core/map.ts` is the engine's structural view and
+   * does not declare the field, so the resolver reads it structurally; every real game
+   * is played on a validated `Ruleset`, which always carries it.)
+   */
+  readonly combat: CombatSpec;
   readonly fidelity: Fidelity;
 }
 
@@ -1292,6 +1384,55 @@ export const CATALOG: Catalog = {
       'the last row, requiring the modern row before it as well as the science branch',
     ),
   ],
+  /**
+   * **The combat globals (M6b)** — every number M6 wrote as a module constant in
+   * `core/combat.ts`, moved here unchanged so that a balance sweep can turn one of them
+   * without editing code (INTERFACES.md M6b; standing requirement, *Tunable*).
+   *
+   * The values are **exactly M6's**, so this is a relocation and not a rebalance: the
+   * resolver's arithmetic, the battles it produces and therefore every stored golden
+   * hash are unchanged by the move. `fidelity: 'cited-only'` refuses the section, as it
+   * refuses every other placeholder row here.
+   *
+   * The shape of the table is worth reading as a whole, because the nine numbers are one
+   * model rather than nine independent preferences:
+   *
+   * - **Three defender bonuses** (`fortifyBonusPct`, `cityDefenseBonusPct`,
+   *   `wallsBonusPct`) are kept *apart* rather than folded into one "defensive terrain"
+   *   number: a city is an advantage on its own and walls are a building a city may or
+   *   may not hold, so one number meaning both would make "the walls did nothing"
+   *   unmeasurable — which is the whole point of sweeping them.
+   * - **`veteranAttackPct`** turns experience into a *continuous* ladder
+   *   (`maxExperience` levels of it) instead of Civ 3's discrete veteran/elite unit
+   *   types, so the sweep can vary one number and measure the effect on outcomes.
+   * - **`rollBound`, `minWinPct`, `maxWinPct`** are one rule: the per-round chance is
+   *   an integer percentage floored against a draw of `rollBound` values, clamped to a
+   *   range the draw can express, so no battle is ever decided before it is fought
+   *   (`maxWinPct <= rollBound`) and no attack is ever hopeless by construction
+   *   (`minWinPct >= 1`).
+   * - **`damagePerRound`** is the pacing knob: with 1 the loop is "one hit point per
+   *   round won", and a sweep can move it to see battles get shorter without any other
+   *   number changing.
+   */
+  combat: {
+    fortifyBonusPct: 25,
+    cityDefenseBonusPct: 50,
+    wallsBonusPct: 50,
+    veteranAttackPct: 25,
+    maxExperience: 3,
+    rollBound: 100,
+    damagePerRound: 1,
+    minWinPct: 1,
+    maxWinPct: 99,
+    provenance: placeholder(
+      'unsourced: these nine combat magnitudes are ours, chosen to be playable, and none of them is ' +
+        'traced to Civ 3, whose combat model (firepower, hit points per unit type, terrain and ' +
+        'veteran rules) is a different one that this engine does not reproduce; M6 shipped them as ' +
+        'module constants in `core/combat.ts` and M6b relocates them here with the **same numbers** ' +
+        '(a relocation, not a rebalance) so a balance sweep can move them through ' +
+        '`RulesetPatch.combat` instead of reporting that they cannot be moved',
+    ),
+  },
 };
 
 /**
@@ -2086,6 +2227,135 @@ const checkTechGraph = (techs: readonly TechSpec[]): readonly RulesetError[] => 
  * points at other techs, its era is ordered against theirs), so they are grouped at
  * the end of the tech block where every complaint about the tree is together.
  */
+/**
+ * The id the combat section is filed under in a provenance report.
+ *
+ * The section is a **singleton** — one row of nine numbers — rather than a list of rows,
+ * so it has no id of its own. It needs one all the same: `ProvenanceRow` is
+ * `{ id, provenance }`, the report prints the id beside the claim, and a section with no
+ * name for itself would be a row a reader cannot cite. The catalog's own field name is
+ * the honest answer, and it is the same string `RulesetPatch.combat` uses.
+ */
+const COMBAT_ROW_ID = 'combat';
+
+/**
+ * **The combat globals, checked as one model rather than as nine numbers** (M6b).
+ *
+ * Every field must be an integer, for the reason every simulation number in this file
+ * must be: these magnitudes are multiplied into a unit's strength, compared against a
+ * draw and subtracted from hit points, and a fraction in any of them would reach a
+ * decision the state hash is supposed to pin (PLAN.md §5.3). Beyond integrality the
+ * contract names a bound per field, and each bound is a *rule* rather than a taste:
+ *
+ * - **`rollBound >= 1`** — the draw is `nextBelow(rng, rollBound)`, which takes a
+ *   positive bound and would throw on 0. It is also the definition of "percentage"
+ *   (100 values, `[0, 100)`), so it is not a tuning choice even though it is data.
+ * - **`maxExperience >= 0`** — 0 is a legal, meaningful statement ("this ruleset has no
+ *   promotions"), which is why the bound is not `>= 1`.
+ * - **`1 <= minWinPct <= maxWinPct <= rollBound`**, checked as **one chain**. The three
+ *   bounds are one rule: the clamp must be a range the draw can express, the floor must
+ *   keep a positive attack from being *certain* (a certainty is not a random process,
+ *   and a sweep over it would measure nothing), and the ceiling must keep the defender
+ *   alive at the top of the roll range. Checking them separately would accept a
+ *   `minWinPct` of 99 with a `maxWinPct` of 1.
+ * - **`damagePerRound >= 1`** — the resolver's loop terminates because every round
+ *   costs the loser a hit point. A damage of 0 is not a slow battle, it is an
+ *   **infinite loop** inside a pure function the turn pipeline calls, so it is refused
+ *   at load time rather than discovered as a hang.
+ * - **Every percentage `>= 0`** — a negative percentage is a modifier that *penalises*
+ *   the side it is attached to, which is not what any of these fields means; a row that
+ *   wants that has a different bug.
+ *
+ * **Total over `unknown`, like the effect and kind checkers.** The value is read through
+ * `unknown` and every field is checked for being a number before any comparison, because
+ * the thing being validated may be JSON, a `Partial` patch or a hand-built literal — and
+ * because a **missing section** has to be reported rather than crashing the validator: a
+ * catalog that says nothing about combat is not a catalog with default combat, it is one
+ * the engine cannot fight under (`combat.ts` reads every magnitude from the ruleset).
+ */
+const checkCombat = (section: unknown): readonly RulesetError[] => {
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'combat',
+    id: COMBAT_ROW_ID,
+    field,
+    detail,
+  });
+
+  const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+    typeof value === 'object' && value !== null;
+  if (!isRecord(section)) {
+    return [bad('combat', 'must be an object carrying the combat magnitudes')];
+  }
+
+  const fields: readonly string[] = [
+    'fortifyBonusPct',
+    'cityDefenseBonusPct',
+    'wallsBonusPct',
+    'veteranAttackPct',
+    'maxExperience',
+    'rollBound',
+    'damagePerRound',
+    'minWinPct',
+    'maxWinPct',
+  ];
+
+  const errors: RulesetError[] = [];
+  const numbers = new Map<string, number>();
+  for (const field of fields) {
+    const value = section[field];
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
+      errors.push(bad(field, 'must be an integer'));
+      continue;
+    }
+    numbers.set(field, value);
+  }
+
+  // The percentages, each on its own terms.
+  for (const field of [
+    'fortifyBonusPct',
+    'cityDefenseBonusPct',
+    'wallsBonusPct',
+    'veteranAttackPct',
+  ]) {
+    const value = numbers.get(field);
+    if (value !== undefined && value < 0) errors.push(bad(field, 'must not be negative'));
+  }
+
+  const rollBound = numbers.get('rollBound');
+  if (rollBound !== undefined && rollBound < 1) errors.push(bad('rollBound', 'must be >= 1'));
+
+  const maxExperience = numbers.get('maxExperience');
+  if (maxExperience !== undefined && maxExperience < 0) {
+    errors.push(bad('maxExperience', 'must not be negative'));
+  }
+
+  const damagePerRound = numbers.get('damagePerRound');
+  if (damagePerRound !== undefined && damagePerRound < 1) {
+    errors.push(
+      bad('damagePerRound', 'must be >= 1: a round that costs no hit point cannot end a battle'),
+    );
+  }
+
+  // The clamp chain, as one statement — see the doc note above for why it is not three.
+  const minWinPct = numbers.get('minWinPct');
+  const maxWinPct = numbers.get('maxWinPct');
+  if (minWinPct !== undefined && maxWinPct !== undefined && rollBound !== undefined) {
+    if (!(1 <= minWinPct && minWinPct <= maxWinPct && maxWinPct <= rollBound)) {
+      errors.push(
+        bad(
+          'minWinPct',
+          `the odds clamp must satisfy 1 <= minWinPct <= maxWinPct <= rollBound ` +
+            `(got ${String(minWinPct)} <= ${String(maxWinPct)} <= ${String(rollBound)}); ` +
+            'a clamp outside the draw range is a range no roll can express',
+        ),
+      );
+    }
+  }
+
+  return errors;
+};
+
 export const validateRuleset = (
   catalog: Catalog,
   fidelity: Fidelity,
@@ -2116,6 +2386,11 @@ export const validateRuleset = (
     // been checked. Reporting it after `checkTechGraph` means a catalog with a broken
     // tree hears about the tree first.
     ...checkTechRefsOfRows(catalog),
+    // M6b: the combat globals are a *section* rather than a row list, so they are checked
+    // after every row catalog — a complaint about the odds clamp is only meaningful once
+    // the units whose strengths it is applied to are themselves well-formed. The section
+    // is read as `unknown` so a catalog that omits it is reported rather than crashing.
+    ...checkCombat(catalog.combat),
   ];
 
   if (fidelity === 'cited-only') {
@@ -2179,6 +2454,17 @@ export const validateRuleset = (
         });
       }
     }
+    // M6b: the combat section is a singleton row of nine numbers, and it is a
+    // `placeholder` like every other row here — so `cited-only` refuses it by name,
+    // exactly as it refuses the tech tree's prices.
+    if (isPlaceholder(catalog.combat.provenance)) {
+      errors.push({
+        kind: 'placeholder-in-cited-only',
+        catalog: 'combat',
+        id: COMBAT_ROW_ID,
+        note: catalog.combat.provenance.note,
+      });
+    }
   }
 
   // The annotations state the contract each `extends` encodes, and keep the
@@ -2188,6 +2474,9 @@ export const validateRuleset = (
   const improvements: readonly ImprovementSpec[] = catalog.improvements;
   const resources: readonly ResourceSpec[] = catalog.resources;
   const techs: readonly TechSpec[] = catalog.techs;
+  // M6b: the combat globals travel with the validated ruleset, because `core/combat.ts`
+  // reads them from the ruleset it is handed and keeps no copy. See `Ruleset.combat`.
+  const combat: CombatSpec = catalog.combat;
 
   return errors.length > 0
     ? err(errors)
@@ -2198,6 +2487,7 @@ export const validateRuleset = (
         improvements,
         resources,
         techs,
+        combat,
         fidelity,
       });
 };
@@ -2273,6 +2563,13 @@ const sectionOf = (name: string, rows: readonly ProvenanceRow[]): ProvenanceSect
  * listing the tech rows would understate exactly the numbers this wave introduced,
  * which is why the section list and `summarizeProvenance` are one function's worth of
  * truth rather than two.
+ *
+ * Combat is the seventh, added by M6b, and it is the section that makes the rule
+ * unavoidable: its nine magnitudes were *not* catalog rows at all until this wave —
+ * they lived as module constants in `core/combat.ts` — so the report had nothing to
+ * count and the balance sweep had nothing to move. A section that the report does not
+ * list is a section content can add without being audited, which is how the numbers got
+ * buried in logic in the first place.
  */
 export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection[] => [
   sectionOf('terrains', catalog.terrains),
@@ -2281,14 +2578,23 @@ export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection
   sectionOf('improvements', catalog.improvements),
   sectionOf('resources', catalog.resources),
   sectionOf('techs', catalog.techs),
+  // M6b: the combat globals are the seventh section, and the argument above is exactly
+  // why they must be *here* rather than only validated: they are nine rules numbers that
+  // decide every battle, they are `placeholder`, and a report that counted the catalog's
+  // rows without this section would understate the numbers M6 introduced — the same
+  // half-truth the terrain/unit split produced in M1. The section is a singleton, so its
+  // "rows" are the one row its provenance is filed under (`COMBAT_ROW_ID`); the count,
+  // like every other count here, comes from the rows the section actually carries.
+  sectionOf('combat', [{ id: COMBAT_ROW_ID, provenance: catalog.combat.provenance }]),
 ];
 
 /**
  * Count **every** row in the catalog — terrain, unit, building, improvement,
- * resource and tech alike. The number answers
+ * resource, tech **and the combat globals** alike. The number answers
  * "how much of what the engine runs on is traced to a source?", so a summary
  * that quietly skipped a catalog would be exactly the half-truth PLAN.md §6.2
- * exists to prevent.
+ * exists to prevent. M6b's combat section counts as one row, because it is one
+ * provenance claim carrying nine numbers — the claim is what is being counted.
  *
  * Defined as the sum of `provenanceSections`, so a caller that prints this
  * number beside those sections — the CLI does — cannot print a total that

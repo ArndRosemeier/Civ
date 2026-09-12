@@ -243,7 +243,7 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     expect(hashOf(CATALOG, 'the shipped catalog again')).toBe(SHIPPED_HASH);
   });
 
-  it('is 01bc03c374363110, and 5db0937200bb25b0 with resources and units reversed', () => {
+  it('is 9d1440035de55f86, and 22f3d14aea97575e with resources and units reversed', () => {
     // These two numbers are the requirement's own measured fact, and pinning them is
     // what ties the property below to the real catalog. **If this assertion fails, the
     // catalog's content or order moved**: that is either an intentional content change
@@ -270,14 +270,25 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     // which is the same corroboration: a golden hash movement with no shape change would
     // be a semantic bug, and this is neither. No row was reordered — the three-arrangement
     // sweep below still passes, which is what says so.
-    expect(SHIPPED_HASH).toBe('01bc03c374363110');
+    //
+    // **M6b re-measured them a third time, and this is the first movement that is NOT a
+    // rehash.** The cause is content again — the catalog gained its required `combat`
+    // section (nine magnitudes plus a provenance note), so the validated ruleset carries a
+    // key `hashValue` never saw before, and the previous pins were `01bc03c374363110` and
+    // `5db0937200bb25b0`. What makes this one different is the *state* goldens: they did
+    // NOT move, because the nine numbers are the ones M6 already used and the resolver's
+    // arithmetic is unchanged — the section is a relocation, so identity moved while
+    // behaviour did not. A state golden moving here would mean something other than the
+    // section moved with it. No row was reordered; the arrangement sweep below still
+    // passes, and the non-vacuity assertions over the rebuild now cover `combat` too.
+    expect(SHIPPED_HASH).toBe('9d1440035de55f86');
     const reversedUnits = arranged(CATALOG, 'units', reverseOrder(CATALOG.units.length));
     const reversedBoth = arranged(
       reversedUnits,
       'resources',
       reverseOrder(CATALOG.resources.length),
     );
-    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('5db0937200bb25b0');
+    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('22f3d14aea97575e');
   });
 });
 
@@ -383,11 +394,17 @@ describe('a catalog rebuilt row for row has the shipped identity', () => {
       improvements: CATALOG.improvements.map((row) => ({ ...row })),
       resources: CATALOG.resources.map((row) => ({ ...row })),
       techs: CATALOG.techs.map((row) => ({ ...row })),
+      // M6b's `combat` section is a singleton rather than a list of rows, so it is cloned
+      // as an object. It is in this rebuild for the same reason every section is: the
+      // identity a replay compares is the *whole* validated ruleset, and a rebuild that
+      // quietly dropped the combat globals would be comparing a different game.
+      combat: { ...CATALOG.combat },
     };
     // Non-vacuity: the rebuild really is a different object graph.
     expect(rebuilt.terrains).not.toBe(CATALOG.terrains);
     expect(at(rebuilt.terrains, 0)).not.toBe(at(CATALOG.terrains, 0));
     expect(rebuilt).not.toBe(CATALOG);
+    expect(rebuilt.combat).not.toBe(CATALOG.combat);
 
     expect(hashOf(rebuilt, 'the rebuilt catalog')).toBe(SHIPPED_HASH);
     // ...and the arrangement is still the shipped one, section by section, so the

@@ -31,6 +31,7 @@ import {
   validateRuleset,
   type BuildingSpec,
   type Catalog,
+  type CombatSpec,
   type EraId,
   type ImprovementSpec,
   type ProvenanceSection,
@@ -51,6 +52,15 @@ const IMPROVEMENTS = CATALOG.improvements;
 const RESOURCES = CATALOG.resources;
 /** The catalog's tech rows. M5's research spends beakers on these. */
 const TECHS = CATALOG.techs;
+/**
+ * M6b's combat globals — the seventh provenance row, and the only section that is **one
+ * row of nine numbers** rather than a list of rows. It is written as a count here (rather
+ * than inlined as `1` in six arithmetic expressions) for the same reason the others are
+ * aliased: the report's total and its sections must agree, and a section whose row count
+ * was written in six places would be a section free to disagree with itself.
+ */
+const COMBAT_ROWS = 1;
+const COMBAT = CATALOG.combat;
 
 /**
  * The catalog with one unit row replaced. Written as a function rather than a
@@ -301,12 +311,21 @@ describe('ruleset validation', () => {
   });
 
   it('reports an empty catalog', () => {
-    // Every section spelled out, `techs` included: a `Catalog` that *omits* a
-    // section would not compile, which is the point of the field being required —
-    // "ships none" is written as `[]`, and validation rejects it like any other
-    // empty catalog.
+    // Every section spelled out, `techs` and M6b's `combat` included: a `Catalog` that
+    // *omits* a row section would not compile, which is the point of the field being
+    // required — "ships none" is written as `[]`, and validation rejects it like any
+    // other empty catalog. `combat` is a singleton rather than a list, so it is spelled
+    // out as the section it is; the missing-section case has its own test below.
     const r = validateRuleset(
-      { terrains: [], units: [], buildings: [], improvements: [], resources: [], techs: [] },
+      {
+        terrains: [],
+        units: [],
+        buildings: [],
+        improvements: [],
+        resources: [],
+        techs: [],
+        combat: CATALOG.combat,
+      },
       'tuned',
     );
     expect(r.ok).toBe(false);
@@ -2087,7 +2106,7 @@ describe('terrain role coverage', () => {
 });
 
 describe('provenance summary', () => {
-  it('counts every row exactly once, terrain, unit, building, improvement, resource and tech alike', () => {
+  it('counts every row exactly once, terrain, unit, building, improvement, resource, tech and combat alike', () => {
     const s = summarizeProvenance(CATALOG);
     expect(s.total).toBe(
       CATALOG.terrains.length +
@@ -2095,7 +2114,8 @@ describe('provenance summary', () => {
         BUILDINGS.length +
         IMPROVEMENTS.length +
         RESOURCES.length +
-        TECHS.length,
+        TECHS.length +
+        COMBAT_ROWS,
     );
     expect(s.cited + s.placeholder).toBe(s.total);
     // The improvement rows are counted, not merely present: the report's sections
@@ -2114,7 +2134,8 @@ describe('provenance summary', () => {
         BUILDINGS.length +
         IMPROVEMENTS.length +
         RESOURCES.length +
-        TECHS.length,
+        TECHS.length +
+        COMBAT_ROWS,
     );
   });
 
@@ -2139,6 +2160,11 @@ describe('provenance summary', () => {
         ...IMPROVEMENTS.map((i) => i.id),
         ...RESOURCES.map((r) => r.id),
         ...TECHS.map((t) => t.id),
+        // M6b's section is one row, filed under the section's own name (it has no id of
+        // its own — see `CombatSpec`). It is listed *last* because that is where the
+        // catalog declares it, and a report whose order disagreed with the catalog's
+        // would be a report a reader has to reconcile.
+        'combat',
       ]);
     });
 
@@ -2156,6 +2182,7 @@ describe('provenance summary', () => {
         'improvements',
         'resources',
         'techs',
+        'combat',
       ]);
       expect(total).toBe(summary.total);
       expect(placeholder).toBe(summary.placeholder);
@@ -2185,6 +2212,14 @@ describe('provenance summary', () => {
       // up as a summary that counts rows the table never lists.
       expect(sectionOf(CATALOG, 'techs')?.summary.total).toBe(TECHS.length);
       expect(sectionOf(CATALOG, 'techs')?.summary.placeholder).toBe(TECHS.length);
+      // M6b's combat globals: one row, one placeholder claim, counting the section the
+      // engine's battles are fought under. The section is the reason this file's aliases
+      // exist at all — a `Catalog` field that the report did not count would be a set of
+      // magnitudes content could add without ever being audited, which is exactly how the
+      // nine numbers spent M6 buried in `combat.ts` as module constants.
+      expect(sectionOf(CATALOG, 'combat')?.summary.total).toBe(COMBAT_ROWS);
+      expect(sectionOf(CATALOG, 'combat')?.summary.placeholder).toBe(COMBAT_ROWS);
+      expect(sectionOf(CATALOG, 'combat')?.rows.map((r) => r.id)).toEqual(['combat']);
     });
 
     it('counts a cited unit row as cited, not as a missing row', () => {
@@ -2203,7 +2238,8 @@ describe('provenance summary', () => {
           BUILDINGS.length +
           IMPROVEMENTS.length +
           RESOURCES.length +
-          TECHS.length,
+          TECHS.length +
+          COMBAT_ROWS,
       );
       expect(summary.cited).toBe(1);
       expect(summary.placeholder).toBe(summary.total - 1);
@@ -2217,6 +2253,148 @@ describe('provenance summary', () => {
       expect(sectionOf(cited, 'improvements')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'resources')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'techs')?.summary.cited).toBe(0);
+      expect(sectionOf(cited, 'combat')?.summary.cited).toBe(0);
     });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M6b — the combat globals, in the catalog where a sweep can move them
+ * ------------------------------------------------------------------ */
+
+describe('the combat globals (M6b)', () => {
+  /** `CATALOG` with one or more combat magnitudes replaced. */
+  const withCombat = (patch: Partial<CombatSpec>): Catalog => ({
+    ...CATALOG,
+    combat: { ...CATALOG.combat, ...patch },
+  });
+
+  /** The `combat` fields validation complained about, ascending as reported. */
+  const combatProblems = (patch: Partial<CombatSpec>): readonly string[] => {
+    const r = validateRuleset(withCombat(patch), 'tuned');
+    return r.ok
+      ? []
+      : r.error.flatMap((e) =>
+          e.kind === 'invalid-value' && e.catalog === 'combat' ? [e.field] : [],
+        );
+  };
+
+  it('ships the nine M6 magnitudes unchanged — a relocation, not a rebalance', () => {
+    // **These are M6's numbers**, written here so that the move from module constants to
+    // the catalog is visible as a move and not as a retune: if the section ever changes a
+    // value, this test changes on purpose or it fails. (The engine's *behaviour* is what
+    // the golden hashes pin; this pins the table itself.)
+    expect(COMBAT.fortifyBonusPct).toBe(25);
+    expect(COMBAT.cityDefenseBonusPct).toBe(50);
+    expect(COMBAT.wallsBonusPct).toBe(50);
+    expect(COMBAT.veteranAttackPct).toBe(25);
+    expect(COMBAT.maxExperience).toBe(3);
+    expect(COMBAT.rollBound).toBe(100);
+    expect(COMBAT.damagePerRound).toBe(1);
+    expect(COMBAT.minWinPct).toBe(1);
+    expect(COMBAT.maxWinPct).toBe(99);
+  });
+
+  it('is placeholder, unsourced, and says so in its own provenance note', () => {
+    // The M6b provenance rule: the new rows are still `placeholder`, chosen to be
+    // playable, and the note has to say that the numbers came from `core/combat.ts` and
+    // that no Civ 3 model is reproduced — a reader must not be able to mistake a
+    // relocation for a citation.
+    expect(isPlaceholder(COMBAT.provenance)).toBe(true);
+    expect(COMBAT.provenance.note).toContain('unsourced');
+    expect(COMBAT.provenance.note).toContain('relocation');
+    expect(COMBAT.provenance.note).toContain('Civ 3');
+  });
+
+  it('reaches the validated ruleset unchanged, so the engine reads content and not a copy', () => {
+    const r = validateRuleset(CATALOG, 'tuned');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // The *same object*: the resolver is handed one section, and nothing between content
+    // and the engine re-creates it.
+    expect(r.value.combat).toBe(CATALOG.combat);
+  });
+
+  it('refuses a non-integer magnitude, naming the field', () => {
+    expect(combatProblems({ fortifyBonusPct: 12.5 })).toEqual(['fortifyBonusPct']);
+    expect(combatProblems({ cityDefenseBonusPct: 0.5 })).toEqual(['cityDefenseBonusPct']);
+    expect(combatProblems({ wallsBonusPct: 1.0000001 })).toEqual(['wallsBonusPct']);
+    expect(combatProblems({ veteranAttackPct: 2.5 })).toEqual(['veteranAttackPct']);
+    expect(combatProblems({ maxExperience: 1.5 })).toEqual(['maxExperience']);
+    expect(combatProblems({ rollBound: 99.5 })).toEqual(['rollBound']);
+    expect(combatProblems({ damagePerRound: 1.5 })).toEqual(['damagePerRound']);
+    expect(combatProblems({ minWinPct: 0.5 })).toEqual(['minWinPct']);
+    expect(combatProblems({ maxWinPct: 98.5 })).toEqual(['maxWinPct']);
+    // A whole section of fractions is nine complaints, not one: each field is checked on
+    // its own terms so a caller fixes all of them in one pass.
+    expect(
+      combatProblems({
+        fortifyBonusPct: 0.5,
+        cityDefenseBonusPct: 0.5,
+        wallsBonusPct: 0.5,
+        veteranAttackPct: 0.5,
+        maxExperience: 0.5,
+        rollBound: 0.5,
+        damagePerRound: 0.5,
+        minWinPct: 0.5,
+        maxWinPct: 0.5,
+      }),
+    ).toHaveLength(9);
+  });
+
+  it('refuses a draw with no outcomes, an impossible promotion cap and a harmless round', () => {
+    // `rollBound` is the denominator of every odds figure and the bound of the draw:
+    // `nextBelow(rng, rollBound)` takes a positive bound, so 0 is not a small number here
+    // but a throw inside the resolver.
+    // Two complaints, not one, and that is the honest answer: a draw with no outcomes also
+    // breaks the clamp, so a caller hears about both rather than about the first one a loop
+    // happened to reach.
+    expect(combatProblems({ rollBound: 0 })).toEqual(['rollBound', 'minWinPct']);
+    expect(combatProblems({ rollBound: -100 })).toContain('rollBound');
+    // 0 is a *legal* `maxExperience` — "this ruleset has no promotions" — so the bound is
+    // `>= 0` and only a negative value is refused.
+    expect(combatProblems({ maxExperience: 0 })).toEqual([]);
+    expect(combatProblems({ maxExperience: -1 })).toEqual(['maxExperience']);
+    // A round that costs no hit point cannot end a battle: this is the one bound whose
+    // absence would be an infinite loop rather than a wrong number.
+    expect(combatProblems({ damagePerRound: 0 })).toEqual(['damagePerRound']);
+    expect(combatProblems({ damagePerRound: -1 })).toContain('damagePerRound');
+  });
+
+  it('refuses a negative percentage, because a bonus that subtracts is a different rule', () => {
+    expect(combatProblems({ fortifyBonusPct: -1 })).toEqual(['fortifyBonusPct']);
+    expect(combatProblems({ cityDefenseBonusPct: -50 })).toEqual(['cityDefenseBonusPct']);
+    expect(combatProblems({ wallsBonusPct: -1 })).toEqual(['wallsBonusPct']);
+    expect(combatProblems({ veteranAttackPct: -25 })).toEqual(['veteranAttackPct']);
+    // Zero is allowed everywhere a percentage is: "this ruleset gives no bonus for that"
+    // is a statement a balance sweep has to be able to make.
+    expect(combatProblems({ fortifyBonusPct: 0, wallsBonusPct: 0, veteranAttackPct: 0 })).toEqual(
+      [],
+    );
+  });
+
+  it('checks the odds clamp as ONE chain rather than three independent bounds', () => {
+    // The three fields are one rule — the clamp must be a range the draw can express —
+    // and the discriminating cases are the ones a per-field check would wave through:
+    // a floor of 0 (a battle that can be lost before it is fought), a floor above the
+    // ceiling, and a ceiling above the draw's range.
+    expect(combatProblems({ minWinPct: 0 })).toEqual(['minWinPct']);
+    expect(combatProblems({ minWinPct: 60, maxWinPct: 50 })).toEqual(['minWinPct']);
+    expect(combatProblems({ maxWinPct: 101 })).toEqual(['minWinPct']);
+    expect(combatProblems({ rollBound: 50 })).toEqual(['minWinPct']);
+    // And the boundary that IS legal: a clamp that exactly fills the draw.
+    expect(combatProblems({ minWinPct: 1, maxWinPct: 100, rollBound: 100 })).toEqual([]);
+  });
+
+  it('refuses the section in cited-only mode, like every other placeholder row', () => {
+    const r = validateRuleset(CATALOG, 'cited-only');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(
+      r.error.some(
+        (e) =>
+          e.kind === 'placeholder-in-cited-only' && e.catalog === 'combat' && e.id === 'combat',
+      ),
+    ).toBe(true);
   });
 });

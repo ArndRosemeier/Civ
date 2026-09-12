@@ -4205,7 +4205,11 @@ describe('the provenance command', () => {
     // which unit is gated on one) are the milestone's newest placeholder content and
     // therefore exactly what this report has to account for. M5 adds the sixth, the
     // tech rows, for the same reason one milestone later: seventeen costs, eras and
-    // prerequisite edges of ours, and the report is where that is readable.
+    // prerequisite edges of ours, and the report is where that is readable. M6b adds
+    // the seventh, `combat` — one singleton row of nine magnitudes that M6 had buried
+    // as module constants in `core/combat.ts`, and which are now content like every
+    // other number here. Its id is the section's own name (`COMBAT_ROW_ID`), because a
+    // section of nine numbers has no id of its own.
     const rows = printedRows(printed);
     expect(rows.map((row) => row.id)).toEqual([
       ...CATALOG.terrains.map((t) => t.id),
@@ -4214,6 +4218,7 @@ describe('the provenance command', () => {
       ...CATALOG.improvements.map((i) => i.id),
       ...CATALOG.resources.map((r) => r.id),
       ...CATALOG.techs.map((t) => t.id),
+      'combat',
     ]);
 
     // …which is what makes the table and the totals agree.
@@ -4229,6 +4234,9 @@ describe('the provenance command', () => {
     // M4c adds `resources` as the fifth heading, after the four M2-M4a catalogs,
     // because the report's sections *are* the catalog list rather than a selection
     // from it. M5 adds `techs` as the sixth, in the same position the catalog puts it.
+    // M6b adds `combat` as the seventh: it is a catalog section like any other, and a
+    // provenance report that skipped it would leave the nine numbers this project was
+    // most recently caught hiding exactly where they used to be — unaccounted for.
     expect(printed.sections.map((section) => section.name)).toEqual([
       'terrains',
       'units',
@@ -4236,6 +4244,7 @@ describe('the provenance command', () => {
       'improvements',
       'resources',
       'techs',
+      'combat',
     ]);
 
     for (const section of printed.sections) {

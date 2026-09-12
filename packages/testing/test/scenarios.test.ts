@@ -45,7 +45,6 @@ import {
   HUT_REWARD_KINDS,
   HUT_REWARD_PROVENANCE,
   MAP_DIMENSIONS,
-  MAX_EXPERIENCE,
   RATE_TOTAL,
   SCHEMA_VERSION,
   STARTING_TREASURY,
@@ -76,6 +75,7 @@ import {
   cityYields,
   civPlayers,
   connected,
+  combatRulesOf,
   defenderBonusPct,
   drawsWin,
   experienceOf,
@@ -200,6 +200,26 @@ const RULESET: RulesetView = (() => {
   }
   return validated.value;
 })();
+
+/**
+ * **The nine combat magnitudes, as the resolver reads them** (M6b).
+ *
+ * M6 shipped these as `export const` values in `packages/core/src/combat.ts` —
+ * `FORTIFY_BONUS_PCT`, `CITY_DEFENSE_BONUS_PCT`, `WALLS_BONUS_PCT`,
+ * `VETERAN_ATTACK_PCT`, `MAX_EXPERIENCE`, `ROLL_BOUND`, `DAMAGE_PER_ROUND` and the two
+ * clamps — and this file imported `MAX_EXPERIENCE` from `@civts/core` by name. M6b moved
+ * all nine into the catalog's `combat` section, so the fixture asks `combatRulesOf` for
+ * them, which is the *same* reader `core/commands.ts` uses before it resolves a battle.
+ *
+ * The values these scenarios assert are still written out by hand: the odds table, the
+ * promotion ladder and the "flooring twice gives a different number" discriminator all
+ * state the number they expect, which is what makes them evidence about the engine rather
+ * than a restatement of it. What this constant supplies is the handful of figures a check
+ * needs at runtime — the promotion cap, and the three bonuses and the roll bound the
+ * readers require a caller to pass — so the relocation moves none of the numbers under
+ * test.
+ */
+const COMBAT_RULES = combatRulesOf(RULESET);
 
 /**
  * The same catalog with one terrain role removed — for the missing-role path.
@@ -8423,7 +8443,7 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
  *    its non-wonder buildings are destroyed in maintenance-descending order, its
  *    wonders survive, its queue and assignment are cleared and its stores are untouched.
  * 3. `a-win-promotes-one-level` — a won battle raises the winner by **exactly one**
- *    level up to `MAX_EXPERIENCE`, announces it only when the level actually rose, and
+ *    level up to `COMBAT_RULES.maxExperience`, announces it only when the level actually rose, and
  *    buys `floor(attack * (100 + 25 * level) / 100)` attack: a ladder whose rungs are
  *    visible as odds, and which stops mattering at the cap.
  * 4. `a-band-approaches-and-sacks` — the barbarian step is engine behaviour: a band
@@ -8723,7 +8743,7 @@ const combatOddsScenario = defineScenario({
       );
 
       // The modifier list, as the engine sums it...
-      const summed = defenderBonusPct({
+      const summed = defenderBonusPct(COMBAT_RULES, {
         terrainBonusPct: row.terrainBonusPct,
         fortified: row.fortified,
         inCity: row.inCity,
@@ -8753,7 +8773,7 @@ const combatOddsScenario = defineScenario({
       // ...and the chance that follows from it.
       checks.push(
         check(
-          winPct(attackValue, modified) === row.expectedPct,
+          winPct(COMBAT_RULES, attackValue, modified) === row.expectedPct,
           `${row.name}: attack ${String(attackValue)} against defence ${String(modified)} is ` +
             `floor(${String(attackValue)} * 100 / ${String(attackValue + modified)}) = ` +
             `${String(row.expectedPct)}%`,
@@ -8779,7 +8799,7 @@ const combatOddsScenario = defineScenario({
         ...(row.inCity && row.walls ? [50] : []),
       ];
       const wrongDefense = flooredAfterEach(defenseValue, bonuses);
-      const wrongPct = winPct(attackValue, wrongDefense);
+      const wrongPct = winPct(COMBAT_RULES, attackValue, wrongDefense);
       const separates = wrongPct !== row.expectedPct;
       checks.push(
         check(
@@ -8874,8 +8894,8 @@ describe('M6 scenario: combat odds for the known modifiers', () => {
     expect(battle?.attackerWinPct).toBe(33);
     expect(modifiedDefense(3, 10)).toBe(3);
     expect(modifiedDefense(3, 35)).toBe(4);
-    expect(winPct(1, modifiedDefense(3, 10))).toBe(25);
-    expect(winPct(1, modifiedDefense(3, 35))).toBe(20);
+    expect(winPct(COMBAT_RULES, 1, modifiedDefense(3, 10))).toBe(25);
+    expect(winPct(COMBAT_RULES, 1, modifiedDefense(3, 35))).toBe(20);
   });
 
   it('the odds assertions fail when the defender is not fortified', () => {
@@ -9155,7 +9175,7 @@ interface PromoCase {
  *   attack 3, which is a fact about the shipped numbers and worth pinning
  * - level 2: `floor(3 * 1.50) = 4` -> `floor(400 / 6) = 66%`
  * - level 3: `floor(3 * 1.75) = 5` -> `floor(500 / 7) = 71%`, and there is no fourth:
- *   `MAX_EXPERIENCE` is the cap
+ *   `COMBAT_RULES.maxExperience` is the cap
  */
 const PROMO_CASES: readonly PromoCase[] = [
   { level: 0, attackerAt: [5, 5], defenderAt: [6, 5], expectedAttack: 3, expectedPct: 60 },
@@ -9183,7 +9203,7 @@ const promotionSetup =
     for (const row of PROMO_CASES) {
       builder = builder
         .addUnit(0, ARCHER, row.attackerAt, {
-          experience: weakens === 'clamp-all' ? MAX_EXPERIENCE : row.level,
+          experience: weakens === 'clamp-all' ? COMBAT_RULES.maxExperience : row.level,
         })
         .addUnit(1, WARRIOR, row.defenderAt);
     }
@@ -9198,13 +9218,18 @@ const promotionScenario = defineScenario({
     const checks: ScenarioAssertion[] = [];
     const defenderDefense = modifiedDefense(
       unitDef(ruleset, WARRIOR)?.defense ?? -1,
-      defenderBonusPct({ terrainBonusPct: 10, fortified: false, inCity: false, walls: false }),
+      defenderBonusPct(COMBAT_RULES, {
+        terrainBonusPct: 10,
+        fortified: false,
+        inCity: false,
+        walls: false,
+      }),
     );
 
     checks.push(
       check(
-        MAX_EXPERIENCE === PROMO_CASES.length - 1 && defenderDefense === 2,
-        `the ladder is measured against ${String(MAX_EXPERIENCE)} levels of promotion and a ` +
+        COMBAT_RULES.maxExperience === PROMO_CASES.length - 1 && defenderDefense === 2,
+        `the ladder is measured against ${String(COMBAT_RULES.maxExperience)} levels of promotion and a ` +
           `grassland warrior's ${String(defenderDefense)} defence, which the attacker's levels ` +
           'do not move (the bonus is the ATTACKER’s)',
       ),
@@ -9220,14 +9245,14 @@ const promotionScenario = defineScenario({
       const next = outcome?.state;
       const promoted = outcome === undefined ? [] : promotions(outcome.events);
       const survivor = next === undefined ? undefined : unitById(next, asUnitId(unitId));
-      const capped = row.level === MAX_EXPERIENCE;
+      const capped = row.level === COMBAT_RULES.maxExperience;
       promotionsSeen += promoted.length;
 
       // The bonus, as arithmetic.
       checks.push(
         check(
-          veteranAttack(3, row.level) === row.expectedAttack &&
-            winPct(row.expectedAttack, defenderDefense) === row.expectedPct,
+          veteranAttack(COMBAT_RULES, 3, row.level) === row.expectedAttack &&
+            winPct(COMBAT_RULES, row.expectedAttack, defenderDefense) === row.expectedPct,
           `at level ${String(row.level)} an attack-3 unit's bonus is floor(3 * ` +
             `${String(100 + 25 * row.level)} / 100) = ${String(row.expectedAttack)}, so its ` +
             `chance is floor(${String(row.expectedAttack)} * 100 / ` +
@@ -9250,9 +9275,9 @@ const promotionScenario = defineScenario({
         checks.push(
           check(
             survivor !== undefined &&
-              experienceOf(survivor) === Math.min(row.level + 1, MAX_EXPERIENCE),
+              experienceOf(survivor) === Math.min(row.level + 1, COMBAT_RULES.maxExperience),
             `winning raises the winner by exactly one level, to the cap: level ` +
-              `${String(row.level)} becomes ${String(Math.min(row.level + 1, MAX_EXPERIENCE))} ` +
+              `${String(row.level)} becomes ${String(Math.min(row.level + 1, COMBAT_RULES.maxExperience))} ` +
               `(got ${survivor === undefined ? 'the unit is gone' : String(experienceOf(survivor))})`,
           ),
         );
@@ -9320,7 +9345,7 @@ describe('M6 scenario: a won battle promotes its winner by one level', () => {
     ]);
     // One promotion for each of the first three levels, none for the capped archer.
     expect(fought.map((outcome) => promotions(outcome?.events ?? []).length)).toEqual([1, 1, 1, 0]);
-    // ...and the level each archer ended the probe on: `min(level + 1, MAX_EXPERIENCE)`.
+    // ...and the level each archer ended the probe on: `min(level + 1, COMBAT_RULES.maxExperience)`.
     expect(
       fought.map((outcome, index) => {
         const unit =

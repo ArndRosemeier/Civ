@@ -29,7 +29,6 @@
 import {
   DEFAULT_SETTINGS,
   IMPROVEMENT_KINDS,
-  MAX_EXPERIENCE,
   MIN_GROWTH_FOOD,
   applyCommand,
   asCityId,
@@ -1355,12 +1354,16 @@ describe('every invariant fires on a deliberately broken state', () => {
   });
 
   it('unit-experience-in-range: a level above the cap, and a fractional one', () => {
+    // M6b: the cap is the ruleset's `combat.maxExperience` — the number this fixture's own
+    // validated ruleset carries, which is what `combatRulesOf(ctx.rulesetView)` inside the
+    // invariant reads, and what `MAX_EXPERIENCE` used to be a module constant for.
+    const cap = RULESET.combat.maxExperience;
     const unit = BASE_UNIT;
     const above = contextFor({
-      state: withUnit(BASE, unit.id, (each) => ({ ...each, experience: MAX_EXPERIENCE + 1 })),
+      state: withUnit(BASE, unit.id, (each) => ({ ...each, experience: cap + 1 })),
     });
     expect(messagesOf('unit-experience-in-range', above)[0]).toContain(
-      `whole number in 0..${String(MAX_EXPERIENCE)}`,
+      `whole number in 0..${String(cap)}`,
     );
 
     const fractional = contextFor({
@@ -1370,7 +1373,7 @@ describe('every invariant fires on a deliberately broken state', () => {
 
     // Paired clean cases: every level the cap allows, and the played state itself (whose
     // units carry no `experience` key at all — absence *is* zero promotions).
-    for (let level = 0; level <= MAX_EXPERIENCE; level += 1) {
+    for (let level = 0; level <= cap; level += 1) {
       const legal = contextFor({
         state: withUnit(BASE, unit.id, (each) => ({ ...each, experience: level })),
       });
@@ -2055,7 +2058,9 @@ const BROKEN_STATES: Readonly<Record<string, () => InvariantContext>> = {
     contextFor({
       state: withUnit(BASE, BASE_UNIT.id, (unit) => ({
         ...unit,
-        experience: MAX_EXPERIENCE + 1,
+        // One above this ruleset's own cap — the bound the invariant now reads out of the
+        // ruleset rather than out of a `core` constant (M6b).
+        experience: RULESET.combat.maxExperience + 1,
       })),
     }),
   'unit-not-inside-foreign-city': () =>

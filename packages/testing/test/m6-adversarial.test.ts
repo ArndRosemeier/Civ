@@ -95,15 +95,6 @@ import { describe, expect, it } from 'vitest';
 
 import {
   BARBARIAN_BAND_SIZE,
-  CITY_DEFENSE_BONUS_PCT,
-  DAMAGE_PER_ROUND,
-  FORTIFY_BONUS_PCT,
-  MAX_EXPERIENCE,
-  MAX_WIN_PCT,
-  MIN_WIN_PCT,
-  ROLL_BOUND,
-  VETERAN_ATTACK_PCT,
-  WALLS_BONUS_PCT,
   advanceTurn,
   applyCommand,
   asBuildingId,
@@ -118,6 +109,7 @@ import {
   cityAt,
   cityProductionOptions,
   connected,
+  combatRulesOf,
   defenderBonusPct,
   distance8,
   drawsWin,
@@ -196,6 +188,23 @@ const RULESET: Ruleset = (() => {
   }
   return validated.value;
 })();
+
+/**
+ * **The nine combat magnitudes, as the resolver reads them** (M6b).
+ *
+ * They were `core/combat.ts` module constants when M6 pinned them — `ROLL_BOUND`,
+ * `MAX_WIN_PCT`, `FORTIFY_BONUS_PCT` and the rest — and this file imported each one by
+ * name. M6b moved them into the catalog's `combat` section, so the pin now reads them out
+ * of the validated ruleset through `combatRulesOf`, which is the *same* reader
+ * `core/commands.ts` asks before it resolves a battle. The numbers, and therefore every
+ * assertion below, are unchanged: this is where they live now, and it is the place a
+ * balance sweep can move them.
+ *
+ * Reading them through `combatRulesOf` rather than off `RULESET.combat` directly is
+ * deliberate: it is the reader under test. A fixture that pulled the raw section out would
+ * agree with itself even if the reader dropped a field on the way to the resolver.
+ */
+const COMBAT = combatRulesOf(RULESET);
 
 /** `Ruleset` is structurally the engine's view; named so the intent is visible at each call. */
 const VIEW: RulesetView = RULESET;
@@ -899,7 +908,7 @@ const unitCatalogItems = (): readonly ProductionItem[] => [
 /**
  * The per-round win chance, re-derived **in this file** from the contract's prose rather
  * than called: `attack / (attack + defense)`, floored once and clamped to
- * `[MIN_WIN_PCT, MAX_WIN_PCT]`.
+ * `[COMBAT.minWinPct, COMBAT.maxWinPct]`.
  *
  * The point of writing it out again is that the resolver's own answer can then be compared
  * with an independent one. The *inputs* (the effective attack and defence) are built with
@@ -915,10 +924,10 @@ const contractWinPct = (attackValue: number, defenseValue: number): number => {
   const attack = Number.isFinite(attackValue) && attackValue > 0 ? Math.floor(attackValue) : 0;
   const defense = Number.isFinite(defenseValue) && defenseValue > 0 ? Math.floor(defenseValue) : 0;
   const total = attack + defense;
-  if (total <= 0) return MIN_WIN_PCT;
-  const raw = Math.floor((attack * ROLL_BOUND) / total);
-  if (raw < MIN_WIN_PCT) return MIN_WIN_PCT;
-  return raw > MAX_WIN_PCT ? MAX_WIN_PCT : raw;
+  if (total <= 0) return COMBAT.minWinPct;
+  const raw = Math.floor((attack * COMBAT.rollBound) / total);
+  if (raw < COMBAT.minWinPct) return COMBAT.minWinPct;
+  return raw > COMBAT.maxWinPct ? COMBAT.maxWinPct : raw;
 };
 
 const terrainRowFor = (
@@ -946,7 +955,7 @@ describe('2. combat honesty', () => {
       { attack: 1, defense: 1, bonusPct: 50, experience: 0 },
       { attack: 2, defense: 3, bonusPct: 135, experience: 0 },
       { attack: 2, defense: 3, bonusPct: 0, experience: 1 },
-      { attack: 2, defense: 3, bonusPct: 0, experience: MAX_EXPERIENCE },
+      { attack: 2, defense: 3, bonusPct: 0, experience: COMBAT.maxExperience },
       { attack: 1_000_000, defense: 1, bonusPct: 0, experience: 0 },
       { attack: 1, defense: 1_000_000, bonusPct: 0, experience: 0 },
       { attack: 0, defense: 0, bonusPct: 0, experience: 0 },
@@ -956,22 +965,23 @@ describe('2. combat honesty', () => {
     for (const testCase of cases) {
       const effectiveAttack = contractScale(
         testCase.attack,
-        testCase.experience * VETERAN_ATTACK_PCT,
+        testCase.experience * COMBAT.veteranAttackPct,
       );
       const effectiveDefense = contractScale(testCase.defense, testCase.bonusPct);
       const expected = contractWinPct(effectiveAttack, effectiveDefense);
       thresholds.push(expected);
 
       // The engine's own readers produce the same intermediate values the contract names.
-      expect(veteranAttack(testCase.attack, testCase.experience)).toBe(effectiveAttack);
+      expect(veteranAttack(COMBAT, testCase.attack, testCase.experience)).toBe(effectiveAttack);
       expect(modifiedDefense(testCase.defense, testCase.bonusPct)).toBe(effectiveDefense);
-      expect(winPct(effectiveAttack, effectiveDefense)).toBe(expected);
+      expect(winPct(COMBAT, effectiveAttack, effectiveDefense)).toBe(expected);
 
       const outcome = resolveCombat({
+        rules: COMBAT,
         attacker: {
           attack: testCase.attack,
           defense: 0,
-          bonusPct: veteranBonusPct(testCase.experience),
+          bonusPct: veteranBonusPct(COMBAT, testCase.experience),
         },
         defender: { attack: 0, defense: testCase.defense, bonusPct: testCase.bonusPct },
         attackerHitPoints: 3,
@@ -984,14 +994,16 @@ describe('2. combat honesty', () => {
         `attack ${String(testCase.attack)} vs defence ${String(testCase.defense)} +${String(testCase.bonusPct)}%`,
       ).toBe(expected);
       expect(outcome.result.attackerWinsBelow).toBe(expected);
-      expect(outcome.result.rollBound).toBe(ROLL_BOUND);
+      expect(outcome.result.rollBound).toBe(COMBAT.rollBound);
     }
 
     // Non-vacuity: the table spans both clamps and an unclamped middle, so "the clamp
     // exists" and "it is not always on" are both measured rather than assumed.
-    expect(thresholds).toContain(MAX_WIN_PCT);
-    expect(thresholds).toContain(MIN_WIN_PCT);
-    expect(thresholds.some((value) => value > MIN_WIN_PCT && value < MAX_WIN_PCT)).toBe(true);
+    expect(thresholds).toContain(COMBAT.maxWinPct);
+    expect(thresholds).toContain(COMBAT.minWinPct);
+    expect(thresholds.some((value) => value > COMBAT.minWinPct && value < COMBAT.maxWinPct)).toBe(
+      true,
+    );
   });
 
   it('sums the defender modifiers and floors ONCE — with a case where flooring twice differs', () => {
@@ -1004,17 +1016,17 @@ describe('2. combat honesty', () => {
     const terrainPct = terrainDefenseBonus(terrain);
     expect(terrainPct).toBeGreaterThan(0);
 
-    const summed = defenderBonusPct({
+    const summed = defenderBonusPct(COMBAT, {
       terrainBonusPct: terrainPct,
       fortified: true,
       inCity: false,
       walls: false,
     });
-    expect(summed).toBe(terrainPct + FORTIFY_BONUS_PCT);
+    expect(summed).toBe(terrainPct + COMBAT.fortifyBonusPct);
 
     const defence = 3;
     const once = modifiedDefense(defence, summed);
-    const twice = modifiedDefense(modifiedDefense(defence, terrainPct), FORTIFY_BONUS_PCT);
+    const twice = modifiedDefense(modifiedDefense(defence, terrainPct), COMBAT.fortifyBonusPct);
     expect(once).not.toBe(twice);
     expect(once).toBe(4);
     expect(twice).toBe(3);
@@ -1084,7 +1096,7 @@ describe('2. combat honesty', () => {
       ],
     });
     expect(fortified).toBe(
-      contractWinPct(attack, modifiedDefense(defense, terrainPct + FORTIFY_BONUS_PCT)),
+      contractWinPct(attack, modifiedDefense(defense, terrainPct + COMBAT.fortifyBonusPct)),
     );
 
     const inCity = oddsOn({
@@ -1092,7 +1104,7 @@ describe('2. combat honesty', () => {
       cities: [{ owner: 1, x: 11, y: 10, population: 3 }],
     });
     expect(inCity).toBe(
-      contractWinPct(attack, modifiedDefense(defense, terrainPct + CITY_DEFENSE_BONUS_PCT)),
+      contractWinPct(attack, modifiedDefense(defense, terrainPct + COMBAT.cityDefenseBonusPct)),
     );
 
     const walled = oddsOn({
@@ -1102,7 +1114,7 @@ describe('2. combat honesty', () => {
     expect(walled).toBe(
       contractWinPct(
         attack,
-        modifiedDefense(defense, terrainPct + CITY_DEFENSE_BONUS_PCT + WALLS_BONUS_PCT),
+        modifiedDefense(defense, terrainPct + COMBAT.cityDefenseBonusPct + COMBAT.wallsBonusPct),
       ),
     );
 
@@ -1119,7 +1131,7 @@ describe('2. combat honesty', () => {
         attack,
         modifiedDefense(
           defense,
-          terrainPct + FORTIFY_BONUS_PCT + CITY_DEFENSE_BONUS_PCT + WALLS_BONUS_PCT,
+          terrainPct + COMBAT.fortifyBonusPct + COMBAT.cityDefenseBonusPct + COMBAT.wallsBonusPct,
         ),
       ),
     );
@@ -1139,6 +1151,7 @@ describe('2. combat honesty', () => {
 
     const fight = (roll: number): ReturnType<typeof resolveCombat> =>
       resolveCombat({
+        rules: COMBAT,
         attacker: { attack: 4, defense: 0, bonusPct: 0 },
         defender: { attack: 0, defense: 4, bonusPct: 0 },
         attackerHitPoints: 1,
@@ -1166,10 +1179,10 @@ describe('2. combat honesty', () => {
 
     // The clamp: a certain result is unreachable, which is what makes a balance sweep over
     // this region measure something.
-    expect(winPct(1_000_000, 1)).toBe(MAX_WIN_PCT);
-    expect(MAX_WIN_PCT).toBeLessThan(ROLL_BOUND);
-    expect(winPct(0, 0)).toBe(MIN_WIN_PCT);
-    expect(winPct(Number.NaN, 5)).toBe(MIN_WIN_PCT);
+    expect(winPct(COMBAT, 1_000_000, 1)).toBe(COMBAT.maxWinPct);
+    expect(COMBAT.maxWinPct).toBeLessThan(COMBAT.rollBound);
+    expect(winPct(COMBAT, 0, 0)).toBe(COMBAT.minWinPct);
+    expect(winPct(COMBAT, Number.NaN, 5)).toBe(COMBAT.minWinPct);
   });
 
   it('takes its dice from the world RNG, and reproduces the same battle from the same state', () => {
@@ -1206,15 +1219,16 @@ describe('2. combat honesty', () => {
     const attacker = mustUnitOn(firstBoard, at(10, 10));
     const defender = mustUnitOn(firstBoard, at(11, 10));
     const independent = resolveCombat({
+      rules: COMBAT,
       attacker: {
         attack: unitRow('warrior').attack,
         defense: 0,
-        bonusPct: veteranBonusPct(0),
+        bonusPct: veteranBonusPct(COMBAT, 0),
       },
       defender: {
         attack: unitRow('warrior').attack,
         defense: unitRow('warrior').defense,
-        bonusPct: defenderBonusPct({
+        bonusPct: defenderBonusPct(COMBAT, {
           terrainBonusPct: terrainDefenseBonus(
             RULESET.terrains.find(
               (row) => row.id === terrainAtIndex(firstBoard.map, Number(defender.tile)),
@@ -1356,7 +1370,7 @@ describe('2. combat honesty', () => {
    *
    * This is written here, from the contract's rules, rather than read from the engine: it is
    * the independent model the measured outcomes are compared against. It is also the assertion
-   * that a round costs exactly `DAMAGE_PER_ROUND` and that the fight runs to a death — a
+   * that a round costs exactly `COMBAT.damagePerRound` and that the fight runs to a death — a
    * resolver that stopped early, or dealt two points a round, would not fit.
    */
   const battleWinProbability = (
@@ -1571,9 +1585,9 @@ describe('3. a unit at 0 hit points is destroyed, and leaves no trace', () => {
     let promotionsBelowCap = 0;
 
     for (let seed = 1; seed <= 24; seed += 1) {
-      const before = board(seed, MAX_EXPERIENCE - 1);
+      const before = board(seed, COMBAT.maxExperience - 1);
       const attacker = mustUnitOn(before, at(10, 10));
-      expect(attacker.experience).toBe(MAX_EXPERIENCE - 1);
+      expect(attacker.experience).toBe(COMBAT.maxExperience - 1);
       const applied = accept(before, attacker.owner, {
         type: 'AttackUnit',
         unitId: attacker.id,
@@ -1590,13 +1604,13 @@ describe('3. a unit at 0 hit points is destroyed, and leaves no trace', () => {
         // The attacker won one level below the cap: it is promoted, by exactly one, with an
         // event that agrees with the state.
         const after = mustUnit(applied.state, attacker.id);
-        expect(after.experience).toBe(MAX_EXPERIENCE);
+        expect(after.experience).toBe(COMBAT.maxExperience);
         const event = promoted.find((candidate) => candidate.unitId === attacker.id);
         if (event === undefined) {
           throw new Error('the winner of a battle was not promoted');
         }
-        expect(event.experience).toBe(MAX_EXPERIENCE);
-        expect(event.maxExperience).toBe(MAX_EXPERIENCE);
+        expect(event.experience).toBe(COMBAT.maxExperience);
+        expect(event.maxExperience).toBe(COMBAT.maxExperience);
         promotionsBelowCap += 1;
       } else {
         defenderWins += 1;
@@ -1605,9 +1619,9 @@ describe('3. a unit at 0 hit points is destroyed, and leaves no trace', () => {
         // name it, and the defender (which won) is the only candidate for one.
         expect(promoted.some((candidate) => candidate.unitId === attacker.id)).toBe(false);
       }
-      expect(applied.state.units.every((unit) => (unit.experience ?? 0) <= MAX_EXPERIENCE)).toBe(
-        true,
-      );
+      expect(
+        applied.state.units.every((unit) => (unit.experience ?? 0) <= COMBAT.maxExperience),
+      ).toBe(true);
       expect(violationsOf(applied.state, before, applied.events)).toEqual([]);
     }
     expect(attackerWins, 'no seed in the sweep let the attacker win').toBeGreaterThan(0);
@@ -1618,7 +1632,7 @@ describe('3. a unit at 0 hit points is destroyed, and leaves no trace', () => {
     // level that did not rise would be a lie in the stream.
     let cappedWins = 0;
     for (let seed = 1; seed <= 24; seed += 1) {
-      const before = board(seed, MAX_EXPERIENCE);
+      const before = board(seed, COMBAT.maxExperience);
       const attacker = mustUnitOn(before, at(10, 10));
       const applied = accept(before, attacker.owner, {
         type: 'AttackUnit',
@@ -1632,7 +1646,7 @@ describe('3. a unit at 0 hit points is destroyed, and leaves no trace', () => {
       const after = unitById(applied.state, attacker.id);
       if (combat.attackerSurvives && after !== undefined) {
         cappedWins += 1;
-        expect(after.experience).toBe(MAX_EXPERIENCE);
+        expect(after.experience).toBe(COMBAT.maxExperience);
         expect(
           applied.events.some(
             (event) => event.type === 'UnitPromoted' && event.unitId === attacker.id,
@@ -1675,7 +1689,7 @@ describe('3. a unit at 0 hit points is destroyed, and leaves no trace', () => {
     ).toBe(true);
 
     const overpromoted = warp((unit) =>
-      unit.owner === asPlayerId(0) ? { ...unit, experience: MAX_EXPERIENCE + 1 } : unit,
+      unit.owner === asPlayerId(0) ? { ...unit, experience: COMBAT.maxExperience + 1 } : unit,
     );
     expect(
       violationsOf(overpromoted).some((line) => line.startsWith('unit-experience-in-range:')),
@@ -2862,7 +2876,7 @@ describe('9. the rules a mutation would have to break', () => {
     const threshold = contractWinPct(3, 3);
     expect(drawsWin(threshold, threshold)).toBe(false);
     expect(drawsWin(threshold - 1, threshold)).toBe(true);
-    expect(drawsWin(0, MIN_WIN_PCT)).toBe(true);
+    expect(drawsWin(0, COMBAT.minWinPct)).toBe(true);
 
     // (b) `cities.ts`' `capturedPopulation`: halved, floored, at least one. A different
     // divisor changes every number here.
@@ -2914,16 +2928,17 @@ describe('9. the rules a mutation would have to break', () => {
 
     // (e) the clamp in `combat.ts`: certainty is unreachable, so a sweep over the extremes
     // measures something.
-    expect(winPct(1_000_000, 0)).toBe(MAX_WIN_PCT);
-    expect(winPct(0, 1_000_000)).toBe(MIN_WIN_PCT);
-    expect(DAMAGE_PER_ROUND).toBe(1);
+    expect(winPct(COMBAT, 1_000_000, 0)).toBe(COMBAT.maxWinPct);
+    expect(winPct(COMBAT, 0, 1_000_000)).toBe(COMBAT.minWinPct);
+    expect(COMBAT.damagePerRound).toBe(1);
   });
 
   it('pins the damage a round deals and the hit-points-at-zero rule', () => {
     // A battle between two one-hit-point units ends in exactly one round, which is what
-    // makes `DAMAGE_PER_ROUND` observable rather than only declared; and the loser is
+    // makes `COMBAT.damagePerRound` observable rather than only declared; and the loser is
     // reported dead rather than stored at zero.
     const fight = resolveCombat({
+      rules: COMBAT,
       attacker: { attack: 9, defense: 0, bonusPct: 0 },
       defender: { attack: 0, defense: 1, bonusPct: 0 },
       attackerHitPoints: 1,
@@ -2932,7 +2947,7 @@ describe('9. the rules a mutation would have to break', () => {
       static: [0],
     });
     expect(fight.result.rounds).toBe(1);
-    expect(fight.result.defenderLost).toBe(DAMAGE_PER_ROUND);
+    expect(fight.result.defenderLost).toBe(COMBAT.damagePerRound);
     expect(fight.result.defenderSurvives).toBe(false);
     expect(fight.result.outcome).toBe('attacker-wins');
   });

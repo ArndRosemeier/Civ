@@ -354,7 +354,6 @@
 import {
   DEFAULT_RATES,
   MAP_DIMENSIONS,
-  MAX_EXPERIENCE,
   MIN_CITY_DISTANCE,
   RATE_TOTAL,
   SCHEMA_VERSION,
@@ -422,6 +421,18 @@ import {
   type UnitTypeId,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
+
+/**
+ * The promotion cap this builder refuses to exceed (M6b).
+ *
+ * It used to be `MAX_EXPERIENCE`, a module constant exported by `core/combat.ts`. That
+ * number is the ruleset's `combat.maxExperience` now — content a balance sweep can move —
+ * so the builder reads it from the catalog it builds its scenarios against rather than
+ * importing a constant that no longer exists. The bound is the same in the shipped game,
+ * which is why the refusal is unchanged; what is new is that a catalog whose section says
+ * something else moves it, instead of this check policing a stale copy.
+ */
+const CATALOG_MAX_EXPERIENCE = CATALOG.combat.maxExperience;
 
 import { hashValue } from './hash.js';
 
@@ -2011,10 +2022,12 @@ export const createScenarioBuilder = (
 
       // M6. The three facts, validated against the engine's own readings rather than
       // against numbers written here: `fullHitPoints` is the same "how much health does
-      // this type have" `spawnUnit` writes a new unit with, and `MAX_EXPERIENCE` is the
-      // cap `promoteUnit` clamps a promotion to. A scenario that states a unit outside
-      // those ranges states a unit no command can produce, and this builder refuses those
-      // at the call that named them (see the module note on the two failure channels).
+      // this type have" `spawnUnit` writes a new unit with, and `CATALOG_MAX_EXPERIENCE`
+      // is the cap `promoteUnit` clamps a promotion to (the catalog's
+      // `combat.maxExperience`, which M6b moved out of `core/combat.ts`). A scenario that
+      // states a unit outside those ranges states a unit no command can produce, and this
+      // builder refuses those at the call that named them (see the module note on the two
+      // failure channels).
       const maximum = fullHitPoints(def);
       const hitPointsLeft = setup.hitPointsLeft ?? maximum;
       if (!Number.isInteger(hitPointsLeft) || hitPointsLeft < 1 || hitPointsLeft > maximum) {
@@ -2027,11 +2040,11 @@ export const createScenarioBuilder = (
       }
 
       const experience = setup.experience ?? 0;
-      if (!Number.isInteger(experience) || experience < 0 || experience > MAX_EXPERIENCE) {
+      if (!Number.isInteger(experience) || experience < 0 || experience > CATALOG_MAX_EXPERIENCE) {
         throw new Error(
           `scenario builder: addUnit(${String(playerIndex)}, "${type}", ...) asks for ` +
             `${String(setup.experience)} experience, and a promotion level is a whole number in ` +
-            `0..${String(MAX_EXPERIENCE)} (a unit at the cap wins without another event)`,
+            `0..${String(CATALOG_MAX_EXPERIENCE)} (a unit at the cap wins without another event)`,
         );
       }
 

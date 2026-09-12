@@ -86,7 +86,6 @@ import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
-  MAX_EXPERIENCE,
   applyCommand,
   civPlayers,
   hitPointsLeftOf,
@@ -122,6 +121,18 @@ import {
 const GOLDEN_SEEDS = [1, 42, 1337] as const;
 const GOLDEN_MAP_SIZE = 'tiny';
 const GOLDEN_CIV_COUNT = 2;
+
+/**
+ * The promotion cap the played golden's battles may reach (M6b).
+ *
+ * It used to be `MAX_EXPERIENCE`, a module constant of `core/combat.ts`. That number is
+ * the catalog's `combat.maxExperience` now — the same value, in the one place a balance
+ * sweep can move it — so this fixture reads it from `CATALOG` rather than from
+ * `@civts/core`. The assertions below are unchanged: they still require every stored
+ * promotion to sit in `1..this`, and still require `UnitPromoted.maxExperience` to be
+ * exactly it.
+ */
+const GOLDEN_MAX_EXPERIENCE = CATALOG.combat.maxExperience;
 
 /**
  * The seed the **played** golden is built on. Deliberately one of the three seeds
@@ -782,7 +793,7 @@ describe('golden scenarios', () => {
           );
           expect(Number.isInteger(unit.experience)).toBe(true);
           expect(unit.experience).toBeGreaterThanOrEqual(1);
-          expect(unit.experience).toBeLessThanOrEqual(MAX_EXPERIENCE);
+          expect(unit.experience).toBeLessThanOrEqual(GOLDEN_MAX_EXPERIENCE);
         }
         expect(() => canonicalize(unit)).not.toThrow();
       }
@@ -970,7 +981,7 @@ describe('golden scenarios', () => {
       } else {
         expect(Number.isInteger(unit.experience)).toBe(true);
         expect(unit.experience).toBeGreaterThanOrEqual(1);
-        expect(unit.experience).toBeLessThanOrEqual(MAX_EXPERIENCE);
+        expect(unit.experience).toBeLessThanOrEqual(GOLDEN_MAX_EXPERIENCE);
         expect([first.attacker, first.defender]).toContain(unit.id);
       }
     }
@@ -988,7 +999,7 @@ describe('golden scenarios', () => {
     for (const event of promotions) {
       const unit = first.state.units.find((candidate) => candidate.id === event.unitId);
       expect(unit?.experience).toBe(event.experience);
-      expect(event.maxExperience).toBe(MAX_EXPERIENCE);
+      expect(event.maxExperience).toBe(GOLDEN_MAX_EXPERIENCE);
     }
   });
 

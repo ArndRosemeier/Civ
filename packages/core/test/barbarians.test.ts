@@ -50,6 +50,7 @@ import {
 } from '../src/barbarians.js';
 import type { City } from '../src/cities.js';
 import { applyCommand, type GameEvent } from '../src/commands.js';
+import type { CombatDef } from '../src/combat.js';
 import {
   asCityId,
   asPlayerId,
@@ -172,12 +173,36 @@ const ROAD: ImprovementDef = {
   allowedRoles: ['grassland', 'hills'],
 };
 
-const RULESET: RulesetView = {
+const RULESET: RulesetView & { readonly combat: CombatDef } = {
   terrains: [GRASSLAND_DEF, HILLS_DEF, MOUNTAINS_DEF],
   units: [WARRIOR, HORSEMAN, WARLORD, SPEARMAN, SCOUT],
   buildings: [],
   improvements: [ROAD],
   resources: [],
+  // M6b: the combat magnitudes are catalog content now, and `combatRulesOf` reads them off
+  // the ruleset it is handed. A view that declares no `combat` section therefore fights
+  // under the *degenerate* table (`NO_COMBAT_RULES`: no bonuses, `rollBound: 1`, no
+  // promotions), which is the deliberate answer `core/combat.ts` gives for "this ruleset
+  // states no combat rules" — an absent section must change the odds rather than silently
+  // reproduce the shipped ones.
+  //
+  // This fixture is about *barbarian behaviour*, not about a ruleset without combat, so it
+  // declares the shipped table's nine numbers. They are written out here for the same
+  // reason every other row in this view is: a hand-built fixture states the world it wants,
+  // and the two tests in "M6 — a barbarian attack is the applier's attack" that check the
+  // battle came out of the world's RNG stream (and that the attacker survived it) are
+  // exactly the ones that need a ruleset under which an attack can be *won*.
+  combat: {
+    fortifyBonusPct: 25,
+    cityDefenseBonusPct: 50,
+    wallsBonusPct: 50,
+    veteranAttackPct: 25,
+    maxExperience: 3,
+    rollBound: 100,
+    damagePerRound: 1,
+    minWinPct: 1,
+    maxWinPct: 99,
+  },
   fidelity: 'tuned',
 };
 

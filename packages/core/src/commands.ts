@@ -267,9 +267,15 @@ import {
 // seed, and `defenderBonusPct`/`terrainDefenseBonus`/`veteranBonusPct` are the
 // module's own readers so a caller cannot re-derive a modifier (and floor it early,
 // which is the M4c compounding rule's failure mode).
+//
+// M6b: `combatRulesOf` is how this file gets the **magnitudes** — the bonuses, the
+// promotion cap, the roll bound, the damage per round and the odds clamp — out of the
+// ruleset it was already handed. Nothing here restates one of them, and there is no
+// `MAX_EXPERIENCE` import to shadow the catalog: the cap a unit is promoted to is
+// `rules.maxExperience`, read from the same section a balance sweep moves.
 import {
+  combatRulesOf,
   defenderBonusPct,
-  MAX_EXPERIENCE,
   resolveCombat,
   terrainDefenseBonus,
   veteranBonusPct,
@@ -1054,7 +1060,7 @@ export type GameEvent =
     }
   /**
    * M6: `unitId` won a battle and earned a promotion. Emitted only when the level
-   * actually rose — a unit already at `MAX_EXPERIENCE` wins without one, and an event
+   * actually rose — a unit already at the ruleset's `maxExperience` wins without one, and an event
    * for a promotion that did not happen would be a lie in the stream.
    *
    * `experience` is the level **after** the promotion and `maxExperience` is the cap
@@ -1071,7 +1077,7 @@ export type GameEvent =
       readonly tile: TileIndex;
       /** The unit's experience **after** this promotion: 1..`maxExperience`. */
       readonly experience: number;
-      /** The cap the level was clamped against (`combat.ts`' `MAX_EXPERIENCE`). */
+      /** The cap the level was clamped against (the ruleset's `combat.maxExperience`). */
       readonly maxExperience: number;
     }
   /**
@@ -2472,12 +2478,18 @@ const woundIn = (state: GameState, unitId: UnitId, lost: number): GameState => {
  *    count rather than a flag;
  * 3. the attacker's remaining movement is set to **0**, whether or not it won (M6);
  * 4. the winner — the side still standing when the other is not — gains exactly one
- *    experience level, capped at `MAX_EXPERIENCE`, and `UnitPromoted` is emitted only
+ *    experience level, capped at the ruleset's `maxExperience`, and `UnitPromoted` is
+ *    emitted only
  *    if the level actually rose. A unit at the cap wins without an event, because an
  *    event for a promotion that did not happen would be a lie in the stream.
  *
- * Exactly one side dies in a battle this engine can produce (`DAMAGE_PER_ROUND` is 1
- * and the loop runs until a side has nothing left), but the code does not assume it:
+ * Every magnitude in the paragraph above is read from the ruleset (`combatRulesOf`), not
+ * from a constant: `maxExperience` is content a sweep can move, and a battle under an
+ * overridden section promotes exactly as far as that section says.
+ *
+ * Exactly one side dies in a battle this engine can produce (`damagePerRound` is 1 in the
+ * shipped catalog and the loop runs until a side has nothing left), but the code does not
+ * assume it:
  * if both survived or both died, no unit *won* anything and nothing is promoted.
  */
 const applyBattle = (
@@ -2489,6 +2501,16 @@ const applyBattle = (
   const defenderDef = unitDef(ruleset, plan.defender.type);
   const experience = experienceOf(plan.unit);
 
+  // M6b: **the magnitudes come out of the ruleset, once, here.** M6 read them from
+  // module constants inside `combat.ts`; this file now asks `combatRulesOf` for the nine
+  // numbers the battle is fought under (the bonuses, the promotion cap, the roll bound,
+  // the damage per round and the odds clamp) and hands them to the resolver, so a
+  // `RulesetPatch.combat` reaches a real battle through this one line. A view that
+  // declares no combat section reads as `combat.ts`' `NO_COMBAT_RULES`, which is
+  // deliberately degenerate — see that constant for why an unstated ruleset must change
+  // the odds rather than quietly inherit the shipped table.
+  const rules = combatRulesOf(ruleset);
+
   // The defender's modifiers. The city bonus is the *defender's own* city: a unit of a
   // third player standing in somebody else's streets is not defending that city's
   // walls, which is the reading `combat.ts` states ("walls are a property of a city")
@@ -2498,20 +2520,23 @@ const applyBattle = (
   const walls = city !== undefined && inCity && city.buildings.includes(WALLS_BUILDING);
 
   const outcome = resolveCombat({
+    rules,
     // The attacker's statistics with its *own* bonus in `bonusPct` — experience, via
-    // `veteranBonusPct`, which is that module's statement of the rule — and the level
-    // passed separately as `experience`, which is the field `resolveCombat` reads. The
-    // two are the same number by construction and are both supplied so that a reader
-    // cannot get a battle without the veteran bonus by filling in only one of them.
+    // `veteranBonusPct`, which is that module's statement of the rule, and the only
+    // place a veteran defender would get one too (it does not: see the deliberate
+    // asymmetry documented in `combat.ts`) — and the level passed separately as
+    // `experience`, which is the field `resolveCombat` reads. The two are the same
+    // number by construction and are both supplied so that a reader cannot get a battle
+    // without the veteran bonus by filling in only one of them.
     attacker: {
       attack: combatStat(attackerDef?.attack),
       defense: combatStat(attackerDef?.defense),
-      bonusPct: veteranBonusPct(experience),
+      bonusPct: veteranBonusPct(rules, experience),
     },
     defender: {
       attack: combatStat(defenderDef?.attack),
       defense: combatStat(defenderDef?.defense),
-      bonusPct: defenderBonusPct({
+      bonusPct: defenderBonusPct(rules, {
         terrainBonusPct: terrainDefenseBonus(terrainDefAt(state, ruleset, plan.target) ?? {}),
         fortified: isFortified(plan.defender),
         inCity,
@@ -2570,7 +2595,7 @@ const applyBattle = (
       : unitById(next, attackerSurvives ? plan.unit.id : plan.defender.id);
 
   if (winner !== undefined) {
-    const promoted = promoteUnit(winner, MAX_EXPERIENCE);
+    const promoted = promoteUnit(winner, rules.maxExperience);
     if (experienceOf(promoted) > experienceOf(winner)) {
       next = withUnitChange(next, winner.id, () => promoted);
       events.push({
@@ -2579,7 +2604,7 @@ const applyBattle = (
         owner: promoted.owner,
         tile: promoted.tile,
         experience: experienceOf(promoted),
-        maxExperience: MAX_EXPERIENCE,
+        maxExperience: rules.maxExperience,
       });
     }
   }
@@ -2604,6 +2629,14 @@ const applyBattle = (
  * state, and nothing between the two calls can change it. It is answered with a typed
  * refusal rather than a silent no-op, so that a future refactor which *does* make it
  * reachable fails loudly instead of reporting an attack that took nothing.
+ *
+ * **This function does not bump `revision`, and that is the M6b repair.** `captureCity`
+ * does, once, because the capture *is* the state change and the counter belongs to the
+ * rule that makes it — M6 put the bump here instead, which was correct for a player's
+ * command and silently wrong for the engine's own sack (the barbarian step applies a
+ * capture through this same path but hands the state on as a *step*, and a counter owned
+ * by one caller is a counter the other callers can drop). One bump per capture, from the
+ * capture rule, wherever the capture came from.
  */
 const applyCapture = (
   state: GameState,
@@ -2626,7 +2659,7 @@ const applyCapture = (
   }));
 
   return ok({
-    state: { ...spent, revision: state.revision + 1 },
+    state: spent,
     events: [
       {
         type: 'CityCaptured',

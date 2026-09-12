@@ -84,9 +84,12 @@ import {
   type MapSize,
   type Provenance,
   type Result,
+  asTechId,
+  fullHitPoints,
   type Settings,
   type SettingsIssue,
   type UnitDomain,
+  terrainDefenseBonus,
 } from '@civts/core';
 import {
   CATALOG,
@@ -332,13 +335,20 @@ const FAULT_NAME = /^[a-z][a-z0-9-]*$/;
 const isOverrideSection = (name: string): name is OverrideSection =>
   OVERRIDE_SECTIONS_LOOKUP.some((candidate) => candidate === name);
 
-/** The catalog sections a patch may address, in the order `@civts/sim` walks them. */
+/**
+ * The catalog sections a patch may address, in the order `@civts/sim` walks them.
+ *
+ * M6b added `combat`, and it is listed here rather than treated as a special case
+ * because "which sections exist" is one fact: a section the applier can merge and the
+ * CLI cannot spell is a knob a sweep reads about in `--help` and then cannot turn.
+ */
 const OVERRIDE_SECTIONS_LOOKUP: readonly OverrideSection[] = [
   'terrains',
   'units',
   'buildings',
   'improvements',
   'resources',
+  'combat',
 ];
 
 /** Parse one flag value into the plain value it names. */
@@ -355,27 +365,66 @@ const parseKnobValue = (raw: string): Result<KnobValue, string> => {
   return ok({ kind: 'text', value: text });
 };
 
+/**
+ * The row id a singleton section is addressed by.
+ *
+ * `combat` is one section of nine numbers, not a list of rows — so `--override
+ * combat.wallsBonusPct=100` names the section and the field and no id at all, and this
+ * is the id the rest of the module (which speaks `section.id.field` everywhere, and the
+ * provenance report prints that way too) sees. Written as the constant the rules package
+ * files the same row under, so a report and a flag call the one section by the one name.
+ */
+const COMBAT_ROW_ID = 'combat';
+
 const parseOverride = (text: string): Result<OverrideAssignment, string> => {
   const equals = text.indexOf('=');
   if (equals < 0) {
-    return err(`--override expects <section>.<id>.<field>=<value>, got "${text}"`);
+    return err(
+      `--override expects <section>.<id>.<field>=<value> (or <section>.<field>=<value> for ` +
+        `the singleton section "combat"), got "${text}"`,
+    );
   }
 
   const path = text.slice(0, equals);
   const parts = path.split('.');
   const section = parts[0] ?? '';
+  if (!isOverrideSection(section)) {
+    return err(
+      `--override names section "${section}", which is not one of ` +
+        `${OVERRIDE_SECTIONS_LOOKUP.join('|')} (in "${text}")`,
+    );
+  }
+  // The singleton section, which has two spellings for one address:
+  //
+  // - `combat.<field>` — the short one, and the one the flag documents;
+  // - `combat.combat.<field>` — the long one, spelled the way the provenance report
+  //   prints the row (`<section>.<id>`), so a reader who copies the printed name gets
+  //   what they copied rather than "that is not a row id".
+  //
+  // A path naming any *other* id (`combat.walls.rollBound`) is refused here rather than
+  // accepted as an id the applier would then fail to find: the section is one row, and
+  // the honest answer is that there is no row to name.
+  if (section === 'combat') {
+    const rest = parts.slice(1);
+    const named = rest.length === 2 && rest[0] === COMBAT_ROW_ID;
+    const field = named ? (rest[1] ?? '') : rest.join('.');
+    if ((!named && rest.length !== 1) || field === '') {
+      return err(
+        `--override expects combat.<field>=<value> — the combat section is one row of ` +
+          `numbers rather than a list of rows, so there is no id to name (in "${text}")`,
+      );
+    }
+    const value = parseKnobValue(text.slice(equals + 1));
+    if (!value.ok) return value;
+    return ok({ text, section, id: COMBAT_ROW_ID, field, value: value.value });
+  }
+
   const id = parts[1] ?? '';
   const field = parts.slice(2).join('.');
   if (parts.length < 3 || id === '' || field === '') {
     return err(
       `--override expects <section>.<id>.<field>=<value> (a section, a row id and a field), ` +
         `got "${text}"`,
-    );
-  }
-  if (!isOverrideSection(section)) {
-    return err(
-      `--override names section "${section}", which is not one of ` +
-        `${OVERRIDE_SECTIONS_LOOKUP.join('|')} (in "${text}")`,
     );
   }
 
@@ -420,6 +469,10 @@ const TERRAIN_FIELDS: readonly string[] = [
   'name',
   'moveCost',
   'defenseBonusPct',
+  // M6's spelling of the same magnitude; the applier sets both from either name, and
+  // leaving it off this list refused the flag with a message that claimed the field was
+  // unsettable when it was only unspellable *here*.
+  'defenseBonus',
   'yields.food',
   'yields.shields',
   'yields.commerce',
@@ -434,6 +487,32 @@ const UNIT_FIELDS: readonly string[] = [
   'cost',
   'domain',
   'requiresResource',
+  // M6's two combat/monopoly fields. They were missing from this list while the patch
+  // type already carried them, so the CLI refused a flag the applier would have honoured
+  // — and, worse, refused it with "not settable from the CLI", which reads as a statement
+  // about the *engine* rather than about this list.
+  'hitPoints',
+  'requiresTech',
+];
+/**
+ * M6b's nine combat magnitudes, in the catalog's own order.
+ *
+ * They are the fields the `combat` section may be patched with, and the list exists so
+ * that `--override combat.rollbown=10` is refused with the nine names that would have
+ * worked rather than silently accepted: a knob that was never applied is indistinguishable
+ * from a knob with no effect, which is the whole reason M6b moved these numbers into the
+ * catalog in the first place.
+ */
+const COMBAT_FIELDS: readonly string[] = [
+  'fortifyBonusPct',
+  'cityDefenseBonusPct',
+  'wallsBonusPct',
+  'veteranAttackPct',
+  'maxExperience',
+  'rollBound',
+  'damagePerRound',
+  'minWinPct',
+  'maxWinPct',
 ];
 const BUILDING_FIELDS: readonly string[] = ['name', 'cost', 'maintenance', 'wonder'];
 const IMPROVEMENT_FIELDS: readonly string[] = [
@@ -523,10 +602,14 @@ const terrainPatch = (list: readonly OverrideAssignment[]): Result<TerrainPatch,
         patch = { ...patch, moveCost: value.value };
         break;
       }
-      case 'defenseBonusPct': {
+      case 'defenseBonusPct':
+      case 'defenseBonus': {
+        // One magnitude, two spellings: the applier sets both names from either, so the
+        // CLI sets both too rather than picking one and leaving the engine reading the
+        // other. (`core/combat.ts`' `terrainDefenseBonus` prefers `defenseBonus`.)
         const value = wantsInteger(a);
         if (!value.ok) return value;
-        patch = { ...patch, defenseBonusPct: value.value };
+        patch = { ...patch, defenseBonusPct: value.value, defenseBonus: value.value };
         break;
       }
       case 'impassable': {
@@ -573,15 +656,23 @@ const unitPatch = (list: readonly OverrideAssignment[]): Result<UnitPatch, strin
         patch = { ...patch, requiresResource: asResourceId(value.value) };
         break;
       }
+      case 'requiresTech': {
+        const value = wantsText(a);
+        if (!value.ok) return value;
+        patch = { ...patch, requiresTech: asTechId(value.value) };
+        break;
+      }
       case 'attack':
       case 'defense':
       case 'movement':
-      case 'cost': {
+      case 'cost':
+      case 'hitPoints': {
         const value = wantsInteger(a);
         if (!value.ok) return value;
         if (a.field === 'attack') patch = { ...patch, attack: value.value };
         else if (a.field === 'defense') patch = { ...patch, defense: value.value };
         else if (a.field === 'movement') patch = { ...patch, movement: value.value };
+        else if (a.field === 'hitPoints') patch = { ...patch, hitPoints: value.value };
         else patch = { ...patch, cost: value.value };
         break;
       }
@@ -695,6 +786,57 @@ const resourcePatch = (list: readonly OverrideAssignment[]): Result<ResourcePatc
   return ok({ ...patch, yields: merged.value });
 };
 
+/**
+ * The singleton `combat` section's patch: nine plain integers and no nesting.
+ *
+ * No row id is consulted, because there is no row to look up: the parser refuses any
+ * `combat` path that names an id other than the section's own, so every assignment
+ * reaching here is already a field of the one row.
+ */
+const combatPatch = (
+  list: readonly OverrideAssignment[],
+): Result<NonNullable<RulesetPatch['combat']>, string> => {
+  let patch: NonNullable<RulesetPatch['combat']> = {};
+  for (const a of list) {
+    const found = COMBAT_FIELDS.find((candidate) => candidate === a.field);
+    if (found === undefined) return err(notSettable(a, COMBAT_FIELDS));
+    const value = wantsInteger(a);
+    if (!value.ok) return value;
+    // Field by field, so a renamed catalog field is a compile error here rather than a
+    // key the applier silently ignores.
+    switch (found) {
+      case 'fortifyBonusPct':
+        patch = { ...patch, fortifyBonusPct: value.value };
+        break;
+      case 'cityDefenseBonusPct':
+        patch = { ...patch, cityDefenseBonusPct: value.value };
+        break;
+      case 'wallsBonusPct':
+        patch = { ...patch, wallsBonusPct: value.value };
+        break;
+      case 'veteranAttackPct':
+        patch = { ...patch, veteranAttackPct: value.value };
+        break;
+      case 'maxExperience':
+        patch = { ...patch, maxExperience: value.value };
+        break;
+      case 'rollBound':
+        patch = { ...patch, rollBound: value.value };
+        break;
+      case 'damagePerRound':
+        patch = { ...patch, damagePerRound: value.value };
+        break;
+      case 'minWinPct':
+        patch = { ...patch, minWinPct: value.value };
+        break;
+      case 'maxWinPct':
+        patch = { ...patch, maxWinPct: value.value };
+        break;
+    }
+  }
+  return ok(patch);
+};
+
 /** One section's assignments, grouped by row id, in ascending id order. */
 const sectionRecord = <P>(
   assignments: readonly OverrideAssignment[],
@@ -742,6 +884,11 @@ export const buildRulesetPatch = (
   if (!improvements.ok) return improvements;
   const resources = sectionRecord(of('resources'), resourcePatch);
   if (!resources.ok) return resources;
+  // The singleton section goes through the same one builder; `sectionRecord` is not used
+  // because there is one row and it has a fixed name, so grouping by id would only
+  // re-derive the constant this module already knows.
+  const combat = combatPatch(of('combat'));
+  if (!combat.ok) return combat;
 
   return ok({
     ...(assignments.some((a) => a.section === 'terrains') ? { terrains: terrains.value } : {}),
@@ -751,6 +898,7 @@ export const buildRulesetPatch = (
       ? { improvements: improvements.value }
       : {}),
     ...(assignments.some((a) => a.section === 'resources') ? { resources: resources.value } : {}),
+    ...(assignments.some((a) => a.section === 'combat') ? { combat: combat.value } : {}),
   });
 };
 
@@ -1604,10 +1752,12 @@ const overrideFailureLine = (
   assignments: readonly OverrideAssignment[],
   error: OverrideError,
 ): string => {
+  // An `unknown-section` complaint names no row (there is no section to have a row in),
+  // so it is matched on the section alone; every other kind carries an id.
   const culprit = assignments.find(
     (a) =>
       a.section === error.section &&
-      a.id === error.id &&
+      (error.kind === 'unknown-section' || a.id === error.id) &&
       (error.kind !== 'unknown-field' || a.field === error.field),
   );
   const what = culprit === undefined ? 'the override' : `--override ${culprit.text}`;
@@ -1780,6 +1930,11 @@ const readNumeric = (
           return ok(row.movement);
         case 'cost':
           return ok(row.cost);
+        case 'hitPoints':
+          // The engine's own reader, so the number this sweep reports as "shipped" is the
+          // number a battle would use: `fullHitPoints` is what `maxHitPointsOf` applies to
+          // a live unit, and it treats a row that declares nothing as 1.
+          return ok(fullHitPoints(row));
         default:
           return notNumeric();
       }
@@ -1806,6 +1961,10 @@ const readNumeric = (
           return ok(row.moveCost);
         case 'defenseBonusPct':
           return ok(row.defenseBonusPct);
+        case 'defenseBonus':
+          // M6's spelling of the same magnitude, read through the reader the engine uses
+          // so the two names cannot report different numbers.
+          return ok(terrainDefenseBonus(row));
         case 'yields.food':
           return ok(row.yields.food);
         case 'yields.shields':
@@ -1849,6 +2008,35 @@ const readNumeric = (
           return notNumeric();
       }
     }
+    case 'combat': {
+      // The one section that is a row rather than a list of rows: its id is its own name,
+      // and its fields are the nine magnitudes. `readKnob` is what makes
+      // `--knob combat.wallsBonusPct` sweepable at all, and the shipped value it reports
+      // comes from here — out of the catalog, never from a literal in this file.
+      if (id !== COMBAT_ROW_ID) return unknown([COMBAT_ROW_ID]);
+      switch (field) {
+        case 'fortifyBonusPct':
+          return ok(catalog.combat.fortifyBonusPct);
+        case 'cityDefenseBonusPct':
+          return ok(catalog.combat.cityDefenseBonusPct);
+        case 'wallsBonusPct':
+          return ok(catalog.combat.wallsBonusPct);
+        case 'veteranAttackPct':
+          return ok(catalog.combat.veteranAttackPct);
+        case 'maxExperience':
+          return ok(catalog.combat.maxExperience);
+        case 'rollBound':
+          return ok(catalog.combat.rollBound);
+        case 'damagePerRound':
+          return ok(catalog.combat.damagePerRound);
+        case 'minWinPct':
+          return ok(catalog.combat.minWinPct);
+        case 'maxWinPct':
+          return ok(catalog.combat.maxWinPct);
+        default:
+          return notNumeric();
+      }
+    }
   }
 };
 
@@ -1880,6 +2068,16 @@ const readProvenance = (
     case 'resources': {
       const row = catalog.resources.find((candidate) => String(candidate.id) === id);
       return row === undefined ? err(`resources.${id} is not a catalog row`) : ok(row.provenance);
+    }
+    case 'combat': {
+      // The section's own provenance, which the report prints beside the set of nine: a
+      // reader has to be able to see that a swept combat number is a placeholder of ours
+      // and not a citation.
+      return id === COMBAT_ROW_ID
+        ? ok(catalog.combat.provenance)
+        : err(
+            `combat.${id} is not a catalog row (the section is one row, named "${COMBAT_ROW_ID}")`,
+          );
     }
   }
 };
