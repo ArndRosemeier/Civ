@@ -1671,3 +1671,67 @@ structured value only (the M2 rule).
   result is byte-reproducible.
 - Policy weights are sweepable: a sweep over one AI weight shows a measured effect.
 - `CAPTURE_POPULATION_DIVISOR` is in the catalog and swept.
+
+---
+
+# M7b contracts — FROZEN (the gate budget, and a sane default)
+
+## A5 is currently FAILING and the number was wrong
+
+Alpha criterion A5: fast `pnpm verify` green in **≤ 90 s**, `verify:full` green in
+**≤ 10 min**. Measured after M7, fast `pnpm verify` takes **104 s of wall time**. The
+reviewing agent measured vitest's *internal* duration (65.9 s) and compared that to
+the bound — the wrong number, because the bound is on the command a person runs.
+
+Rules for this wave:
+
+- The bound is on **`time pnpm verify`**, end to end, measured from a cold shell.
+  Report wall time, never vitest's internal figure, and never a figure taken from a
+  run that overlapped another job on the machine.
+- Re-draw the tier boundary so the fast tier lands at **≤ 70 s**, leaving deliberate
+  headroom: M8 adds a browser suite, and M9-M11 add systems. A tier that exactly
+  meets its bound is a tier that is about to break it.
+- `verify:full` must stay **≤ 10 min** with room left. Report its wall time too.
+
+## The 20-seed tournament is EVIDENCE, not a gate test
+
+A full 20-seed × 100-turn tournament measures at roughly 26 s per game, so the run
+alpha's A3 requires costs about **9 minutes**. That belongs in a script whose output
+is reported as evidence, **not** in the per-commit suite. The suite keeps a small
+smoke tournament (a few seeds at a short horizon) that proves the machinery works and
+that violations surface; the real 20-seed run is executed deliberately and its result
+recorded in the docs.
+
+Two stale claims to correct, both measured rather than guessed:
+
+1. The tournament module documents ~7.7 s per game; the measured figure is ~26 s.
+   Either re-measure and correct the arithmetic, or widen the bound deliberately —
+   do not leave a number in a comment that a reader would rely on.
+2. `civts run` now defaults to a ~9-minute experiment. A CLI whose plainest verb
+   takes nine minutes is a footgun: give it a small, stated default and require the
+   larger run to be asked for explicitly, so nobody starts a nine-minute job by
+   accident while believing it is a stub.
+
+## The AI does not besiege cities (an honest capability gap)
+
+M7 measured 23 battles across 5 seeds and **not one targeted a city tile**, while the
+AI builds walls readily. So `wallsBonusPct` still has nothing to defend in a sweep,
+and the flat table is a true finding about the AI, not about the knob. The AI must
+learn to attack cities — this is also what makes combat a real path to winning rather
+than a way to lose units, and A3 asks for opponents that play a *complete* game.
+
+Required: the AI besieges a city when it has the force for it, using the engine's own
+combat maths for the decision (never a second implementation of the odds). Then re-run
+the walls sweep and report whether it now shows an effect. If it still does not, say
+which of the two it is — knob or measurement — and prove the claim.
+
+## Acceptance evidence
+
+- `time pnpm verify` ≤ 70 s wall, reported as the raw command output.
+- `time pnpm verify:full` ≤ 10 min wall, and the gap to the bound stated.
+- The fast tier still REPORTS skipped tests by name, so the split stays discoverable
+  and full ⊇ fast remains structurally true.
+- The 20-seed A3 tournament runs to completion with zero invariant violations, and its
+  wall time and result are recorded as evidence.
+- The AI attacks a city in a fixed-seed scenario, with the exact outcome asserted, and
+  the walls sweep is re-run honestly.

@@ -101,13 +101,16 @@
  *
  * ## Policy dependence, stated because it is load-bearing
  *
- * The runs are played by `SIMPLE_POLICY`, the shipped placeholder AI — so what is
- * measured is *this AI's* fighting under each value, not a human's and not M7's. The
- * policy decides to attack on the odds the applier itself reports
- * (`SIMPLE_POLICY_TUNING.attackOddsFloorPct`), which means a knob that raises the
- * attacker's strength can change *which attacks happen at all* as well as how they go.
- * That coupling is real, it is reported, and `--floor` varies the threshold so a reader
- * can see whether the effect survives it.
+ * The runs are played by an AI, named in the report: `--policy simple` (the default) is the
+ * M1–M6 placeholder, `--policy smart` is M7's real opponent. What is measured either way is
+ * *that AI's* fighting under each value, not a human's — and the two AIs fight differently,
+ * so a walls verdict without the policy named beside it is not a verdict. The placeholder
+ * attacks on the per-round odds the applier itself reports
+ * (`SIMPLE_POLICY_TUNING.attackOddsFloorPct`); the real one prices each whole battle from
+ * those same engine numbers and refuses the ones its own maths loses. Either way a knob that
+ * raises the attacker's strength can change *which attacks happen at all* as well as how they
+ * go. That coupling is real, it is reported, and `--floor` varies the placeholder's threshold
+ * so a reader can see whether the effect survives it.
  *
  * ## Provenance
  *
@@ -152,7 +155,9 @@ import {
   policyRngFor,
   runSimulation,
   simplePolicy,
+  smartPolicy,
   tryApplyOverrides,
+  SMART_WEIGHTS,
   SIMPLE_POLICY_TUNING,
   type Policy,
   type RulesetPatch,
@@ -560,8 +565,51 @@ const DEFAULTS = {
   seedSpec: '1..3',
   turns: 60,
   floor: SIMPLE_POLICY_TUNING.attackOddsFloorPct,
+  policy: 'simple',
   values: undefined as readonly number[] | undefined,
 };
+
+/**
+ * The policies that can play the runs, by name — and the reason `--policy` exists at all.
+ *
+ * `--policy simple` is the M1–M6 placeholder this sweep was built around, and it is the
+ * default so that every figure the sweep has ever published stays comparable. `--policy smart`
+ * plays the M7 AI instead, which is the policy whose combat decisions actually ship.
+ *
+ * The two are not interchangeable and the report says so: `simplePolicy` attacks whenever the
+ * **per-round** odds the applier reports clear `attackOddsFloorPct` — it never prices a whole
+ * battle — while `SMART_POLICY` composes the engine's per-round number into a battle
+ * probability and refuses anything its own maths says it loses. So the same knob can look
+ * inert under one and live under the other, and a walls verdict is only meaningful with the
+ * policy named beside it (which is why the name is in the report, in the caveats and in the
+ * `NO MEASURABLE EFFECT` classification).
+ */
+interface SweepPolicyChoice {
+  readonly id: string;
+  /** What the report calls it — the same string the `sim` command prints, so the two agree. */
+  readonly label: string;
+  readonly build: (floor: number) => readonly Policy[];
+}
+
+const SWEEP_POLICIES: readonly SweepPolicyChoice[] = [
+  {
+    id: 'simple',
+    label: 'simple-placeholder',
+    build: (floor) => [
+      simplePolicy({ attackOddsFloorPct: floor }),
+      simplePolicy({ attackOddsFloorPct: floor }),
+    ],
+  },
+  {
+    id: 'smart',
+    label: 'smart',
+    build: () => [smartPolicy(), smartPolicy()],
+  },
+];
+
+/** `--policy`'s resolver, so an unknown name is refused with the known ones listed. */
+const sweepPolicy = (id: string): SweepPolicyChoice | undefined =>
+  SWEEP_POLICIES.find((choice) => choice.id === id);
 
 /** How many civilizations a run plays. Two is the minimum that can meet in a war. */
 const CIV_COUNT = 2;
@@ -732,6 +780,7 @@ interface Flag {
   readonly seedSpec?: string;
   readonly turns?: number;
   readonly floor?: number;
+  readonly policy?: string;
   readonly stopOnViolation?: boolean;
 }
 
@@ -741,6 +790,7 @@ const parseFlags = (argv: readonly string[]): Flag => {
   let seedSpec: string = DEFAULTS.seedSpec;
   let turns: number = DEFAULTS.turns;
   let floor: number = DEFAULTS.floor;
+  let policy: string = DEFAULTS.policy;
   let stopOnViolation = false;
   let json = false;
   let help = false;
@@ -797,6 +847,16 @@ const parseFlags = (argv: readonly string[]): Flag => {
       seedSpec = value;
       continue;
     }
+    if (flag === '--policy') {
+      const value = take();
+      if (value === undefined) return { ok: false, error: '--policy needs a value' };
+      const known = SWEEP_POLICIES.map((choice) => choice.id).join(', ');
+      if (sweepPolicy(value) === undefined) {
+        return { ok: false, error: `unknown policy "${value}" (known: ${known})` };
+      }
+      policy = value;
+      continue;
+    }
     if (flag === '--turns' || flag === '--floor') {
       const value = take();
       if (value === undefined) return { ok: false, error: `${flag} needs a value` };
@@ -822,6 +882,7 @@ const parseFlags = (argv: readonly string[]): Flag => {
     seedSpec,
     turns,
     floor,
+    policy,
     ...(values === undefined ? {} : { values }),
     ...(stopOnViolation ? { stopOnViolation: true } : {}),
   };
@@ -1182,13 +1243,11 @@ const buildVariant = (
   seeds: readonly number[],
   turns: number,
   floor: number,
+  policy: SweepPolicyChoice,
   stopOnViolation: boolean,
 ): { readonly variant: Variant; readonly disagreements: readonly string[] } => {
   const patched = patchedRuleset(knob, value);
-  const policies = [
-    simplePolicy({ attackOddsFloorPct: floor }),
-    simplePolicy({ attackOddsFloorPct: floor }),
-  ];
+  const policies = policy.build(floor);
 
   const runs: SeedRun[] = [];
   const disagreements: string[] = [];
@@ -1240,13 +1299,14 @@ const buildReport = (
   seeds: readonly number[],
   turns: number,
   floor: number,
+  policy: SweepPolicyChoice,
   stopOnViolation: boolean,
 ): CombatSweepReport => {
   const variants: Variant[] = [];
   const disagreements: string[] = [];
 
   for (const value of values) {
-    const built = buildVariant(knob, value, seeds, turns, floor, stopOnViolation);
+    const built = buildVariant(knob, value, seeds, turns, floor, policy, stopOnViolation);
     variants.push(built.variant);
     disagreements.push(...built.disagreements);
   }
@@ -1277,11 +1337,21 @@ const buildReport = (
     );
   }
 
+  const military = SMART_WEIGHTS.military;
   const caveats: string[] = [
-    'the runs are played by SIMPLE_POLICY, the shipped placeholder AI (M7 replaces it), so ' +
-      "these are that policy's battles and not a human's",
-    `the policy attacks only at odds >= ${String(floor)}% (SIMPLE_POLICY_TUNING.attackOddsFloorPct), ` +
-      'so a value that changes the odds can change WHICH attacks happen as well as how they go',
+    `the runs are played by ${policy.label} (--policy ${policy.id}), so these are that ` +
+      "policy's battles and not a human's",
+    policy.id === 'simple'
+      ? `the policy attacks whenever the engine's PER-ROUND odds clear ${String(floor)}% ` +
+        '(SIMPLE_POLICY_TUNING.attackOddsFloorPct) — it never prices a whole battle — so a value ' +
+        'that changes the odds can change WHICH attacks happen as well as how they go'
+      : `the policy prices each battle from the engine's own per-round number and refuses an ` +
+        `attack below its floors (SMART_WEIGHTS.military: ${String(military.attackWinFloorPct)}% ` +
+        `in the open, ${String(military.attackWinFloorVsCityPct)}% into a city, ` +
+        `${String(military.attackWinFloorVsWalledCityPct)}% into a walled one, and a group of ` +
+        `attackers may storm a walled city at ${String(military.siegeAssaultFloorPct)}% between ` +
+        'them), so a value that changes the odds can change WHICH attacks happen as well as how ' +
+        'they go — and --floor does not apply to it',
     'figures are cumulative over each run unless the column says "at the horizon"',
     stopOnViolation
       ? 'the runner stopped each run at its first invariant violation, so `turns` is the mean over ' +
@@ -1316,7 +1386,7 @@ const buildReport = (
     turns,
     mapSize: MAP_SIZE,
     civCount: CIV_COUNT,
-    policy: 'simple-placeholder',
+    policy: policy.label,
     attackOddsFloorPct: floor,
     variants,
     unreachable: UNREACHABLE,
@@ -1352,7 +1422,10 @@ const renderReport = (report: CombatSweepReport): string => {
   lines.push(`  seeds:     ${report.seeds.join(', ')} (${MAP_SIZE}, ${String(CIV_COUNT)} civs)`);
   lines.push(`  turns:     ${String(report.turns)}`);
   lines.push(
-    `  policy:    ${report.policy} (attack at odds >= ${String(report.attackOddsFloorPct)}%)`,
+    `  policy:    ${report.policy}` +
+      (report.policy === 'simple-placeholder'
+        ? ` (attack at odds >= ${String(report.attackOddsFloorPct)}%)`
+        : ` (battle floors in SMART_WEIGHTS.military; --floor ${String(report.attackOddsFloorPct)}% does not apply)`),
   );
   lines.push('');
 
@@ -1575,8 +1648,10 @@ const noEffectReason = (report: CombatSweepReport): string => {
     return (
       `MEASUREMENT LIMITATION, not a finding about the knob: ${exposure.zeroMeans}. ` +
       `The knob would need ${exposure.needs}. What would fix the measurement is a run set in ` +
-      'which that happens — more turns, more seeds, a bigger map, a lower --floor, or (M7) the ' +
-      'real policy, which reaches positions this placeholder never does.'
+      `which that happens — more turns, more seeds, a bigger map, a different --policy, or (for ` +
+      `--policy simple) a lower --floor. This report was played by **${report.policy}**, and the ` +
+      'exposure above is what that policy gave the knob; a different policy reaches different ' +
+      'positions, which is why the policy is named in this sentence rather than assumed.'
     );
   }
 
@@ -1597,8 +1672,9 @@ const noEffectReason = (report: CombatSweepReport): string => {
     `every value produced the same battles, the same losses, the same captures and the same ` +
     `populations, ${grid}.${identical} The exposure is the strength of that finding and not ` +
     'merely its context: read the knob as "it did not move these games", not as "it can never ' +
-    'matter". More exposure (a bigger map, more turns, or the M7 policy) would test it harder; a ' +
-    'wider grid of values cannot, because the games did not move across this one.'
+    `matter". More exposure (a bigger map, more turns, or the other --policy than the one played ` +
+    `here, ${report.policy}) would test it harder; a wider grid of values cannot, because the ` +
+    'games did not move across this one.'
   );
 };
 
@@ -1615,8 +1691,10 @@ usage: npx tsx scripts/combat-balance-sweep.ts [flags]
   --values <list>    comma-separated whole numbers (default: the knob's own grid)
   --seeds <spec>     "1,2,3" or "1..10" (default ${DEFAULTS.seedSpec})
   --turns <n>        turns per run (default ${String(DEFAULTS.turns)})
-  --floor <pct>      the policy's attack odds floor in whole percent
+  --floor <pct>      the attack odds floor in whole percent, for --policy simple only
                      (default ${String(DEFAULTS.floor)}, SIMPLE_POLICY_TUNING.attackOddsFloorPct)
+  --policy <id>      which AI plays the runs (default ${DEFAULTS.policy})
+                     ${SWEEP_POLICIES.map((choice) => `${choice.id} → ${choice.label}`).join('\n                     ')}
   --stop-on-violation  let the runner stop a run at its first invariant violation
                      (the default plays the full horizon and checks the registry here)
   --json             print the structured report instead of the table
@@ -1658,12 +1736,22 @@ const main = (): number => {
     return 2;
   }
 
+  const policy = sweepPolicy(parsed.policy ?? DEFAULTS.policy);
+  if (policy === undefined) {
+    const known = SWEEP_POLICIES.map((choice) => choice.id).join(', ');
+    process.stderr.write(
+      `error: unknown policy "${String(parsed.policy)}" (known: ${known})\n\n${USAGE}`,
+    );
+    return 2;
+  }
+
   const report = buildReport(
     knob,
     parsed.values ?? knob.values,
     seeds,
     parsed.turns ?? DEFAULTS.turns,
     parsed.floor ?? DEFAULTS.floor,
+    policy,
     parsed.stopOnViolation === true,
   );
 

@@ -38,6 +38,20 @@
  *    pinned against an exact `BigInt` rational model of the same race, so its "should I
  *    attack?" is a derivation from `combat.ts`' own per-round number rather than a second
  *    opinion about it.
+ *
+ * ## The tier split (M7b — the gate budget, re-drawn)
+ *
+ * Every claim above is still checked on every run; what changed is *which* run. M7b's bound
+ * is on `time pnpm verify` (≤ 70 s wall), and this file was the whole gate: measured with
+ * vitest's per-file reporter it cost **54.4 s of wall on its own**, against a 37 s floor for
+ * `typecheck` + `lint` + `format:check` — one file cannot leave room for M8's browser suite.
+ *
+ * So the tests that play *whole games* moved behind `it.skipIf(!FULL_TIER)`, and each one's
+ * comment records the milliseconds it was measured at. What the fast tier keeps is the part
+ * that proves the AI *plays*: three command-tally/walk tests over 20-25 turns (~4 s total),
+ * the totality suite, the weight-catalog suite, the pure-function and attack-odds checks, and
+ * the fixtures — every one of them sub-100 ms or a single short game. `pnpm verify:full` runs
+ * the moved tests; the fast run prints each of them by name as skipped.
  */
 
 import {
@@ -46,25 +60,31 @@ import {
   WALLS_BUILDING,
   advanceTurn,
   applyCommand,
+  asBuildingId,
   asCityId,
   asPlayerId,
   asUnitId,
+  asUnitTypeId,
   citiesOf,
   cityById,
+  hitPointsLeftOf,
   neighbors8,
   newGame,
+  tileIndex,
   unitById,
   unitDef,
   type City,
   type Command,
+  type GameEvent,
   type GameState,
   type PlayerId,
   type RngState,
   type Settings,
   type Unit,
+  type UnitTypeId,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
-import { canonicalize } from '@civts/testing';
+import { FULL_TIER, canonicalize, createScenarioBuilder } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -103,6 +123,13 @@ const RULESET: Ruleset = (() => {
  * world in which "does it expand and does it fight" is a question at all.
  */
 const SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'tiny', civCount: 2 };
+
+/**
+ * The map and size `scripts/combat-balance-sweep.ts` itself measures on — `duel`, two
+ * civilizations — so the walls exposure this file reports is read off the same fixture the
+ * sweep's flat table comes from rather than off a friendlier one.
+ */
+const DUEL_SETTINGS: Settings = { ...DEFAULT_SETTINGS, mapSize: 'duel', civCount: 2 };
 
 /** How many turns a measured run plays. */
 const TURNS = 45;
@@ -258,7 +285,11 @@ const emptyState = (): GameState => ({
  * ------------------------------------------------------------------ */
 
 describe('M7 — the real AI is deterministic and cannot move the world', () => {
-  it('plays a seed identically twice', () => {
+  // Full tier: two 25-turn games of the real AI, twice each. Measured at 8.8 s with vitest's
+  // per-file reporter, which is the largest single item in the file and pure wall time in the
+  // fast gate. Determinism is the property M7 rests on, so it is not dropped — `pnpm verify:full`
+  // runs it, and this run reports it as skipped by name.
+  it.skipIf(!FULL_TIER)('plays a seed identically twice', () => {
     for (const seed of [7, 23]) {
       const options = {
         seed,
@@ -282,7 +313,8 @@ describe('M7 — the real AI is deterministic and cannot move the world', () => 
     expect(SMART_POLICY.chooseCommands(ctx)).toEqual(SMART_POLICY.chooseCommands(ctx));
   });
 
-  it('takes its own stream and never reads the world RNG while deciding', () => {
+  // Full tier: 2.6 s — three 20-turn drives plus three more games advanced turn by turn.
+  it.skipIf(!FULL_TIER)('takes its own stream and never reads the world RNG while deciding', () => {
     // **What the property is, stated exactly.** M5's requirement is that a policy consumes
     // *only* its own stream, so that two policies on one seed leave the **world's** trajectory
     // comparable. It is not that the trajectory is *identical* under any two policies: the
@@ -409,7 +441,10 @@ describe('M7 — the real AI is total: it never throws and never proposes the il
  * ------------------------------------------------------------------ */
 
 describe('M7 — every command the AI proposes is one the applier accepts', () => {
-  it('has zero refusals over several seeds and turns, non-vacuously', () => {
+  // Full tier: 7.9 s. Folds every command the AI returns through the real applier over several
+  // seeds and turns — the M2 keystone applied to the AI, and the most expensive thing in the
+  // file after the baseline comparison. `pnpm verify:full` runs it.
+  it.skipIf(!FULL_TIER)('has zero refusals over several seeds and turns, non-vacuously', () => {
     let totalApplied = 0;
     let totalProposed = 0;
     const report: string[] = [];
@@ -435,92 +470,105 @@ describe('M7 — every command the AI proposes is one the applier accepts', () =
  * ------------------------------------------------------------------ */
 
 describe('M7 — the real AI decisively beats the do-nothing baseline', () => {
-  it('founds cities, grows people, learns techs and builds units where the baseline does not', () => {
-    const aiSeats: Seat[] = [];
-    const idleSeats: Seat[] = [];
+  // Full tier: 16.8 s — the single most expensive test in the fast tier before M7b re-drew the
+  // boundary, and the one that made `time pnpm verify` exceed its bound on its own. This is
+  // M7's core claim (the AI is an opponent, not a stub), so it is kept and moved rather than
+  // trimmed: three seeds x 45 turns x two policies, against the do-nothing control on the same
+  // world. `pnpm verify:full` runs it; the fast run reports it as skipped by name.
+  it.skipIf(!FULL_TIER)(
+    'founds cities, grows people, learns techs and builds units where the baseline does not',
+    () => {
+      const aiSeats: Seat[] = [];
+      const idleSeats: Seat[] = [];
 
-    for (const seed of SEEDS) {
-      aiSeats.push(
-        seatOf(
-          seed,
-          runSimulation({
+      for (const seed of SEEDS) {
+        aiSeats.push(
+          seatOf(
             seed,
-            settings: SETTINGS,
-            ruleset: RULESET,
-            policies: [SMART_POLICY, SMART_POLICY],
-            maxTurns: TURNS,
-          }),
-        ),
-      );
-      idleSeats.push(
-        seatOf(
-          seed,
-          runSimulation({
+            runSimulation({
+              seed,
+              settings: SETTINGS,
+              ruleset: RULESET,
+              policies: [SMART_POLICY, SMART_POLICY],
+              maxTurns: TURNS,
+            }),
+          ),
+        );
+        idleSeats.push(
+          seatOf(
             seed,
-            settings: SETTINGS,
-            ruleset: RULESET,
-            policies: [DO_NOTHING_POLICY, DO_NOTHING_POLICY],
-            maxTurns: TURNS,
-          }),
-        ),
-      );
-    }
+            runSimulation({
+              seed,
+              settings: SETTINGS,
+              ruleset: RULESET,
+              policies: [DO_NOTHING_POLICY, DO_NOTHING_POLICY],
+              maxTurns: TURNS,
+            }),
+          ),
+        );
+      }
 
-    // The evidence, printed: a reader sees the numbers rather than a claim about them.
-    const table = [
-      `M7 AI vs do-nothing (tiny map, 2 civs, ${String(TURNS)} turns, player 0):`,
-      ...aiSeats.map((seat) => line('  ai  ', seat)),
-      ...idleSeats.map((seat) => line('  idle', seat)),
-    ].join('\n');
+      // The evidence, printed: a reader sees the numbers rather than a claim about them.
+      const table = [
+        `M7 AI vs do-nothing (tiny map, 2 civs, ${String(TURNS)} turns, player 0):`,
+        ...aiSeats.map((seat) => line('  ai  ', seat)),
+        ...idleSeats.map((seat) => line('  idle', seat)),
+      ].join('\n');
 
-    for (const seat of [...aiSeats, ...idleSeats]) {
-      expect(seat.violations, `run ${String(seat.seed)} reported invariant violations`).toBe(0);
-    }
+      // Printed rather than only attached to a failure: these numbers are the deliverable of
+      // the comparison, and a reader of a green run should be able to see them without
+      // breaking the test to get them.
+      console.log(table);
 
-    const wins = (pick: (seat: Seat) => number): number =>
-      aiSeats.filter((seat, index) => {
-        const other = idleSeats[index];
-        return other !== undefined && pick(seat) > pick(other);
-      }).length;
+      for (const seat of [...aiSeats, ...idleSeats]) {
+        expect(seat.violations, `run ${String(seat.seed)} reported invariant violations`).toBe(0);
+      }
 
-    const majority = Math.floor(SEEDS.length / 2) + 1;
-    expect(
-      wins((seat) => seat.cities),
-      table,
-    ).toBeGreaterThanOrEqual(majority);
-    expect(
-      wins((seat) => seat.population),
-      table,
-    ).toBeGreaterThanOrEqual(majority);
-    expect(
-      wins((seat) => seat.techs),
-      table,
-    ).toBeGreaterThanOrEqual(majority);
-    expect(
-      wins((seat) => seat.units),
-      table,
-    ).toBeGreaterThanOrEqual(majority);
+      const wins = (pick: (seat: Seat) => number): number =>
+        aiSeats.filter((seat, index) => {
+          const other = idleSeats[index];
+          return other !== undefined && pick(seat) > pick(other);
+        }).length;
 
-    // "Decisively", not "by one citizen". The baseline founds nothing at all by construction —
-    // `DO_NOTHING_POLICY` returns an empty list, so its settler never moves — which is what
-    // makes its zero population a floor rather than a coincidence. These are the absolute
-    // numbers the claim rests on, asserted per seed so one lucky seed cannot carry the row.
-    const idleTotal = idleSeats.reduce((total, seat) => total + seat.population, 0);
-    expect(idleTotal).toBe(0);
-    expect(idleSeats.every((seat) => seat.cities === 0)).toBe(true);
-    for (const seat of aiSeats) {
-      expect(seat.cities, table).toBeGreaterThanOrEqual(1);
-      expect(seat.population, table).toBeGreaterThanOrEqual(1);
-    }
-    // Research is asserted in total rather than per seed: a short game on a small map can end
-    // before a single 6-beaker tech completes on one seed and not another, and the claim being
-    // made here is that this AI *does* research, which the sum answers without pretending a
-    // single slow seed is a failure.
-    expect(
-      aiSeats.reduce((total, seat) => total + seat.techs, 0),
-      table,
-    ).toBeGreaterThanOrEqual(SEEDS.length);
-  });
+      const majority = Math.floor(SEEDS.length / 2) + 1;
+      expect(
+        wins((seat) => seat.cities),
+        table,
+      ).toBeGreaterThanOrEqual(majority);
+      expect(
+        wins((seat) => seat.population),
+        table,
+      ).toBeGreaterThanOrEqual(majority);
+      expect(
+        wins((seat) => seat.techs),
+        table,
+      ).toBeGreaterThanOrEqual(majority);
+      expect(
+        wins((seat) => seat.units),
+        table,
+      ).toBeGreaterThanOrEqual(majority);
+
+      // "Decisively", not "by one citizen". The baseline founds nothing at all by construction —
+      // `DO_NOTHING_POLICY` returns an empty list, so its settler never moves — which is what
+      // makes its zero population a floor rather than a coincidence. These are the absolute
+      // numbers the claim rests on, asserted per seed so one lucky seed cannot carry the row.
+      const idleTotal = idleSeats.reduce((total, seat) => total + seat.population, 0);
+      expect(idleTotal).toBe(0);
+      expect(idleSeats.every((seat) => seat.cities === 0)).toBe(true);
+      for (const seat of aiSeats) {
+        expect(seat.cities, table).toBeGreaterThanOrEqual(1);
+        expect(seat.population, table).toBeGreaterThanOrEqual(1);
+      }
+      // Research is asserted in total rather than per seed: a short game on a small map can end
+      // before a single 6-beaker tech completes on one seed and not another, and the claim being
+      // made here is that this AI *does* research, which the sum answers without pretending a
+      // single slow seed is a failure.
+      expect(
+        aiSeats.reduce((total, seat) => total + seat.techs, 0),
+        table,
+      ).toBeGreaterThanOrEqual(SEEDS.length);
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -568,7 +616,9 @@ describe('M7 — the AI magnitudes live in one named, sweepable place', () => {
     expect(luxuryShareWhenRich).toBeLessThanOrEqual(RATE_TOTAL);
   });
 
-  it('changes the game when a weight moves — the sweep is measurable', () => {
+  // Full tier: 3.0 s — two full games per weight value, because the claim is that moving one
+  // weight moves the *game*, not that a function returns a different number.
+  it.skipIf(!FULL_TIER)('changes the game when a weight moves — the sweep is measurable', () => {
     const seed = 11;
     const size = (targetCities: number): number => {
       const policy = smartPolicy({ settlement: { targetCities } });
@@ -608,6 +658,11 @@ interface WallsRead {
   readonly battlesIntoCities: number;
   /** Battles whose **target** was a barbarian unit. */
   readonly battlesAgainstBarbarians: number;
+  /**
+   * Cities that changed hands. The counter that separates "this AI never reaches the enemy"
+   * from "this AI reaches the enemy and the fighting there happens to be elsewhere".
+   */
+  readonly citiesCaptured: number;
   readonly refusals: number;
 }
 
@@ -620,16 +675,21 @@ interface WallsRead {
  * command was applied. The wall set is therefore rebuilt from `state` before each fold and read
  * from the state the battle was fought in, not from the end of the game.
  */
-const walkWalls = (seeds: readonly number[], turns: number): WallsRead => {
+const walkWalls = (
+  seeds: readonly number[],
+  turns: number,
+  settings: Settings = SETTINGS,
+): WallsRead => {
   let citiesWithWalls = 0;
   let battles = 0;
   let battlesIntoWalledCities = 0;
   let battlesIntoCities = 0;
   let battlesAgainstBarbarians = 0;
+  let citiesCaptured = 0;
   let refusals = 0;
 
   for (const seed of seeds) {
-    const started = newGame(seed, SETTINGS, RULESET);
+    const started = newGame(seed, settings, RULESET);
     if (!started.ok) throw new Error(`newGame refused seed ${String(seed)}`);
     let state = started.value;
 
@@ -654,6 +714,10 @@ const walkWalls = (seeds: readonly number[], turns: number): WallsRead => {
           const walls = walledTiles(state);
           const cityTiles = new Set(state.cities.map((city) => Number(city.tile)));
           for (const event of outcome.value.events) {
+            if (event.type === 'CityCaptured') {
+              citiesCaptured += 1;
+              continue;
+            }
             if (event.type !== 'CombatResolved') continue;
             battles += 1;
             const target = Number(event.target);
@@ -680,59 +744,86 @@ const walkWalls = (seeds: readonly number[], turns: number): WallsRead => {
     battlesIntoWalledCities,
     battlesIntoCities,
     battlesAgainstBarbarians,
+    citiesCaptured,
     refusals,
   };
 };
 
 describe('M7 — the walls sweep now has something to measure', () => {
-  it('builds walls, and fights often enough for a walls bonus to move something', () => {
-    const read = walkWalls([7, 23], 40);
-    const summary =
-      `walls over ${String(read.seeds)} seeds: citiesWithWalls=${String(read.citiesWithWalls)} ` +
-      `battles=${String(read.battles)} intoCities=${String(read.battlesIntoCities)} ` +
-      `intoWalledCities=${String(read.battlesIntoWalledCities)} ` +
-      `vsBarbarians=${String(read.battlesAgainstBarbarians)} refusals=${String(read.refusals)}`;
+  // Full tier: 6.0 s — the walls measurement (M7's second task): it walks several seeds and
+  // counts the battles, and the battles *into* walled cities, that decide whether the walls
+  // bonus has anything to move at all.
+  it.skipIf(!FULL_TIER)(
+    'builds walls, and fights often enough for a walls bonus to move something',
+    () => {
+      // Two fixtures, and the second one is the point. `tiny` is the M7 fixture this test was
+      // written against (the AI rarely meets anybody there); `duel` is the sweep's own map, where
+      // the rival is reachable and the fighting happens. Reporting only the first was how a
+      // measurement limitation came to look like a finding about the AI.
+      const read = walkWalls([7, 23], 40);
+      const duel = walkWalls([1, 2, 3], 60, DUEL_SETTINGS);
+      const render = (label: string, one: WallsRead): string =>
+        `${label}: seeds=${String(one.seeds)} citiesWithWalls=${String(one.citiesWithWalls)} ` +
+        `battles=${String(one.battles)} intoCities=${String(one.battlesIntoCities)} ` +
+        `intoWalledCities=${String(one.battlesIntoWalledCities)} ` +
+        `captures=${String(one.citiesCaptured)} ` +
+        `vsBarbarians=${String(one.battlesAgainstBarbarians)} refusals=${String(one.refusals)}`;
+      const summary = `walls ${render('tiny', read)}\nwalls ${render('duel', duel)}`;
 
-    expect(read.refusals, summary).toBe(0);
+      // Printed, because `intoWalledCities` is the number this whole section is about and a
+      // reader of a green run should not have to break the test to see it.
+      console.log(summary);
 
-    // **What is true, asserted**: the AI builds walls, and it fights. Both are load-bearing.
-    // `citiesWithWalls` is the half the placeholder policy never did — it never produced a
-    // wall at all, so `wallsBonusPct` had no walled city anywhere in any game to defend, and
-    // sweeping it could not have changed a single battle. That is fixed here.
-    expect(read.citiesWithWalls, summary).toBeGreaterThan(0);
-    expect(read.battles, summary).toBeGreaterThan(0);
+      for (const one of [read, duel]) {
+        expect(one.refusals, summary).toBe(0);
+        // The AI builds walls, and it fights. Both are load-bearing, and the first is the half
+        // the M1–M6 placeholder never did: it produced no wall in any game, so `wallsBonusPct`
+        // had no walled city anywhere to defend and sweeping it could not have changed one battle.
+        expect(one.citiesWithWalls, summary).toBeGreaterThan(0);
+        expect(one.battles, summary).toBeGreaterThan(0);
+      }
 
-    // **What is NOT asserted, and why — this is the answer to M7's walls question.**
-    //
-    // `summary` reports how many of those battles were fought into a city, and how many into a
-    // *walled* one. Neither is pinned to a floor, because the honest measurement is that the
-    // second number is **zero**, and asserting a floor it does not meet would be a lie dressed
-    // as a guarantee.
-    //
-    // The finding, stated plainly: **the walls sweep is half-meaningful, and the half that is
-    // missing is not a tuning problem.** Measured over these two seeds — and over five seeds
-    // and 40 turns in the development log — the AI raises walls readily (`citiesWithWalls`
-    // above zero is the half the placeholder policy never did: it built no wall in any game, so
-    // `wallsBonusPct` had no walled city anywhere to defend and sweeping it could not have
-    // changed one battle), and it fights (`battles`). But its battles are fought **in the open**
-    // — against barbarians and against field units — so the wall bonus, which applies to a
-    // battle for a city tile, is rarely exercised.
-    //
-    // The cause is the AI's own attack rule, not a shortage of walls. Its battle-win floor for
-    // a walled city is `attackWinFloorVsWalledCityPct` (`65` by default); an attacker that has
-    // to land `defenderHitPoints` hits while a walled, fortified city lands its own is
-    // genuinely below that floor for every unit in the shipped catalog, so a *rational* AI
-    // declines the assault. A higher-level reading is that this is the correct behaviour and
-    // the scenario is the limitation: a sweep of `wallsBonusPct` will show a real effect only
-    // once an attacker exists that can win such a battle — a veteran stack, a larger tech
-    // advantage, or a ruleset whose `wallsBonusPct` is small enough that the floor is met.
-    //
-    // So this test reports rather than promises, and the number to watch is `intoWalledCities`.
-    // A sweep of `wallsBonusPct` against this AI measures the bonus on the **defensive** side
-    // (the AI's own walled cities being attacked) as much as anything; to measure it on the
-    // offensive side, lower `attackWinFloorVsWalledCityPct` and watch this number move.
-    expect(summary).toContain('intoWalledCities=');
-  });
+      // **The improvement this milestone is about, asserted on the sweep's own fixture.** Before
+      // it, the sweep's `duel` runs ended with `captures=0` on every seed: no city changed hands,
+      // no battle was fought anywhere near one, and the walls knob had nothing to enter. Now the
+      // AI assaults a city it has the force for and takes it — so the counters that say "the
+      // measurement had a subject" are non-zero rather than merely reported.
+      expect(duel.citiesCaptured, summary).toBeGreaterThan(0);
+
+      // **What is still NOT asserted, and why — this is the answer to M7's walls question.**
+      //
+      // `summary` reports how many battles were fought on a city tile, and how many of those
+      // cities held the walls row. Both are **zero on both fixtures**, and pinning a floor they do
+      // not meet would be a lie dressed as a guarantee. What changed in M7 is *why* they are zero,
+      // and the two reasons are now distinguishable from the counters themselves:
+      //
+      // 1. (before) the AI never reached a city at all — `citiesCaptured` was 0 on every fixture,
+      //    so the sweep's exposure counter had nothing to count on any playing.
+      // 2. (now) the AI reaches cities and takes them (`citiesCaptured` above zero), but the ones
+      //    it takes are **undefended**: an undefended city is taken by a single command that
+      //    emits `CityCaptured` **and no `CombatResolved` at all**. No battle, no odds, no walls
+      //    bonus. The garrison is simply elsewhere — which is what a city-holding AI with
+      //    `fieldArmySharePct` does with an over-extended empire.
+      //
+      // So the honest verdict on the flat `wallsBonusPct` table is **measurement, not the knob**,
+      // and it is proven three ways rather than asserted:
+      //
+      // - the knob is wired into the odds and the AI's decision: the test below moves
+      //   `wallsBonusPct` over the sweep's own grid on a world where a defender **is** inside its
+      //   own walled city, and the engine's per-round odds go 42% → 37% → 33% → 30% while the
+      //   pair's assault flips from STORM to decline;
+      // - the AI does besiege, and a group assault takes a walled city: section 9's fixture takes
+      //   a walled, fortified city with five archers and asserts the capture exactly;
+      // - the sweep itself now names the exposure (`0 of 232` battles at a walled city) instead
+      //   of printing a flat table, and `--policy smart` is what produces that number.
+      //
+      // What would close it is not a tuning change but more war: a defended city, a longer
+      // horizon, or a rival that garrisons what it walls. The number to watch is
+      // `intoWalledCities`, and the second number to watch beside it is `captures` — a zero there
+      // means the army never arrived, which is the limitation that was mistaken for a finding.
+      expect(summary).toContain('intoWalledCities=');
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -810,49 +901,38 @@ const exactBattleWinPct = (
 };
 
 describe('M7 — the attack decision is derived from the engine, not restated', () => {
-  it('agrees with an exact rational battle model over a grid of odds and hit points', () => {
-    // The driver below is the same accumulation the policy's `battleWinPctOf` performs —
-    // pinned here as a checkable property, so its arithmetic is verified against an
-    // independent model without exporting an implementation detail of the policy.
-    const accumulated = (perRound: number, attacker: number, defender: number): number => {
-      const chance = perRound / 100;
-      if (chance <= 0) return 0;
-      // The attacker has to land `defender` hits before taking `attacker` of them, so the
-      // series runs over the hits it can afford to take — `attacker` terms — and each term is
-      // the negative-binomial mass of `defender - 1` misses before the last hit.
-      let cumulative = 1;
-      let total = 0;
-      for (let r = 0; r < attacker; r += 1) {
-        if (cumulative <= 1e-300) break;
-        total += cumulative * chance ** defender;
-        // `C(d - 1 + r, r) -> C(d + r, r + 1)`, the ratio between consecutive negative-
-        // binomial coefficients, times the extra `q` each further miss costs.
-        cumulative *= ((defender + r) / (r + 1)) * (1 - chance);
-      }
-      // Truncated, not rounded: a battle at 99.6% is not a certainty.
-      return Math.max(0, Math.min(100, Math.floor(total * 100)));
-    };
-
-    const disagreements: string[] = [];
+  it('prices a battle exactly over a grid of odds and hit points', () => {
+    // **This test used to check the policy against a copy of the policy's own arithmetic**,
+    // written out here and compared term by term. The copy was more correct than the original:
+    // it raised `p` to the defender's hit points where `battleWinPctOf` multiplied by `p`
+    // alone, so the two agreed on the one-hit-point rows that a hand-checked example uses and
+    // the copy silently *excused* the original where it was wrong. A model of the policy is not
+    // evidence about the policy, and this one hid a real defect for a whole milestone.
+    //
+    // So the policy's arithmetic is no longer restated here. What is left is what an oracle is
+    // for — the exact rational model, checked for the properties a probability has — and the
+    // policy itself is pinned **behaviourally** in section 9, on worlds whose battle this model
+    // prices: the attack has to be made if and only if the exact answer clears the floor. That
+    // test fails on the old expression and passes on this one.
     for (const [perRound, attacker, defender] of BATTLE_GRID) {
       const exact = exactBattleWinPct(perRound, attacker, defender);
-      const approximate = accumulated(perRound, attacker, defender);
       expect(exact).toBeGreaterThanOrEqual(0);
       expect(exact).toBeLessThanOrEqual(100);
-      // A two-point tolerance: the exact recurrence truncates integer division at every state
-      // and the series accumulates floating-point error over a handful of terms, so they agree
-      // to within a point or two everywhere and never disagree about the *decision* — a
-      // threshold at 55% or 65% is nowhere near these boundaries.
-      if (Math.abs(exact - approximate) > 2) {
-        disagreements.push(
-          `p=${String(perRound)} a=${String(attacker)} d=${String(defender)}: ` +
-            `exact=${String(exact)} accumulated=${String(approximate)}`,
-        );
-      }
       if (perRound === 0) expect(exact).toBe(0);
       if (perRound === 100) expect(exact).toBe(100);
+      // A defender with more hit points is never easier to kill than one with fewer, at the
+      // same per-round odds.
+      if (defender > 1) {
+        expect(exact).toBeLessThanOrEqual(exactBattleWinPct(perRound, attacker, defender - 1));
+      }
+      // And the shape of the defect above, stated as a property: a one-hit-point attacker
+      // cannot afford a single lost round, so its battle is the run of `defender` wins and
+      // nothing else — `p ** defender`, strictly below the per-round chance. An accumulation
+      // that multiplies by `p` alone reads `p` here and cannot be below it.
+      if (attacker === 1 && defender > 1 && perRound > 0 && perRound < 100) {
+        expect(exact).toBeLessThan(perRound);
+      }
     }
-    expect(disagreements).toEqual([]);
   });
 
   it('prices hit points: a bigger stack wins a battle a thinner one loses at the same odds', () => {
@@ -925,30 +1005,37 @@ describe('M7 — the AI plays rather than merely returning legal commands', () =
     expect([...kinds.values()].reduce((total, count) => total + count, 0)).toBeGreaterThan(20);
   });
 
-  it('works its cities’ tiles, builds in them, and researches continuously', () => {
-    const result = runSimulation({
-      seed: 23,
-      settings: SETTINGS,
-      ruleset: RULESET,
-      policies: [SMART_POLICY, SMART_POLICY],
-      maxTurns: TURNS,
-    });
-    const cities: readonly City[] = citiesOf(result.finalState, asPlayerId(0));
-    expect(cities.length).toBeGreaterThanOrEqual(1);
-    for (const city of cities) {
-      // A city with nothing queued is legal (a fresh city, or one whose item was completed
-      // that turn), so the assertion is on the **worked tiles**, which every city of this AI
-      // assigns on the turn it is founded and never leaves empty.
-      expect(city.workedTiles.length).toBeGreaterThan(0);
-      // One citizen works one tile: the assignment is the engine's own rule and never more
-      // than the city can staff.
-      expect(city.workedTiles.length).toBeLessThanOrEqual(city.population);
-      expect(new Set(city.workedTiles.map(Number)).size).toBe(city.workedTiles.length);
-    }
-    const player = result.finalState.players.find((row) => row.id === asPlayerId(0));
-    expect(player?.techs.length ?? 0).toBeGreaterThanOrEqual(1);
-    expect(player?.treasury ?? -1).toBeGreaterThanOrEqual(0);
-  });
+  // Full tier: 4.9 s — a 45-turn game (`TURNS`), asserting the worked tiles, the research and
+  // the treasury of the finished game rather than of one turn of it. The three cheaper
+  // `commandTally`/`drive` tests below stay in the fast tier: they are the ones that prove the
+  // AI *plays* at gate speed.
+  it.skipIf(!FULL_TIER)(
+    'works its cities’ tiles, builds in them, and researches continuously',
+    () => {
+      const result = runSimulation({
+        seed: 23,
+        settings: SETTINGS,
+        ruleset: RULESET,
+        policies: [SMART_POLICY, SMART_POLICY],
+        maxTurns: TURNS,
+      });
+      const cities: readonly City[] = citiesOf(result.finalState, asPlayerId(0));
+      expect(cities.length).toBeGreaterThanOrEqual(1);
+      for (const city of cities) {
+        // A city with nothing queued is legal (a fresh city, or one whose item was completed
+        // that turn), so the assertion is on the **worked tiles**, which every city of this AI
+        // assigns on the turn it is founded and never leaves empty.
+        expect(city.workedTiles.length).toBeGreaterThan(0);
+        // One citizen works one tile: the assignment is the engine's own rule and never more
+        // than the city can staff.
+        expect(city.workedTiles.length).toBeLessThanOrEqual(city.population);
+        expect(new Set(city.workedTiles.map(Number)).size).toBe(city.workedTiles.length);
+      }
+      const player = result.finalState.players.find((row) => row.id === asPlayerId(0));
+      expect(player?.techs.length ?? 0).toBeGreaterThanOrEqual(1);
+      expect(player?.treasury ?? -1).toBeGreaterThanOrEqual(0);
+    },
+  );
 
   it('moves a unit to the tile it said it would, and only to a tile it may hold', () => {
     const seed = 97;
@@ -984,7 +1071,440 @@ describe('M7 — the AI plays rather than merely returning legal commands', () =
 });
 
 /* ------------------------------------------------------------------ *
- * 9. Identity, and the control
+ * 9. The siege — a city the army has the force for, and one it has not
+ * ------------------------------------------------------------------ */
+
+/**
+ * The two halves of M7b's siege task, on worlds small enough to read: **the AI storms a
+ * walled city when the stack has the force for it, and refuses the same city when it has
+ * not.** Same city, same defender, same walls; the only thing that changes is how many
+ * archers are standing beside it.
+ *
+ * Why a hand-built world and not a played-out game: on a `duel` map this AI's two
+ * civilizations spend forty turns finding each other, and the question "does it storm a city"
+ * would be answered by "it never arrived" — a measurement of the map, not of the decision.
+ * These worlds put the army where the decision is, and the decision is what is being
+ * measured. The end-to-end numbers (an actual game, against an actual opponent) are in
+ * section 6 above and in `scripts/combat-balance-sweep.ts`; these are the mechanism.
+ */
+
+/** `Ostia`, the city under siege: four citizens, a granary, walls, and the Pyramids. */
+const OSTIA: readonly [number, number] = [20, 20];
+const OSTIA_NAME = 'Ostia';
+/** The tiles the besiegers stand on — the five beside `OSTIA`, nearest first. */
+const SIEGE_POSTS: readonly (readonly [number, number])[] = [
+  [21, 20],
+  [21, 21],
+  [20, 21],
+  [19, 21],
+  [19, 20],
+];
+
+const GRANARY = asBuildingId('granary');
+const WALLS = asBuildingId(WALLS_BUILDING);
+const PYRAMIDS = asBuildingId('pyramids');
+const ARCHER = asUnitTypeId('archer');
+const SPEARMAN = asUnitTypeId('spearman');
+const WARRIOR = asUnitTypeId('warrior');
+const SETTLER = asUnitTypeId('settler');
+
+/** Which world to build: how many besiegers, and what is standing inside the city. */
+interface SiegeSpec {
+  readonly attackers: number;
+  /** The garrison's remaining hit points; `0` leaves the city undefended. */
+  readonly garrisonHitPoints: number;
+  readonly fortified: boolean;
+  /** The garrison's unit type — `spearman` (defence 3) unless a case wants another. */
+  readonly defenderType?: UnitTypeId;
+  /** The besiegers' type — `archer` (attack 3) unless a case wants another. */
+  readonly attackerType?: UnitTypeId;
+}
+
+/**
+ * Build the siege world: Rome's archers beside Carthage's `Ostia`.
+ *
+ * Both civilizations get a settler far away so the world is one `newGame` could have
+ * produced, and Carthage's settler is parked in a corner where it cannot interfere.
+ */
+const siegeWorld = (spec: SiegeSpec, ruleset: Ruleset = RULESET): GameState => {
+  let builder = createScenarioBuilder(ruleset, { mapSize: 'tiny', civCount: 2, seed: 5 })
+    .addPlayer('Rome')
+    .addPlayer('Carthage')
+    .fillTerrain('grassland')
+    .addUnit(0, SETTLER, [2, 2])
+    .addUnit(1, SETTLER, [40, 40])
+    .addCity(1, OSTIA, {
+      name: OSTIA_NAME,
+      population: 4,
+      foodBox: 5,
+      shields: 3,
+      buildings: [GRANARY, WALLS, PYRAMIDS],
+    });
+
+  if (spec.garrisonHitPoints > 0) {
+    builder = builder.addUnit(1, spec.defenderType ?? SPEARMAN, OSTIA, {
+      hitPointsLeft: spec.garrisonHitPoints,
+      ...(spec.fortified ? { fortified: true } : {}),
+    });
+  }
+  for (let index = 0; index < spec.attackers; index += 1) {
+    const post = SIEGE_POSTS[index];
+    if (post === undefined) throw new Error(`no siege post ${String(index)}`);
+    builder = builder.addUnit(0, spec.attackerType ?? ARCHER, post);
+  }
+
+  const built = builder.build();
+  if (!built.ok) throw new Error(`the siege world did not build: ${built.error.kind}`);
+  return built.value;
+};
+
+/** What a siege run saw. */
+interface SiegeRun {
+  readonly state: GameState;
+  readonly events: readonly GameEvent[];
+  readonly commands: readonly Command[];
+  /** The start state, so a revision delta can be stated exactly. */
+  readonly start: GameState;
+  /**
+   * The fold that captured the city: the state before it, the state after it, and the
+   * engine's own event. Kept because the city an assault leaves behind is not the city the
+   * AI is running three turns later — it re-builds what it lost, which is the AI working,
+   * not the capture un-happening.
+   */
+  readonly capture:
+    | {
+        readonly event: Extract<GameEvent, { readonly type: 'CityCaptured' }>;
+        readonly before: GameState;
+        readonly after: GameState;
+      }
+    | undefined;
+}
+
+/**
+ * Play `turns` turns of the **shipped policy** for Rome — Carthage does nothing, so every
+ * event is this AI's doing. Returns the events, because the evidence for "it attacked the
+ * city" is the engine's own `CombatResolved`/`CityCaptured` and not the absence of an error.
+ */
+const playSiege = (start: GameState, turns: number, ruleset: Ruleset = RULESET): SiegeRun => {
+  let state = start;
+  const events: GameEvent[] = [];
+  const commands: Command[] = [];
+  let capture: SiegeRun['capture'];
+  for (let turn = 0; turn < turns; turn += 1) {
+    for (const player of state.players) {
+      if (player.kind !== 'civ') continue;
+      const policy = player.id === asPlayerId(0) ? SMART_POLICY : DO_NOTHING_POLICY;
+      // The context is built here rather than through `ctxFor` because a siege may be played
+      // on a *patched* ruleset (the walls sweep below), and a context that quietly used the
+      // shipped one would measure the wrong engine.
+      const commandsThisTurn = policy.chooseCommands({
+        state,
+        playerId: player.id,
+        ruleset,
+        rng: policyRngFor(5, player.id, state.turn),
+      });
+      for (const command of commandsThisTurn) {
+        const before = state;
+        const outcome = applyCommand(state, player.id, command, ruleset);
+        if (!outcome.ok) continue;
+        commands.push(command);
+        events.push(...outcome.value.events);
+        state = outcome.value.state;
+        const taken = outcome.value.events.find(
+          (event): event is Extract<GameEvent, { readonly type: 'CityCaptured' }> =>
+            event.type === 'CityCaptured',
+        );
+        if (taken !== undefined) capture = { event: taken, before, after: state };
+      }
+    }
+    state = advanceTurn(state, RULESET).state;
+  }
+  return { state, events, commands, start, capture };
+};
+
+/**
+ * The shipped catalog with **one** combat magnitude moved — the same shape the sweep's
+ * `RulesetPatch` produces, validated the same way, so a case that is not a legal ruleset fails
+ * here rather than measuring a world the engine could never hold.
+ */
+const rulesetWithWallsBonus = (wallsBonusPct: number): Ruleset => {
+  const validated = validateRuleset(
+    { ...CATALOG, combat: { ...CATALOG.combat, wallsBonusPct } },
+    'tuned',
+  );
+  if (!validated.ok) {
+    throw new Error(`wallsBonusPct ${String(wallsBonusPct)} did not validate`);
+  }
+  return validated.value;
+};
+
+/** The engine's own per-round odds for one attack that is *not* taken, read off a fold. */
+const perRoundOddsAgainst = (spec: SiegeSpec, ruleset: Ruleset = RULESET): number => {
+  const world = siegeWorld(spec, ruleset);
+  const attacker = world.units.find(
+    (unit) =>
+      unit.owner === asPlayerId(0) && String(unit.type) === String(spec.attackerType ?? ARCHER),
+  );
+  if (attacker === undefined) throw new Error('no attacker in the world');
+  const outcome = applyCommand(
+    world,
+    asPlayerId(0),
+    {
+      type: 'AttackUnit',
+      unitId: attacker.id,
+      target: tileIndex(world.map.width, OSTIA[0], OSTIA[1]),
+    },
+    ruleset,
+  );
+  if (!outcome.ok) return 0;
+  const resolved = outcome.value.events.find((event) => event.type === 'CombatResolved');
+  return resolved === undefined ? 0 : resolved.attackerWinPct;
+};
+
+/** The chance that **at least one** of a group's attacks wins — the siege's own number. */
+const groupChance = (chances: readonly number[]): number =>
+  100 * (1 - chances.reduce((missed, chance) => missed * (1 - chance / 100), 1));
+
+/**
+ * The AI storms a walled city when the **stack** has the force, and the engine takes it.
+ *
+ * The numbers are printed rather than asserted, because they are the point: a lone archer's
+ * true chance against a fortified, walled spearman is well under its own floor, and the same
+ * archer in a group of five is not.
+ */
+it('storms a walled city the stack has the force for, and the city falls', () => {
+  const spec: SiegeSpec = { attackers: 5, garrisonHitPoints: 3, fortified: true };
+  const perRound = perRoundOddsAgainst(spec);
+  const each = exactBattleWinPct(perRound, 3, 3);
+  const group = groupChance([each, each, each, each, each]);
+  const weights = SMART_WEIGHTS.military;
+  console.log(
+    `siege (5 archers beside a walled, fortified spearman):\n` +
+      `  engine per-round odds ${String(perRound)}% -> each archer's battle win ${String(each)}% ` +
+      `(exact rational model), the group of five ${group.toFixed(1)}%\n` +
+      `  floors: a soldier attacking alone needs ${String(weights.attackWinFloorVsWalledCityPct)}% ` +
+      `(walled city), the group needs ${String(weights.siegeAssaultFloorPct)}%\n` +
+      `  force: 5 archers x 3 hit points = 15 against a 3-hit-point garrison ` +
+      `(ratio ${String((15 * 100) / 3)}%, needing ${String(weights.siegeForceRatioPct)}%)`,
+  );
+
+  const run = playSiege(siegeWorld(spec), 4);
+  const battles = run.events.filter((event) => event.type === 'CombatResolved');
+  const tile = tileIndex(siegeWorld(spec).map.width, OSTIA[0], OSTIA[1]);
+
+  const outcome =
+    run.capture === undefined
+      ? 'no capture'
+      : `a capture on turn ${String(run.capture.before.turn)}`;
+  console.log(`  the assault: ${String(battles.length)} battle(s), then ${outcome}`);
+
+  // The assault happened, it happened at the city, and the engine resolved it as a battle
+  // (taking an undefended city would be a capture with no `CombatResolved` at all).
+  expect(battles.length).toBeGreaterThanOrEqual(1);
+  for (const battle of battles) {
+    expect(Number(battle.target)).toBe(Number(tile));
+    // The engine's own per-round number for a walled, fortified defender, which is the whole
+    // reason a lone archer may not attack and a stack may.
+    expect(battle.attackerWinPct).toBe(perRound);
+  }
+
+  // The exact outcome, off the engine's own event, at the moment it happened.
+  const capture = run.capture;
+  expect(capture).toBeDefined();
+  if (capture === undefined) return;
+  expect(Number(capture.event.cityId)).toBe(0);
+  expect(Number(capture.event.tile)).toBe(Number(tile));
+  expect(capture.event.name).toBe(OSTIA_NAME);
+  expect(capture.event.from).toBe(asPlayerId(1));
+  expect(capture.event.to).toBe(asPlayerId(0));
+  expect(capture.event.population).toBe(2);
+  // Non-wonders destroyed, the wonder not — the engine's own list.
+  expect([...capture.event.destroyed].sort()).toEqual(['granary', 'walls'].sort());
+  // The revision moves by exactly one for the command that took the city, and by exactly one
+  // for every other command that applied: nothing here is a state change outside a command.
+  expect(capture.after.revision).toBe(capture.before.revision + 1);
+  expect(run.state.revision).toBe(run.start.revision + run.commands.length);
+
+  // And the city the capture left behind: the new owner, half the citizens, the wonder alone,
+  // the queue and the worked tiles cleared and the stores the engine says it keeps.
+  const after = cityById(capture.after, asCityId(0));
+  expect(after?.owner).toBe(asPlayerId(0));
+  expect(after?.population).toBe(2);
+  expect(after?.buildings).toEqual([PYRAMIDS]);
+  expect(after?.name).toBe(OSTIA_NAME);
+  expect(after?.tile).toBe(tile);
+  expect(after?.foodBox).toBe(5);
+  expect(after?.shields).toBe(3);
+  expect(after?.queue).toEqual([]);
+  expect(after?.workedTiles).toEqual([]);
+  expect(after?.production).toBeUndefined();
+});
+
+/** The same city, the same walls — and not enough force to take it. */
+it('refuses that city when the force is not there, and loses no unit doing it', () => {
+  const weights = SMART_WEIGHTS.military;
+  const lines: string[] = [];
+  for (const attackers of [1, 2]) {
+    const spec: SiegeSpec = { attackers, garrisonHitPoints: 3, fortified: true };
+    const perRound = perRoundOddsAgainst(spec);
+    const each = exactBattleWinPct(perRound, 3, 3);
+    const chances = Array.from({ length: attackers }, () => each);
+    const group = groupChance(chances);
+    lines.push(
+      `  ${String(attackers)} archer(s): each ${String(each)}% -> group ${group.toFixed(1)}% ` +
+        `(the group floor is ${String(weights.siegeAssaultFloorPct)}%), ` +
+        `a soldier alone needs ${String(weights.attackWinFloorVsWalledCityPct)}%`,
+    );
+
+    const run = playSiege(siegeWorld(spec), 4);
+    // No battle, no capture, and every attacker still standing: the AI declined, and the
+    // evidence is the absence of the engine's events rather than the absence of an error.
+    expect(run.events.filter((event) => event.type === 'CombatResolved')).toEqual([]);
+    expect(run.events.filter((event) => event.type === 'CityCaptured')).toEqual([]);
+    expect(
+      run.state.units.filter(
+        (unit) => unit.owner === asPlayerId(0) && String(unit.type) === String(ARCHER),
+      ),
+    ).toHaveLength(attackers);
+
+    const city = cityById(run.state, asCityId(0));
+    expect(city?.owner).toBe(asPlayerId(1));
+    expect(city?.population).toBe(4);
+    expect(city?.buildings).toEqual([GRANARY, WALLS, PYRAMIDS]);
+  }
+  console.log(`refusal (the same walled, fortified spearman, fewer archers):\n${lines.join('\n')}`);
+});
+
+/**
+ * **The `p`-versus-`p ** needed` bug, pinned where it lived.**
+ *
+ * `battleWinPctOf` multiplies `p ** needed` into the negative-binomial sum, and an earlier
+ * version of it multiplied by `p` — the last hit's probability instead of the whole run of
+ * them. The two spellings agree only when the defender has **one** hit point, which is
+ * exactly the case a hand-checked example uses, and they diverge violently otherwise: at 30 %
+ * per round against three hit points the truth is **16 %** and the old expression answered
+ * `181 %`, clamped to `100`. The AI therefore cleared its own floor with units it was about
+ * to lose — the one thing this policy is supposed to refuse.
+ *
+ * The check below is behavioural on purpose. The suite's own oracle used to re-state the
+ * policy's accumulator instead of exercising it, and a restatement that is more correct than
+ * the original passes while the original is wrong. So the policy is **run** on worlds whose
+ * battle the exact rational model prices, and the attack has to be made if and only if that
+ * model clears the floor. On the old expression this table fails on every row with a
+ * multi-hit-point defender; on this one it holds on all of them, and it would have held on
+ * the old code only by accident.
+ */
+it('attacks exactly when the exact rational model clears the floor, not when its own sum says so', () => {
+  const cases: (readonly [UnitTypeId, UnitTypeId, number])[] = [];
+  for (const attacker of [WARRIOR, ARCHER]) {
+    for (const defender of [WARRIOR, SPEARMAN, ARCHER]) {
+      for (const hitPointsLeft of [1, 2, 3]) cases.push([attacker, defender, hitPointsLeft]);
+    }
+  }
+
+  const floor = SMART_WEIGHTS.military.attackWinFloorPct;
+  const rows: string[] = [];
+  const wrong: string[] = [];
+
+  for (const [attackerType, defenderType, garrisonHitPoints] of cases) {
+    const spec: SiegeSpec = {
+      attackers: 1,
+      garrisonHitPoints,
+      fortified: false,
+      attackerType,
+      defenderType,
+    };
+    // The world already puts the one attacker on `SIEGE_POSTS[0]`, beside the one defender,
+    // on open grassland with no city anywhere: what is being priced is the open-field floor
+    // of `attackWinFloorPct` and nothing else about the map.
+    const world = siegeWorld(spec);
+    const defender = world.units.find(
+      (unit) => unit.owner === asPlayerId(1) && String(unit.type) === String(defenderType),
+    );
+    if (defender === undefined) throw new Error('the case did not build a defender');
+    const attacker = world.units.find(
+      (unit) => unit.owner === asPlayerId(0) && String(unit.type) === String(attackerType),
+    );
+    if (attacker === undefined) throw new Error('the case did not build an attacker');
+
+    const perRound = perRoundOddsAgainst(spec);
+    const exact = exactBattleWinPct(perRound, hitPointsLeftOf(attacker), garrisonHitPoints);
+    const shouldAttack = exact >= floor;
+
+    const run = playSiege(world, 1);
+    const attacked = run.events.some(
+      (event) => event.type === 'CombatResolved' && Number(event.target) === Number(defender.tile),
+    );
+    rows.push(
+      `  ${attackerType} (${String(perRound)}%/round) vs ${defenderType} at ` +
+        `${String(garrisonHitPoints)} hp: exact ${String(exact)}% -> ` +
+        `${shouldAttack ? 'attack' : 'decline'}; the policy ${attacked ? 'attacked' : 'declined'}`,
+    );
+    if (attacked !== shouldAttack) {
+      wrong.push(
+        `${attackerType}/${defenderType}/${String(garrisonHitPoints)}: exact=${String(exact)} attacked=${String(attacked)}`,
+      );
+    }
+  }
+
+  console.log(
+    `attack floor = ${String(floor)}% (open field), over ${String(cases.length)} worlds:`,
+  );
+  console.log(rows.join('\n'));
+  expect(wrong).toEqual([]);
+});
+
+/**
+ * **The walls knob is not inert — the sweep's fixture never puts a defender behind a wall.**
+ *
+ * `scripts/combat-balance-sweep.ts --knob walls-bonus --policy smart` prints a flat table and
+ * `NOT EXERCISED — the walls bonus never entered a single odds computation in these runs`, and
+ * that sentence is the whole finding: it is a statement about the run set, not about the knob.
+ * This is the other half of the proof, and it is the half the flat table cannot give. The same
+ * knob, moved over the sweep's own grid, on a world where a defender *is* standing inside its
+ * own walled city: the engine's per-round odds move, the AI's own battle maths moves with them,
+ * and the **decision flips** — two archers storm at `wallsBonusPct = 0` and decline at the
+ * shipped `50`.
+ *
+ * So the answer to M7's walls question is neither "the knob does nothing" nor "the sweep is
+ * broken": the knob works, and it is exercised exactly where a walled city is attacked, which
+ * this AI does not reach inside 60 turns of a `duel` map (0 of 116 battles in that report).
+ * Measurement, not knob — and here is the measurement that says so.
+ */
+it('moves the AI\u2019s own battle maths and its decision when the walls knob moves', () => {
+  const rows: string[] = [];
+  const decisions = new Map<number, boolean>();
+  const perRounds: number[] = [];
+
+  for (const wallsBonusPct of [0, 25, 50, 100]) {
+    const ruleset = rulesetWithWallsBonus(wallsBonusPct);
+    const spec: SiegeSpec = { attackers: 2, garrisonHitPoints: 3, fortified: false };
+    const perRound = perRoundOddsAgainst(spec, ruleset);
+    const each = exactBattleWinPct(perRound, 3, 3);
+    const group = groupChance([each, each]);
+    const run = playSiege(siegeWorld(spec, ruleset), 4, ruleset);
+    const attacked = run.events.some((event) => event.type === 'CombatResolved');
+    decisions.set(wallsBonusPct, attacked);
+    perRounds.push(perRound);
+    rows.push(
+      `  wallsBonusPct=${String(wallsBonusPct).padStart(3)} -> engine per-round ${String(perRound)}%, ` +
+        `each archer ${String(each)}%, the pair ${group.toFixed(1)}% ` +
+        `(group floor ${String(SMART_WEIGHTS.military.siegeAssaultFloorPct)}%) -> ` +
+        (attacked ? 'STORM' : 'decline'),
+    );
+  }
+  console.log(
+    `the walls knob, on a world where a defender stands inside its own walls:\n${rows.join('\n')}`,
+  );
+
+  // The knob is wired into the engine's odds: four values, and the odds are not all the same.
+  expect(new Set(perRounds).size).toBeGreaterThan(1);
+  // It is wired into the **decision** too: the pair storms at one value and declines at another.
+  expect(new Set([...decisions.values()]).size).toBe(2);
+});
+
+/* ------------------------------------------------------------------ *
+ * 10. Identity, and the control
  * ------------------------------------------------------------------ */
 
 describe('M7 — the policy identifies itself and the control stays silent', () => {
@@ -1003,7 +1523,7 @@ describe('M7 — the policy identifies itself and the control stays silent', () 
 });
 
 /* ------------------------------------------------------------------ *
- * 10. Fixture sanity, so a rename upstream fails loudly here
+ * 11. Fixture sanity, so a rename upstream fails loudly here
  * ------------------------------------------------------------------ */
 
 describe('M7 — the fixtures still describe the shipped content', () => {

@@ -288,17 +288,43 @@ const elapsedSince = (clock: TournamentClock, started: number): number => {
  * vary is a magnitude like any other: `--budget-ms` and `TournamentOptions.budgetMs` move
  * it, and nothing else in this module mentions a millisecond.
  *
- * Fifteen minutes is the stated bound for the experiment the CLI defaults to — twenty seeds
- * of a 100-turn game, every decision made by the real AI (see `DEFAULT_TOURNAMENT_TURNS` in
- * `sim-cli.ts` for why that horizon). Measured while this was written: about 7.7 s per game
- * on an idle machine, so ~2.6 minutes for the twenty, and up to four times that when the
- * machine was shared with other work — which is what makes a *bound* the right shape here
- * rather than a target. The AI's per-turn decision work dominates a tournament by orders of
- * magnitude; the engine and the invariant checks are noise beside it.
+ * ## The experiment it is sized for, and the measured cost of that experiment
  *
- * So this is a bound on a *stated* experiment, not a benchmark and not a promise. A slower
- * or busier machine can, and should, report the run over budget — and the report says so,
- * with the elapsed time beside the stated one, rather than dropping seeds to fit.
+ * Fifteen minutes is the stated bound for **A3's experiment**: twenty seeds of a 100-turn
+ * game, every decision made by the real AI. Measured, rather than assumed — twice, on two
+ * machines, by two runs that agree to 1.6 %:
+ *
+ * - **26.0 s per game**, on a quiet machine, for a 100-turn game at `tiny` with two
+ *   civilizations and `SMART_POLICY` in both seats — measured by the M7b evidence script as
+ *   **519.4 s of externally bracketed wall time for the twenty** (`process.hrtime.bigint`
+ *   around the call), against 519.3 s reported by the harness's own clock — **0.01 % agreement**
+ *   between the two clocks, 0 violations, exit code 0;
+ * - the M7 adversarial review measured the same experiment independently at **527.3 s wall and
+ *   26.4 s per game** (0.1 % two-clock agreement), which is the same number within noise;
+ * - so the twenty-seed run costs about **8.7 minutes**, leaving about **6.3 minutes** (1.7×)
+ *   of headroom under this bound.
+ *
+ * Reproduce it with `pnpm tournament:evidence` (`scripts/tournament-evidence.ts`), which runs
+ * exactly that — the shipped `civts tournament --seeds 1..20 --turns 100` — and prints the
+ * structured result, the verdict, the wall time and both clocks. The figure this comment used
+ * to carry, **~7.7 s per game / ~2.6 minutes for the twenty, was stale by 3.4×** (FINDING E in
+ * that review): it would have promised a shared machine a comfortable margin and delivered an
+ * overrun verdict instead.
+ *
+ * ## Why the cost is what it is, and why this is a bound rather than a target
+ *
+ * The AI's per-turn decision work dominates a tournament by orders of magnitude, and it grows
+ * with the empire it is managing: the same twenty seeds cost about 0.06 s per turn in the
+ * opening and 0.26 s per turn averaged over a hundred. The engine and the invariant checks are
+ * noise beside it. A *bound* is therefore the right shape here rather than a benchmark: a
+ * slower or busier machine can, and should, report the run over budget — and the report says
+ * so, with the elapsed time beside the stated one, rather than dropping seeds to fit.
+ *
+ * Note what this default is **not** sized for any more: since M7b the CLI's own default run is
+ * a two-game smoke tournament of ten turns (seconds), so a plain `civts run` finishes far
+ * inside a bound that exists for the evidence run. Keeping one stated default is deliberate —
+ * the report always prints the budget it was judged against, so a small run never reads as a
+ * near miss against a bound that was not written for it.
  */
 export const DEFAULT_TOURNAMENT_BUDGET_MS = 900_000;
 

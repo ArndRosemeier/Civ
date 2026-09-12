@@ -9170,6 +9170,112 @@ describe('M6 scenario: a capture halves the city and spares its wonders', () => 
   });
 });
 
+/**
+ * The same capture, driven through the scenarios DSL's **`run`** path instead of a probe: the
+ * attacker is a *scripted* command, the runner applies it, and the world after it is the world
+ * the assertions are handed.
+ *
+ * Two things this adds over 17b, and neither is reachable from a probe:
+ *
+ * 1. **The `run` path itself.** 17b builds a world and folds one command by hand, which proves
+ *    the capture rule but never exercises `runScenarioAgainst`'s own loop — the thing every
+ *    scripted scenario in this file depends on. A capture is the case where "the runner applied
+ *    exactly the command that was written" is worth asserting, because the command's effect is
+ *    permanent.
+ * 2. **The revision delta.** `revision` is the state's one monotone counter and the basis of
+ *    every hash and every "did anything change" question in the project, and the M6 capture
+ *    evidence never checked it: it asserted the *content* of the change and not that one
+ *    command had produced **exactly one** revision. `build()` writes `revision: 0` and the run
+ *    is one command, so the world after it must be at `1` — not `0` (the command silently
+ *    dropped, which the capture assertions would also have caught) and not `2` (something else
+ *    counted, which nothing else would have).
+ */
+const captureRevisionScenario = defineScenario({
+  name: 'capture-through-the-run-path-moves-the-revision-by-one',
+  settings: DUEL_SETTINGS,
+  setup: captureSetup('nothing'),
+  run: [attack(2, ...CAPTURE_TILE)],
+  assert: (after) => {
+    const city = cityById(after, CAPTURE_CITY);
+    return [
+      check(
+        after.revision === 1,
+        'one scripted command moves the revision by exactly one, from the 0 the builder ' +
+          `writes: got ${String(after.revision)}`,
+      ),
+      check(
+        city?.owner === ROME && city.population === 2,
+        'the scripted attacker took the city and the sack halved it: owner ' +
+          `${String(city?.owner)} (Rome is ${String(ROME)}), population ` +
+          `${String(city?.population)} — expected 2`,
+      ),
+      check(
+        city !== undefined &&
+          city.buildings.includes(PYRAMIDS) &&
+          !city.buildings.includes(WALLS) &&
+          !city.buildings.includes(GRANARY),
+        'the wonders survive a sack and nothing else does: the city holds ' +
+          `[${(city?.buildings ?? []).join(', ')}] — expected the Pyramids alone`,
+      ),
+      check(
+        city !== undefined && city.foodBox === CAPTURE_FOOD_BOX && city.shields === CAPTURE_SHIELDS,
+        'the stores the sack found are still there: box ' +
+          `${String(city?.foodBox)}, shields ${String(city?.shields)}`,
+      ),
+      check(
+        city !== undefined && city.queue.length === 0 && city.workedTiles.length === 0,
+        'the queue and the tile assignment of the old owner are gone with it: ' +
+          `${String(city?.queue.length)} queued, ${String(city?.workedTiles.length)} worked`,
+      ),
+      check(
+        city !== undefined && city.name === 'Ostia' && Number(city.id) === Number(CAPTURE_CITY),
+        'the city keeps its identity across the change of hands — the same id and the same ' +
+          `name (got ${String(city?.id)} "${String(city?.name)}")`,
+      ),
+    ];
+  },
+});
+
+describe('M6 scenario: the same capture through the `run` path, revision and all', () => {
+  it('takes Ostia with one scripted command and moves the revision by exactly one', () => {
+    const result = runScenario(captureRevisionScenario);
+
+    expect(failures(result.assertions)).toEqual([]);
+    expect(result.passed).toBe(true);
+    expect(result.finalState?.revision).toBe(1);
+
+    // The typed event, exactly as the engine emitted it — `from`, `to`, the tile, the name,
+    // the halved population and the destruction list.
+    const event = captures(result.events)[0];
+    expect(result.events.filter((entry) => entry.type === 'CombatResolved')).toEqual([]);
+    expect(event?.from).toBe(CARTHAGE);
+    expect(event?.to).toBe(ROME);
+    expect(event?.name).toBe('Ostia');
+    expect(Number(event?.cityId)).toBe(Number(CAPTURE_CITY));
+    expect(Number(event?.tile)).toBe(Number(tileAt(CAPTURE_TILE)));
+    expect(event?.population).toBe(2);
+    expect(event?.destroyed).toEqual([WALLS, GRANARY]);
+  });
+
+  it('the revision assertion is not vacuous: a world with no command at all sits at 0', () => {
+    const variant: Scenario = {
+      name: 'the-same-world-with-nothing-run',
+      settings: DUEL_SETTINGS,
+      setup: captureSetup('nothing'),
+      assert: assertOf(captureRevisionScenario),
+    };
+
+    const result = runScenario(variant);
+
+    // Nothing was run, so nothing moved the counter and the *capture* assertions fail while
+    // the revision one… also fails, because the world is not at 1. Both halves matter: the
+    // assertion above is a statement about the run and not about the builder.
+    expect(result.passed).toBe(false);
+    expect(result.finalState?.revision).toBe(0);
+    expect(failures(result.assertions).join('\n')).toMatch(/got 0/);
+  });
+});
+
 /* ---- 17c. A won battle promotes its winner by one level ------------ */
 
 interface PromoCase {

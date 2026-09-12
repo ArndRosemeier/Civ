@@ -442,6 +442,56 @@ export interface SmartWeights {
      * bad" is a named number rather than a branch.
      */
     readonly standAndFortifyRatioPct: number;
+    /**
+     * How far from an enemy city a soldier's hit points still count toward that city's
+     * **assault force** — the force the AI asks whether it has before it commits to a siege.
+     * **PLACEHOLDER.**
+     *
+     * A radius rather than "the soldiers standing next to the city" because a siege is
+     * decided *before* the army is in position: the troops that count are the ones close
+     * enough to arrive, and `siegeForceRatioPct` is what decides whether they are enough.
+     */
+    readonly siegeRadius: number;
+    /**
+     * The assault force's hit points as a percentage of the garrison's hit points, below
+     * which an enemy city is **not** this AI's siege objective. **PLACEHOLDER**, and the
+     * whole content of "besiege a city **when it has the force for it**".
+     *
+     * Hit points and not a second odds model, on purpose: hit points are the engine's own
+     * measure of how much punishment a force can take (`hitPointsLeftOf`), and the garrison
+     * is what the engine will make an assault resolve against — the odds themselves come
+     * from the engine, through the fold `ai/smart.ts`' `bestAttack` already performs. A
+     * ratio of `100` means "as many hit points as the garrison"; the shipped default asks
+     * for half again as much.
+     */
+    readonly siegeForceRatioPct: number;
+    /**
+     * The chance, in whole percent, that the **whole assault group** takes an enemy city,
+     * below which the AI will not storm it — the number that turns "a walled city is
+     * unassailable" into "a walled city is unassailable *alone*". **PLACEHOLDER.**
+     *
+     * The group's chance is composed from the engine's own per-attack numbers
+     * (`1 - Π(1 - pᵢ)`, which is exactly the chance that at least one of the committed
+     * attackers wins, and a *lower* bound on the truth because each attack is priced against
+     * the defender as it stands before the assault, not as the attacks wound it). It is
+     * therefore not a second odds model: every `pᵢ` is read off the engine's own
+     * `CombatResolved.attackerWinPct` for that attacker, and `battleWinPctOf` turns it into
+     * the battle's chance. What the group number buys is that **a stack may attack where a
+     * lone unit must not**: the individual floors above stay the rule for a soldier that
+     * attacks by itself, and this is the rule for a soldier that attacks with the army.
+     *
+     * The shipped default is **even money on the first assault**. Lower and a stack that is
+     * merely numerous walks into a fortified walled city — which, with a lone archer's true
+     * chance against one at 16 %, means five archers at 58 % and one at 16 %; higher and an
+     * army that has arrived in force still stands outside, because the individual floors it
+     * is otherwise held to (`attackWinFloorVsWalledCityPct`, 65) are unreachable against a
+     * walled city for every unit in the shipped catalog. It is a **lower bound** on the
+     * siege, not the siege: the attacks that fail also land `damagePerRound` on the defender
+     * (the engine says so in `CombatResolved.defenderLost`), so a wave of three kills a
+     * three-hit-point garrison outright whatever the dice do. Erring low is still the safe
+     * direction, which is why the group's chance is floored rather than rounded.
+     */
+    readonly siegeAssaultFloorPct: number;
   };
 
   /** What the AI does with units that have nothing to fight or build. */
@@ -538,6 +588,9 @@ export const SMART_WEIGHTS: SmartWeights = {
     maxStepsPerUnit: 8,
     huntRadius: 6,
     standAndFortifyRatioPct: 150,
+    siegeRadius: 3,
+    siegeForceRatioPct: 150,
+    siegeAssaultFloorPct: 50,
   },
   exploration: {
     minRevealPerStep: 0,
@@ -695,6 +748,10 @@ export const mergeSmartWeights = (patch: SmartWeightsPatch = {}): SmartWeights =
       huntRadius: patch.military?.huntRadius ?? base.military.huntRadius,
       standAndFortifyRatioPct:
         patch.military?.standAndFortifyRatioPct ?? base.military.standAndFortifyRatioPct,
+      siegeRadius: patch.military?.siegeRadius ?? base.military.siegeRadius,
+      siegeForceRatioPct: patch.military?.siegeForceRatioPct ?? base.military.siegeForceRatioPct,
+      siegeAssaultFloorPct:
+        patch.military?.siegeAssaultFloorPct ?? base.military.siegeAssaultFloorPct,
     },
     exploration: {
       minRevealPerStep: patch.exploration?.minRevealPerStep ?? base.exploration.minRevealPerStep,

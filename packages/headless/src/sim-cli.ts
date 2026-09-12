@@ -1885,22 +1885,69 @@ const overrideFailureLine = (
  * the renderer: the renderer pads columns, prints stored numbers, and nothing else.
  * ------------------------------------------------------------------ */
 
-/** The seeds a tournament plays when `--seeds` is absent: A3's twenty-seed tournament. */
-const DEFAULT_TOURNAMENT_SEED_SPEC = '1..20';
+/**
+ * The seeds a tournament plays when `--seeds` is absent: **two games**.
+ *
+ * ## Why the default is small, and what the large run costs
+ *
+ * The M7 command shipped with A3's twenty-seed experiment as its default, which made
+ * `civts run` — the plainest verb this CLI has, and one that used to print "the M7 self-play
+ * harness is not built yet" — start a **nine-minute** job (measured: 26.0 s per game at a
+ * hundred turns; see `A3_TOURNAMENT_TURNS`). A default is what happens when nobody decided
+ * anything, so the thing it does by accident has to be cheap and *stated*: two games is
+ * seconds, and two games is also the shortest experiment whose seat rotation completes with
+ * the default two seats (`seatPlan`: over `n` games every one of `n` policies plays every
+ * seat). A one-game default would report a rotation that had not happened.
+ *
+ * A3's experiment is asked for **explicitly** — it is not gone, it is no longer implicit:
+ *
+ * ```
+ *   civts tournament --seeds 1..20 --turns 100
+ *   pnpm tournament:evidence        # the same run, with the structured result and wall time
+ * ```
+ *
+ * The flags and the report are the same either way: the report always states the seed spec and
+ * the horizon it used, so a two-game smoke run can never be mistaken for the twenty-seed one.
+ */
+export const DEFAULT_TOURNAMENT_SEED_SPEC = '1..2';
 
 /**
- * Turns per game when `--turns` is absent.
+ * Turns per game when `--turns` is absent: **ten**.
  *
- * A tournament is about a *game*, not a probe: the AI has to settle, expand, research,
- * build and fight, and a horizon too short to reach those measures the opening instead of
- * the strategy. A hundred turns is a complete arc at this engine's scale — the real policy
- * has founded its cities, worked its land, finished its early tech tree and fielded an army
- * well inside it — and it is why the default run takes minutes rather than seconds, which
- * `--help` says in as many words. Two hundred turns is affordable too, at roughly twice the
- * cost per game; `--turns` moves the horizon, and the report always states the one it used,
- * so two runs cannot be compared by accident.
+ * A smoke horizon, not a full game. It is enough for the real AI to settle, put its first
+ * cities to work and open its research — the machinery the command exists to drive — and it is
+ * short enough that the default run finishes in seconds, which is the property that matters
+ * for a default. A run that measures *strategy* wants a full arc and says so with `--turns`;
+ * see `A3_TOURNAMENT_TURNS`, which is the horizon the milestone's evidence uses.
  */
-const DEFAULT_TOURNAMENT_TURNS = 100;
+export const DEFAULT_TOURNAMENT_TURNS = 10;
+
+/**
+ * A3's seed set: the twenty seeds the alpha acceptance line names.
+ *
+ * Exported, and printed in `--help`, so that "the large run must be asked for" is a *stated*
+ * requirement rather than a missing default: a reader who wants the evidence run is told the
+ * exact flags, and `scripts/tournament-evidence.ts` runs precisely this.
+ */
+export const A3_TOURNAMENT_SEED_SPEC = '1..20';
+
+/**
+ * A3's horizon: a hundred turns.
+ *
+ * A tournament is about a *game*, not a probe: the AI has to settle, expand, research, build
+ * and fight, and a horizon too short to reach those measures the opening instead of the
+ * strategy. A hundred turns is a complete arc at this engine's scale — the real policy has
+ * founded its cities, worked its land, finished its early tech tree and fielded an army well
+ * inside it. It is expensive, which is exactly why it is not the default: **measured at 26.0 s
+ * per game** by the M7b evidence run, so A3's twenty seeds cost about **8.7 minutes** (519.4 s
+ * wall, bracketed externally by `scripts/tournament-evidence.ts`, which also prints the two
+ * clocks — they agreed to 0.01 %). The M7 adversarial review measured the same experiment
+ * independently at 527.3 s / 26.4 s per game, which is the same number within noise. Two
+ * hundred turns is affordable too, at roughly twice the cost per game; `--turns` moves the
+ * horizon, and the report always states the one it used, so two runs cannot be compared by
+ * accident.
+ */
+export const A3_TOURNAMENT_TURNS = 100;
 
 /**
  * The seat list when `--seats` is absent: the real AI in **every** seat.
@@ -1919,7 +1966,7 @@ export const TOURNAMENT_USAGE = `usage: civts tournament [--seeds <spec>] [--sea
                             [--override <section>.<id>.<field>=<value>]...
                             [--fault <name>]... [--json]
 
-  --seeds <spec>      which games to play: a list, ranges, or both — "1..20", "3", "1,4,7"
+  --seeds <spec>      which games to play: a list, ranges, or both — "1..2", "3", "1,4,7"
                       (default ${DEFAULT_TOURNAMENT_SEED_SPEC}; ascending; a seed listed twice is played
                       twice, and the two plays are different seatings)
   --seats <list>      the policy for each seat, left to right: "smart,none", or
@@ -1927,9 +1974,7 @@ export const TOURNAMENT_USAGE = `usage: civts tournament [--seeds <spec>] [--sea
                       ${SIM_POLICIES.join('|')} (default: ${DEFAULT_TOURNAMENT_SEAT} in every seat)
   --map-size <size>   one of ${MAP_SIZES.join('|')} (default tiny)
   --civs <int>        civilizations per game — which is also the number of seats (default 2)
-  --turns <int>       turns to play per game, at least 1 (default ${String(DEFAULT_TOURNAMENT_TURNS)}, a full game at this
-                      engine's scale — so the default run takes minutes, because the real
-                      AI decides every turn; a small --turns is a quick check)
+  --turns <int>       turns to play per game, at least 1 (default ${String(DEFAULT_TOURNAMENT_TURNS)})
   --budget-ms <int>   the budget the whole run is judged against, in milliseconds
                       (default ${String(DEFAULT_TOURNAMENT_BUDGET_MS)}). A run that exceeds it SAYS SO and still plays
                       every seed: the seed set is never trimmed to fit a budget
@@ -1943,6 +1988,18 @@ export const TOURNAMENT_USAGE = `usage: civts tournament [--seeds <spec>] [--sea
                       two: the measured elapsed time, and — when a run is over budget — the
                       amount it is over by, which is derived from it. Those two are the
                       harness's own measurement, and nothing about a game depends on them
+
+THE DEFAULT RUN IS SMALL ON PURPOSE: ${DEFAULT_TOURNAMENT_SEED_SPEC} is two games of
+${String(DEFAULT_TOURNAMENT_TURNS)} turns — seconds, not minutes — because "run" and "tournament" are the same
+command and a plain invocation must not start an experiment nobody asked for. A3's experiment,
+the twenty seeds of a hundred turns the acceptance line names, costs about NINE MINUTES
+(measured at 26.0 s per game, 519 s wall) and is therefore asked for EXPLICITLY:
+
+  civts tournament --seeds ${A3_TOURNAMENT_SEED_SPEC} --turns ${String(A3_TOURNAMENT_TURNS)}
+  pnpm tournament:evidence        the same run, printing the structured result and wall time
+
+Both are the same command; only the horizon differs, and the report always states the one it
+used, so a smoke run cannot be mistaken for the evidence run.
 
 Seats ROTATE. In game i, seat s is played by seat-list entry (s + i) mod seats, so over
 enough games every policy plays every seat, and no strategy is ever measured from one
@@ -2128,7 +2185,7 @@ export interface TournamentParameters {
   readonly maxTurns: number;
   /** The policy names by seat, left to right — the list the rotation permutes. */
   readonly seats: readonly string[];
-  /** The seed spec as typed (`1..20`), for the report's own provenance. */
+  /** The seed spec as typed (`1..2` by default, `1..20` for A3's run), for the report's own provenance. */
   readonly seedSpec: string;
   /** The seeds actually played, ascending. */
   readonly seeds: readonly number[];

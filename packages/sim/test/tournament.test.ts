@@ -21,9 +21,11 @@
  * 5. **The clock cannot reach a game.** The same tournament run under two wildly different
  *    clocks produces identical games, totals and violations; only the timing fields move.
  *
- * The fast tier keeps the small tournaments (a handful of games, four to six turns); the
- * twenty-seed tournament of the real AI, which is what A3's acceptance line asks for, is
- * behind the FULL tier marker with the cost it was measured at.
+ * The fast tier keeps the small tournaments (a handful of games, four to six turns), and the
+ * full tier keeps one smoke tournament of the *real* policy — four seeds at twenty-five turns.
+ * A3's twenty-seed run is **evidence, not a gate test**: it measured 417 s for twenty games at
+ * sixty turns (M7b, on a quiet machine), so it lives in `scripts/tournament-evidence.ts` and is
+ * asked for explicitly.
  */
 
 import { DEFAULT_SETTINGS, civPlayers, type Settings } from '@civts/core';
@@ -593,33 +595,41 @@ describe('a tournament refuses arguments that would produce a plausible wrong re
 });
 
 /* ------------------------------------------------------------------ *
- * The twenty-seed tournament (FULL tier)
+ * The smoke self-play tournament, on the real AI (FULL tier)
  * ------------------------------------------------------------------ */
 
-describe('the twenty-seed self-play tournament', () => {
-  // Full tier: A3's acceptance line is a twenty-seed tournament with ZERO invariant
-  // violations inside a stated budget, and that is a claim about the real policy playing
-  // real games — far too slow for the fast gate, and exactly the class of evidence the full
-  // tier exists for. Measured while this was written: ~100 s for the twenty games on an idle
-  // machine, ~400 s on one shared with other work, so the run is given a stated fifteen
-  // minutes and a timeout that is only a backstop — the *budget verdict* is what decides,
-  // and it is printed by the test rather than only written down here.
+describe('a smoke self-play tournament of the real AI', () => {
+  // **Why this is four seeds at twenty-five turns and not A3's twenty at a hundred.**
+  //
+  // It was twenty seeds at sixty turns, documented at "~100 s on an idle machine". M7b measured
+  // that same run on a quiet machine at **417 s** — 4.2× the comment — which was 85 % of the
+  // entire full tier's 489 s. A gate test that is most of the gate, on a claim that had already
+  // gone stale by a factor of four, is the wrong place for the experiment: the twenty-seed
+  // tournament is EVIDENCE, and it now runs deliberately in `scripts/tournament-evidence.ts`
+  // (`pnpm tournament:evidence`, twenty seeds at A3's hundred turns, ~26 s per game, ~9 min),
+  // where its structured result and wall time are printed as evidence.
+  //
+  // What stays here is what a gate should own: the machinery, end to end, on the *real* policy
+  // rather than a stub — every seed played, the seats rotated, the clock read exactly twice, the
+  // budget verdict honest, and no invariant violated. The violations-surfacing half of that
+  // claim is proved elsewhere in this file by injected faults, which cost nothing.
+  const SMOKE_SEEDS = 4;
+  const SMOKE_TURNS = 25;
+  // Stated, not implied: twelve times the measured cost of the four games, so a contended
+  // machine does not turn this red, and a real regression in per-turn cost still trips it.
+  const SMOKE_BUDGET_MS = 120_000;
+
   it.skipIf(!FULL_TIER)(
-    'plays twenty games of self-play with zero violations, inside its budget, every seat played',
+    'plays four games of self-play with zero violations, inside its budget, every seat played',
     () => {
-      const seeds = Array.from({ length: 20 }, (_, index) => index + 1);
+      const seeds = Array.from({ length: SMOKE_SEEDS }, (_, index) => index + 1);
       const result = runTournament({
         seeds,
         settings: { ...DEFAULT_SETTINGS, seed: 1, mapSize: 'tiny', civCount: 2 },
         ruleset: RULESET,
         policies: [SMART_POLICY, SMART_POLICY],
-        maxTurns: 60,
-        // A stated budget, so the verdict means something: fifteen minutes against a
-        // measured ~100 s on an idle machine and ~400 s when the machine was shared. It is
-        // deliberately loose — the AI's decision work dominates a tournament by orders of
-        // magnitude, and this gate may run beside other work — and its purpose is to be a
-        // bound a real regression trips, not a benchmark.
-        budgetMs: 900_000,
+        maxTurns: SMOKE_TURNS,
+        budgetMs: SMOKE_BUDGET_MS,
       });
       const verdict = tournamentVerdict(result);
 
@@ -630,38 +640,40 @@ describe('the twenty-seed self-play tournament', () => {
       expect(verdict.violatingGames).toBe(0);
       // Every game ran its whole horizon: a tournament whose games stopped early would be
       // measuring a shorter game than the one it reports.
-      expect(new Set(result.games.map((game) => game.turnsPlayed))).toStrictEqual(new Set([60]));
+      expect(new Set(result.games.map((game) => game.turnsPlayed))).toStrictEqual(
+        new Set([SMOKE_TURNS]),
+      );
       expect(new Set(result.games.map((game) => game.stoppedBecause))).toStrictEqual(
         new Set(['max-turns']),
       );
       // The budget, reported honestly: inside a budget it was told about, and the two
       // fields agree with each other.
-      expect(result.budgetMs).toBe(900_000);
+      expect(result.budgetMs).toBe(SMOKE_BUDGET_MS);
       expect(result.withinBudget).toBe(true);
       expect(result.elapsedMs).toBeLessThanOrEqual(result.budgetMs);
       expect(verdict.accepted).toBe(true);
 
-      // Rotation over twenty games with two seats: both policies everywhere.
+      // Rotation over four games with two seats: both policies everywhere.
       for (const policy of result.totals.policies) {
         expect(policy.seatGames.filter((games) => games > 0)).toHaveLength(2);
-        expect(policy.seatGames.reduce((total, games) => total + games, 0)).toBe(20);
+        expect(policy.seatGames.reduce((total, games) => total + games, 0)).toBe(SMOKE_SEEDS);
       }
 
       // Non-vacuity, and not a content pin: the AI really played, so the tournament is
-      // measuring games rather than twenty idle worlds.
+      // measuring games rather than four idle worlds.
       const first = result.totals.policies[0];
       if (first === undefined) throw new Error('the tournament reported no policy totals');
       expect(aggregateOf(first.aggregates, 'cities').sum).toBeGreaterThan(0);
-      expect(result.totals.metricRows).toBeGreaterThan(20 * 10);
+      expect(result.totals.metricRows).toBeGreaterThan(SMOKE_SEEDS * 10);
 
       console.log(
-        `20-seed self-play at 60 turns: ${result.elapsedMs.toFixed(0)}ms of ` +
+        `smoke self-play at ${String(SMOKE_TURNS)} turns: ${result.elapsedMs.toFixed(0)}ms of ` +
           `${String(result.budgetMs)}ms budget, ${String(result.totals.metricRows)} metric rows, ` +
           `seat games ${JSON.stringify(result.totals.policies.map((policy) => policy.seatGames))}`,
       );
     },
-    // A backstop only: 25 minutes, so that a run which is *slow* reports an honest budget
+    // A backstop only: five minutes, so that a run which is *slow* reports an honest budget
     // verdict instead of being cut off by the runner before it can say anything.
-    1_500_000,
+    300_000,
   );
 });

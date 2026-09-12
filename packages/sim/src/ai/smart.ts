@@ -436,19 +436,34 @@ const battleWinPctOf = (
   // truncated at the `survivable`-th failure — because a battle lost at that point is no
   // longer a win. The accumulator below is that sum term by term: `cumulative` is the
   // running `C(needed - 1 + r, r) * q^r` (built by the standard ratio between consecutive
-  // terms), and `p * cumulative` is the term itself.
+  // terms), and `p ** needed * cumulative` is the term itself.
+  //
+  // **`p ** needed`, and the exponent is the whole correctness of this function.** It was
+  // written as `p` once — the last hit's probability instead of the whole run of them — and
+  // that single missing exponent made every attack against a defender with more than one hit
+  // point look better than it is, up to a flat **100 %** where the truth was **16 %**
+  // (per-round 30 %, three hit points each way: the real negative binomial is
+  // `0.3³·(1 + 3·0.7 + 6·0.49) = 16 %`, and the old accumulator returned
+  // `0.3·(1 + 2.1 + 2.94) = 181 %`, clamped to 100). For a `needed` of exactly one the two
+  // spellings coincide, which is why the bug survived: a one-hit-point defender is the only
+  // case where it does not matter, and it is the case a hand-checked example tends to use. So
+  // the AI cleared its own `attackWinFloorPct` with units it was about to lose, which is
+  // exactly the thing this policy exists not to do, and the fix is the exponent.
   //
   // Both counts matter, and an earlier version of this file used only the defender's: the
   // tail loop ran to `needed`, so it computed `1 - q^survivable` extended past the point
   // where the attacker was already dead — for a 4-hit-point attacker against a 1-hit-point
-  // defender at even odds it answered **65%** where the true answer is **34%**. The clipped
-  // version below agrees with the exact `BigInt` oracle in `ai.test.ts` across the whole
-  // grid of odds and hit points the shipped catalog can produce.
+  // defender at even odds it answered **65 %** where the true answer is **34 %**. The clipped
+  // version below is pinned against the exact `BigInt` oracle in `ai.test.ts` **through the
+  // policy's own decisions** rather than through a copy of this arithmetic: the test builds
+  // worlds whose battle is exactly one the oracle prices, runs the shipped policy on them,
+  // and requires the attack to be made if and only if the oracle clears the floor. A test
+  // that restated this sum would have agreed with the bug above, and did.
   let cumulative = 1;
   let total = 0;
   for (let r = 0; r < survivable; r += 1) {
     if (cumulative <= 1e-300) break;
-    total += cumulative * p;
+    total += cumulative * p ** needed;
     cumulative *= ((needed + r) / (r + 1)) * (1 - p);
   }
   // Truncated, not rounded: a battle at 99.6% is not a certainty, and rounding it up to
@@ -1387,10 +1402,38 @@ const searchStateFor = (engine: Engine, unit: Unit, tile: TileIndex): GameState 
   units: [{ ...unit, tile }],
 });
 
-const stepsToTile = (engine: Engine, unit: Unit, goal: number): readonly TileIndex[] => {
+/**
+ * The fewest-steps route from `unit` toward `goal`, or an empty list when there is none.
+ *
+ * `beside` is the whole of what M7's siege work added here, and it is a rule of the engine
+ * rather than a convenience: **the tile an enemy stands on, and the tile an enemy city stands
+ * on, are not enterable** — `planMove` refuses both with `occupied-by-enemy`, because the
+ * command that answers them is `AttackUnit`. A route search that only ever accepted the goal
+ * tile itself therefore had **no route to any enemy, ever**: on a duel map the army walked to
+ * within two tiles of a city and stopped there for the rest of the game, because the only
+ * tiles the search would accept were the one tile it is never allowed to stand on. With
+ * `beside` the search accepts any tile **orthogonally or diagonally adjacent** to the goal, so
+ * "march on the city" means "arrive where you can attack it" and the route goes round
+ * obstacles exactly as it does for a tile the unit may enter.
+ *
+ * The goal tiles are built once, and `start` counts as arrived, so a unit already in contact
+ * is asked for no step at all rather than being sent round the block.
+ */
+const stepsToTile = (
+  engine: Engine,
+  unit: Unit,
+  goal: number,
+  beside: boolean,
+): readonly TileIndex[] => {
   const bare = searchStateFor(engine, unit, unit.tile);
   const start = Number(unit.tile);
-  if (start === goal) return [];
+  const goals = new Set<number>([goal]);
+  if (beside) {
+    for (const tile of neighbors8(engine.state.map, asTile(engine.state, goal))) {
+      goals.add(Number(tile));
+    }
+  }
+  if (goals.has(start)) return [];
   const cameFrom = new Map<number, number>();
   const seen = new Set<number>([start]);
   const queue: number[] = [start];
@@ -1408,7 +1451,7 @@ const stepsToTile = (engine: Engine, unit: Unit, goal: number): readonly TileInd
       if (seen.has(to)) continue;
       seen.add(to);
       cameFrom.set(to, at);
-      if (to === goal) {
+      if (goals.has(to)) {
         reached = to;
         break;
       }
@@ -1430,25 +1473,38 @@ const stepsToTile = (engine: Engine, unit: Unit, goal: number): readonly TileInd
 };
 
 /** The cached route from `unit` toward `target`, or an empty list when there is none. */
-const routeTo = (engine: Engine, unit: Unit, target: TileIndex): readonly TileIndex[] => {
+const routeTo = (
+  engine: Engine,
+  unit: Unit,
+  target: TileIndex,
+  beside: boolean,
+): readonly TileIndex[] => {
   const goal = Number(target);
   let byUnit = routeCache.get(engine.state);
   if (byUnit === undefined) {
     byUnit = new Map<string, readonly TileIndex[]>();
     routeCache.set(engine.state, byUnit);
   }
-  const key = `${String(unit.id)}:${String(goal)}`;
+  // `beside` is part of the key because it is part of the question: "the tile" and "a tile
+  // beside it" are two different routes, and a cache that could not tell them apart would hand
+  // a siege the route it computed for something else.
+  const key = `${String(unit.id)}:${String(goal)}:${beside ? 'beside' : 'on'}`;
   const cached = byUnit.get(key);
   if (cached !== undefined) return cached;
-  const path = stepsToTile(engine, unit, goal);
+  const path = stepsToTile(engine, unit, goal, beside);
   byUnit.set(key, path);
   return path;
 };
 
 /** The first step of the cached route from `unit` toward `target`, or `undefined`. */
-const firstRouteStep = (engine: Engine, unit: Unit, target: TileIndex): TileIndex | undefined => {
+const firstRouteStep = (
+  engine: Engine,
+  unit: Unit,
+  target: TileIndex,
+  beside: boolean,
+): TileIndex | undefined => {
   if (Number(unit.tile) === Number(target)) return undefined;
-  const route = routeTo(engine, unit, target);
+  const route = routeTo(engine, unit, target, beside);
   if (route.length === 0) return undefined;
   // A route is a cached fact about a *state*, and the unit may already have moved within this
   // turn: if the next tile is no longer where the route expects it, re-search rather than walk
@@ -1460,8 +1516,13 @@ const firstRouteStep = (engine: Engine, unit: Unit, target: TileIndex): TileInde
 };
 
 /** The command that takes `unit` one step along its route, if the route exists. */
-const routeStep = (engine: Engine, unit: Unit, target: TileIndex): MoveCommand | undefined => {
-  const next = firstRouteStep(engine, unit, target);
+const routeStep = (
+  engine: Engine,
+  unit: Unit,
+  target: TileIndex,
+  beside: boolean,
+): MoveCommand | undefined => {
+  const next = firstRouteStep(engine, unit, target, beside);
   if (next === undefined) return undefined;
   return unitActions(engine.state, engine.ruleset, unit.id)
     .filter(isMove)
@@ -1595,6 +1656,21 @@ interface AttackChoice {
   readonly capture: boolean;
 }
 
+/** Everything the engine said about one `AttackUnit` candidate — see `readAssault`. */
+interface AssaultRead {
+  readonly command: AttackCommand;
+  /** The engine's per-round odds for this attack, in whole percent. */
+  readonly perRoundPct: number;
+  /** The probability the attacker wins the whole battle, in whole percent. */
+  readonly winPct: number;
+  /** `true` when the engine's own fold reported a `CityCaptured` — an undefended city. */
+  readonly capture: boolean;
+  /** The unit the engine would resolve the attack against; absent for a capture. */
+  readonly defender: Unit | undefined;
+  /** Whether the target tile holds an enemy city, and whether that city holds walls. */
+  readonly kind: { readonly inCity: boolean; readonly walled: boolean };
+}
+
 /**
  * Whether the tile holding the defender is a city, and — when it is — whether that city
  * holds **defensive walls**.
@@ -1616,52 +1692,43 @@ const targetKind = (
 };
 
 /**
- * The best attack `unit` may make, or `undefined` when it may make none worth making.
+ * Fold one `AttackUnit` candidate through the engine's own applier and read what the engine
+ * said about it.
  *
- * Every candidate comes from `unitActions` and every one is **folded through
- * `applyCommand`** on the scratch state: what is read off the fold is the engine's own
- * `CombatResolved.attackerWinPct` and its own `CityCaptured`. Nothing about the odds is
- * recomputed from the ruleset — no attack strength, no terrain bonus, no fortification, no
- * wall bonus, no veteran bonus — and what is deliberately **not** read off the fold is the
- * *result* (`attackerSurvives`, the losses): a policy with perfect foresight plays a game
- * no balance sweep is measuring. The fold advances a copy of the RNG that goes nowhere;
- * the chosen attack is applied again, once, on the real fold.
+ * **The one place an assault is priced**, so the policy cannot hold two opinions about the
+ * same attack. What comes back is the engine's own `CombatResolved.attackerWinPct` and its
+ * own `CityCaptured`, plus the defender the engine would resolve against and whether that
+ * defender stood in a city (and a walled one) — the two facts that choose which floor
+ * applies. Nothing about the odds is recomputed from the ruleset here: no attack strength,
+ * no terrain bonus, no fortification, no wall bonus, no veteran bonus.
  *
- * The decision is `battleWinPctOf` — the battle's probability, derived from the engine's
- * per-round number — against a threshold chosen by **what is being attacked**: an open
- * unit, a unit inside a city, a unit inside a walled city, or a barbarian. A capture (an
- * undefended city) has no defender to lose to and is always taken.
+ * The fold advances a **copy** of the state and its RNG; neither goes anywhere. A refused
+ * candidate — one `unitActions` advertised but the applier rejects, which is the
+ * command-vs-generator check this project keeps making — reads as `undefined` and is
+ * dropped rather than trusted.
  */
-const bestAttack = (engine: Engine, unit: Unit): AttackChoice | undefined => {
-  const weights = engine.weights.military;
-  let best: AttackChoice | undefined;
+const readAssault = (
+  engine: Engine,
+  unit: Unit,
+  command: AttackCommand,
+): AssaultRead | undefined => {
+  const outcome = applyCommand(engine.state, engine.playerId, command, engine.ruleset);
+  if (!outcome.ok) return undefined;
 
-  for (const command of unitActions(engine.state, engine.ruleset, unit.id)) {
-    if (command.type !== 'AttackUnit') continue;
-    const outcome = applyCommand(engine.state, engine.playerId, command, engine.ruleset);
-    if (!outcome.ok) continue;
+  const resolved = outcome.value.events.find(
+    (event): event is Extract<GameEvent, { type: 'CombatResolved' }> =>
+      event.type === 'CombatResolved',
+  );
+  const capture = outcome.value.events.some((event) => event.type === 'CityCaptured');
+  const defender = unitsOnTile(engine.state, command.target).find(
+    (other) => other.owner !== engine.playerId,
+  );
+  const perRoundPct = resolved?.attackerWinPct ?? 0;
 
-    const resolved = outcome.value.events.find(
-      (event): event is Extract<GameEvent, { type: 'CombatResolved' }> =>
-        event.type === 'CombatResolved',
-    );
-    const captured = outcome.value.events.some((event) => event.type === 'CityCaptured');
-    const defender = unitsOnTile(engine.state, command.target).find(
-      (other) => other.owner !== engine.playerId,
-    );
-    const kind = targetKind(engine, command.target);
-
-    let required = weights.attackWinFloorPct;
-    if (defender !== undefined && isBarbarian(engine.state, defender.owner)) {
-      required = weights.attackWinFloorVsBarbarianPct;
-    } else if (kind.walled) {
-      required = weights.attackWinFloorVsWalledCityPct;
-    } else if (kind.inCity) {
-      required = weights.attackWinFloorVsCityPct;
-    }
-
-    const perRoundPct = resolved?.attackerWinPct ?? 0;
-    const winPct =
+  return {
+    command,
+    perRoundPct,
+    winPct:
       defender === undefined
         ? 100
         : battleWinPctOf(
@@ -1669,22 +1736,90 @@ const bestAttack = (engine: Engine, unit: Unit): AttackChoice | undefined => {
             hitPointsOf(unit),
             hitPointsOf(defender),
             combatRulesOf(engine.ruleset).damagePerRound,
-          );
+          ),
+    capture,
+    defender,
+    kind: targetKind(engine, command.target),
+  };
+};
 
-    if (!captured && winPct < required) continue;
+/**
+ * The battle-win chance this attack has to clear **on its own** — the floor the target's
+ * kind sets.
+ *
+ * A soldier attacking by itself is held to this. A soldier attacking as one member of a
+ * committed assault group is not: see `stormedCities`, which is where the group's own
+ * chance is the number that was checked.
+ */
+const attackFloorPct = (engine: Engine, read: AssaultRead): number => {
+  const weights = engine.weights.military;
+  if (read.defender !== undefined && isBarbarian(engine.state, read.defender.owner)) {
+    return weights.attackWinFloorVsBarbarianPct;
+  }
+  if (read.kind.walled) return weights.attackWinFloorVsWalledCityPct;
+  if (read.kind.inCity) return weights.attackWinFloorVsCityPct;
+  return weights.attackWinFloorPct;
+};
 
-    const choice: AttackChoice = { command, perRoundPct, winPct, capture: captured };
+/**
+ * The best attack `unit` may make, or `undefined` when it may make none worth making.
+ *
+ * Every candidate comes from `unitActions` and every one is **folded through
+ * `applyCommand`** on the scratch state (`readAssault`): what is read off the fold is the
+ * engine's own `CombatResolved.attackerWinPct` and its own `CityCaptured`. What is
+ * deliberately **not** read off the fold is the *result* (`attackerSurvives`, the losses):
+ * a policy with perfect foresight plays a game no balance sweep is measuring.
+ *
+ * The decision is `battleWinPctOf` — the battle's probability, derived from the engine's
+ * per-round number — against a threshold chosen by **what is being attacked**: an open
+ * unit, a unit inside a city, a unit inside a walled city, or a barbarian. A capture (an
+ * undefended city) has no defender to lose to and is always taken. A city that this AI's
+ * army has **committed to storming this turn** is an exception to the per-attack floors,
+ * and only that: `stormedCities` has already asked the engine for every member's odds and
+ * required the *group's* chance to clear `siegeAssaultFloorPct`.
+ */
+const bestAttack = (engine: Engine, unit: Unit): AttackChoice | undefined => {
+  const stormed = stormedCities(engine);
+  let best: AttackChoice | undefined;
+  let bestIsStorm = false;
+
+  for (const command of unitActions(engine.state, engine.ruleset, unit.id)) {
+    if (command.type !== 'AttackUnit') continue;
+    const read = readAssault(engine, unit, command);
+    if (read === undefined) continue;
+
+    const storm = !read.capture && stormed.has(Number(command.target));
+    if (!read.capture && !storm && read.winPct < attackFloorPct(engine, read)) continue;
+
+    const choice: AttackChoice = {
+      command,
+      perRoundPct: read.perRoundPct,
+      winPct: read.winPct,
+      capture: read.capture,
+    };
     if (best === undefined) {
       best = choice;
+      bestIsStorm = storm;
       continue;
     }
-    // Taking a city outranks any battle; among battles, the safer one wins, and the
-    // engine's per-round number breaks a tie. The comparison is *asymmetric* on purpose —
-    // a capture displaces anything, a battle only displaces another battle.
-    const displace = best.capture
-      ? false
-      : captured ||
-        compareRanks([choice.winPct, choice.perRoundPct], [best.winPct, best.perRoundPct]) > 0;
+    // Taking a city outranks any battle; a committed assault outranks a battle the AI
+    // merely happens to like better. Among equals the safer fight wins, and the engine's
+    // per-round number breaks a tie. The comparisons are *asymmetric* on purpose: a higher
+    // rank displaces, a lower one never does.
+    if (best.capture) continue;
+    if (read.capture) {
+      best = choice;
+      bestIsStorm = false;
+      continue;
+    }
+    if (bestIsStorm && !storm) continue;
+    if (storm && !bestIsStorm) {
+      best = choice;
+      bestIsStorm = true;
+      continue;
+    }
+    const displace =
+      compareRanks([choice.winPct, choice.perRoundPct], [best.winPct, best.perRoundPct]) > 0;
     if (displace) best = choice;
   }
 
@@ -1801,6 +1936,202 @@ const nearestHostile = (engine: Engine, unit: Unit): TileIndex | undefined => {
 };
 
 /* ------------------------------------------------------------------ *
+ * Sieges — the force for a city, and the group that storms it
+ * ------------------------------------------------------------------ */
+
+/**
+ * The nearest enemy city this player's map knows about — the army's strategic objective when
+ * there is nothing to chase.
+ *
+ * Read off `state.cities` (every city in the world, whose owner this player can see) and not
+ * off the fog: a city is a permanent fact about the map, and "march on the rival's capital" is
+ * a decision a player makes with an atlas, not with a scout's last report. The fog governs
+ * *what a unit can see this turn*, which is what `hostileTiles` is for; it does not make a
+ * known city unknown again.
+ */
+const nearestKnownEnemyCity = (engine: Engine, unit: Unit): TileIndex | undefined => {
+  let best: { readonly tile: TileIndex; readonly distance: number } | undefined;
+  for (const city of engine.state.cities) {
+    if (city.owner === engine.playerId) continue;
+    const distance = tileDistance(engine.state, unit.tile, city.tile);
+    if (best === undefined || distance < best.distance) best = { tile: city.tile, distance };
+  }
+  return best?.tile;
+};
+
+/**
+ * The chance that **at least one** of these attacks takes the city, in whole percent, from the
+ * engine's own per-attack numbers.
+ *
+ * `1 - Π(1 - pᵢ)` is exactly the chance that a group all of whose members attack wins at
+ * least once — and it is a **lower bound** on the truth for a siege, because every `pᵢ` is
+ * priced against the defender as it stands *before* the assault, where the real sequence only
+ * gets better: each attack that fails has already taken hit points off the defender, and the
+ * next attacker is resolved against the wounded one. Understating the group is the direction
+ * this AI must err in.
+ *
+ * The miss is accumulated in whole percent and rounded **up** (`Math.ceil`), so the number
+ * that comes out is never larger than the truth — the same rule as `exactBattleWinPct`'s
+ * truncation in `ai.test.ts`, in the direction that refuses a fight rather than talking one up.
+ * Every input is an integer percentage, so the accumulation is exact integer arithmetic: a
+ * step multiplies two values no larger than `100`, and the result is divided back by `100`.
+ */
+const groupChancePct = (chances: readonly number[]): number => {
+  let misses = 100;
+  for (const raw of chances) {
+    const chance = Math.max(0, Math.min(100, Math.floor(raw)));
+    misses = Math.ceil((misses * (100 - chance)) / 100);
+  }
+  return 100 - misses;
+};
+
+/**
+ * The **hit points** this player could bring against `city`: every soldier within
+ * `siegeRadius` of it, plus every soldier whose nearest known enemy city **is** it.
+ *
+ * Hit points and not a head count, because that is what the engine's own `hitPointsLeftOf`
+ * says a force is worth, and a stack of wounded units is not the force a stack of fresh ones
+ * is. The second clause is the one that makes a siege a *plan* rather than a coincidence: the
+ * army is counted as committed to the city it is already marching on (`nearestKnownEnemyCity`
+ * is the same reading the march uses), so a siege can be decided while the troops are still on
+ * their way — otherwise the test could only ever be passed by troops that had already arrived,
+ * and no unit would ever set out.
+ */
+const assaultHitPoints = (engine: Engine, city: City): number => {
+  const radius = engine.weights.military.siegeRadius;
+  let total = 0;
+  for (const unit of ownedUnits(engine)) {
+    const def = unitDef(engine.ruleset, unit.type);
+    if (def === undefined || def.role !== 'military' || def.attack <= 0) continue;
+    const near = tileDistance(engine.state, unit.tile, city.tile) <= radius;
+    const marching = Number(nearestKnownEnemyCity(engine, unit)) === Number(city.tile);
+    if (near || marching) total += hitPointsOf(unit);
+  }
+  return total;
+};
+
+/** The hit points standing **on** `city`'s tile and owned by someone else — its garrison. */
+const garrisonHitPoints = (engine: Engine, city: City): number => {
+  let total = 0;
+  for (const unit of unitsOnTile(engine.state, city.tile)) {
+    if (unit.owner === engine.playerId) continue;
+    total += hitPointsOf(unit);
+  }
+  return total;
+};
+
+const siegeForceSlot: TurnCacheSlot<readonly City[]> = {
+  state: undefined,
+  revision: -1,
+  value: undefined,
+};
+
+/**
+ * The enemy cities this player **has the force to besiege**, in `state.cities` order.
+ *
+ * The whole of "besiege a city when it has the force for it", and the reason a knob is needed
+ * at all: the assault force's hit points against the garrison's, through
+ * `siegeForceRatioPct`. An **undefended** city needs no force and passes for any soldier — an
+ * empty city is not a battle, it is a walk, and `bestAttack` takes it the moment a soldier is
+ * beside it.
+ *
+ * Nothing here computes an odd. The comparison is hit points against hit points; the odds are
+ * the engine's, and they are read where they are used (`readAssault`).
+ *
+ * Cached per turn, because every military unit asks the same question on the same state.
+ */
+const besiegeableCities = (engine: Engine): readonly City[] =>
+  cachedForTurn(siegeForceSlot, engine.state, () => {
+    const ratio = engine.weights.military.siegeForceRatioPct;
+    const qualified: City[] = [];
+    for (const city of engine.state.cities) {
+      if (city.owner === engine.playerId) continue;
+      const force = assaultHitPoints(engine, city);
+      if (force <= 0) continue;
+      if (force * 100 < garrisonHitPoints(engine, city) * ratio) continue;
+      qualified.push(city);
+    }
+    return qualified;
+  });
+
+/**
+ * The enemy city `unit` is besieging — the nearest one it has the force for, ties going to the
+ * lower city id because `besiegeableCities` is in `state.cities` order and the comparison is
+ * strict.
+ *
+ * A **shared objective**, in the only sense that matters: the force test is asked of the city
+ * and not of the soldier, so every soldier the player has answers the same question about the
+ * same city and they converge on it. A soldier with `attack: 0` is not part of any siege — it
+ * could not assault the place if it arrived.
+ */
+const siegeTarget = (engine: Engine, unit: Unit): City | undefined => {
+  const def = unitDef(engine.ruleset, unit.type);
+  if (def === undefined || def.attack <= 0) return undefined;
+  let best: { readonly city: City; readonly distance: number } | undefined;
+  for (const city of besiegeableCities(engine)) {
+    const distance = tileDistance(engine.state, unit.tile, city.tile);
+    if (best === undefined || distance < best.distance) best = { city, distance };
+  }
+  return best?.city;
+};
+
+const stormSlot: TurnCacheSlot<ReadonlySet<number>> = {
+  state: undefined,
+  revision: -1,
+  value: undefined,
+};
+
+/**
+ * The tiles of the enemy cities this player's army **storms this turn**, as a set of tile
+ * indices.
+ *
+ * This is what lets a stack attack a city a lone unit must refuse, and it is the second half
+ * of "besiege a city when it has the force for it". The members are the soldiers standing
+ * **beside** the city (the ones the engine would actually resolve an attack from, this turn);
+ * each one's odds are read off the engine's own fold (`readAssault`), and the group's chance is
+ * `groupChancePct` of those numbers against `siegeAssaultFloorPct`.
+ *
+ * Two consequences, both intended and both stated rather than discovered later:
+ *
+ * - **A member attacks on the group's number, not on its own.** A soldier with a 35 % chance
+ *   beside a walled city is not throwing itself away when three others are beside it: the group
+ *   is at 72 %, and every attack that fails has already hurt the defender for the next one.
+ *   That is why `bestAttack` skips the per-attack floor for a storm tile — the floor was asked
+ *   of the group.
+ * - **A city is not stormed by one soldier.** With one attacker the group's chance is that
+ *   attacker's own, so the individual floors above are exactly what it is held to. Measured
+ *   before this rule existed: the AI reached an enemy city's doorstep and stood there for the
+ *   rest of the game, because its own maths correctly said that one archer cannot take a
+ *   fortified walled city and it had no other answer.
+ *
+ * Cached per turn like the force test, and recomputed after every applied command (the cache
+ * is keyed by revision), so an assault that has wounded the defender is re-priced before the
+ * next soldier decides — the group is not committed to a decision the battle has overtaken.
+ */
+const stormedCities = (engine: Engine): ReadonlySet<number> =>
+  cachedForTurn(stormSlot, engine.state, () => {
+    const floor = engine.weights.military.siegeAssaultFloorPct;
+    const stormed = new Set<number>();
+    for (const city of besiegeableCities(engine)) {
+      const chances: number[] = [];
+      for (const unit of ownedUnits(engine)) {
+        const def = unitDef(engine.ruleset, unit.type);
+        if (def === undefined || def.role !== 'military' || def.attack <= 0) continue;
+        if (tileDistance(engine.state, unit.tile, city.tile) !== 1) continue;
+        const read = readAssault(engine, unit, {
+          type: 'AttackUnit',
+          unitId: unit.id,
+          target: city.tile,
+        });
+        if (read === undefined || read.capture) continue;
+        chances.push(read.winPct);
+      }
+      if (groupChancePct(chances) >= floor) stormed.add(Number(city.tile));
+    }
+    return stormed;
+  });
+
+/* ------------------------------------------------------------------ *
  * The turn
  * ------------------------------------------------------------------ */
 
@@ -1815,13 +2146,44 @@ const upkeepOf = (engine: Engine): number => {
   return unitSupport(engine.state, engine.playerId).gold + maintenance;
 };
 
-/** Walk a unit toward `target`, one legal step at a time, within its movement budget. */
+/**
+ * Walk a unit toward `target`, one legal step at a time, within its movement budget.
+ *
+ * `beside` says whether the unit has to *stand on* the target or merely **reach it**: an enemy
+ * unit's tile and an enemy city's tile are both refused by `planMove`, so every walk this
+ * policy makes toward an enemy is a walk to a tile *next to* it (see `stepsToTile`).
+ *
+ * Returns whether the walk **went anywhere**: `true` once a step was applied, or when the unit
+ * already stands where the walk was going. A caller that treats "no step was available" as
+ * "the decision was made" is a caller that parks an army for the rest of the game — see
+ * `planMilitary`, where the difference was measured: two archers stood beside a rival unit they
+ * were right to refuse and two tiles from a city they could have besieged, for the last twelve
+ * turns of a seed, because the route to the occupied tile was empty and the branch returned
+ * anyway.
+ */
+/**
+ * Walk the unit along its route to `target` and report whether it **moved**.
+ *
+ * The return value is "a step was taken", and *not* "the unit is where the walk was headed". The
+ * difference is a bug this file had, and it is worth the paragraph: a `beside` walk used to
+ * report **arrived** as soon as the unit stood next to its target, so a soldier standing next to
+ * an enemy **stack** — a tile `planAttackUnit` refuses outright (`target-stacked`) — read as
+ * arrival. The chase branch returned, the soldier held that tile, and the branch's own guard
+ * (`|| attackable(...)`) could never speak, because `||` never gets a second operand when the
+ * first is true. Measured on a duel map, seed 2: eight soldiers of one civilization, a movement
+ * point each, stood on a single tile four tiles from the rival's city from turn 49 to turn 58
+ * with the siege target visible and three tiles away, and not one of them moved. The route
+ * itself ends the walk: a unit already at the target, or already beside it, has an empty goal
+ * set and therefore no step to take, so the loop below stops on its own.
+ */
 const walkTo = (
   engine: Engine,
   unit: Unit,
   target: TileIndex,
   attempt: (command: Command) => boolean,
-): void => {
+  beside: boolean,
+): boolean => {
+  let moved = false;
   for (
     let step = 0;
     step < stepBudget(unit.movementLeft, engine.weights.military.maxStepsPerUnit);
@@ -1829,11 +2191,12 @@ const walkTo = (
   ) {
     const moving = unitById(engine.state, unit.id);
     if (moving === undefined) break;
-    if (Number(moving.tile) === Number(target)) break;
-    const command = routeStep(engine, moving, target);
+    const command = routeStep(engine, moving, target, beside);
     if (command === undefined) break;
     if (!attempt(command)) break;
+    moved = true;
   }
+  return moved;
 };
 
 /** Walk a unit toward whatever it has not seen yet, claiming huts on the way. */
@@ -2042,21 +2405,47 @@ const planWorker = (engine: Engine, unit: Unit, attempt: (command: Command) => b
     const moving = unitById(engine.state, unit.id);
     if (moving === undefined) break;
     if (Number(moving.tile) === Number(job.tile)) break;
-    const command = routeStep(engine, moving, job.tile);
+    const command = routeStep(engine, moving, job.tile, false);
     if (command === undefined) break;
     if (!attempt(command)) break;
   }
 };
 
 /**
- * A military unit: hold a city that needs it, hunt what is out there, fortify in bad
- * contact, or explore.
+ * Whether the engine would let this soldier attack `tile` — `unitActions` offers an
+ * `AttackUnit` for it.
  *
- * The order is the whole policy: **garrison before hunting** (an undefended city is how
- * this AI loses), and **fortify before wandering** when contact is bad — the fortification
- * bonus is a rule the engine already states, and standing still behind it is the one
- * defensive move this AI knows. It has no retreat logic and no threat model beyond
- * `standAndFortifyRatioPct`, and it says so rather than pretending otherwise.
+ * The question a chase has to ask about its target, and it is the **engine's** answer rather
+ * than a rule restated here: a tile holding more than one enemy unit is refused with
+ * `target-stacked`, a tile holding none and no city with `nothing-to-attack`, and a soldier
+ * with no movement left gets no action at all. `bestAttack` has already looked at every one of
+ * these and decided not to take it; what this answers is whether the refusal was a *decision*
+ * or a dead end.
+ */
+const attackable = (engine: Engine, unit: Unit, tile: TileIndex): boolean =>
+  unitActions(engine.state, engine.ruleset, unit.id).some(
+    (command) => command.type === 'AttackUnit' && Number(command.target) === Number(tile),
+  );
+
+/**
+ * A military unit: hold a city that needs it, hunt what is out there, fortify in bad
+ * contact, besiege a city it has the force for, or explore.
+ *
+ * The order is the whole policy:
+ *
+ * 1. **fortify in bad contact** — the fortification bonus is a rule the engine already
+ *    states, and standing still behind it is the one defensive move this AI knows;
+ * 2. **hunt** an enemy inside `huntRadius`, but *only while the hunt is a decision*: either
+ *    the soldier steps, or it stands beside something the engine would let it attack (and
+ *    which it has declined on its own maths). A soldier parked beside a stack it may not
+ *    attack is not holding a line, it is stuck — see below;
+ * 3. **garrison** a city short of a defender — an undefended city is how this AI loses;
+ * 4. **besiege** — march on the enemy city this player has the force for and hold there;
+ * 5. pursue the nearest visible enemy from any distance, then march on the nearest known
+ *    enemy city, then explore.
+ *
+ * It still has no retreat logic and no threat model beyond `standAndFortifyRatioPct`, and it
+ * says so rather than pretending otherwise.
  */
 const planMilitary = (engine: Engine, unit: Unit, attempt: (command: Command) => boolean): void => {
   const weights = engine.weights;
@@ -2109,23 +2498,58 @@ const planMilitary = (engine: Engine, unit: Unit, attempt: (command: Command) =>
   // has already mapped has no step that reveals anything, so every soldier simply stood still
   // for the rest of the game. The nearest enemy is therefore pursued from **any** distance when
   // there is no city to reinforce; the radius only breaks the tie against one.
-  const chase = enemy !== undefined && enemyDistance <= weights.military.huntRadius;
-  if (chase) {
-    walkTo(engine, unit, enemy, attempt);
-    return;
-  }
+  //
+  // The chase is a **decision** only while there is something at the end of it, and there are
+  // two ways to have nothing: no step to take, and nothing to attack. The second is the one
+  // that stranded M7's armies. Measured on a duel map at turn 60: seven soldiers of one
+  // civilization and fourteen of the other stood on two adjacent tiles, `huntRadius` was
+  // satisfied, `walkTo` reported the soldier already beside its target, and the branch
+  // returned — for the rest of the game, because `planAttackUnit` refuses a tile holding more
+  // than one enemy unit (`target-stacked`) and a stack cannot be attacked by anybody. Neither
+  // army ever attacked anything again, and no city was ever reached.
+  //
+  // So a soldier holds only where it could fight: it steps, or the engine offers it an attack
+  // on the tile it is standing beside. Where it can do neither, the hunt is abandoned and the
+  // branches below — the siege above all — get the turn instead.
+  //
+  // **The guard only became effective when `walkTo` stopped reporting "arrived"** (see its own
+  // note above): with `walkTo` short-circuiting on "already beside", the `attackable` check was
+  // unreachable and the park was still there, one summary narrower. Measured again after that
+  // fix, on the same seed-2 world: the eight soldiers left their tile and the stack walked onto
+  // its siege target.
+  const chase =
+    enemy !== undefined &&
+    enemyDistance <= weights.military.huntRadius &&
+    (walkTo(engine, unit, enemy, attempt, true) || attackable(engine, unit, enemy));
+  if (chase) return;
 
   if (target !== undefined) {
     if (Number(unit.tile) === Number(target.tile)) {
       if (!isFortified(unit)) attempt({ type: 'FortifyUnit', unitId: unit.id });
       return;
     }
-    walkTo(engine, unit, target.tile, attempt);
+    walkTo(engine, unit, target.tile, attempt, false);
+    return;
+  }
+
+  // **The siege.** A city this player has the force for, and a soldier who is not needed on a
+  // wall: march on it and stay there. Standing beside the city with the assault refused is not
+  // idleness — it is the siege, and it is what turns a trickle of single attacks into the group
+  // `stormedCities` prices. Two soldiers beside the same city also reinforce each other's
+  // assault: the second is resolved against a defender the first has already wounded.
+  //
+  // This sits **above** the generic chase below on purpose. A soldier that can see an enemy it
+  // cannot reach — the neighbour is standing on the tile, and the engine will not let a unit
+  // step onto one — had no branch left that moved it, which is exactly how M7's AI came to
+  // stand two tiles from a city for the rest of a game without ever attacking it.
+  const siege = siegeTarget(engine, unit);
+  if (siege !== undefined) {
+    walkTo(engine, unit, siege.tile, attempt, true);
     return;
   }
 
   if (enemy !== undefined) {
-    walkTo(engine, unit, enemy, attempt);
+    walkTo(engine, unit, enemy, attempt, true);
     return;
   }
 
@@ -2142,31 +2566,11 @@ const planMilitary = (engine: Engine, unit: Unit, attempt: (command: Command) =>
   // fight a battle, and gives M7's walls bonus nothing to defend.
   const march = nearestKnownEnemyCity(engine, unit);
   if (march !== undefined) {
-    walkTo(engine, unit, march, attempt);
+    walkTo(engine, unit, march, attempt, true);
     return;
   }
 
   planExplorer(engine, unit, attempt, weights.military.maxStepsPerUnit);
-};
-
-/**
- * The nearest enemy city this player's map knows about — the army's strategic objective when
- * there is nothing to chase.
- *
- * Read off `state.cities` (every city in the world, whose owner this player can see) and not
- * off the fog: a city is a permanent fact about the map, and "march on the rival's capital" is
- * a decision a player makes with an atlas, not with a scout's last report. The fog governs
- * *what a unit can see this turn*, which is what `hostileTiles` is for; it does not make a
- * known city unknown again.
- */
-const nearestKnownEnemyCity = (engine: Engine, unit: Unit): TileIndex | undefined => {
-  let best: { readonly tile: TileIndex; readonly distance: number } | undefined;
-  for (const city of engine.state.cities) {
-    if (city.owner === engine.playerId) continue;
-    const distance = tileDistance(engine.state, unit.tile, city.tile);
-    if (best === undefined || distance < best.distance) best = { tile: city.tile, distance };
-  }
-  return best?.tile;
 };
 
 /** Hand `unitId` its whole turn: fight, or garrison, or work, or settle, or explore. */

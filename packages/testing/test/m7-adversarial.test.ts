@@ -71,8 +71,10 @@
  *    both in the AI's own files** — FINDING B and FINDING C below.
  *
  * 8. **TOURNAMENT SCALE.** The twenty seeds A3 names are run, and the wall time, invariant
- *    count and budget verdict are reported (full tier). The alpha-scale *CLI* run at its own
- *    defaults (twenty seeds, a hundred turns) was measured outside the suite on an idle machine:
+ *    count and budget verdict are reported (full tier). The alpha-scale *CLI* run at A3's own
+ *    size (twenty seeds, a hundred turns — asked for with `--seeds 1..20 --turns 100`, since
+ *    M7b made the CLI's plain default a two-game smoke run; see `scripts/tournament-evidence.ts`)
+ *    was measured outside the suite on an idle machine:
  *    527.3 s wall, 26.4 s per game, zero violations, within its fifteen-minute budget — and
  *    **3.4× the per-game time its own comment documents**, which is FINDING E.
  *
@@ -141,9 +143,14 @@
  * section 3 proves the property properly, and section 3d prints the author-style probe's blind
  * spot beside this file's, so the gap is visible in the log rather than merely described.
  *
- * **FINDING E — the tournament's own runtime figure is stale by a factor of 3.4.** The CLI's
- * default experiment is twenty seeds of a hundred turns, and `tournament.ts` (lines 293-294)
- * records it as *"about 7.7 s per game on an idle machine, so ~2.6 minutes for the twenty"*.
+ * **FINDING E — the tournament's own runtime figure is stale by a factor of 3.4.** The
+ * experiment this measures is A3's — twenty seeds of a hundred turns, which was the CLI's
+ * default when this review ran and is now asked for with `--seeds 1..20 --turns 100` (M7b;
+ * `scripts/tournament-evidence.ts` is the reproducible home for it) — and `tournament.ts`
+ * (lines 293-294) records it as *"about 7.7 s per game on an idle machine, so ~2.6 minutes for
+ * the twenty"*. **M7b corrected that figure to this measurement**: 527.3 s wall, 26.4 s per
+ * game, 8.8 minutes for the twenty, with the run and the command that reproduces it named in
+ * the module's comment.
  * Measured on an idle machine at this commit: **527.3 s wall, 26.4 s per game, 8.8 minutes for
  * the twenty.** The bound it is compared against (fifteen minutes) still holds with 6.2 minutes
  * of headroom, the run reported its own time to 0.1 % of an external wall clock, and it exited 0
@@ -558,63 +565,70 @@ const countEvents = (
  * ------------------------------------------------------------------ */
 
 describe('1. every command the real AI issues is one the engine accepts', () => {
-  it('has zero refusals and zero unadvertised commands, over seeds and turns', () => {
-    const walks = aiWalks();
-    const refusals = walks.flatMap((run) => run.refusals.map((line) => `${run.label}: ${line}`));
-    const unadvertised = walks.flatMap((run) =>
-      run.unadvertised.map((line) => `${run.label}: ${line}`),
-    );
-    const proposed = walks.reduce((total, run) => total + run.proposed, 0);
-    const applied = walks.reduce((total, run) => total + run.applied, 0);
-    const plannerOnly = new Map<string, number>();
-    for (const run of walks) {
-      for (const [kind, count] of run.plannerOnly) {
-        plannerOnly.set(kind, (plannerOnly.get(kind) ?? 0) + count);
+  // Full tier (M7b): measured at 5.6 s by vitest's per-file reporter — a walk of three seeds
+  // for `WALK_TURNS` turns with `legalActions` audited on every command. The keystone claim is
+  // kept, not dropped: `pnpm verify:full` runs it and the fast run names it as skipped.
+  it.skipIf(!FULL_TIER)(
+    'has zero refusals and zero unadvertised commands, over seeds and turns',
+    () => {
+      const walks = aiWalks();
+      const refusals = walks.flatMap((run) => run.refusals.map((line) => `${run.label}: ${line}`));
+      const unadvertised = walks.flatMap((run) =>
+        run.unadvertised.map((line) => `${run.label}: ${line}`),
+      );
+      const proposed = walks.reduce((total, run) => total + run.proposed, 0);
+      const applied = walks.reduce((total, run) => total + run.applied, 0);
+      const plannerOnly = new Map<string, number>();
+      for (const run of walks) {
+        for (const [kind, count] of run.plannerOnly) {
+          plannerOnly.set(kind, (plannerOnly.get(kind) ?? 0) + count);
+        }
       }
-    }
 
-    console.log(
-      `1. legality: seeds=${SEEDS.join(',')} turns=${String(WALK_TURNS)} proposed=${String(
-        proposed,
-      )} applied=${String(applied)} refusals=${String(refusals.length)} unadvertised=${String(
-        unadvertised.length,
-      )} planner-only=${JSON.stringify([...plannerOnly.entries()].sort())}`,
-    );
+      console.log(
+        `1. legality: seeds=${SEEDS.join(',')} turns=${String(WALK_TURNS)} proposed=${String(
+          proposed,
+        )} applied=${String(applied)} refusals=${String(refusals.length)} unadvertised=${String(
+          unadvertised.length,
+        )} planner-only=${JSON.stringify([...plannerOnly.entries()].sort())}`,
+      );
 
-    // **The headline claim.** A refusal means the AI issued an order the engine rejects.
-    expect(refusals, `the AI issued commands the applier refused:\n${refusals.join('\n')}`).toEqual(
-      [],
-    );
-    expect(
-      unadvertised,
-      `the AI issued commands no legality advertises:\n${unadvertised.join('\n')}`,
-    ).toEqual([]);
-
-    // Non-vacuity: a policy that proposed nothing would pass both assertions above.
-    expect(
-      proposed,
-      'the AI proposed nothing at all, so the checks above proved nothing',
-    ).toBeGreaterThan(100);
-    expect(applied).toBe(proposed);
-
-    // The commands outside `legalActions` are exactly the four planner-only setters, by
-    // name. A fifth would be a **new** class of unadvertised command, which is the thing this
-    // assertion exists to refuse to overlook.
-    expect([...plannerOnly.keys()].sort()).toEqual([
-      'SetProduction',
-      'SetRates',
-      'SetResearch',
-      'SetWorkedTiles',
-    ]);
-    // And each one really was issued: a pinned list that was always empty would be a promise
-    // about code paths nobody ran.
-    for (const [kind, count] of plannerOnly) {
+      // **The headline claim.** A refusal means the AI issued an order the engine rejects.
       expect(
-        count,
-        `the AI never issued ${kind}, so its planner check is untested`,
-      ).toBeGreaterThan(0);
-    }
-  });
+        refusals,
+        `the AI issued commands the applier refused:\n${refusals.join('\n')}`,
+      ).toEqual([]);
+      expect(
+        unadvertised,
+        `the AI issued commands no legality advertises:\n${unadvertised.join('\n')}`,
+      ).toEqual([]);
+
+      // Non-vacuity: a policy that proposed nothing would pass both assertions above.
+      expect(
+        proposed,
+        'the AI proposed nothing at all, so the checks above proved nothing',
+      ).toBeGreaterThan(100);
+      expect(applied).toBe(proposed);
+
+      // The commands outside `legalActions` are exactly the four planner-only setters, by
+      // name. A fifth would be a **new** class of unadvertised command, which is the thing this
+      // assertion exists to refuse to overlook.
+      expect([...plannerOnly.keys()].sort()).toEqual([
+        'SetProduction',
+        'SetRates',
+        'SetResearch',
+        'SetWorkedTiles',
+      ]);
+      // And each one really was issued: a pinned list that was always empty would be a promise
+      // about code paths nobody ran.
+      for (const [kind, count] of plannerOnly) {
+        expect(
+          count,
+          `the AI never issued ${kind}, so its planner check is untested`,
+        ).toBeGreaterThan(0);
+      }
+    },
+  );
 
   it('is the same game the shipped runner plays, so this driver measures the shipped loop', () => {
     // The driver above is this file's own code. If it differed from `runSimulation` — a
@@ -898,10 +912,12 @@ describe('2. the AI beats doing nothing, and shows no pathological game', () => 
 
   /**
    * How long the runaway hunt plays. Measured: at thirty turns the defect is already unmistakable
-   * and each game still costs a few seconds (seeds 8, 14 and 20: 7.2 s, 3.6 s, 7.2 s), so both
-   * tiers can afford to watch it rather than infer it — 18 s of work, and this file's fast-tier
-   * share stays well inside the tier's 90 s. The horizon is deliberately *before* the games that
-   * cost 170 s: the defect is visible long before it is expensive.
+   * and each game still costs a few seconds (seeds 8, 14 and 20: 7.2 s, 3.6 s, 7.2 s) — 18 s of
+   * work for the hunt as a whole. **M7b moved that hunt to the full tier** (measured at 21.0 s
+   * for the test, 45% of this file's fast-tier wall), because the bound is now on
+   * `time pnpm verify` (≤ 70 s) and this one test was most of the difference. The horizon is
+   * deliberately *before* the games that cost 170 s: the defect is visible long before it is
+   * expensive.
    */
   const RUNAWAY_TURNS = 31;
 
@@ -921,41 +937,50 @@ describe('2. the AI beats doing nothing, and shows no pathological game', () => 
   // runs: this is visible in every full-tier run, and when the AI stops running away the test
   // reports an *unexpected pass* and fails — which is the signal to promote it to an ordinary
   // `it` and delete this comment. It asserts the property that *should* hold, never the defect.
-  it.fails('keeps each empire near the city count its own weight asks for (FINDING F)', () => {
-    const target = SMART_WEIGHTS.settlement.targetCities;
-    const rows: string[] = [];
-    const seats: { seed: number; cities: number }[] = [];
+  // Full tier (M7b): measured at 21.0 s — the single most expensive test in the whole fast
+  // tier, and 45% of this file's wall time. It is the FINDING F hunt (three seeds x
+  // `RUNAWAY_TURNS`), recorded as `it.fails` because the AI does not hold the property today.
+  // Moving it does not soften FINDING F: `pnpm verify:full` still reports the expected failure
+  // on every full run, and the fast run names it as skipped. `it.skipIf(...).fails(...)` — the
+  // two chain, so the skip cannot silently turn the expected failure into a pass.
+  it.skipIf(!FULL_TIER).fails(
+    'keeps each empire near the city count its own weight asks for (FINDING F)',
+    () => {
+      const target = SMART_WEIGHTS.settlement.targetCities;
+      const rows: string[] = [];
+      const seats: { seed: number; cities: number }[] = [];
 
-    for (const seed of [8, 14, 20]) {
-      const ran = walk(seed, SMART_POLICY, RUNAWAY_TURNS, false);
-      const counts = civPlayers(ran.state).map((player) => ({
-        name: `civ ${String(player.id)}`,
-        cities: citiesOf(ran.state, player.id).length,
-      }));
-      rows.push(
-        `  seed ${String(seed)} (turn ${String(ran.state.turn)}): ` +
-          counts.map((row) => `${row.name}=${String(row.cities)}`).join(' ') +
-          `, its own target is ${String(target)}`,
+      for (const seed of [8, 14, 20]) {
+        const ran = walk(seed, SMART_POLICY, RUNAWAY_TURNS, false);
+        const counts = civPlayers(ran.state).map((player) => ({
+          name: `civ ${String(player.id)}`,
+          cities: citiesOf(ran.state, player.id).length,
+        }));
+        rows.push(
+          `  seed ${String(seed)} (turn ${String(ran.state.turn)}): ` +
+            counts.map((row) => `${row.name}=${String(row.cities)}`).join(' ') +
+            `, its own target is ${String(target)}`,
+        );
+        for (const row of counts) seats.push({ seed, cities: row.cities });
+      }
+
+      console.log(
+        `2. runaway-expansion hunt (FINDING F — an expected failure, because the AI does not hold ` +
+          `this):\n${rows.join('\n')}`,
       );
-      for (const row of counts) seats.push({ seed, cities: row.cities });
-    }
 
-    console.log(
-      `2. runaway-expansion hunt (FINDING F — an expected failure, because the AI does not hold ` +
-        `this):\n${rows.join('\n')}`,
-    );
-
-    // The property `weights.ts:368-375` documents: no empire grows past the city count its own
-    // weight asks for. Today the second civilization in each of these three games is 2-3× past it.
-    for (const seat of seats) {
-      expect(
-        seat.cities,
-        `seed ${String(seat.seed)} has an empire of ${String(
+      // The property `weights.ts:368-375` documents: no empire grows past the city count its own
+      // weight asks for. Today the second civilization in each of these three games is 2-3× past it.
+      for (const seat of seats) {
+        expect(
           seat.cities,
-        )} cities where its own weight asks for ${String(target)}`,
-      ).toBeLessThanOrEqual(target);
-    }
-  });
+          `seed ${String(seat.seed)} has an empire of ${String(
+            seat.cities,
+          )} cities where its own weight asks for ${String(target)}`,
+        ).toBeLessThanOrEqual(target);
+      }
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -1127,66 +1152,73 @@ describe('3. the AI cannot read, and cannot move, the world’s randomness', () 
     expect(plain.state.cities.length).toBeGreaterThan(0);
   });
 
-  it('detects a policy that DOES read the world stream — and measures how visible it is', () => {
-    // The converse, and the honest form of it. A policy that reads `state.rng` is detectable,
-    // but **not by comparing the world's RNG trail**, which is what a first attempt at this
-    // check compared and what the measurement below refused to support: the world's stream
-    // advances only when the *engine* has a reason to draw (a hut entered, a barbarian band
-    // spawned, a battle resolved), so in a quiet game its state is a constant and its trail is
-    // identical no matter who is playing. The detector that does work varies the stream and
-    // watches the answer (the probe above); the measurement here says how often the twin is
-    // visible in a real game, and why.
-    //
-    // Six seeds at six turns, because the twin drops commands from turn one — a shorter horizon
-    // shows the difference in fewer games, and the claim is about detectability, not about a
-    // particular game's shape.
-    const huntSeeds = [1, 2, 3, 5, 7, 11];
-    const huntTurns = 6;
-    const rows = huntSeeds.map((seed) => {
-      const plain = walk(seed, SMART_POLICY, huntTurns, false);
-      const peeking = walk(seed, worldPeekingTwin(SMART_POLICY), huntTurns, false);
-      // How many distinct world-RNG states the game passed through: 1 means the world never
-      // drew, so nothing a policy reads from the stream could change between turns.
-      const draws = new Set(plain.trail).size;
-      return {
-        seed,
-        draws,
-        visible: plain.hash !== peeking.hash || plain.proposed !== peeking.proposed,
-        plainHash: plain.hash,
-        twinHash: peeking.hash,
-      };
-    });
-    const visible = rows.filter((row) => row.visible).length;
-    console.log(
-      `3. world-reading twin over ${String(huntSeeds.length)} seeds × ${String(huntTurns)} turns: ` +
-        `visible in ${String(visible)}; per seed ` +
-        rows
-          .map(
-            (row) =>
-              `${String(row.seed)}:${row.visible ? 'caught' : 'invisible'}/rngStates=${String(
-                row.draws,
-              )}`,
-          )
-          .join(' '),
-    );
+  // Full tier (M7b): measured at 4.3 s — twelve six-turn games (a plain walk and a
+  // world-reading twin on each of six seeds). The in-suite half that stays fast is the probe
+  // test above, which catches the twin directly; this one measures how often it is visible in
+  // real games, which is a measurement rather than a contract.
+  it.skipIf(!FULL_TIER)(
+    'detects a policy that DOES read the world stream — and measures how visible it is',
+    () => {
+      // The converse, and the honest form of it. A policy that reads `state.rng` is detectable,
+      // but **not by comparing the world's RNG trail**, which is what a first attempt at this
+      // check compared and what the measurement below refused to support: the world's stream
+      // advances only when the *engine* has a reason to draw (a hut entered, a barbarian band
+      // spawned, a battle resolved), so in a quiet game its state is a constant and its trail is
+      // identical no matter who is playing. The detector that does work varies the stream and
+      // watches the answer (the probe above); the measurement here says how often the twin is
+      // visible in a real game, and why.
+      //
+      // Six seeds at six turns, because the twin drops commands from turn one — a shorter horizon
+      // shows the difference in fewer games, and the claim is about detectability, not about a
+      // particular game's shape.
+      const huntSeeds = [1, 2, 3, 5, 7, 11];
+      const huntTurns = 6;
+      const rows = huntSeeds.map((seed) => {
+        const plain = walk(seed, SMART_POLICY, huntTurns, false);
+        const peeking = walk(seed, worldPeekingTwin(SMART_POLICY), huntTurns, false);
+        // How many distinct world-RNG states the game passed through: 1 means the world never
+        // drew, so nothing a policy reads from the stream could change between turns.
+        const draws = new Set(plain.trail).size;
+        return {
+          seed,
+          draws,
+          visible: plain.hash !== peeking.hash || plain.proposed !== peeking.proposed,
+          plainHash: plain.hash,
+          twinHash: peeking.hash,
+        };
+      });
+      const visible = rows.filter((row) => row.visible).length;
+      console.log(
+        `3. world-reading twin over ${String(huntSeeds.length)} seeds × ${String(huntTurns)} turns: ` +
+          `visible in ${String(visible)}; per seed ` +
+          rows
+            .map(
+              (row) =>
+                `${String(row.seed)}:${row.visible ? 'caught' : 'invisible'}/rngStates=${String(
+                  row.draws,
+                )}`,
+            )
+            .join(' '),
+      );
 
-    // The claim that matters: an entangled policy is caught, in real games, on seeds this test
-    // did not choose by hand. If this ever reports zero, the honest reading is that the game
-    // comparison is not a detector at all on these seeds — the probe above still is, and this
-    // section's comment says why.
-    expect(
-      visible,
-      'no seed in the hunted set showed a world-reading policy changing the game',
-    ).toBeGreaterThan(0);
-    // And the non-vacuity of the explanation: at least one of these games never drew from the
-    // world's stream at all, which is why "the trail moved" cannot be the detector.
-    expect(rows.filter((row) => row.draws === 1).length).toBeGreaterThan(0);
-    // A caught seed is caught by the game moving, not by the refusal list (the twin drops
-    // commands, it does not invent them).
-    for (const row of rows) {
-      if (row.visible) expect(row.twinHash).not.toBe(row.plainHash);
-    }
-  });
+      // The claim that matters: an entangled policy is caught, in real games, on seeds this test
+      // did not choose by hand. If this ever reports zero, the honest reading is that the game
+      // comparison is not a detector at all on these seeds — the probe above still is, and this
+      // section's comment says why.
+      expect(
+        visible,
+        'no seed in the hunted set showed a world-reading policy changing the game',
+      ).toBeGreaterThan(0);
+      // And the non-vacuity of the explanation: at least one of these games never drew from the
+      // world's stream at all, which is why "the trail moved" cannot be the detector.
+      expect(rows.filter((row) => row.draws === 1).length).toBeGreaterThan(0);
+      // A caught seed is caught by the game moving, not by the refusal list (the twin drops
+      // commands, it does not invent them).
+      for (const row of rows) {
+        if (row.visible) expect(row.twinHash).not.toBe(row.plainHash);
+      }
+    },
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -1354,7 +1386,8 @@ const A3_SEEDS: readonly number[] = Array.from({ length: 20 }, (_, index) => ind
  * The twenty-seed tournament, at a horizon the full tier can afford.
  *
  * The turns are stated rather than implied, and the horizon is the one thing here that differs
- * from the CLI's own default (100 turns, measured separately — see section 8). Twenty turns is
+ * from A3's own experiment (100 turns, measured separately — see section 8, and reproducible
+ * with `pnpm tournament:evidence`). Twenty turns is
  * long enough for every civilization to have settled, worked tiles, produced and researched,
  * and short enough that the review does not double the gate's runtime for a claim the horizon
  * does not change.
@@ -1781,7 +1814,10 @@ describe('7. the AI’s preferences are sweepable, and its decision code carries
     }
   });
 
-  it('changes the game when one weight moves — the sweep is measurable', () => {
+  // Full tier (M7b): measured at 8.2 s — four 14-turn games per swept value, and the sweep is
+  // run twice (once for the table, once for the assertion). `pnpm verify:full` runs it; the fast
+  // tier's cheap half of this section (the no-bare-magnitude and field-name checks) stays.
+  it.skipIf(!FULL_TIER)('changes the game when one weight moves — the sweep is measurable', () => {
     // The measurement M7 asks for: vary ONE named weight and show a measured effect on
     // outcomes. `targetCities` is the expansion appetite, and the outcome it should move is how
     // much empire exists.
@@ -1834,11 +1870,15 @@ describe('7. the AI’s preferences are sweepable, and its decision code carries
 
 describe('8. the tournament at the size alpha names', () => {
   it.skipIf(!FULL_TIER)('plays twenty seeds and reports wall time, invariants and budget', () => {
-    // **The alpha-scale CLI run, measured outside this suite** (the CLI's own defaults are
-    // twenty seeds at a hundred turns, and running that inside the gate would spend the gate's
-    // own budget measuring it), on an otherwise idle machine at this commit:
+    // **The alpha-scale CLI run, measured outside this suite** (it is twenty seeds at a hundred
+    // turns, and running that inside the gate would spend the gate's own budget measuring it;
+    // M7b then took that size off the CLI's default and made it explicit), on an otherwise idle
+    // machine at this commit. The command line, corrected for M7b — the old `tournament --json`
+    // with no flags now runs the two-game smoke default, so a reader copying it would no longer
+    // reproduce these numbers:
     //
-    //   npx tsx packages/headless/src/cli.ts tournament --json
+    //   npx tsx packages/headless/src/cli.ts tournament --seeds 1..20 --turns 100 --json
+    //   pnpm tournament:evidence        # the same run, plus the wall time and the two-clock check
     //
     //   seeds 1..20, 100 turns, tiny, 2 civs, seats [smart, smart]
     //   wall 527.3 s externally bracketed          = 26.4 s per game
@@ -1849,14 +1889,25 @@ describe('8. the tournament at the size alpha names', () => {
     // **FINDING E, and it is a documentation finding, not a behaviour one.**
     // `tournament.ts` (lines 293-294) records the same experiment as *"about 7.7 s per game on
     // an idle machine, so ~2.6 minutes for the twenty"*. Measured here: **26.4 s per game,
-    // 8.8 minutes for the twenty — 3.4× the documented figure.** The bound still holds on this
+    // 8.8 minutes for the twenty — 3.4× the documented figure.** M7b fixed that arithmetic:
+    // the module comment now carries this measurement, names the command that reproduces it and
+    // says which budget is sized for it. The bound still holds on this
     // machine (8.8 of 15 minutes, 6.2 minutes of headroom), and the run *reported* its own time
-    // honestly, which is the property section 6 asserts. What does not hold is the arithmetic in
+    // honestly, which is the property section 6 asserts. What did not hold was the arithmetic in
     // the comment: at the documented "up to four times that when the machine was shared", a
     // shared machine would be expected to finish in ~35 minutes, where the same 3.4× puts it at
-    // over 15 and the run would be reported over budget. Both statements come from the same
-    // sentence, and the milestone's own test file already uses the honest value
-    // (`tournament.test.ts`: "measured ~100 s on an idle machine", 60 turns, 20 seeds).
+    // over 15 and the run would be reported over budget. Both statements came from the same
+    // sentence, and the same failure sat one file over: `tournament.test.ts` ran these twenty
+    // seeds at sixty turns and documented it as *"~100 s on an idle machine"*, which M7b
+    // measured at **417 s** — 4.2×, and 85 % of the entire full tier's wall time. M7b shrank
+    // that test to a four-seed smoke run and moved the twenty-seed experiment here and into
+    // `pnpm tournament:evidence`, so the number a reader relies on is now the measured one.
+    //
+    // M7b re-measured this run independently, through the new evidence script, on a quiet
+    // machine: **519.4 s wall, 26.0 s per game, 0.01 % two-clock agreement, 0 violations,
+    // exit 0** — 1.6 % from the figures above, which is the agreement two independent
+    // measurements of the same twenty games should show, and the reason the module comment's
+    // corrected arithmetic is the number to trust.
     //
     // The five hashes this review reproduced independently of the CLI — `runSimulation` on the
     // same seeds and settings — match the report's `games[i].finalHash` exactly for seeds 1-5

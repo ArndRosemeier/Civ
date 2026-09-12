@@ -48,6 +48,10 @@ import { describe, expect, it } from 'vitest';
 import { FULL_TIER } from '@civts/testing';
 
 import {
+  A3_TOURNAMENT_SEED_SPEC,
+  A3_TOURNAMENT_TURNS,
+  DEFAULT_TOURNAMENT_SEED_SPEC,
+  DEFAULT_TOURNAMENT_TURNS,
   HORIZON_METRICS,
   buildRulesetPatch,
   parseIntegerSpec,
@@ -1249,6 +1253,64 @@ describe('the tournament command parses its flags, and refuses what it cannot me
     // Every exit code this command can return is stated, including the one that says a run
     // was slow rather than broken.
     expect(output.stdout).toContain('but the run took longer than the budget');
+  });
+
+  it('states the default it will run, and says how to ask for A3’s nine-minute experiment', () => {
+    // M7b's second stale claim: the help text used to present A3's twenty seeds at a hundred
+    // turns as the default, which is what made `civts run` a nine-minute job. The two facts a
+    // reader needs are (a) what will happen if they type nothing and (b) what to type to get
+    // the evidence run — and both are asserted here rather than left to the reader to infer
+    // from a constant.
+    const lines = okOrThrow(runTournamentCommand(['--help'])).stdout;
+
+    expect(lines).toContain(`(default ${DEFAULT_TOURNAMENT_SEED_SPEC}`);
+    expect(lines).toContain(`(default ${String(DEFAULT_TOURNAMENT_TURNS)})`);
+    expect(lines).toContain('THE DEFAULT RUN IS SMALL ON PURPOSE');
+    // The larger run is NAMED, with both of its numbers and its measured cost, so "ask for it
+    // explicitly" is an instruction a reader can follow.
+    expect(lines).toContain(A3_TOURNAMENT_SEED_SPEC);
+    expect(lines).toContain(`--turns ${String(A3_TOURNAMENT_TURNS)}`);
+    expect(lines).toContain('NINE MINUTES');
+    expect(lines).toContain('pnpm tournament:evidence');
+    // And A3's experiment is NOT the default: a help text that mentioned it as one would be
+    // the footgun this change exists to remove.
+    expect(lines).not.toContain(`default ${A3_TOURNAMENT_SEED_SPEC}`);
+    expect(lines).not.toContain(`default ${String(A3_TOURNAMENT_TURNS)})`);
+  });
+
+  it('runs two games of ten turns when no flag is given — the pinned default', () => {
+    // The default is pinned by RUNNING it, not by reading two constants: the report is the
+    // CLI's own structured value, so this fails if the command stops reading the constants it
+    // documents. `--map-size duel` is the only flag, and it is there to keep the two default
+    // games cheap (~1 s in-process) — the horizon and the seed set are the defaults.
+    const report = tournamentReportOf(['--map-size', 'duel']);
+
+    expect(DEFAULT_TOURNAMENT_SEED_SPEC).toBe('1..2');
+    expect(DEFAULT_TOURNAMENT_TURNS).toBe(10);
+    expect(report.parameters.seedSpec).toBe(DEFAULT_TOURNAMENT_SEED_SPEC);
+    expect(report.parameters.seeds).toStrictEqual([1, 2]);
+    expect(report.parameters.maxTurns).toBe(DEFAULT_TOURNAMENT_TURNS);
+    // Both games really played the whole default horizon — a report that *said* ten turns and
+    // stopped at two would be worse than a slow default.
+    expect(report.games.map((game) => game.turnsPlayed)).toStrictEqual([
+      DEFAULT_TOURNAMENT_TURNS,
+      DEFAULT_TOURNAMENT_TURNS,
+    ]);
+    expect(report.games.map((game) => game.stoppedBecause)).toStrictEqual([
+      'max-turns',
+      'max-turns',
+    ]);
+    // Two games with two seats is the shortest run whose rotation completes: each of the two
+    // policy instances plays each seat once, which is what "a policy that only wins from seat
+    // 0 has not been tested" asks of the smallest experiment.
+    for (const policy of report.policies) {
+      expect(policy.seatGames).toStrictEqual([1, 1]);
+    }
+    expect(report.verdict.accepted).toBe(true);
+    // A3's experiment is a different, larger thing — and the constants say so, so the help
+    // text, the default and the evidence script cannot drift apart.
+    expect(A3_TOURNAMENT_SEED_SPEC).not.toBe(DEFAULT_TOURNAMENT_SEED_SPEC);
+    expect(A3_TOURNAMENT_TURNS).toBeGreaterThan(DEFAULT_TOURNAMENT_TURNS);
   });
 
   it('defaults to the real AI in every seat — a self-play tournament', () => {

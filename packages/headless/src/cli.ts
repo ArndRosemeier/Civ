@@ -107,17 +107,25 @@ sim options (the full text is in "civts sim --help"):
   that is the command working, not failing. "exit 0" means every run held every
   invariant.
 
-tournament options (the full text is in "civts tournament --help"):
-  --seeds <spec>      games to play: "1..20", "3", "1,4,7"   (default: 1..20, A3's size)
+tournament / run options (the full text is in "civts tournament --help"):
+  --seeds <spec>      games to play: "1..2", "3", "1,4,7"   (default 1..2 — a smoke run)
   --seats <names>     one policy per seat, comma-separated; a name may repeat, and
                       "smart,smart" is a self-play tournament (default: smart in every
                       seat). The seats ROTATE across games.
   --map-size <size>   ${MAP_SIZES.join('|')}  (default: tiny)
   --civs <int>        civilizations, and the number of seats  (default: 2)
-  --turns <int>       turns to play per game                (default: 100)
+  --turns <int>       turns to play per game                (default 10)
   --budget-ms <int>   the budget the whole run is judged against; every seed is played
                       whatever the clock says, and an overrun is reported, never hidden
   --json              emit one canonical JSON report (sorted keys) instead of text
+
+  THE DEFAULT IS DELIBERATELY SMALL. "run" is an alias for "tournament" — one command, one
+  default — so a plain invocation is TWO GAMES OF TEN TURNS, seconds rather than minutes, and
+  never the nine-minute experiment. A3's twenty seeds of a hundred turns is asked for
+  explicitly; its wall time is about nine minutes (26.0 s per game, 519 s for the twenty):
+
+    civts tournament --seeds 1..20 --turns 100
+    pnpm tournament:evidence    the same run, printing the structured result and wall time
 
   exit 0 means every game held every invariant AND the run was within budget; exit 1
   names a violation, exit 3 reports an honest overrun.
@@ -140,8 +148,9 @@ Examples:
   pnpm play --seed 42 --script session.txt
   npx tsx packages/headless/src/cli.ts sim --seeds 1..10 --turns 20
   npx tsx packages/headless/src/cli.ts sim --seeds 1..3 --override units.settler.cost=4 --json
-  npx tsx packages/headless/src/cli.ts tournament --seeds 1..20 --json
-  npx tsx packages/headless/src/cli.ts tournament --seats smart,none --seeds 1..5
+  npx tsx packages/headless/src/cli.ts run --seats smart,none
+  npx tsx packages/headless/src/cli.ts tournament --seeds 1..20 --turns 100 --json
+  npx tsx scripts/tournament-evidence.ts
   npx tsx scripts/balance-sweep.ts
 `;
 
@@ -508,6 +517,15 @@ const main = async (argv: readonly string[]): Promise<number> => {
     case 'run':
       // PLAN.md §8.1's name for the same self-play game. Written as its own case rather than a
       // fallthrough so that neither branch depends on a lint comment to stay honest.
+      //
+      // `run` is the plainest verb this CLI has and it used to be a stub that printed "the M7
+      // self-play harness is not built yet" — so the two ways it could mislead are closed in
+      // the command itself, not here: the default experiment is two games of ten turns
+      // (`DEFAULT_TOURNAMENT_SEED_SPEC` / `DEFAULT_TOURNAMENT_TURNS`, stated in the usage
+      // block above and in "civts tournament --help"), and A3's twenty seeds of a hundred
+      // turns — about nine minutes — has to be asked for with `--seeds 1..20 --turns 100`.
+      // Nothing here can start a long job by accident, because nothing here decides anything:
+      // this case routes, and `runTournamentCommand` owns the defaults.
       return commandTournament(rest);
     default:
       console.error(`unknown command: ${command}`);
