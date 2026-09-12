@@ -51,6 +51,7 @@
 import { err, ok, type Result, type TerrainYields } from '@civts/core';
 import type {
   BuildingSpec,
+  CaptureSpec,
   Catalog,
   CombatSpec,
   ImprovementSpec,
@@ -61,6 +62,7 @@ import type {
 
 import type {
   BuildingPatch,
+  CapturePatch,
   CombatPatch,
   ImprovementPatch,
   OverrideSection,
@@ -169,9 +171,10 @@ export interface OverrideOutcome {
  *
  * `combat` is deliberately absent: it is a section a patch may address (see
  * `PATCH_SECTIONS`) but it is *one row of nine numbers with no id*, so walking it as a
- * `Record<id, Patch>` would be walking a shape it does not have. It is merged after these
- * five, which is also the order the catalog declares its sections in and the order
- * `provenanceSections` reports them.
+ * `Record<id, Patch>` would be walking a shape it does not have. M7's `capture` section is
+ * absent for the same reason, one row later. Both are merged after these five, which is
+ * also the order the catalog declares its sections in and the order `provenanceSections`
+ * reports them.
  */
 export const OVERRIDE_SECTIONS: readonly OverrideSection[] = [
   'terrains',
@@ -193,8 +196,18 @@ export const OVERRIDE_SECTIONS: readonly OverrideSection[] = [
 const COMBAT_ROW_ID = 'combat';
 
 /**
+ * **The one id the capture section is recorded under** (M7).
+ *
+ * Same argument as `COMBAT_ROW_ID`: the section is one row of one magnitude with no id of
+ * its own, the override record is a list of `section.id.field` lines, and the catalog's own
+ * field name is the honest id — the same string `@civts/rules` files the section's
+ * provenance under.
+ */
+const CAPTURE_ROW_ID = 'capture';
+
+/**
  * Every section a patch may address, ascending — the *whole* surface, row sections and
- * the singleton together.
+ * the singletons together.
  *
  * It exists to be compared against the keys a patch really carries. That comparison is
  * M6b's other half of "reported, never ignored": the field-level checks below catch a
@@ -202,7 +215,11 @@ const COMBAT_ROW_ID = 'combat';
  * `{ unit: {...} }` — which used to be accepted silently, because the applier only ever
  * read the keys it knew about.
  */
-export const PATCH_SECTIONS: readonly OverrideSection[] = [...OVERRIDE_SECTIONS, 'combat'];
+export const PATCH_SECTIONS: readonly OverrideSection[] = [
+  ...OVERRIDE_SECTIONS,
+  'combat',
+  'capture',
+];
 
 /**
  * The catalog sections **no patch can address**, named rather than left implicit.
@@ -306,6 +323,17 @@ const COMBAT_FIELDS: readonly (keyof CombatPatch)[] = [
   'minWinPct',
   'maxWinPct',
 ];
+
+/**
+ * M7's capture rule — **the whole section**, which `keyof` is what keeps whole.
+ *
+ * One field today (`populationDivisor`), and the same rule every other list follows: a
+ * magnitude this surface can move is named *explicitly*, and a magnitude it cannot move is
+ * reported rather than dropped. The list is `keyof CapturePatch`, so a field added to the
+ * section in `types.ts` is a compile error here until it is named — which is exactly how
+ * M6's silent `hitPoints` reset would have been caught.
+ */
+const CAPTURE_FIELDS: readonly (keyof CapturePatch)[] = ['populationDivisor'];
 
 /** The three channels of a yield partial, in the order a record writes them. */
 const YIELDS_FIELDS: readonly (keyof YieldsPatch)[] = ['food', 'shields', 'commerce'];
@@ -707,6 +735,48 @@ const mergeCombatSection = (
   patch === undefined ? ok(row) : mergeCombat(row, patch, notes);
 
 /**
+ * M7: the capture rule, merged **field by field** like the combat section above.
+ *
+ * Written out rather than spread for the module's stated reason: a generic merge over an
+ * index signature needs a cast to put the result back into a typed value, and a cast is
+ * where a renamed catalog field goes unnoticed. Every field of `CaptureSpec` except
+ * `provenance` appears below, `provenance` is carried through untouched (authorship is not
+ * a magnitude), and a patch key that is not one of the section's fields is **reported**
+ * with the real names — so a sweep whose knob was misspelled is an error rather than a
+ * measured "no effect".
+ *
+ * The record lines use `CAPTURE_ROW_ID` for the id half, so a reader of the override record
+ * sees `capture.capture.populationDivisor: 2 -> 4` — section, the section's own id, field —
+ * which is the shape every other section's lines have and what
+ * `scripts/combat-balance-sweep.ts` prints as the knob's receipt.
+ */
+const mergeCapture = (
+  row: CaptureSpec,
+  patch: CapturePatch,
+  notes: string[],
+): Result<CaptureSpec, OverrideError> => {
+  const bad = unknownFieldOf('capture', CAPTURE_ROW_ID, Object.keys(patch), CAPTURE_FIELDS);
+  if (bad !== undefined) return err(bad);
+
+  recordFields(notes, 'capture', CAPTURE_ROW_ID, [
+    ['populationDivisor', row.populationDivisor, patch.populationDivisor],
+  ]);
+
+  return ok({
+    populationDivisor: patch.populationDivisor ?? row.populationDivisor,
+    provenance: row.provenance,
+  });
+};
+
+/** The capture section merged, or the catalog's own section when the patch says nothing. */
+const mergeCaptureSection = (
+  row: CaptureSpec,
+  patch: CapturePatch | undefined,
+  notes: string[],
+): Result<CaptureSpec, OverrideError> =>
+  patch === undefined ? ok(row) : mergeCapture(row, patch, notes);
+
+/**
  * The first section a patch names that this surface cannot address, if any.
  *
  * Sorted, so a patch with two bad keys always reports the same one — the same determinism
@@ -792,6 +862,15 @@ export const tryApplyOverrides = (
   const combat = mergeCombatSection(catalog.combat, patch.combat, notes);
   if (!combat.ok) return combat;
 
+  // M7: the capture rule last, after the combat globals it follows in the catalog. The
+  // same wire, for the same reason: an absent `patch.capture` returns the catalog's **same
+  // object**, so a patch that does not mention the section cannot be observed to have
+  // touched it — and cannot *drop* it either, which would leave every sack in a swept game
+  // reducing populations under `NO_CAPTURE_RULES` and reporting a large effect from a knob
+  // that was never applied.
+  const capture = mergeCaptureSection(catalog.capture, patch.capture, notes);
+  if (!capture.ok) return capture;
+
   return ok({
     catalog: {
       terrains: terrains.value,
@@ -800,6 +879,7 @@ export const tryApplyOverrides = (
       improvements: improvements.value,
       resources: resources.value,
       combat: combat.value,
+      capture: capture.value,
       // M5's tech tree is carried through **unchanged**, and that is stated rather
       // than left to look like an oversight: `RulesetPatch` has no `techs` section yet,
       // so no patch can move a tech's price through this surface. The catalog is still

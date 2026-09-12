@@ -101,11 +101,16 @@ import {
 } from '@civts/rules';
 import {
   CORE_INVARIANTS,
+  DEFAULT_TOURNAMENT_BUDGET_MS,
   DO_NOTHING_POLICY,
   MEASURED_METRIC_FIELDS,
   SIMPLE_POLICY,
+  SMART_POLICY,
   formatOverrideError,
   runBatch,
+  runTournament,
+  seatPlan,
+  tournamentVerdict,
   tryApplyOverrides,
   type BatchResult,
   type BuildingPatch,
@@ -121,6 +126,8 @@ import {
   type SimulationResult,
   type StopReason,
   type TerrainPatch,
+  type TournamentResult,
+  type TournamentTotals,
   type TurnMetrics,
   type UnitPatch,
   type Violation,
@@ -157,8 +164,24 @@ const DEFAULT_TURNS = 20;
 /** Metrics sampling stride when `--sample-every` is absent. */
 const DEFAULT_SAMPLE_EVERY = 1;
 
-/** The policies `--policy` accepts. `none` is the do-nothing control. */
-export const SIM_POLICIES = ['simple', 'none'] as const;
+/**
+ * The policies the CLI can run, by the names its flags accept.
+ *
+ * One list, because "which strategies exist" is one fact: `--policy` takes one for a whole
+ * batch of games, `--seats` takes one per seat for a tournament, and a name that is legal
+ * in one place and not the other would be a second statement of the same list waiting to
+ * drift.
+ *
+ * - `smart` — M7's real opponent (`SMART_POLICY`, `packages/sim/src/ai/`), the strategy a
+ *   tournament is about and the default in every seat when `--seats` is absent;
+ * - `simple` — the placeholder policy M7 replaces, still runnable because a real AI has to
+ *   be measured *against* something;
+ * - `none` — `DO_NOTHING_POLICY`: the control, which returns no commands at all.
+ *
+ * The order is the order `--help` prints them in: the real AI, then what it replaces, then
+ * the control.
+ */
+export const SIM_POLICIES = ['smart', 'simple', 'none'] as const;
 export type SimPolicyName = (typeof SIM_POLICIES)[number];
 
 /** `UnitSpec.domain`'s two values. A type's domain, not a game magnitude. */
@@ -194,8 +217,9 @@ export const SIM_USAGE = `usage: civts sim [--seeds <spec>] [--map-size <size>] 
   --map-size <size>   one of ${MAP_SIZES.join('|')} (default tiny)
   --civs <int>        civilizations per game (default 2)
   --turns <int>       turns to play per game, at least 1 (default ${String(DEFAULT_TURNS)})
-  --policy <name>     ${SIM_POLICIES.join('|')} — "none" is the do-nothing control the
-                      shipped policy is compared against (default simple)
+  --policy <name>     ${SIM_POLICIES.join('|')} — "smart" is M7's real opponent, "simple" is the
+                      placeholder it replaces and "none" is the do-nothing control
+                      (default simple)
   --sample-every <n>  sample metrics every n turns (default ${String(DEFAULT_SAMPLE_EVERY)})
   --override <p>=<v>  change ONE catalog number for the whole batch, repeatable:
                         --override units.settler.cost=4
@@ -341,6 +365,8 @@ const isOverrideSection = (name: string): name is OverrideSection =>
  * M6b added `combat`, and it is listed here rather than treated as a special case
  * because "which sections exist" is one fact: a section the applier can merge and the
  * CLI cannot spell is a knob a sweep reads about in `--help` and then cannot turn.
+ * M7 adds `capture` — the second singleton — for exactly that reason, one milestone
+ * after the argument was first made.
  */
 const OVERRIDE_SECTIONS_LOOKUP: readonly OverrideSection[] = [
   'terrains',
@@ -349,6 +375,7 @@ const OVERRIDE_SECTIONS_LOOKUP: readonly OverrideSection[] = [
   'improvements',
   'resources',
   'combat',
+  'capture',
 ];
 
 /** Parse one flag value into the plain value it names. */
@@ -376,12 +403,35 @@ const parseKnobValue = (raw: string): Result<KnobValue, string> => {
  */
 const COMBAT_ROW_ID = 'combat';
 
+/**
+ * The row id the **capture** section is addressed by (M7).
+ *
+ * The same argument as `COMBAT_ROW_ID`: one section of one magnitude has no id of its
+ * own, and the section's name is the id the rest of the module speaks.
+ */
+const CAPTURE_ROW_ID = 'capture';
+
+/**
+ * The sections that are **one row rather than a list of rows**, by their own names.
+ *
+ * A list rather than a chain of `if (section === 'combat')` branches, because "which
+ * sections are singletons" is one fact about the catalog — the same argument this file
+ * makes for `OVERRIDE_SECTIONS_LOOKUP`, and the same reason M6b centralised it. M7's
+ * `capture` section is the second member, and adding it here is the whole of what makes
+ * `--knob capture.populationDivisor` work.
+ */
+const SINGLETON_SECTIONS: readonly { readonly section: OverrideSection; readonly id: string }[] = [
+  { section: 'combat', id: COMBAT_ROW_ID },
+  { section: 'capture', id: CAPTURE_ROW_ID },
+];
+
 const parseOverride = (text: string): Result<OverrideAssignment, string> => {
   const equals = text.indexOf('=');
   if (equals < 0) {
     return err(
       `--override expects <section>.<id>.<field>=<value> (or <section>.<field>=<value> for ` +
-        `the singleton section "combat"), got "${text}"`,
+        `a singleton section: ${SINGLETON_SECTIONS.map((s) => s.section).join(', ')}), ` +
+        `got "${text}"`,
     );
   }
 
@@ -394,7 +444,7 @@ const parseOverride = (text: string): Result<OverrideAssignment, string> => {
         `${OVERRIDE_SECTIONS_LOOKUP.join('|')} (in "${text}")`,
     );
   }
-  // The singleton section, which has two spellings for one address:
+  // The singleton sections, each of which has two spellings for one address:
   //
   // - `combat.<field>` — the short one, and the one the flag documents;
   // - `combat.combat.<field>` — the long one, spelled the way the provenance report
@@ -403,20 +453,24 @@ const parseOverride = (text: string): Result<OverrideAssignment, string> => {
   //
   // A path naming any *other* id (`combat.walls.rollBound`) is refused here rather than
   // accepted as an id the applier would then fail to find: the section is one row, and
-  // the honest answer is that there is no row to name.
-  if (section === 'combat') {
+  // the honest answer is that there is no row to name. M7's `capture` section is
+  // addressed the same way, through the same branch, because the rule is about the
+  // section's *shape* and not about which section it is.
+  const singleton = SINGLETON_SECTIONS.find((candidate) => candidate.section === section);
+  if (singleton !== undefined) {
     const rest = parts.slice(1);
-    const named = rest.length === 2 && rest[0] === COMBAT_ROW_ID;
+    const named = rest.length === 2 && rest[0] === singleton.id;
     const field = named ? (rest[1] ?? '') : rest.join('.');
     if ((!named && rest.length !== 1) || field === '') {
       return err(
-        `--override expects combat.<field>=<value> — the combat section is one row of ` +
-          `numbers rather than a list of rows, so there is no id to name (in "${text}")`,
+        `--override expects ${singleton.section}.<field>=<value> — the ${singleton.section} ` +
+          `section is one row of numbers rather than a list of rows, so there is no id to ` +
+          `name (in "${text}")`,
       );
     }
     const value = parseKnobValue(text.slice(equals + 1));
     if (!value.ok) return value;
-    return ok({ text, section, id: COMBAT_ROW_ID, field, value: value.value });
+    return ok({ text, section, id: singleton.id, field, value: value.value });
   }
 
   const id = parts[1] ?? '';
@@ -514,6 +568,15 @@ const COMBAT_FIELDS: readonly string[] = [
   'minWinPct',
   'maxWinPct',
 ];
+/**
+ * M7's capture section — one magnitude, and the list exists for the same reason.
+ *
+ * `--override capture.populationDivizor=4` must be refused with the name that would have
+ * worked, not accepted and ignored: a knob that was never applied is indistinguishable
+ * from a knob with no effect, which is the failure mode this whole surface exists to
+ * prevent.
+ */
+const CAPTURE_FIELDS: readonly string[] = ['populationDivisor'];
 const BUILDING_FIELDS: readonly string[] = ['name', 'cost', 'maintenance', 'wonder'];
 const IMPROVEMENT_FIELDS: readonly string[] = [
   'kind',
@@ -837,6 +900,34 @@ const combatPatch = (
   return ok(patch);
 };
 
+/**
+ * The singleton `capture` section's patch (M7): one plain integer and no nesting.
+ *
+ * Written out rather than folded into `combatPatch` because the two sections are
+ * different rows of different shapes, and a generic "patch a singleton" helper would have
+ * to be keyed by a runtime field name — which is exactly the cast-shaped hole
+ * `@civts/sim`'s merges avoid. No row id is consulted here either, for the reason
+ * `combatPatch` states: the parser refuses any `capture` path that names an id other than
+ * the section's own, so every assignment reaching here is a field of the one row.
+ */
+const capturePatch = (
+  list: readonly OverrideAssignment[],
+): Result<NonNullable<RulesetPatch['capture']>, string> => {
+  let patch: NonNullable<RulesetPatch['capture']> = {};
+  for (const a of list) {
+    const found = CAPTURE_FIELDS.find((candidate) => candidate === a.field);
+    if (found === undefined) return err(notSettable(a, CAPTURE_FIELDS));
+    const value = wantsInteger(a);
+    if (!value.ok) return value;
+    switch (found) {
+      case 'populationDivisor':
+        patch = { ...patch, populationDivisor: value.value };
+        break;
+    }
+  }
+  return ok(patch);
+};
+
 /** One section's assignments, grouped by row id, in ascending id order. */
 const sectionRecord = <P>(
   assignments: readonly OverrideAssignment[],
@@ -889,6 +980,10 @@ export const buildRulesetPatch = (
   // re-derive the constant this module already knows.
   const combat = combatPatch(of('combat'));
   if (!combat.ok) return combat;
+  // M7's capture section, through its own builder, for the same reason the combat globals
+  // have one: there is one row and it has a fixed name.
+  const capture = capturePatch(of('capture'));
+  if (!capture.ok) return capture;
 
   return ok({
     ...(assignments.some((a) => a.section === 'terrains') ? { terrains: terrains.value } : {}),
@@ -899,6 +994,7 @@ export const buildRulesetPatch = (
       : {}),
     ...(assignments.some((a) => a.section === 'resources') ? { resources: resources.value } : {}),
     ...(assignments.some((a) => a.section === 'combat') ? { combat: combat.value } : {}),
+    ...(assignments.some((a) => a.section === 'capture') ? { capture: capture.value } : {}),
   });
 };
 
@@ -1101,9 +1197,24 @@ export const parseSimArgs = (args: readonly string[]): Result<SimFlags, string> 
  * Running the batch
  * ------------------------------------------------------------------ */
 
-/** One policy, by the name `--policy` gives it. */
-const policyOf = (name: SimPolicyName): Policy =>
-  name === 'none' ? DO_NOTHING_POLICY : SIMPLE_POLICY;
+/**
+ * One policy, by the name the CLI's flags give it.
+ *
+ * The three names map to the three shipped policies by name and nothing else: `smart` is
+ * M7's real opponent, `simple` the placeholder it replaces, `none` the do-nothing control.
+ * A switch rather than a map, so adding a name to `SIM_POLICIES` without saying which
+ * policy it runs is a type error rather than an `undefined` reaching a run.
+ */
+const policyOf = (name: SimPolicyName): Policy => {
+  switch (name) {
+    case 'smart':
+      return SMART_POLICY;
+    case 'simple':
+      return SIMPLE_POLICY;
+    case 'none':
+      return DO_NOTHING_POLICY;
+  }
+};
 
 /**
  * A deliberately failing invariant, appended by `--fault`.
@@ -1765,6 +1876,818 @@ const overrideFailureLine = (
 };
 
 /* ------------------------------------------------------------------ *
+ * `tournament` — the same policies across seeds, with the seats rotated
+ *
+ * The M7 contract's second CLI command, built the way `sim` is built and for the same
+ * reason: a structured value (`TournamentReport`, which embeds `@civts/sim`'s own
+ * `TournamentResult` rather than restating it), a text renderer that only formats it, and
+ * `--json` for `canonicalize` of that same value. No figure in this section is computed by
+ * the renderer: the renderer pads columns, prints stored numbers, and nothing else.
+ * ------------------------------------------------------------------ */
+
+/** The seeds a tournament plays when `--seeds` is absent: A3's twenty-seed tournament. */
+const DEFAULT_TOURNAMENT_SEED_SPEC = '1..20';
+
+/**
+ * Turns per game when `--turns` is absent.
+ *
+ * A tournament is about a *game*, not a probe: the AI has to settle, expand, research,
+ * build and fight, and a horizon too short to reach those measures the opening instead of
+ * the strategy. A hundred turns is a complete arc at this engine's scale — the real policy
+ * has founded its cities, worked its land, finished its early tech tree and fielded an army
+ * well inside it — and it is why the default run takes minutes rather than seconds, which
+ * `--help` says in as many words. Two hundred turns is affordable too, at roughly twice the
+ * cost per game; `--turns` moves the horizon, and the report always states the one it used,
+ * so two runs cannot be compared by accident.
+ */
+const DEFAULT_TOURNAMENT_TURNS = 100;
+
+/**
+ * The seat list when `--seats` is absent: the real AI in **every** seat.
+ *
+ * That is a self-play tournament, which is what M7 asks this command to be and what
+ * "replacing `SIMPLE_POLICY` as the default in tournaments" means. `--seats smart,none`
+ * is the comparison against the do-nothing control, and `--seats simple,none` the older
+ * placeholder — all three names are in `SIM_POLICIES`, so the flags and the help text
+ * cannot disagree about what a policy is called.
+ */
+const DEFAULT_TOURNAMENT_SEAT = 'smart' as const;
+
+export const TOURNAMENT_USAGE = `usage: civts tournament [--seeds <spec>] [--seats <name,...>]
+                            [--map-size <size>] [--civs <int>] [--turns <int>]
+                            [--budget-ms <int>]
+                            [--override <section>.<id>.<field>=<value>]...
+                            [--fault <name>]... [--json]
+
+  --seeds <spec>      which games to play: a list, ranges, or both — "1..20", "3", "1,4,7"
+                      (default ${DEFAULT_TOURNAMENT_SEED_SPEC}; ascending; a seed listed twice is played
+                      twice, and the two plays are different seatings)
+  --seats <list>      the policy for each seat, left to right: "smart,none", or
+                      "smart,smart" for self-play (a policy may repeat). Each name is one of
+                      ${SIM_POLICIES.join('|')} (default: ${DEFAULT_TOURNAMENT_SEAT} in every seat)
+  --map-size <size>   one of ${MAP_SIZES.join('|')} (default tiny)
+  --civs <int>        civilizations per game — which is also the number of seats (default 2)
+  --turns <int>       turns to play per game, at least 1 (default ${String(DEFAULT_TOURNAMENT_TURNS)}, a full game at this
+                      engine's scale — so the default run takes minutes, because the real
+                      AI decides every turn; a small --turns is a quick check)
+  --budget-ms <int>   the budget the whole run is judged against, in milliseconds
+                      (default ${String(DEFAULT_TOURNAMENT_BUDGET_MS)}). A run that exceeds it SAYS SO and still plays
+                      every seed: the seed set is never trimmed to fit a budget
+  --override <p>=<v>  change ONE catalog number for the whole tournament, repeatable — the
+                      same flag "civts sim" takes, through the same override machinery
+  --fault <name>      append a deliberately failing invariant named <name>: a self-test of
+                      the violation path, so the pass/fail condition can be watched firing
+                      end to end. It changes nothing about the game. Repeatable.
+  --json              print one canonical JSON report (recursively sorted keys) instead of
+                      the text report. Every field is a pure function of the flags except
+                      two: the measured elapsed time, and — when a run is over budget — the
+                      amount it is over by, which is derived from it. Those two are the
+                      harness's own measurement, and nothing about a game depends on them
+
+Seats ROTATE. In game i, seat s is played by seat-list entry (s + i) mod seats, so over
+enough games every policy plays every seat, and no strategy is ever measured from one
+position only. A policy that only wins from seat 0 has not been tested; this command cannot
+be asked to test it that way.
+
+Exit codes:
+  0  every game held every invariant, and the run was within budget
+  1  a game broke an invariant — ZERO violations is the pass condition, not a statistic;
+     the violation is printed loudly, naming itself, its seed and its turn
+  2  the flags themselves are unusable (syntax, an unknown policy, a seat list that does
+     not match the number of civilizations, a bad number)
+  3  every invariant held, but the run took longer than the budget it was given
+`;
+
+/** Flags as parsed — absent means "leave the default alone", not "zero". */
+export interface TournamentFlags {
+  readonly seeds: readonly number[] | undefined;
+  /** The seed spec as typed, so the report can quote what was asked for. */
+  readonly seedSpec: string | undefined;
+  /** The policy per seat, left to right, as `--seats` named them. */
+  readonly seats: readonly SimPolicyName[] | undefined;
+  readonly mapSize: MapSize | undefined;
+  readonly civCount: number | undefined;
+  readonly turns: number | undefined;
+  readonly budgetMs: number | undefined;
+  readonly overrides: readonly string[];
+  readonly faults: readonly string[];
+  readonly json: boolean;
+}
+
+const TOURNAMENT_VALUE_FLAGS: readonly string[] = [
+  '--seeds',
+  '--seats',
+  '--map-size',
+  '--civs',
+  '--turns',
+  '--budget-ms',
+  '--override',
+  '--fault',
+];
+
+/**
+ * One `--seats` value: a comma-separated list of policy names, in seat order.
+ *
+ * Parsed here rather than inside the command so a typo costs no games — the same rule
+ * `--override` follows. An empty entry is refused instead of skipped: `--seats smart,,none`
+ * is a typo, and quietly dropping the empty one would seat a policy the caller did not name.
+ */
+const parseSeatList = (raw: string): Result<readonly SimPolicyName[], string> => {
+  const names: SimPolicyName[] = [];
+  for (const entry of raw.split(',')) {
+    const name = entry.trim();
+    if (name === '') {
+      return err(
+        `--seats has an empty entry in "${raw}" — it takes one policy name per seat, like ` +
+          `"smart,${SIM_POLICIES[1]}"`,
+      );
+    }
+    const known = SIM_POLICIES.find((candidate) => candidate === name);
+    if (known === undefined) {
+      return err(
+        `--seats expects a comma-separated list of ${SIM_POLICIES.join('|')}, got "${name}"`,
+      );
+    }
+    names.push(known);
+  }
+  return ok(names);
+};
+
+export const parseTournamentArgs = (args: readonly string[]): Result<TournamentFlags, string> => {
+  let seeds: readonly number[] | undefined;
+  let seedSpec: string | undefined;
+  let seats: readonly SimPolicyName[] | undefined;
+  let mapSize: MapSize | undefined;
+  let civCount: number | undefined;
+  let turns: number | undefined;
+  let budgetMs: number | undefined;
+  let json = false;
+  const overrides: string[] = [];
+  const faults: string[] = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const flag = args[i];
+    if (flag === undefined) break;
+
+    if (flag === '--json') {
+      json = true;
+      continue;
+    }
+    if (!TOURNAMENT_VALUE_FLAGS.includes(flag)) {
+      return err(`unknown option for the tournament: "${flag}"`);
+    }
+
+    const raw = args[i + 1];
+    if (raw === undefined) return err(`${flag} needs a value`);
+    i += 1; // consume the value
+
+    switch (flag) {
+      case '--seeds': {
+        const parsed = parseSeedSpec(raw);
+        if (!parsed.ok) return parsed;
+        seeds = parsed.value;
+        seedSpec = raw.trim();
+        break;
+      }
+      case '--seats': {
+        const parsed = parseSeatList(raw);
+        if (!parsed.ok) return parsed;
+        seats = parsed.value;
+        break;
+      }
+      case '--map-size': {
+        const size = MAP_SIZES.find((candidate) => candidate === raw);
+        if (size === undefined) {
+          return err(`--map-size expects one of ${MAP_SIZES.join('|')}, got "${raw}"`);
+        }
+        mapSize = size;
+        break;
+      }
+      case '--turns':
+      case '--civs':
+      case '--budget-ms': {
+        const parsed = parseIntFlag(flag, raw);
+        if (!parsed.ok) return err(parsed.error);
+        if (flag === '--turns') turns = parsed.value;
+        else if (flag === '--civs') civCount = parsed.value;
+        else budgetMs = parsed.value;
+        break;
+      }
+      case '--override':
+        overrides.push(raw);
+        break;
+      case '--fault': {
+        const name = raw.trim();
+        if (!FAULT_NAME.test(name)) {
+          return err(
+            `--fault expects a kebab-case invariant name (like "gold-conservation"), got "${raw}"`,
+          );
+        }
+        faults.push(name);
+        break;
+      }
+      default:
+        return err(`unknown option for the tournament: "${flag}"`);
+    }
+  }
+
+  if (turns !== undefined && turns < 1) {
+    return err(
+      `--turns must be at least 1, got ${String(turns)} (a tournament of zero turns measures nothing)`,
+    );
+  }
+  if (budgetMs !== undefined && budgetMs < 0) {
+    return err(
+      `--budget-ms must be zero or more, got ${String(budgetMs)} (a negative budget is a ` +
+        'verdict no run can satisfy)',
+    );
+  }
+
+  return ok({
+    seeds,
+    seedSpec,
+    seats,
+    mapSize,
+    civCount,
+    turns,
+    budgetMs,
+    overrides,
+    faults,
+    json,
+  });
+};
+
+/* ---- the structured report ---- */
+
+/** The experiment the tournament report describes. */
+export interface TournamentParameters {
+  readonly mapSize: string;
+  readonly width: number;
+  readonly height: number;
+  readonly civCount: number;
+  readonly maxTurns: number;
+  /** The policy names by seat, left to right — the list the rotation permutes. */
+  readonly seats: readonly string[];
+  /** The seed spec as typed (`1..20`), for the report's own provenance. */
+  readonly seedSpec: string;
+  /** The seeds actually played, ascending. */
+  readonly seeds: readonly number[];
+}
+
+/** One game's summary, with the seating the rotation gave it. */
+export interface TournamentGameReport {
+  readonly seed: number;
+  /** The policy playing each seat of **this** game — the rotation, spelled out. */
+  readonly seats: readonly string[];
+  readonly turnsPlayed: number;
+  readonly stoppedBecause: StopReason;
+  readonly finalHash: string;
+  readonly metricRows: number;
+  readonly violations: readonly ReportedViolation[];
+}
+
+/** The budget, and the verdict on it — stored, so the renderer prints rather than decides. */
+export interface TournamentBudgetReport {
+  readonly budgetMs: number;
+  readonly elapsedMs: number;
+  readonly withinBudget: boolean;
+  /** `max(0, elapsedMs - budgetMs)`: how far over, or `0`. */
+  readonly overByMs: number;
+  /** One line, with no figure in it: the numbers are the fields above. */
+  readonly verdict: string;
+}
+
+/** The pass/fail condition and the budget's verdict, as one value. */
+export interface TournamentVerdictReport {
+  /** The pass/fail condition: zero invariant violations. */
+  readonly passed: boolean;
+  readonly withinBudget: boolean;
+  /** `passed && withinBudget` — what A3's evidence needs. */
+  readonly accepted: boolean;
+  readonly games: number;
+  readonly violations: number;
+  readonly violatingGames: number;
+  /** One line naming both verdicts, for the report's last line. */
+  readonly summary: string;
+}
+
+/** One seat's figures: its horizon totals, and the aggregates over all of its rows. */
+export interface TournamentSeatReport {
+  readonly seat: number;
+  readonly games: number;
+  readonly policies: readonly string[];
+  /** `HORIZON_METRICS` summed over this seat's final sampled rows, one per game. */
+  readonly horizon: readonly MetricTotal[];
+  /** Every measured metric over every sampled row of this seat (from the engine's totals). */
+  readonly aggregates: readonly MetricAggregate[];
+}
+
+/** One policy's figures, across every seat it played. */
+export interface TournamentPolicyReport {
+  readonly policy: string;
+  readonly policyIndex: number;
+  /**
+   * What to print for this policy: its name, plus `#index` when the seat list names the
+   * same policy twice.
+   *
+   * A seat list may repeat a policy — `--seats smart,smart` is a self-play tournament — and
+   * two *tuned* instances of one policy share a name (`smartPolicy({...})` is named
+   * `smart`), so `smart` and `smart` would otherwise print as two identical rows and a
+   * weight comparison would look like a bug. The label is built here rather than by the
+   * renderer, because a report's labels are part of the structured value like its figures.
+   */
+  readonly label: string;
+  readonly games: number;
+  /** Games played in each seat, indexed by seat. */
+  readonly seatGames: readonly number[];
+  readonly horizon: readonly MetricTotal[];
+  readonly aggregates: readonly MetricAggregate[];
+}
+
+/**
+ * The whole tournament report — the one value the text renderer and `--json` both read.
+ *
+ * `totals` is `@civts/sim`'s own `TournamentTotals`, embedded rather than restated: the
+ * per-seat and per-policy aggregates in this report *are* the engine's, not a second
+ * opinion about them.
+ */
+export interface TournamentReport {
+  readonly kind: 'civts-tournament-report';
+  readonly reportVersion: number;
+  readonly status: 'ok' | 'violations' | 'over-budget';
+  readonly exitCode: number;
+  readonly parameters: TournamentParameters;
+  readonly ruleset: SimRulesetReport;
+  readonly budget: TournamentBudgetReport;
+  readonly verdict: TournamentVerdictReport;
+  readonly invariants: SimInvariantReport;
+  readonly totals: TournamentTotals;
+  readonly seats: readonly TournamentSeatReport[];
+  readonly policies: readonly TournamentPolicyReport[];
+  /** Every game, ascending by seed. */
+  readonly games: readonly TournamentGameReport[];
+  /** Every violation in the tournament, ascending by seed then turn. */
+  readonly violations: readonly ReportedViolation[];
+}
+
+export const TOURNAMENT_REPORT_VERSION = 1;
+
+/**
+ * What a tournament's unit of work is called in the violation banner.
+ *
+ * A tournament plays **games**, not runs: the batch command's banner ("in 3 of 20 runs")
+ * is right for `sim` and would be wrong here, and one word is cheaper than a reader
+ * wondering whether "runs" means the same thing in the two reports.
+ */
+const TOURNAMENT_SUBJECT: readonly [string, string] = ['game', 'games'];
+
+/** One game's horizon rows for one seat: the last sampled turn, that civilization only. */
+const seatHorizonRows = (game: SimulationResult, seat: number): readonly TurnMetrics[] =>
+  horizonRows(game).filter((row) => Number(row.playerId) === seat);
+
+/** The seat-list entry a policy index names, or a thrown message about an impossible plan. */
+const seatNameOf = (names: readonly string[], index: number): string => {
+  const name = names[index];
+  if (name === undefined) {
+    throw new Error(
+      `internal: the seat rotation named seat-list entry ${String(index)} of ` +
+        `${String(names.length)}, which the rotation cannot produce`,
+    );
+  }
+  return name;
+};
+
+/**
+ * What to print for each policy of a seat list: the name, and `#index` when the list names
+ * one policy more than once (see `TournamentPolicyReport.label`).
+ */
+const policyLabels = (names: readonly string[]): readonly string[] =>
+  names.map((name, index) =>
+    names.filter((candidate) => candidate === name).length > 1 ? `${name} #${String(index)}` : name,
+  );
+
+export interface TournamentReportInput {
+  readonly result: TournamentResult;
+  readonly parameters: TournamentParameters;
+  readonly ruleset: SimRulesetReport;
+  readonly invariantNames: readonly string[];
+}
+
+/**
+ * Turn a tournament result into the report. **Every figure the text prints is computed
+ * here** (or is a field of the engine's result), and the renderer below only formats.
+ *
+ * The horizon is `sim`'s own definition — the last sampled turn of a game, read by the same
+ * `horizonRows` helper the batch and the sweep use — so "by turn N" means the same thing in
+ * all three reports. The full per-metric aggregates travel in `totals`; the text leads with
+ * the horizon because that is the figure a balance decision reads first, and a reader who
+ * wants all sixteen columns has `--json`.
+ */
+export const buildTournamentReport = (input: TournamentReportInput): TournamentReport => {
+  const result = input.result;
+  const names = input.parameters.seats;
+  const plan = seatPlan(names.length, result.games.length);
+  // What each policy is called in this report — see `TournamentPolicyReport.label`.
+  const labels = policyLabels(names);
+
+  const games: readonly TournamentGameReport[] = result.games.map((game, index) => {
+    const seatsInGame = plan[index];
+    if (seatsInGame === undefined) {
+      throw new Error(
+        `internal: the seat plan has no entry for game ${String(index)} of ${String(result.games.length)}`,
+      );
+    }
+    return {
+      seed: game.seed,
+      seats: seatsInGame.map((policyIndex) => seatNameOf(labels, policyIndex)),
+      turnsPlayed: game.turnsPlayed,
+      stoppedBecause: game.stoppedBecause,
+      finalHash: game.finalHash,
+      metricRows: game.metrics.length,
+      violations: reportedViolations(game.seed, game.violations),
+    };
+  });
+
+  const seats: readonly TournamentSeatReport[] = result.totals.seats.map((totals) => ({
+    seat: totals.seat,
+    games: totals.games,
+    policies: totals.policies,
+    horizon: metricTotals(
+      result.games.flatMap((game) => seatHorizonRows(game, totals.seat)),
+      HORIZON_METRICS,
+    ),
+    aggregates: totals.aggregates,
+  }));
+
+  const policies: readonly TournamentPolicyReport[] = result.totals.policies.map((totals) => ({
+    policy: totals.policy,
+    policyIndex: totals.policyIndex,
+    label: seatNameOf(labels, totals.policyIndex),
+    games: totals.games,
+    seatGames: totals.seatGames,
+    horizon: metricTotals(
+      result.games.flatMap((game, index) => {
+        const seatsInGame = plan[index];
+        if (seatsInGame === undefined) {
+          throw new Error(
+            `internal: the seat plan has no entry for game ${String(index)} of ${String(result.games.length)}`,
+          );
+        }
+        const seat = seatsInGame.indexOf(totals.policyIndex);
+        if (seat < 0) {
+          throw new Error(
+            `internal: policy ${String(totals.policyIndex)} is seated nowhere in game ${String(index)}`,
+          );
+        }
+        return seatHorizonRows(game, seat);
+      }),
+      HORIZON_METRICS,
+    ),
+    aggregates: totals.aggregates,
+  }));
+
+  const violations = games.flatMap((game) => game.violations);
+  const verdict = tournamentVerdict(result);
+  const invariantCount = input.invariantNames.length;
+  const checks = result.games.reduce((total, game) => total + game.turnsPlayed * invariantCount, 0);
+
+  const invariantSentence = verdict.passed
+    ? `every invariant held in all ${String(verdict.games)} ${plural(verdict.games, 'game')}`
+    : `${String(verdict.violations)} invariant ${plural(verdict.violations, 'violation')} in ` +
+      `${String(verdict.violatingGames)} of ${String(verdict.games)} games — a tournament that ` +
+      'mostly holds its invariants has found a bug';
+  const budgetSentence = verdict.withinBudget
+    ? 'within budget'
+    : 'OVER BUDGET, with every seed still played';
+
+  const status: TournamentReport['status'] = !verdict.passed
+    ? 'violations'
+    : verdict.withinBudget
+      ? 'ok'
+      : 'over-budget';
+
+  return {
+    kind: 'civts-tournament-report',
+    reportVersion: TOURNAMENT_REPORT_VERSION,
+    status,
+    // A broken invariant is a defect, an overrun is a slow run: they exit differently so
+    // that a pipeline can tell them apart, and a run that is over budget *and* broken
+    // reports the defect.
+    exitCode: status === 'violations' ? 1 : status === 'over-budget' ? 3 : 0,
+    parameters: input.parameters,
+    ruleset: input.ruleset,
+    budget: {
+      budgetMs: result.budgetMs,
+      elapsedMs: result.elapsedMs,
+      withinBudget: result.withinBudget,
+      overByMs: Math.max(0, result.elapsedMs - result.budgetMs),
+      verdict: result.withinBudget
+        ? 'within budget'
+        : 'OVER BUDGET — every seed of the stated set was still played (the seed set is never trimmed to fit)',
+    },
+    verdict: {
+      passed: verdict.passed,
+      withinBudget: verdict.withinBudget,
+      accepted: verdict.accepted,
+      games: verdict.games,
+      violations: verdict.violations,
+      violatingGames: verdict.violatingGames,
+      summary: `${invariantSentence}; ${budgetSentence}`,
+    },
+    invariants: {
+      names: input.invariantNames,
+      count: invariantCount,
+      checks,
+      violations: violations.length,
+    },
+    totals: result.totals,
+    seats,
+    policies,
+    games,
+    violations,
+  };
+};
+
+/* ---- the text renderer ---- */
+
+/** One group of the tables below: a heading, then the stored horizon totals under it. */
+const tournamentGroupLines = (
+  heading: string,
+  horizon: readonly MetricTotal[],
+): readonly string[] => [heading, ...horizonLines(horizon)];
+
+const tournamentGameLines = (games: readonly TournamentGameReport[]): readonly string[] => {
+  const seatsWidth = games.reduce(
+    (width, game) => Math.max(width, game.seats.join(', ').length),
+    0,
+  );
+  // Header and rows are built from one width list, so a column can never drift away from
+  // the value under it.
+  const header =
+    `  ${padRight('seed', 6)}${padRight('seats', seatsWidth + 2)}${padRight('turns', 7)}` +
+    `${padRight('stop', 13)}${padRight('rows', 6)}final hash`;
+  const lines = [header];
+  for (const game of games) {
+    lines.push(
+      `  ${padRight(String(game.seed), 6)}${padRight(game.seats.join(', '), seatsWidth + 2)}` +
+        `${padRight(String(game.turnsPlayed), 7)}${padRight(game.stoppedBecause, 13)}` +
+        `${padRight(String(game.metricRows), 6)}${game.finalHash}`,
+    );
+  }
+  return lines;
+};
+
+/**
+ * The text tournament report: one line per stored field.
+ *
+ * The renderer performs no arithmetic over game numbers — no totals, no averages, no
+ * deltas — and it prints no figure the structured value does not carry. The budget line is
+ * the one place a number is *formatted* (`elapsedMs.toFixed(1)`, exactly as the batch
+ * report formats a stored mean) and the verdict lines are stored strings, so this function
+ * cannot disagree with the value it was handed.
+ */
+export const renderTournamentReport = (report: TournamentReport): string => {
+  const lines: string[] = [];
+
+  if (report.violations.length > 0) {
+    lines.push(
+      ...violationBannerLines(
+        TOURNAMENT_SUBJECT,
+        report.totals.games,
+        report.verdict.violatingGames,
+        report.violations,
+      ),
+      '',
+    );
+  }
+
+  // The label column is as wide as the widest label this report has, so a long policy name
+  // cannot run into the figure beside it. Layout, not data.
+  const labelWidth =
+    report.policies.reduce((width, policy) => Math.max(width, policy.label.length), 0) + 2;
+
+  lines.push(
+    `civts tournament — ${String(report.totals.games)} ` +
+      `${plural(report.totals.games, 'game')}, ${String(report.parameters.civCount)} seats, ` +
+      report.policies.map((policy) => policy.label).join(' vs '),
+    '',
+    `seeds       ${report.parameters.seedSpec} (${String(report.parameters.seeds.length)} games, ascending)`,
+    `settings    ${report.parameters.mapSize} ${String(report.parameters.width)}x` +
+      `${String(report.parameters.height)}, ${String(report.parameters.civCount)} civs, ` +
+      `${String(report.parameters.maxTurns)} turns max`,
+    `seats       ${report.parameters.seats.join(', ')} — rotated one seat per game, so every ` +
+      'policy plays every seat over enough games',
+    ...rulesetLines(report.ruleset),
+    `totals      ${String(report.totals.turnsPlayed)} ` +
+      `${plural(report.totals.turnsPlayed, 'turn')} played, ` +
+      `${String(report.totals.metricRows)} metric ${plural(report.totals.metricRows, 'row')}, ` +
+      `${String(report.invariants.checks)} invariant ${plural(report.invariants.checks, 'check')}`,
+    '',
+    `budget      ${String(report.budget.budgetMs)}ms stated, ` +
+      `${report.budget.elapsedMs.toFixed(1)}ms elapsed — ${report.budget.verdict}`,
+  );
+
+  if (!report.budget.withinBudget) {
+    lines.push(`            over by ${report.budget.overByMs.toFixed(1)}ms`);
+  }
+
+  lines.push('', `per seat — at the horizon (the last sampled turn of each game):`);
+  for (const seat of report.seats) {
+    lines.push(
+      ...tournamentGroupLines(
+        `  seat ${String(seat.seat)} — ${String(seat.games)} ${plural(seat.games, 'game')}, played by ` +
+          `${seat.policies.join(', ')}:`,
+        seat.horizon,
+      ),
+    );
+  }
+
+  lines.push('', 'per policy — at the horizon, in every seat it played:');
+  for (const policy of report.policies) {
+    lines.push(
+      ...tournamentGroupLines(
+        `  ${padRight(policy.label, labelWidth)}${String(policy.games)} ` +
+          `${plural(policy.games, 'game')}, seats ${policy.seatGames.join('/')}` +
+          ' (games per seat, by seat):',
+        policy.horizon,
+      ),
+    );
+  }
+
+  lines.push('', 'games (ascending seed, with the policy each seat was played by):');
+  lines.push(...tournamentGameLines(report.games));
+
+  lines.push(
+    '',
+    `invariants  ${String(report.invariants.count)} named predicates, ` +
+      `${String(report.invariants.checks)} checks, ${String(report.invariants.violations)} violations`,
+    `  checked: ${report.invariants.names.join(', ')}`,
+    '',
+    `verdict     ${report.verdict.summary}`,
+  );
+
+  return `${lines.join('\n')}\n`;
+};
+
+/** The banner alone, for the `--json` path: the report on stdout, the shout on stderr. */
+export const renderTournamentBanner = (report: TournamentReport): string =>
+  report.violations.length === 0
+    ? ''
+    : `${violationBannerLines(
+        TOURNAMENT_SUBJECT,
+        report.totals.games,
+        report.verdict.violatingGames,
+        report.violations,
+      ).join('\n')}\n`;
+
+/* ---- the command ---- */
+
+export interface TournamentCommandOutput {
+  readonly report: TournamentReport | undefined;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+}
+
+/** The default seat list: the real AI in every seat. */
+const defaultSeats = (civCount: number): readonly SimPolicyName[] =>
+  Array.from({ length: civCount }, () => DEFAULT_TOURNAMENT_SEAT);
+
+/**
+ * `civts tournament …`, with no I/O: the caller writes `stdout`/`stderr` and exits
+ * `exitCode`, exactly as `runSimCommand` is wired.
+ *
+ * It shares the `sim` command's override machinery, its fault injection and its report
+ * discipline, so a catalog number overridden here means what it means there, and the
+ * tournament cannot grow a second set of rules about what a knob is.
+ */
+export const runTournamentCommand = (
+  args: readonly string[],
+): Result<TournamentCommandOutput, SimCommandFailure> => {
+  if (args.includes('-h') || args.includes('--help')) {
+    return ok({ report: undefined, stdout: TOURNAMENT_USAGE, stderr: '', exitCode: 0 });
+  }
+
+  const flags = parseTournamentArgs(args);
+  if (!flags.ok) return err(failure(2, [`error: ${flags.error}`], TOURNAMENT_USAGE));
+
+  const assignments: OverrideAssignment[] = [];
+  for (const text of flags.value.overrides) {
+    const parsed = parseOverride(text);
+    if (!parsed.ok) return err(failure(2, [`error: ${parsed.error}`], TOURNAMENT_USAGE));
+    assignments.push(parsed.value);
+  }
+  const patch = buildRulesetPatch(assignments);
+  if (!patch.ok) return err(failure(2, [`error: ${patch.error}`], TOURNAMENT_USAGE));
+
+  const layer: Record<string, unknown> = {};
+  if (flags.value.mapSize !== undefined) layer['mapSize'] = flags.value.mapSize;
+  if (flags.value.civCount !== undefined) layer['civCount'] = flags.value.civCount;
+
+  const settings = loadSettings(layer);
+  if (!settings.ok) {
+    return err(
+      failure(
+        2,
+        settings.error.map((issue) => `settings error: ${formatSettingsIssue(issue)}`),
+        TOURNAMENT_USAGE,
+      ),
+    );
+  }
+
+  const seatNames = flags.value.seats ?? defaultSeats(settings.value.civCount);
+  if (seatNames.length !== settings.value.civCount) {
+    return err(
+      failure(
+        2,
+        [
+          `error: --seats names ${String(seatNames.length)} ` +
+            `${seatNames.length === 1 ? 'policy' : 'policies'} (${seatNames.join(', ')}) but the game has ` +
+            `${String(settings.value.civCount)} civilizations — every seat needs exactly one ` +
+            'policy, and a policy may repeat (--seats smart,smart)',
+        ],
+        TOURNAMENT_USAGE,
+      ),
+    );
+  }
+
+  const overridden = tryApplyOverrides(CATALOG, patch.value);
+  if (!overridden.ok)
+    return err(failure(2, [overrideFailureLine(assignments, overridden.error)], TOURNAMENT_USAGE));
+
+  const validated = validateRuleset(overridden.value.catalog, settings.value.fidelity);
+  if (!validated.ok) {
+    return err(
+      failure(
+        1,
+        validated.error.map((e) => `ruleset error: ${formatRulesetError(e)}`),
+        undefined,
+      ),
+    );
+  }
+
+  const seeds = flags.value.seeds ?? parseDefaultSeedSpec(DEFAULT_TOURNAMENT_SEED_SPEC);
+  const seedSpec = flags.value.seedSpec ?? DEFAULT_TOURNAMENT_SEED_SPEC;
+  const maxTurns = flags.value.turns ?? DEFAULT_TOURNAMENT_TURNS;
+  const invariants: readonly Invariant[] = [
+    ...CORE_INVARIANTS,
+    ...flags.value.faults.map((name) => faultInvariant(name)),
+  ];
+
+  const parameters: TournamentParameters = {
+    mapSize: settings.value.mapSize,
+    width: MAP_DIMENSIONS[settings.value.mapSize].width,
+    height: MAP_DIMENSIONS[settings.value.mapSize].height,
+    civCount: settings.value.civCount,
+    maxTurns,
+    seats: seatNames.map((name) => policyOf(name).name),
+    seedSpec,
+    seeds,
+  };
+
+  let result: TournamentResult;
+  try {
+    result = runTournament(
+      {
+        seeds,
+        settings: settings.value,
+        ruleset: validated.value,
+        policies: seatNames.map((name) => policyOf(name)),
+        maxTurns,
+        ...(flags.value.budgetMs === undefined ? {} : { budgetMs: flags.value.budgetMs }),
+      },
+      // The registry is handed to the harness, not to the frozen options: `--fault` is a
+      // self-test of *this command's* violation path, and the pass/fail condition is what
+      // it exists to exercise.
+      { invariants },
+    );
+  } catch (cause) {
+    return err(failure(1, [`error: ${messageOf(cause)}`], undefined));
+  }
+
+  const report = buildTournamentReport({
+    result,
+    parameters,
+    ruleset: {
+      fidelity: validated.value.fidelity,
+      hash: hashValue(overridden.value.catalog),
+      overrideCount: overridden.value.applied.length,
+      applied: overridden.value.applied,
+      patch: patch.value,
+    },
+    invariantNames: invariants.map((invariant) => invariant.name),
+  });
+
+  const json = flags.value.json;
+  return ok({
+    report,
+    stdout: json ? `${canonicalize(report)}\n` : renderTournamentReport(report),
+    stderr: json ? renderTournamentBanner(report) : '',
+    exitCode: report.exitCode,
+  });
+};
+
+/* ------------------------------------------------------------------ *
  * The balance sweep
  * ------------------------------------------------------------------ */
 
@@ -2037,6 +2960,18 @@ const readNumeric = (
           return notNumeric();
       }
     }
+    case 'capture': {
+      // M7's singleton, addressed the same way the combat globals are: no row id beyond
+      // the section's own name, and the shipped value read *out of the catalog* so a
+      // `--knob capture.populationDivisor` sweep can never restate the number.
+      if (id !== CAPTURE_ROW_ID) return unknown([CAPTURE_ROW_ID]);
+      switch (field) {
+        case 'populationDivisor':
+          return ok(catalog.capture.populationDivisor);
+        default:
+          return notNumeric();
+      }
+    }
   }
 };
 
@@ -2077,6 +3012,17 @@ const readProvenance = (
         ? ok(catalog.combat.provenance)
         : err(
             `combat.${id} is not a catalog row (the section is one row, named "${COMBAT_ROW_ID}")`,
+          );
+    }
+    case 'capture': {
+      // M7's section provenance, printed beside the divisor for the same reason: a reader
+      // has to be able to see that a swept capture number is a placeholder of ours and not
+      // a citation.
+      return id === CAPTURE_ROW_ID
+        ? ok(catalog.capture.provenance)
+        : err(
+            `capture.${id} is not a catalog row (the section is one row, named ` +
+              `"${CAPTURE_ROW_ID}")`,
           );
     }
   }

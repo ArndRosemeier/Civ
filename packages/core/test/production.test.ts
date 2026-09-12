@@ -35,7 +35,13 @@ import { describe, expect, it } from 'vitest';
 import { hashValue } from '@civts/testing';
 import { cityProductionOptions } from '../src/actions.js';
 import { availableBuildings, mayStartBuilding } from '../src/buildings.js';
-import { captureCity, type BuildingDef, type City, type ProductionItem } from '../src/cities.js';
+import {
+  captureCity,
+  type BuildingDef,
+  type CaptureDef,
+  type City,
+  type ProductionItem,
+} from '../src/cities.js';
 import { applyEconomy } from '../src/economy.js';
 import {
   asBuildingId,
@@ -117,6 +123,16 @@ const FACTORY: BuildingDef = {
 };
 
 const BUILDINGS: readonly BuildingDef[] = [WONDER, TEMPLE, FACTORY];
+
+/**
+ * The capture rule this file's two sack fixtures are played under (M7).
+ *
+ * The divisor is a **parameter** of `captureCity` now rather than a constant in
+ * `cities.ts`, so every caller says where its number came from; this file is about shields
+ * and completions, so it states the shipped placeholder directly the way `cities.test.ts`
+ * does, and asserts nothing about the population.
+ */
+const CAPTURE_RULES: CaptureDef = { populationDivisor: 2 };
 
 const RULESET: RulesetView = {
   terrains: [TERRAIN],
@@ -534,7 +550,7 @@ describe('a captured city banks its shields and completes nothing (M6)', () => {
     expect(uncaptured.state.cities[0]?.production).toEqual(building('factory'));
 
     // The same city, taken by player 0 before the production step runs.
-    const capture = captureCity(before, BUILDINGS, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, BUILDINGS, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     // What the capture did, stated here as the premise of the production assertion:
@@ -567,7 +583,13 @@ describe('a captured city banks its shields and completes nothing (M6)', () => {
     // production immediately (the setter's own rules are `commands.test.ts`'), and
     // nothing about the old owner's choice can still complete.
     const target = bigCity(0, 1, 5, { shields: 3, production: building('temple') });
-    const capture = captureCity(board([target]), BUILDINGS, asCityId(0), asPlayerId(0));
+    const capture = captureCity(
+      board([target]),
+      BUILDINGS,
+      asCityId(0),
+      asPlayerId(0),
+      CAPTURE_RULES,
+    );
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     const chosen: GameState = {

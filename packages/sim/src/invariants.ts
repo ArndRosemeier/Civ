@@ -82,10 +82,10 @@
  */
 
 import {
-  CAPTURE_POPULATION_DIVISOR,
   IMPROVEMENT_KINDS,
   MIN_GROWTH_FOOD,
   UNIT_SUPPORT_COST,
+  captureRulesOf,
   cityAt,
   cityRadius,
   cityYields,
@@ -987,10 +987,11 @@ const unitMovementInRange = (ctx: InvariantContext): readonly string[] => {
  * The measured magnitudes are *not* restated here: the promotion cap comes from the
  * ruleset's `combat` section through `combatRulesOf` — the same reader `commands.ts` asks
  * before it clamps a promotion, and M6b's home for the number that was the `MAX_EXPERIENCE`
- * constant of `core/combat.ts` — and `CAPTURE_POPULATION_DIVISOR` comes from `@civts/core`
- * (`cities.ts`), so a knob that moves moves these checks with it. Nothing below is a
- * balance claim, and nothing here is a Civ 3 number — the same provenance rule the module
- * doc states for the whole file.
+ * constant of `core/combat.ts` — and the capture population divisor comes from the
+ * ruleset's `capture` section through `captureRulesOf` (M7's home for the number that was
+ * `cities.ts`' `CAPTURE_POPULATION_DIVISOR`), so a knob that moves moves these checks with
+ * it. Nothing below is a balance claim, and nothing here is a Civ 3 number — the same
+ * provenance rule the module doc states for the whole file.
  *
  * Two readings are deliberately **not** made, and both for the same reason (see the
  * module doc's "reading the context honestly"): a turn's boundary is not the moment a
@@ -1252,7 +1253,8 @@ const unitNotInsideForeignCity = (ctx: InvariantContext): readonly string[] => {
  *   building a sack preserves;
  * - with a `previous` snapshot: the event's `population` is the capture rule applied
  *   to the population the city held **when it was taken** (`max(1, floor(population /
- *   CAPTURE_POPULATION_DIVISOR))`, the divisor imported from `cities.ts`) — read from the
+ *   divisor))`, the divisor read from the ruleset's `capture` section through
+ *   `captureRulesOf`) — read from the
  *   *ordered* event stream by `captureTrail`, because growth can run before a sack
  *   (barbarians attack inside the pipeline) as well as after one (a civilization attacks
  *   in the command phase) — and every building the city holds that the sack did *not*
@@ -1343,12 +1345,19 @@ const capturedCityConsistent = (ctx: InvariantContext): readonly string[] => {
     const held = position === -1 ? before.population : trail.atCapture[position];
     if (held === undefined) continue;
 
-    const expectedPopulation = Math.max(1, Math.floor(held / CAPTURE_POPULATION_DIVISOR));
+    // The divisor is read from the ruleset this turn is being played under, exactly as
+    // the promotion cap above is: M7 moved it out of `cities.ts` and into the catalog's
+    // `capture` section, so a knob that moves moves this check with it — and the
+    // arithmetic below stays a *restatement* of the rule rather than a call to
+    // `capturedPopulation`, because a check that asks the function it is checking cannot
+    // catch a bug in that function.
+    const divisor = captureRulesOf(ctx.rulesetView).populationDivisor;
+    const expectedPopulation = Math.max(1, Math.floor(held / divisor));
     if (event.population !== expectedPopulation) {
       problems.push(
         `${label} held ${String(held)} people when it was captured and the event says ` +
           `${String(event.population)}; the capture rule is max(1, floor(population / ` +
-          `${String(CAPTURE_POPULATION_DIVISOR)})) = ${String(expectedPopulation)}`,
+          `${String(divisor)})) = ${String(expectedPopulation)}`,
       );
     }
 
@@ -1811,12 +1820,16 @@ const cityFoodConservation = (ctx: InvariantContext): readonly string[] => {
         if (capture === undefined) continue;
         const held = trail.atCapture[index];
         if (held === undefined) continue;
-        const expected = Math.max(1, Math.floor(held / CAPTURE_POPULATION_DIVISOR));
+        // The same read as `captured-city-consistent` makes, for the same reason: the
+        // divisor is the ruleset's (M7's catalog section), and the arithmetic is restated
+        // here rather than asked of `cities.ts`.
+        const divisor = captureRulesOf(ctx.rulesetView).populationDivisor;
+        const expected = Math.max(1, Math.floor(held / divisor));
         if (capture.population !== expected) {
           problems.push(
             `${label} was captured with a population of ${String(capture.population)} while it ` +
               `held ${String(held)}; the capture rule is max(1, floor(population / ` +
-              `${String(CAPTURE_POPULATION_DIVISOR)})) = ${String(expected)}`,
+              `${String(divisor)})) = ${String(expected)}`,
           );
         }
       }

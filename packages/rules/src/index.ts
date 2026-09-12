@@ -181,6 +181,16 @@ export interface Catalog {
    * the resolver happened to carry.
    */
   readonly combat: CombatSpec;
+  /**
+   * The capture rule — the magnitudes a sack applies to the city it takes. Required,
+   * like `combat`, and required *in fact* rather than by convention: `cities.ts`'
+   * `captureCity` reads the divisor from the ruleset it is handed and keeps no copy of
+   * it, so a catalog without this section is a game whose captures have no rule at all.
+   * `validateRuleset` refuses such a catalog, which is what makes this a *section*
+   * rather than an optional field with a default hiding behind it — the M6b argument,
+   * applied to the one M6 magnitude that was still buried in logic.
+   */
+  readonly capture: CaptureSpec;
 }
 
 /**
@@ -471,6 +481,65 @@ export interface CombatSpec {
   readonly provenance: Provenance;
 }
 
+/**
+ * **The capture section of the catalog** — the one magnitude a *sack* applies, as
+ * opposed to the nine the `combat` section applies to the fight that causes it.
+ *
+ * ## Why this section exists at all
+ *
+ * M6 wrote the rule "a captured city's population is halved" into
+ * `packages/core/src/cities.ts` as `CAPTURE_POPULATION_DIVISOR = 2` — a module-level
+ * constant. That is the standing requirement's third clause violated a second time
+ * (*every magnitude a system introduces lives in the rules catalog, or an explicit
+ * override, never as a literal buried in logic*), and it had exactly the cost M6b's
+ * combat section was added to remove: `scripts/combat-balance-sweep.ts` had to list
+ * `CAPTURE_POPULATION_DIVISOR` under "magnitudes this override surface CANNOT move".
+ * **A knob nobody can turn is a knob nobody will ever tune**, so the number lives
+ * here, `RulesetPatch.capture` moves it, `cities.ts` reads it from the ruleset it is
+ * handed (`captureRulesOf`) and keeps no copy of it, and the sweep turns it.
+ *
+ * ## A section of its own, rather than a tenth combat magnitude
+ *
+ * The two tables answer different questions: `combat` decides **who wins a fight**,
+ * and this section decides **what the winner inherits**. Folding a capture magnitude
+ * into `combat` would make that section's own doc ("the nine magnitudes that decide
+ * how a battle goes") false, and would make "the walls did nothing" and "the sack
+ * cost the city nothing" two readings of one table — which is the confusion the two
+ * separate sections exist to prevent.
+ *
+ * ## This is a RELOCATION, not a rebalance
+ *
+ * `populationDivisor` is **exactly the number M6 shipped** (`2`), so the engine's
+ * behaviour — and therefore every stored golden hash — is unchanged by the move. If a
+ * golden moves after this section appears, something other than this section moved
+ * with it.
+ *
+ * ## Provenance: placeholder
+ *
+ * The divisor is an **unsourced value of ours, chosen to be playable**. It is not
+ * traced to Civ 3 and is not presented as Civ 3's: the real game's capture losses
+ * depend on the city's size, its buildings and the wonders it holds, which this engine
+ * does not model at all, and the M6 contract states the rule itself as "population
+ * drops (placeholder rule: halved, floored, minimum 1)" — a rule of ours, with no
+ * source behind it. `fidelity: 'cited-only'` refuses this section exactly as it
+ * refuses every other placeholder row.
+ */
+export interface CaptureSpec {
+  /**
+   * The divisor a captured city's population is divided by, floored, and never below
+   * 1 citizen. Integer `>= 1`.
+   *
+   * `1` is legal and it *means* something — "a sack costs the city no citizens", a
+   * lenient tuning position rather than a typo — while `0` is refused, because
+   * `Math.floor(population / 0)` is `Infinity`: a value `canonicalize` cannot round-trip
+   * and a state hash that would not survive a save. A negative divisor is refused for
+   * the same reason a negative percentage is: it would *increase* a conquered city's
+   * population, which is not what this field is.
+   */
+  readonly populationDivisor: number;
+  readonly provenance: Provenance;
+}
+
 export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
@@ -544,6 +613,21 @@ export interface Ruleset {
    * is played on a validated `Ruleset`, which always carries it.)
    */
   readonly combat: CombatSpec;
+  /**
+   * The capture rule, carried through validation unchanged — and **present on the
+   * validated ruleset**, not only on the catalog.
+   *
+   * Load-bearing for the same reason as `combat`, one rule later in the turn: every
+   * capture — the player's `AttackUnit`, and the barbarian step's own sacks inside
+   * `advanceTurn` — reaches `cities.ts`' `captureCity` with the ruleset in hand, and the
+   * population the sack leaves is read from *this* section through `captureRulesOf`. A
+   * validated ruleset that dropped it would leave a captured city's population decided by
+   * a number nobody chose, which is the exact defect the M7 repair removes. (`RulesetView`
+   * does not declare the field — it is the engine's structural view — so the reader is
+   * total over it; every real game is played on a validated `Ruleset`, which always
+   * carries it.)
+   */
+  readonly capture: CaptureSpec;
   readonly fidelity: Fidelity;
 }
 
@@ -1433,6 +1517,33 @@ export const CATALOG: Catalog = {
         '`RulesetPatch.combat` instead of reporting that they cannot be moved',
     ),
   },
+  /**
+   * **The capture rule (M7)** — the one M6 magnitude that was still a module constant
+   * in `core/cities.ts` (`CAPTURE_POPULATION_DIVISOR = 2`), moved here unchanged so a
+   * balance sweep can turn it (INTERFACES.md M7, "Repairs carried into this wave";
+   * standing requirement, *Tunable*).
+   *
+   * The value is **exactly M6's**, so this is a relocation and not a rebalance: the
+   * capture rule's arithmetic, the cities it produces and therefore every stored golden
+   * hash are unchanged by the move. `fidelity: 'cited-only'` refuses the section, as it
+   * refuses every other placeholder row here.
+   *
+   * The section is one number because the *rule* is one number: M6 captured "halved,
+   * floored, minimum 1", and the divisor is the whole of what that leaves to choose. The
+   * parts that are not a choice are stated in `cities.ts` where the rule is applied —
+   * the floor, the minimum of one citizen, the maintenance-descending destruction order,
+   * and the two fields a sack deliberately leaves alone (`foodBox`, `shields`).
+   */
+  capture: {
+    populationDivisor: 2,
+    provenance: placeholder(
+      'unsourced: this divisor is ours, chosen to be playable, and none of it is traced to Civ 3, ' +
+        "whose capture losses depend on the city's size, its buildings and its wonders — which this " +
+        'engine does not model; M6 shipped it as `CAPTURE_POPULATION_DIVISOR` in `core/cities.ts` and ' +
+        'M7 relocates it here with the **same number** (a relocation, not a rebalance) so a balance ' +
+        'sweep can move it through `RulesetPatch.capture` instead of reporting that it cannot be moved',
+    ),
+  },
 };
 
 /**
@@ -2239,6 +2350,16 @@ const checkTechGraph = (techs: readonly TechSpec[]): readonly RulesetError[] => 
 const COMBAT_ROW_ID = 'combat';
 
 /**
+ * The id the capture section is filed under in a provenance report.
+ *
+ * Same argument as `COMBAT_ROW_ID`, and the same string `RulesetPatch.capture` uses:
+ * `ProvenanceRow` is `{ id, provenance }`, the report prints the id beside the claim,
+ * and a singleton section with no name for itself would be a row a reader cannot cite.
+ * The catalog's own field name is that name.
+ */
+const CAPTURE_ROW_ID = 'capture';
+
+/**
  * **The combat globals, checked as one model rather than as nine numbers** (M6b).
  *
  * Every field must be an integer, for the reason every simulation number in this file
@@ -2356,6 +2477,61 @@ const checkCombat = (section: unknown): readonly RulesetError[] => {
   return errors;
 };
 
+/**
+ * **The capture section, checked on its own terms.**
+ *
+ * One field, one rule, and the rule is a *range the arithmetic can express* rather than
+ * a preference:
+ *
+ * - **integer** — the divisor feeds `Math.floor(population / divisor)`, and a fraction
+ *   there would put a non-integer population into `GameState`, which `canonicalize`
+ *   cannot round-trip and no golden hash can pin. A string or a missing field is the
+ *   same complaint, reported as "must be an integer".
+ * - **`>= 1`** — `0` is a division by zero: `Math.floor(4 / 0)` is `Infinity`, a value
+ *   that is not a city's population and is not hashable either. A negative divisor
+ *   *grows* the conquered city, which is not what the field means — the same argument
+ *   the combat section's percentages make about a negative percentage. `1` is legal and
+ *   meaningful: it states "a sack costs the city no citizens", which is a lenient
+ *   tuning position a sweep must be able to reach, not an error.
+ *
+ * **Total over `unknown`, like `checkCombat`**: the value may be JSON, a `Partial` patch
+ * or a hand-built literal, and a **missing section** has to be reported rather than
+ * crashing the validator — a catalog that says nothing about capture is not a catalog
+ * with a default capture, it is one whose sacks have no rule (`cities.ts` reads the
+ * divisor from the ruleset).
+ */
+const checkCapture = (section: unknown): readonly RulesetError[] => {
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'capture',
+    id: CAPTURE_ROW_ID,
+    field,
+    detail,
+  });
+
+  const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+    typeof value === 'object' && value !== null;
+  if (!isRecord(section)) {
+    return [bad('capture', 'must be an object carrying the capture magnitudes')];
+  }
+
+  const divisor = section['populationDivisor'];
+  if (typeof divisor !== 'number' || !Number.isInteger(divisor)) {
+    return [bad('populationDivisor', 'must be an integer')];
+  }
+  if (divisor < 1) {
+    return [
+      bad(
+        'populationDivisor',
+        "must be >= 1: it divides a city's population, and 0 is a division by zero " +
+          '(Infinity is not a population and not a hashable state)',
+      ),
+    ];
+  }
+
+  return [];
+};
+
 export const validateRuleset = (
   catalog: Catalog,
   fidelity: Fidelity,
@@ -2391,6 +2567,11 @@ export const validateRuleset = (
     // the units whose strengths it is applied to are themselves well-formed. The section
     // is read as `unknown` so a catalog that omits it is reported rather than crashing.
     ...checkCombat(catalog.combat),
+    // M7: the capture rule is a section too, and it is checked after the row catalogs
+    // for the same reason — a complaint about a divisor is only meaningful once the
+    // buildings a sack destroys are themselves well-formed. Read as `unknown`, so a
+    // catalog that omits it is *reported* rather than crashing the validator.
+    ...checkCapture(catalog.capture),
   ];
 
   if (fidelity === 'cited-only') {
@@ -2465,6 +2646,17 @@ export const validateRuleset = (
         note: catalog.combat.provenance.note,
       });
     }
+    // M7: the capture rule is a singleton row too — one placeholder claim carrying the
+    // number M6 buried in `cities.ts` — so `cited-only` refuses it by name, exactly as
+    // it refuses the combat globals.
+    if (isPlaceholder(catalog.capture.provenance)) {
+      errors.push({
+        kind: 'placeholder-in-cited-only',
+        catalog: 'capture',
+        id: CAPTURE_ROW_ID,
+        note: catalog.capture.provenance.note,
+      });
+    }
   }
 
   // The annotations state the contract each `extends` encodes, and keep the
@@ -2477,6 +2669,9 @@ export const validateRuleset = (
   // M6b: the combat globals travel with the validated ruleset, because `core/combat.ts`
   // reads them from the ruleset it is handed and keeps no copy. See `Ruleset.combat`.
   const combat: CombatSpec = catalog.combat;
+  // M7: the capture rule travels with the validated ruleset for the same reason, and
+  // `cities.ts`' `captureRulesOf` is the one reader. See `Ruleset.capture`.
+  const capture: CaptureSpec = catalog.capture;
 
   return errors.length > 0
     ? err(errors)
@@ -2488,6 +2683,7 @@ export const validateRuleset = (
         resources,
         techs,
         combat,
+        capture,
         fidelity,
       });
 };
@@ -2586,15 +2782,24 @@ export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection
   // "rows" are the one row its provenance is filed under (`COMBAT_ROW_ID`); the count,
   // like every other count here, comes from the rows the section actually carries.
   sectionOf('combat', [{ id: COMBAT_ROW_ID, provenance: catalog.combat.provenance }]),
+  // M7: the capture rule is the eighth section, and it is here for exactly the reason the
+  // combat globals are: it was *not* a catalog row until this wave — M6 left it as
+  // `CAPTURE_POPULATION_DIVISOR` in `core/cities.ts` — so before this section existed the
+  // report had nothing to count and the balance sweep had nothing to move. A singleton,
+  // so its "row" is the one its provenance is filed under (`CAPTURE_ROW_ID`), and the
+  // count comes from the rows the section actually carries.
+  sectionOf('capture', [{ id: CAPTURE_ROW_ID, provenance: catalog.capture.provenance }]),
 ];
 
 /**
  * Count **every** row in the catalog — terrain, unit, building, improvement,
- * resource, tech **and the combat globals** alike. The number answers
+ * resource, tech **and the combat and capture globals** alike. The number answers
  * "how much of what the engine runs on is traced to a source?", so a summary
  * that quietly skipped a catalog would be exactly the half-truth PLAN.md §6.2
  * exists to prevent. M6b's combat section counts as one row, because it is one
- * provenance claim carrying nine numbers — the claim is what is being counted.
+ * provenance claim carrying nine numbers — the claim is what is being counted —
+ * and M7's capture section counts as one row for the same reason: one claim
+ * carrying the divisor M6 had buried in `cities.ts`.
  *
  * Defined as the sum of `provenanceSections`, so a caller that prints this
  * number beside those sections — the CLI does — cannot print a total that

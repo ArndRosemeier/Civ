@@ -192,6 +192,7 @@ import {
   nextUint32,
   type City,
   type CityId,
+  captureRulesOf,
   type Command,
   type GameEvent,
   type GameState,
@@ -1435,7 +1436,13 @@ const captureIn = (
     state.players.find((player) => player.kind === 'civ' && player.id !== target.owner),
     'a rival civilization',
   );
-  const captured = captureCity(state, RULESET.buildings, target.id, rival.id);
+  const captured = captureCity(
+    state,
+    RULESET.buildings,
+    target.id,
+    rival.id,
+    captureRulesOf(RULESET),
+  );
   if (captured === undefined) {
     throw new Error(`captureCity found no city ${String(target.id)} to capture`);
   }

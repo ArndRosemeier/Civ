@@ -1584,3 +1584,90 @@ these as unsweepable, and that list should shrink to whatever genuinely cannot m
   "this proves nothing" if the knob genuinely does not matter.
 - Removing the catalog values and leaving a literal in `combat.ts` must fail a test —
   prove the dual-source rule is enforced rather than merely stated.
+
+---
+
+# M7 contracts — FROZEN (a real opponent, and self-play)
+
+Alpha criterion A3: *AI opponents play a complete game unaided; at least one victory
+condition demonstrated ending a real game; 20-seed tournament, 0 invariant
+violations, budget met.* Victory conditions arrive in M10, so M7 delivers the
+opponent and the tournament machinery; the victory-ending run is demonstrated once
+M10 lands.
+
+## The AI is a `Policy`, and it must actually play
+
+`packages/sim/src/ai/` gains a real policy (`SmartPolicy` or similar) replacing
+`SIMPLE_POLICY` as the default in tournaments. It must:
+
+- **play unaided** for a full horizon: settle, expand, work tiles, assign production,
+  set rates, research with a goal, build and use military units, and respond to
+  barbarians
+- be **deterministic**: same seed and settings give byte-identical games, and it must
+  never draw from `state.rng` (the M5 property — the AI must not be able to change
+  the world)
+- be **fast enough to matter**: a 20-seed tournament inside a stated budget
+- be **decomposable for balance work**: its decisions read from named weights or
+  thresholds that live in one place, so a balance sweep can vary them the way the
+  catalog is varied. An AI whose preferences are scattered literals cannot be tuned,
+  which is the same violation M6b fixed for combat.
+
+**A policy must be shown to be playing, not merely running.** Required evidence: the
+real policy must decisively beat the do-nothing baseline on a majority of seeds by
+stated metrics (cities, population, techs). An AI that technically returns commands
+and produces the same game as doing nothing is worse than no AI, because it looks
+like an opponent.
+
+## Self-play tournament
+
+```ts
+export interface TournamentOptions {
+  readonly seeds: readonly number[];
+  readonly settings: Settings;
+  readonly ruleset: Ruleset;
+  readonly policies: readonly Policy[];      // by seat; a policy may repeat
+  readonly maxTurns: number;
+  readonly budgetMs?: number;
+}
+export interface TournamentResult {
+  readonly games: readonly SimulationResult[];
+  readonly totals: TournamentTotals;         // per-seat aggregates, deterministically ordered
+  readonly violations: readonly Violation[]; // MUST be empty for A3
+  readonly budgetMs: number;
+  readonly elapsedMs: number;
+  readonly withinBudget: boolean;
+}
+```
+
+- Seats are assigned so the same policy plays different starting positions across
+  seeds — a policy that only wins from seat 0 has not been tested.
+- Aggregates are order-independent (the M4b/M5 rule) and must be stable when the seed
+  list is permuted.
+- **Zero invariant violations is a pass/fail condition, not a statistic.** A
+  tournament that "mostly" holds invariants has found a bug; report it, do not
+  average it away.
+- The budget is reported honestly: if the run exceeds it, say so rather than
+  trimming the seed set silently.
+
+CLI: a `tournament` command alongside `sim`, printing per-seat aggregates and the
+violation count, with `--json` for the structured result. Rendering comes from the
+structured value only (the M2 rule).
+
+## Repairs carried into this wave (standing-requirement debt)
+
+1. `CAPTURE_POPULATION_DIVISOR` is still a literal in `cities.ts` and is listed by
+   the sweep as unmovable — the same violation M6b fixed for combat. Move it into the
+   catalog and make it sweepable.
+2. The walls-bonus sweep was flat because the placeholder policy never fights inside
+   a walled city. With a real AI reaching walled cities routinely, re-run that sweep
+   and report whether it now shows an effect — and if it still does not, say whether
+   that is a true finding about the knob or a limitation of the measurement.
+
+## Acceptance evidence
+
+- The policy beats the do-nothing baseline on a majority of seeds, by stated metrics.
+- Determinism: identical seeds → identical hashes, in-process and in a fresh process.
+- The 20-seed tournament runs within budget with ZERO invariant violations, and the
+  result is byte-reproducible.
+- Policy weights are sweepable: a sweep over one AI weight shows a measured effect.
+- `CAPTURE_POPULATION_DIVISOR` is in the catalog and swept.

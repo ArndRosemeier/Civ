@@ -243,7 +243,7 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     expect(hashOf(CATALOG, 'the shipped catalog again')).toBe(SHIPPED_HASH);
   });
 
-  it('is 9d1440035de55f86, and 22f3d14aea97575e with resources and units reversed', () => {
+  it('is 7cf57f33400a00f6, and c2d3d7665e3a17ce with resources and units reversed', () => {
     // These two numbers are the requirement's own measured fact, and pinning them is
     // what ties the property below to the real catalog. **If this assertion fails, the
     // catalog's content or order moved**: that is either an intentional content change
@@ -281,14 +281,26 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     // behaviour did not. A state golden moving here would mean something other than the
     // section moved with it. No row was reordered; the arrangement sweep below still
     // passes, and the non-vacuity assertions over the rebuild now cover `combat` too.
-    expect(SHIPPED_HASH).toBe('9d1440035de55f86');
+    //
+    // **M7 re-measured them a fourth time, and it is the second movement that is not a
+    // rehash — the same shape of change one milestone later.** The catalog gained its
+    // required `capture` section (one magnitude plus a provenance note), so the validated
+    // ruleset carries one more key, and the pins were `9d1440035de55f86` and
+    // `22f3d14aea97575e`. The state goldens did NOT move again, and for the same reason:
+    // the divisor is M6's own 2 and the capture arithmetic (`floor(population / divisor)`,
+    // never below one) is unchanged, so `core/cities.ts` now *reads* a number it used to
+    // *hold*. Identity moved because the ruleset says one more thing; behaviour did not,
+    // because it says the same thing. A state golden moving here would mean the
+    // relocation had become a retune. No row was reordered — the arrangement sweep below
+    // still passes — and the rebuild's non-vacuity assertions now cover `capture` as well.
+    expect(SHIPPED_HASH).toBe('7cf57f33400a00f6');
     const reversedUnits = arranged(CATALOG, 'units', reverseOrder(CATALOG.units.length));
     const reversedBoth = arranged(
       reversedUnits,
       'resources',
       reverseOrder(CATALOG.resources.length),
     );
-    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('22f3d14aea97575e');
+    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('c2d3d7665e3a17ce');
   });
 });
 
@@ -399,12 +411,17 @@ describe('a catalog rebuilt row for row has the shipped identity', () => {
       // identity a replay compares is the *whole* validated ruleset, and a rebuild that
       // quietly dropped the combat globals would be comparing a different game.
       combat: { ...CATALOG.combat },
+      // M7's `capture` section is the second singleton, cloned for the same reason: the
+      // identity a replay compares is the whole validated ruleset, and the divisor a sack
+      // applies is part of what a game is played under.
+      capture: { ...CATALOG.capture },
     };
     // Non-vacuity: the rebuild really is a different object graph.
     expect(rebuilt.terrains).not.toBe(CATALOG.terrains);
     expect(at(rebuilt.terrains, 0)).not.toBe(at(CATALOG.terrains, 0));
     expect(rebuilt).not.toBe(CATALOG);
     expect(rebuilt.combat).not.toBe(CATALOG.combat);
+    expect(rebuilt.capture).not.toBe(CATALOG.capture);
 
     expect(hashOf(rebuilt, 'the rebuilt catalog')).toBe(SHIPPED_HASH);
     // ...and the arrangement is still the shipped one, section by section, so the
@@ -432,5 +449,21 @@ describe('a catalog rebuilt row for row has the shipped identity', () => {
     expect(hashOf(edited, 'a terrain renamed')).not.toBe(SHIPPED_HASH);
     // The edit is the only difference: the rows are the same rows in the same order.
     expect(edited.terrains).toHaveLength(CATALOG.terrains.length);
+
+    // **The singleton sections are inside the identity too** (M7). A section that the
+    // rebuild carried but the hash ignored would make a replay compare two games played
+    // under different capture rules — which is exactly the class of bug this file exists
+    // for, and the reason the `capture` divisor is worth one assertion of its own rather
+    // than a line in a list.
+    const otherDivisor: Catalog = {
+      ...CATALOG,
+      capture: { ...CATALOG.capture, populationDivisor: CATALOG.capture.populationDivisor + 1 },
+    };
+    expect(hashOf(otherDivisor, 'the capture divisor moved')).not.toBe(SHIPPED_HASH);
+    const otherWalls: Catalog = {
+      ...CATALOG,
+      combat: { ...CATALOG.combat, wallsBonusPct: CATALOG.combat.wallsBonusPct + 1 },
+    };
+    expect(hashOf(otherWalls, 'the walls bonus moved')).not.toBe(SHIPPED_HASH);
   });
 });

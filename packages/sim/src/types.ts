@@ -318,7 +318,9 @@ export type OverrideSection =
   | 'improvements'
   | 'resources'
   /** M6b: the combat globals — one section, not a record of rows. See `CombatPatch`. */
-  | 'combat';
+  | 'combat'
+  /** M7: the capture rule — the second singleton section. See `CapturePatch`. */
+  | 'capture';
 
 /** A partial of a yield triple: a patch may set one channel without the others. */
 export type YieldsPatch = Partial<TerrainYields>;
@@ -479,6 +481,46 @@ export interface CombatPatch {
 }
 
 /**
+ * What may be overridden on the catalog's **`capture` section** (M7, "Repairs carried
+ * into this wave").
+ *
+ * ## Why a section of fields rather than a record of rows
+ *
+ * Exactly the `CombatPatch` argument, one milestone later: the capture rule is a
+ * **singleton** — one magnitude that describes one rule, with no id to key it by
+ * (`@civts/rules`' `CaptureSpec` has no `id` field; its provenance is filed under the
+ * section's own name `capture`). So the patch is a flat `Partial<CaptureSpec>`, and
+ * `overrides.ts` reports an unknown key here the way it reports an unknown field inside a
+ * row: naming `populationDivisor` with a typo must be a *report*, never a silent no-op,
+ * because a sweep whose knob was never applied reports "no effect" — the most expensive
+ * wrong answer this package can give.
+ *
+ * ## What the field is for, and what it is *not*
+ *
+ * `populationDivisor` decides what a captured city has left. It arrives here because M6
+ * wrote it into `core/cities.ts` as `CAPTURE_POPULATION_DIVISOR = 2`, a module constant,
+ * which made it the one combat-adjacent magnitude the M6b sweep still had to list under
+ * "cannot move" — and a knob nobody can turn is a knob nobody will ever tune.
+ * `scripts/combat-balance-sweep.ts` sweeps it now and its report names what it moved.
+ * **It is not a Civ 3 figure**: the catalog's own provenance note says so, and the real
+ * game's capture losses depend on a city's size and holdings, which this engine does not
+ * model.
+ *
+ * ## The one rule attached to it
+ *
+ * `populationDivisor` must be an integer `>= 1`, and `validateRuleset` refuses anything
+ * else — `0` because `floor(population / 0)` is `Infinity`, which is neither a population
+ * nor a hashable state. A patch that sets `0` therefore produces a catalog that **fails
+ * validation**, exactly as a hand-edited catalog would: overrides are applied *before*
+ * `validateRuleset` on purpose, so an impossible sweep value is refused rather than
+ * blessed. `1` is accepted and means "a sack costs the city no citizens".
+ */
+export interface CapturePatch {
+  /** The divisor a captured city's population is divided by; integer `>= 1`. */
+  readonly populationDivisor?: number;
+}
+
+/**
  * A **deep-partial of the catalog, addressed by id** — the balance knob the
  * standing requirement asks for ("every magnitude it introduces lives in the rules
  * catalog … or an explicit override").
@@ -531,4 +573,15 @@ export interface RulesetPatch {
    * it is named rather than left for a sweep to discover as a zero.
    */
   readonly combat?: CombatPatch;
+  /**
+   * The capture rule (M7) — **partial**, so a sweep moves the divisor and leaves the rest
+   * of the catalog exactly as the author wrote it.
+   *
+   * M7 added this field for the reason M6b added `combat`: the magnitude had been a
+   * module constant in `core/cities.ts`, and the combat sweep had to report that it could
+   * not be moved. `CapturePatch` names the whole section (one field), and
+   * `overrides.test.ts` asserts that moving it leaves the combat section untouched, so a
+   * capture sweep cannot be measuring a combat change by accident.
+   */
+  readonly capture?: CapturePatch;
 }

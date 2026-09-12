@@ -249,10 +249,17 @@
 
 // `buildingCatalog` here, with `buildings.ts`' rule, because `planSetProduction` is
 // where "may this city build this" is decided for *both* kinds of item.
+//
+// M7: `captureRulesOf` is how a sack gets its **magnitude** — the population divisor —
+// out of the ruleset this file was already handed, exactly as `combatRulesOf` does one
+// step earlier in the same turn. Nothing here restates it, and there is no
+// `CAPTURE_POPULATION_DIVISOR` import to shadow the catalog: the population a conquered
+// city is left with comes from the same section a balance sweep moves.
 import {
   autoAssignWorkedTiles,
   buildingCatalog,
   captureCity,
+  captureRulesOf,
   cityAt,
   cityById,
   cityRadius,
@@ -2643,7 +2650,13 @@ const applyCapture = (
   ruleset: RulesetView,
   plan: Extract<AttackPlan, { kind: 'capture' }>,
 ): Result<CommandOutcome, GameError> => {
-  const capture = captureCity(state, buildingCatalog(ruleset), plan.city.id, plan.unit.owner);
+  const capture = captureCity(
+    state,
+    buildingCatalog(ruleset),
+    plan.city.id,
+    plan.unit.owner,
+    captureRulesOf(ruleset),
+  );
   if (capture === undefined) {
     return err({
       kind: 'invalid-argument',

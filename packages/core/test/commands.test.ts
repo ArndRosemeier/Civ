@@ -34,8 +34,10 @@ import { canonicalize, hashValue } from '@civts/testing';
 import { combatRulesOf, type CombatDef } from '../src/combat.js';
 import {
   MIN_CITY_DISTANCE,
+  captureRulesOf,
   cityById,
   type BuildingDef,
+  type CaptureDef,
   type City,
   type ProductionItem,
 } from '../src/cities.js';
@@ -4038,12 +4040,29 @@ const M6_COMBAT: CombatDef = {
 };
 
 /**
+ * **The capture rule this file's sacks are applied under** (M7) — the divisor the shipped
+ * `@civts/rules` catalog declares, written out here for the same reason `M6_COMBAT` is:
+ * `@civts/core` cannot depend on the content package, and a fixture that read the number
+ * back from the engine would assert nothing about what the engine does with it.
+ *
+ * M7 moved it out of `cities.ts`, where it was `CAPTURE_POPULATION_DIVISOR = 2`. A capture
+ * now reads the section off the ruleset it is played under, and a view that declares none
+ * gets the *degenerate* rule (`NO_CAPTURE_RULES`: divisor 1, "a sack costs the city no
+ * citizens") rather than a copy of the shipped 2 — which is why this fixture has to say
+ * what its divisor is, and why the M7 block below asserts that moving it moves the
+ * population the engine leaves.
+ */
+const M7_CAPTURE: CaptureDef = { populationDivisor: 2 };
+
+/**
  * The same escape hatch `TechView` above uses, for the same reason: `RulesetView` (the
  * engine's structural view) does not declare `combat`, so a fixture that carries one says
- * so in its own type rather than casting the section in.
+ * so in its own type rather than casting the section in. M7's `capture` section is declared
+ * the same way.
  */
 interface CombatView extends TechView {
   readonly combat: CombatDef;
+  readonly capture: CaptureDef;
 }
 
 /** The M2 fixture view plus M6's unit and building rows and M6b's combat section. */
@@ -4052,6 +4071,7 @@ const M6_RULESET: CombatView = {
   units: [...RULESET.units, LEGION, PHALANX, CIVILIAN],
   buildings: M6_BUILDINGS,
   combat: M6_COMBAT,
+  capture: M7_CAPTURE,
 };
 
 /**
@@ -4832,6 +4852,38 @@ describe('applyCommand — capture changes exactly what M6 says it changes', () 
         Math.max(1, Math.floor(population / 2)),
       );
     }
+  });
+
+  it('applies the divisor the ruleset declares, and reads it through the engine’s own reader', () => {
+    // **M7's own claim, through the command layer.** The first half says the fixture's
+    // section is the one the applier reads (`captureRulesOf`, the same reader
+    // `applyCapture` asks) — so the numbers in this block are the arithmetic of *this*
+    // section and not of two answers quietly agreeing. The second half is the knob: the
+    // same board, the same attack, three rulesets, three populations, which is what makes
+    // the divisor sweepable rather than a constant with a section-shaped shadow.
+    expect(captureRulesOf(M6_RULESET)).toEqual(M7_CAPTURE);
+
+    const capturedUnder = (populationDivisor: number): number | undefined => {
+      const rules = { ...M6_RULESET, capture: { populationDivisor } };
+      const outcome = mustOk(apply(targetBoard(), P0, attack(ATTACKER, 6), rules));
+      return cityById(outcome.state, asCityId(0))?.population;
+    };
+
+    expect(capturedUnder(1)).toBe(5); // "a sack costs the city no citizens"
+    expect(capturedUnder(2)).toBe(2); // the shipped placeholder: floor(5 / 2)
+    expect(capturedUnder(5)).toBe(1); // floor(5 / 5) = 1, and the minimum agrees
+
+    // …and a view that declares no capture section is the *degenerate* rule, not the
+    // shipped one: absent must change what a sack does, or a literal would be hiding here.
+    // The section is dropped by a rest pattern, and the drop is *asserted* rather than
+    // trusted (the same discipline the M6 terrain and unit fixtures use for a key they
+    // really remove — a removal that silently failed would leave this assertion vacuous).
+    const { capture: declared, ...withoutCapture } = M6_RULESET;
+    expect(declared).toEqual(M7_CAPTURE);
+    expect('capture' in withoutCapture).toBe(false);
+    expect(captureRulesOf(withoutCapture).populationDivisor).toBe(1);
+    const outcome = mustOk(apply(targetBoard(), P0, attack(ATTACKER, 6), withoutCapture));
+    expect(cityById(outcome.state, asCityId(0))?.population).toBe(5);
   });
 
   it('lets a barbarian take a city too — ownership is ownership', () => {

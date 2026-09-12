@@ -39,6 +39,7 @@ import {
   asUnitId,
   asUnitTypeId,
   captureCity,
+  captureRulesOf,
   cityProductionOptions,
   cityRadius,
   civPlayers,
@@ -533,7 +534,13 @@ const captureFixture = (): CaptureFixture => {
     civPlayers(BASE).find((player) => player.id !== target.owner),
     'a rival civilization in the played state',
   );
-  const captured = captureCity(BASE, RULESET.buildings, target.id, rival.id);
+  const captured = captureCity(
+    BASE,
+    RULESET.buildings,
+    target.id,
+    rival.id,
+    captureRulesOf(RULESET),
+  );
   if (captured === undefined) {
     throw new Error(`captureCity found no city ${String(target.id)} to capture`);
   }

@@ -71,6 +71,7 @@ import {
   cityById,
   cityMaintenance,
   cityProductionOptions,
+  captureRulesOf,
   capturedPopulation,
   cityYields,
   civPlayers,
@@ -220,6 +221,18 @@ const RULESET: RulesetView = (() => {
  * test.
  */
 const COMBAT_RULES = combatRulesOf(RULESET);
+
+/**
+ * **The capture rule, read the same way** (M7).
+ *
+ * M6 shipped the divisor as `CAPTURE_POPULATION_DIVISOR`, a module constant in
+ * `packages/core/src/cities.ts`, and this file imported it by name. M7 moves it into the
+ * catalog's `capture` section, so the fixture asks `captureRulesOf` for it — the *same*
+ * reader `core/commands.ts` uses before it applies a sack — and the scenarios below keep
+ * stating the numbers they expect (4 -> 2, and never below one), which is what makes them
+ * evidence about the engine rather than a restatement of it.
+ */
+const CAPTURE_RULES = captureRulesOf(RULESET);
 
 /**
  * The same catalog with one terrain role removed — for the missing-role path.
@@ -9002,11 +9015,13 @@ const captureScenario = defineScenario({
     return [
       // The rule, and both ends of it: half, floored, and never below one.
       check(
-        capturedPopulation(4) === 2 && capturedPopulation(1) === 1 && capturedPopulation(0) === 1,
+        capturedPopulation(CAPTURE_RULES, 4) === 2 &&
+          capturedPopulation(CAPTURE_RULES, 1) === 1 &&
+          capturedPopulation(CAPTURE_RULES, 0) === 1,
         'a capture halves the population and floors it, but never empties the city: ' +
-          `capturedPopulation(4) = ${String(capturedPopulation(4))}, ` +
-          `capturedPopulation(1) = ${String(capturedPopulation(1))}, ` +
-          `capturedPopulation(0) = ${String(capturedPopulation(0))}`,
+          `capturedPopulation(4) = ${String(capturedPopulation(CAPTURE_RULES, 4))}, ` +
+          `capturedPopulation(1) = ${String(capturedPopulation(CAPTURE_RULES, 1))}, ` +
+          `capturedPopulation(0) = ${String(capturedPopulation(CAPTURE_RULES, 0))}`,
       ),
       check(
         before.population === CAPTURE_POPULATION &&
@@ -9516,9 +9531,9 @@ const bandScenario = defineScenario({
           event.from === ROME &&
           event.to === BARBARIANS &&
           Number(event.tile) === Number(tileAt(ROMAN_CITY_TILE)) &&
-          event.population === capturedPopulation(4),
+          event.population === capturedPopulation(CAPTURE_RULES, 4),
         'arriving beside an undefended city, the band takes it: population 4 -> ' +
-          `${String(capturedPopulation(4))}, from Rome to the barbarians (got ${
+          `${String(capturedPopulation(CAPTURE_RULES, 4))}, from Rome to the barbarians (got ${
             event === undefined
               ? 'no CityCaptured at all'
               : `${event.name} ${String(event.population)} ${String(event.from)} -> ${String(event.to)}`

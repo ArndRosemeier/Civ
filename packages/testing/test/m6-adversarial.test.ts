@@ -105,6 +105,7 @@ import {
   asUnitTypeId,
   buildingCatalog,
   buildingsLostToCapture,
+  captureRulesOf,
   capturedPopulation,
   cityAt,
   cityProductionOptions,
@@ -205,6 +206,17 @@ const RULESET: Ruleset = (() => {
  * agree with itself even if the reader dropped a field on the way to the resolver.
  */
 const COMBAT = combatRulesOf(RULESET);
+
+/**
+ * **The capture rule, read the same way** (M7).
+ *
+ * M6's `CAPTURE_POPULATION_DIVISOR` was a module constant in `core/cities.ts` and this file
+ * imported it by name; M7 moves the divisor into the catalog's `capture` section, so the
+ * pin reads it out of the validated ruleset through `captureRulesOf` — the *same* reader
+ * `core/commands.ts` asks before it applies a sack. The number, and therefore every
+ * assertion below, is unchanged.
+ */
+const CAPTURE = captureRulesOf(RULESET);
 
 /** `Ruleset` is structurally the engine's view; named so the intent is visible at each call. */
 const VIEW: RulesetView = RULESET;
@@ -1848,7 +1860,7 @@ describe('4. capture integrity', () => {
     expect(event.to).toBe(asPlayerId(0));
     expect(event.tile).toBe(before.tile);
     expect(event.name).toBe(before.name);
-    expect(event.population).toBe(capturedPopulation(before.population));
+    expect(event.population).toBe(capturedPopulation(CAPTURE, before.population));
     expect(event.population).toBe(2);
 
     // …and the state agrees with it, field by field.
@@ -1960,7 +1972,7 @@ describe('4. capture integrity', () => {
     expect(event.to).toBe(barbarian.id);
 
     const captured = mustCity(applied.state, barbarian.id);
-    expect(captured.population).toBe(capturedPopulation(3));
+    expect(captured.population).toBe(capturedPopulation(CAPTURE, 3));
     expect([...captured.buildings]).toEqual([WONDER.id]);
     expect(event.destroyed).toEqual(['granary']);
 
@@ -2880,11 +2892,14 @@ describe('9. the rules a mutation would have to break', () => {
 
     // (b) `cities.ts`' `capturedPopulation`: halved, floored, at least one. A different
     // divisor changes every number here.
-    expect(capturedPopulation(5)).toBe(2);
-    expect(capturedPopulation(4)).toBe(2);
-    expect(capturedPopulation(1)).toBe(1);
-    expect(capturedPopulation(0)).toBe(1);
-    expect(capturedPopulation(2.5)).toBe(1);
+    expect(capturedPopulation(CAPTURE, 5)).toBe(2);
+    expect(capturedPopulation(CAPTURE, 4)).toBe(2);
+    expect(capturedPopulation(CAPTURE, 1)).toBe(1);
+    expect(capturedPopulation(CAPTURE, 0)).toBe(1);
+    expect(capturedPopulation(CAPTURE, 2.5)).toBe(1);
+    // …and the divisor is the *catalog's*, not a copy of it: the same population under a
+    // different capture section is a different city, which is what makes this knob sweepable.
+    expect(capturedPopulation({ populationDivisor: 4 }, 4)).toBe(1);
 
     // (c) `cities.ts`' `buildingsLostToCapture`: maintenance-descending, ties by the most
     // recently completed, and **the wonder is kept**. Dropping the `isWonder` guard puts

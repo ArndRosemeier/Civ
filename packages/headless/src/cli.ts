@@ -50,7 +50,13 @@ import {
   runInteractive,
   runScript,
 } from './repl.js';
-import { SIM_POLICIES, formatRulesetError, formatSettingsIssue, runSimCommand } from './sim-cli.js';
+import {
+  SIM_POLICIES,
+  formatRulesetError,
+  formatSettingsIssue,
+  runSimCommand,
+  runTournamentCommand,
+} from './sim-cli.js';
 
 const USAGE = `civts — headless tooling
 
@@ -63,8 +69,10 @@ Commands:
   play         interactive text REPL: play the game from a terminal or a script
   sim          run a batch of headless games and report per-metric aggregates and
                every invariant's verdict; see "civts sim --help"
-  run          headless AI-vs-AI game                     (arrives in M7; "sim" is the
-               batch harness that exists today)
+  tournament   self-play: the same policies across seeds with the seats ROTATED, so no
+               policy is ever tested from one position only; zero invariant violations
+               is the pass condition and the budget is reported; see "civts tournament
+               --help". "run" is an accepted alias for this command.
 
 Options:
   -h, --help   show this help
@@ -99,6 +107,21 @@ sim options (the full text is in "civts sim --help"):
   that is the command working, not failing. "exit 0" means every run held every
   invariant.
 
+tournament options (the full text is in "civts tournament --help"):
+  --seeds <spec>      games to play: "1..20", "3", "1,4,7"   (default: 1..20, A3's size)
+  --seats <names>     one policy per seat, comma-separated; a name may repeat, and
+                      "smart,smart" is a self-play tournament (default: smart in every
+                      seat). The seats ROTATE across games.
+  --map-size <size>   ${MAP_SIZES.join('|')}  (default: tiny)
+  --civs <int>        civilizations, and the number of seats  (default: 2)
+  --turns <int>       turns to play per game                (default: 100)
+  --budget-ms <int>   the budget the whole run is judged against; every seed is played
+                      whatever the clock says, and an overrun is reported, never hidden
+  --json              emit one canonical JSON report (sorted keys) instead of text
+
+  exit 0 means every game held every invariant AND the run was within budget; exit 1
+  names a violation, exit 3 reports an honest overrun.
+
 play commands (inside a session; "help" prints the same list with detail):
   move <unitId> <x> <y>      found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
@@ -117,6 +140,8 @@ Examples:
   pnpm play --seed 42 --script session.txt
   npx tsx packages/headless/src/cli.ts sim --seeds 1..10 --turns 20
   npx tsx packages/headless/src/cli.ts sim --seeds 1..3 --override units.settler.cost=4 --json
+  npx tsx packages/headless/src/cli.ts tournament --seeds 1..20 --json
+  npx tsx packages/headless/src/cli.ts tournament --seats smart,none --seeds 1..5
   npx tsx scripts/balance-sweep.ts
 `;
 
@@ -425,6 +450,42 @@ const commandSim = (args: readonly string[]): number => {
   return result.value.exitCode;
 };
 
+/* ------------------------------------------------------------------ *
+ * `tournament` — the self-play harness, wired to the same rules as `sim`.
+ *
+ * This is the M7 contract's CLI half: "a `tournament` command alongside `sim`, printing
+ * per-seat aggregates and the violation count, with `--json` for the structured
+ * result". It is the *same* wiring `commandSim` is — write the stdout the command built,
+ * pass its stderr through, return its exit code — because `runTournamentCommand` already
+ * owns the flags, the run, the structured report and the renderer, and a second
+ * interpretation of a report here is exactly the M2 provenance bug the standing
+ * requirement's "Reporting" paragraph exists to prevent.
+ *
+ * **Why this function exists at all.** `sim-cli.ts` shipped `runTournamentCommand` with
+ * its own tests while `main` below had no case for it: `civts tournament …` answered
+ * "unknown command: tournament", so the command could only be reached by importing it in
+ * a test. The tool was implemented and unreachable — the integration half of a feature is
+ * the wiring, and a CLI command nobody can type is not shipped. `run` is routed here too:
+ * PLAN.md §8.1 names the AI-vs-AI game `run`, and the old stub's message ("the M7
+ * self-play harness is not built yet") was a lie the moment this milestone landed.
+ * ------------------------------------------------------------------ */
+
+const commandTournament = (args: readonly string[]): number => {
+  const result = runTournamentCommand(args);
+  if (!result.ok) {
+    for (const line of result.error.lines) console.error(line);
+    if (result.error.usage !== undefined) {
+      console.error('');
+      console.error(result.error.usage);
+    }
+    return result.error.exitCode;
+  }
+
+  process.stdout.write(result.value.stdout);
+  if (result.value.stderr !== '') process.stderr.write(result.value.stderr);
+  return result.value.exitCode;
+};
+
 const main = async (argv: readonly string[]): Promise<number> => {
   const [command, ...rest] = argv;
 
@@ -442,11 +503,12 @@ const main = async (argv: readonly string[]): Promise<number> => {
       return commandPlay(rest);
     case 'sim':
       return commandSim(rest);
+    case 'tournament':
+      return commandTournament(rest);
     case 'run':
-      console.log(
-        'run: the M7 self-play harness is not built yet; "sim" runs batches headlessly today.',
-      );
-      return 0;
+      // PLAN.md §8.1's name for the same self-play game. Written as its own case rather than a
+      // fallthrough so that neither branch depends on a lint comment to stay honest.
+      return commandTournament(rest);
     default:
       console.error(`unknown command: ${command}`);
       console.error(USAGE);

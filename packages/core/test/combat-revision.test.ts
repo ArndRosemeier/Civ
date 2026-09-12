@@ -29,7 +29,7 @@ import { describe, expect, it } from 'vitest';
 
 import { hashValue } from '@civts/testing';
 
-import { captureCity, type BuildingDef, type City } from '../src/cities.js';
+import { captureCity, captureRulesOf, type BuildingDef, type City } from '../src/cities.js';
 import { defenderBonusPct, resolveCombat } from '../src/combat.js';
 import { applyCommand, type Command, type GameEvent } from '../src/commands.js';
 import {
@@ -124,8 +124,15 @@ const WALLS: BuildingDef = {
  * A view that carries a combat section, because the applier reads the combat magnitudes
  * out of the ruleset it is handed (M6b) and an absent section is the *degenerate* table
  * rather than the shipped one. The nine numbers are the shipped ones.
+ *
+ * M7 gives it a `capture` section too, for the same reason one rule later: a capture reads
+ * the population divisor out of the ruleset it is played under, and a view that declared
+ * nothing would leave the sack under the degenerate "costs the city no citizens".
  */
-interface CombatView extends RulesetView {
+interface SectionedView extends RulesetView {
+  readonly capture: {
+    readonly populationDivisor: number;
+  };
   readonly combat: {
     readonly fortifyBonusPct: number;
     readonly cityDefenseBonusPct: number;
@@ -139,13 +146,15 @@ interface CombatView extends RulesetView {
   };
 }
 
-const RULESET: CombatView = {
+const RULESET: SectionedView = {
   terrains: [GRASS],
   units: [WARRIOR],
   buildings: [WALLS],
   improvements: [],
   resources: [],
   fidelity: 'tuned',
+  // The shipped divisor, stated by this fixture rather than assumed by `cities.ts`.
+  capture: { populationDivisor: 2 },
   combat: {
     fortifyBonusPct: 25,
     cityDefenseBonusPct: 50,
@@ -309,7 +318,13 @@ describe('the capture revision delta is exactly one per sack', () => {
     // The rule on its own: this is what the barbarian step reaches, and what M6b moved the
     // bump *into*. A capture that did not bump here would be the zero-bump failure.
     const before = board(1);
-    const capture = captureCity(before, RULESET.buildings ?? [], asCityId(0), asPlayerId(0));
+    const capture = captureCity(
+      before,
+      RULESET.buildings ?? [],
+      asCityId(0),
+      asPlayerId(0),
+      captureRulesOf(RULESET),
+    );
     if (capture === undefined) throw new Error('the fixture holds city 0');
 
     expect(capture.state.revision - before.revision).toBe(1);
@@ -322,11 +337,23 @@ describe('the capture revision delta is exactly one per sack', () => {
     // comment states ("one bump per capture, from the capture rule") reduced to the rule.
     const before = board(2);
     const first = must(
-      captureCity(before, RULESET.buildings ?? [], asCityId(0), asPlayerId(0)),
+      captureCity(
+        before,
+        RULESET.buildings ?? [],
+        asCityId(0),
+        asPlayerId(0),
+        captureRulesOf(RULESET),
+      ),
       'the first capture',
     );
     const second = must(
-      captureCity(first.state, RULESET.buildings ?? [], asCityId(1), asPlayerId(0)),
+      captureCity(
+        first.state,
+        RULESET.buildings ?? [],
+        asCityId(1),
+        asPlayerId(0),
+        captureRulesOf(RULESET),
+      ),
       'the second capture',
     );
 

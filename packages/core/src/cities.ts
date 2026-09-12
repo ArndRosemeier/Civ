@@ -482,8 +482,10 @@ export const autoAssignWorkedTiles = (
  *
  * 1. **Ownership changes** to the attacker's player. There is no "no owner" state:
  *    a city is always somebody's, which is what makes `citiesOf` total.
- * 2. **Population is halved, floored, at a minimum of 1** — `capturedPopulation`
- *    below. Placeholder, unsourced, ours.
+ * 2. **Population is divided by the ruleset's divisor, floored, at a minimum of 1** —
+ *    `capturedPopulation` below, whose divisor is read from the ruleset the caller hands
+ *    over (`captureRulesOf`) and never from a constant here. Placeholder, unsourced, ours
+ *    (M7 moved it into the catalog so a balance sweep can turn it).
  * 3. **Buildings are destroyed deterministically**, and **a wonder is never
  *    destroyed by capture**: a wonder is globally unique (M4c), so destroying one
  *    would silently make it buildable again — `production.ts`' completion pass asks
@@ -529,27 +531,115 @@ export const autoAssignWorkedTiles = (
  * ------------------------------------------------------------------ */
 
 /**
- * The divisor a captured city's population is reduced by. 2 is a **placeholder**:
- * unsourced, chosen to be playable, and **not** a Civ 3 figure — the M6 contract
- * states the rule ("halved, floored, minimum 1") without a source, and the real
- * game's capture losses depend on the city's size and its buildings, which this
- * engine does not model.
+ * **The capture magnitudes a ruleset declares** — the engine's structural view of
+ * `@civts/rules`' `CaptureSpec`, minus `provenance` (a field the engine never reads),
+ * exactly as `BuildingDef` mirrors `BuildingSpec` and `CombatDef` mirrors `CombatSpec`.
+ *
+ * ## Why this type exists at all (M7)
+ *
+ * M6 shipped the rule "a captured city's population is halved" as
+ * `CAPTURE_POPULATION_DIVISOR = 2`, a module-level constant **in this file**. That is the
+ * standing requirement's third clause violated — *every magnitude a system introduces
+ * lives in the rules catalog, or an explicit override, never as a literal buried in
+ * logic* — and it had the cost that clause exists to prevent:
+ * `scripts/combat-balance-sweep.ts` had to print the constant under "magnitudes this
+ * override surface CANNOT move". **A knob nobody can turn is a knob nobody will ever
+ * tune.** So the number lives in the catalog's `capture` section now, `RulesetPatch`
+ * moves it, `captureRulesOf` below is the one read of it, and there is no copy of it left
+ * behind here: `cities.test.ts` applies two different `CaptureDef`s to the same city and
+ * requires the population to move, so a literal left behind would fail a test instead of
+ * quietly becoming a second source of truth. That is the same proof `combat.test.ts`
+ * makes for the combat globals, for the same reason.
+ *
+ * ## Provenance
+ *
+ * Every field is an integer by validation (`validateRuleset`'s `checkCapture`), and the
+ * one field is a **placeholder** of ours: unsourced, chosen to be playable, and not a
+ * Civ 3 figure. The provenance claim lives with the row in `@civts/rules`.
  */
-export const CAPTURE_POPULATION_DIVISOR = 2;
+export interface CaptureDef {
+  /** The divisor a captured city's population is divided by, floored, minimum 1. */
+  readonly populationDivisor: number;
+}
+
+/**
+ * **What a capture does when the ruleset declares no capture section.**
+ *
+ * A *degenerate* rule, deliberately unlike the shipped table, and deliberately not a
+ * second copy of it: `populationDivisor: 1` states "a sack costs the city no citizens",
+ * which is the least destructive reading of "this ruleset says nothing about capture" —
+ * the exact counterpart of `NO_COMBAT_RULES`' "nothing favours an assault". The floor and
+ * the minimum of one citizen still apply, because they are the *rule's* arithmetic rather
+ * than a magnitude (see `capturedPopulation`).
+ *
+ * **Why not the shipped catalog's number?** Because a fallback that reproduced today's
+ * value would be the dual-source bug M6b and M7 exist to remove, wearing a new costume:
+ * moving the catalog's `populationDivisor` would then leave every capture that arrived
+ * through a section-less view — a hand-built fixture, a foreign object — halving
+ * populations under a number nobody can see or sweep. An absent section must *change what
+ * a capture does*, and `cities.test.ts` asserts that it does.
+ *
+ * A real game never meets this: `validateRuleset` requires the catalog's `capture`
+ * section, so every state built through `newGame` captures under declared rules. This is
+ * the answer for a *structural* view, the same totality rule `terrainDefenseBonus`
+ * applies to a terrain that declares no defence bonus.
+ */
+export const NO_CAPTURE_RULES: CaptureDef = {
+  populationDivisor: 1,
+};
+
+/** Is this value a plain object (not an array, not `null`)? */
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * **The capture magnitudes a ruleset declares** — the one read of them.
+ *
+ * The section is read *structurally*, through `unknown`, exactly as `combatRulesOf` reads
+ * a view's `combat` and `techCatalog` reads a view's `techs`: `RulesetView` (in `map.ts`)
+ * is the engine's structural view and does not declare `capture`, while `@civts/rules`'
+ * validated `Ruleset` carries it, and a hand-built fixture may carry anything at all.
+ * Reading it this way means the number reaches a capture from content without this
+ * package depending on `rules`, and without a cast.
+ *
+ * **Absent is not "use the shipped value"**: see `NO_CAPTURE_RULES` for why an unstated
+ * section must change what a capture does. A value that *is* present but unreadable (a
+ * string, a fraction, a zero, a negative) reads as the degenerate divisor rather than as
+ * a `NaN` or an `Infinity` that would poison the population and the state hash with it.
+ */
+export const captureRulesOf = (ruleset: RulesetView): CaptureDef => {
+  const view: unknown = ruleset;
+  const section = isRecord(view) ? view['capture'] : undefined;
+  if (!isRecord(section)) return NO_CAPTURE_RULES;
+
+  const divisor = section['populationDivisor'];
+  return {
+    populationDivisor:
+      typeof divisor === 'number' && Number.isInteger(divisor) && divisor >= 1
+        ? divisor
+        : NO_CAPTURE_RULES.populationDivisor,
+  };
+};
 
 /**
  * The population a city of `population` citizens has after being captured:
- * `max(1, floor(population / CAPTURE_POPULATION_DIVISOR))`.
+ * `max(1, floor(population / rules.populationDivisor))`.
  *
- * Floored **once**, on the halved value (the M4c compounding rule's cousin: two
- * floors in a row is a different number, and someone will otherwise "simplify"
- * this). Total on purpose — a hand-built or foreign state can carry a population
- * that is not a positive whole number, and the answer for such a city is the
- * minimum rather than a fraction that `canonicalize` would reject.
+ * Floored **once**, on the divided value (the M4c compounding rule's cousin: two floors
+ * in a row is a different number, and someone will otherwise "simplify" this). Total on
+ * purpose — a hand-built or foreign state can carry a population that is not a positive
+ * whole number, and the answer for such a city is the minimum rather than a fraction that
+ * `canonicalize` would reject.
+ *
+ * The divisor is a **parameter**, read by the caller from the ruleset it is playing under
+ * (`captureRulesOf`), rather than a constant this module would have to own: that is the
+ * whole M7 repair. `rules.test.ts` pins the shipped value, `cities.test.ts` proves this
+ * function honours whatever it is handed, and the balance sweep moves it through
+ * `RulesetPatch.capture`.
  */
-export const capturedPopulation = (population: number): number => {
+export const capturedPopulation = (rules: CaptureDef, population: number): number => {
   const whole = Number.isInteger(population) && population > 0 ? population : 1;
-  return Math.max(1, Math.floor(whole / CAPTURE_POPULATION_DIVISOR));
+  return Math.max(1, Math.floor(whole / rules.populationDivisor));
 };
 
 /**
@@ -617,6 +707,13 @@ export interface CityCapture {
  * `commands.ts`' `planAttackUnit`, and mixing the two would give legality a second
  * home.
  *
+ * `rules` is the capture section read from the ruleset the caller is playing under
+ * (`captureRulesOf`), and it is **required** rather than defaulted: a default would have
+ * to be *some* number, and a default that reproduced the shipped one is exactly the
+ * dual-source bug M7 removes — a sweep would move the catalog's divisor and this
+ * function would keep halving under a value nobody could see. The compiler is what
+ * enforces that every caller states where its number came from.
+ *
  * **It bumps `revision`, and folds fog. Both were M6 review findings, and both are
  * repairs rather than features.**
  *
@@ -645,6 +742,7 @@ export const captureCity = (
   catalog: readonly BuildingDef[],
   cityId: CityId,
   owner: PlayerId,
+  rules: CaptureDef,
 ): CityCapture | undefined => {
   const city = cityById(state, cityId);
   if (city === undefined) return undefined;
@@ -657,7 +755,7 @@ export const captureCity = (
     owner,
     name: city.name,
     tile: city.tile,
-    population: capturedPopulation(city.population),
+    population: capturedPopulation(rules, city.population),
     // Untouched by design — see the section note: the contract's list of what capture
     // changes does not include the stored food or the stored shields.
     foodBox: city.foodBox,

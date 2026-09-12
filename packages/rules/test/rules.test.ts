@@ -30,6 +30,7 @@ import {
   summarizeProvenance,
   validateRuleset,
   type BuildingSpec,
+  type CaptureSpec,
   type Catalog,
   type CombatSpec,
   type EraId,
@@ -61,6 +62,14 @@ const TECHS = CATALOG.techs;
  */
 const COMBAT_ROWS = 1;
 const COMBAT = CATALOG.combat;
+/**
+ * M7's capture rule — the eighth provenance row, and the second section that is one row
+ * rather than a list. Aliased for the same reason `COMBAT_ROWS` is: the report's total and
+ * its sections must agree, and a row count written in six places is free to disagree with
+ * itself.
+ */
+const CAPTURE_ROWS = 1;
+const CAPTURE = CATALOG.capture;
 
 /**
  * The catalog with one unit row replaced. Written as a function rather than a
@@ -314,8 +323,9 @@ describe('ruleset validation', () => {
     // Every section spelled out, `techs` and M6b's `combat` included: a `Catalog` that
     // *omits* a row section would not compile, which is the point of the field being
     // required — "ships none" is written as `[]`, and validation rejects it like any
-    // other empty catalog. `combat` is a singleton rather than a list, so it is spelled
-    // out as the section it is; the missing-section case has its own test below.
+    // other empty catalog. `combat` and M7's `capture` are singletons rather than lists,
+    // so they are spelled out as the sections they are; the missing-section case has its
+    // own tests below.
     const r = validateRuleset(
       {
         terrains: [],
@@ -325,6 +335,7 @@ describe('ruleset validation', () => {
         resources: [],
         techs: [],
         combat: CATALOG.combat,
+        capture: CATALOG.capture,
       },
       'tuned',
     );
@@ -2106,7 +2117,7 @@ describe('terrain role coverage', () => {
 });
 
 describe('provenance summary', () => {
-  it('counts every row exactly once, terrain, unit, building, improvement, resource, tech and combat alike', () => {
+  it('counts every row exactly once, terrain, unit, building, improvement, resource, tech, combat and capture alike', () => {
     const s = summarizeProvenance(CATALOG);
     expect(s.total).toBe(
       CATALOG.terrains.length +
@@ -2115,7 +2126,8 @@ describe('provenance summary', () => {
         IMPROVEMENTS.length +
         RESOURCES.length +
         TECHS.length +
-        COMBAT_ROWS,
+        COMBAT_ROWS +
+        CAPTURE_ROWS,
     );
     expect(s.cited + s.placeholder).toBe(s.total);
     // The improvement rows are counted, not merely present: the report's sections
@@ -2135,7 +2147,8 @@ describe('provenance summary', () => {
         IMPROVEMENTS.length +
         RESOURCES.length +
         TECHS.length +
-        COMBAT_ROWS,
+        COMBAT_ROWS +
+        CAPTURE_ROWS,
     );
   });
 
@@ -2165,6 +2178,9 @@ describe('provenance summary', () => {
         // catalog declares it, and a report whose order disagreed with the catalog's
         // would be a report a reader has to reconcile.
         'combat',
+        // M7's capture rule: one row, filed under the section's own name, listed last for
+        // the same reason — the order is the catalog's.
+        'capture',
       ]);
     });
 
@@ -2183,6 +2199,7 @@ describe('provenance summary', () => {
         'resources',
         'techs',
         'combat',
+        'capture',
       ]);
       expect(total).toBe(summary.total);
       expect(placeholder).toBe(summary.placeholder);
@@ -2220,6 +2237,12 @@ describe('provenance summary', () => {
       expect(sectionOf(CATALOG, 'combat')?.summary.total).toBe(COMBAT_ROWS);
       expect(sectionOf(CATALOG, 'combat')?.summary.placeholder).toBe(COMBAT_ROWS);
       expect(sectionOf(CATALOG, 'combat')?.rows.map((r) => r.id)).toEqual(['combat']);
+      // M7's capture rule: one row, one placeholder claim. This is the assertion that makes
+      // the relocation auditable — the divisor left `core/cities.ts` and arrived in a
+      // section the report counts, so it is visible to a reader and to a sweep.
+      expect(sectionOf(CATALOG, 'capture')?.summary.total).toBe(CAPTURE_ROWS);
+      expect(sectionOf(CATALOG, 'capture')?.summary.placeholder).toBe(CAPTURE_ROWS);
+      expect(sectionOf(CATALOG, 'capture')?.rows.map((r) => r.id)).toEqual(['capture']);
     });
 
     it('counts a cited unit row as cited, not as a missing row', () => {
@@ -2239,7 +2262,8 @@ describe('provenance summary', () => {
           IMPROVEMENTS.length +
           RESOURCES.length +
           TECHS.length +
-          COMBAT_ROWS,
+          COMBAT_ROWS +
+          CAPTURE_ROWS,
       );
       expect(summary.cited).toBe(1);
       expect(summary.placeholder).toBe(summary.total - 1);
@@ -2254,6 +2278,7 @@ describe('provenance summary', () => {
       expect(sectionOf(cited, 'resources')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'techs')?.summary.cited).toBe(0);
       expect(sectionOf(cited, 'combat')?.summary.cited).toBe(0);
+      expect(sectionOf(cited, 'capture')?.summary.cited).toBe(0);
     });
   });
 });
@@ -2394,6 +2419,123 @@ describe('the combat globals (M6b)', () => {
       r.error.some(
         (e) =>
           e.kind === 'placeholder-in-cited-only' && e.catalog === 'combat' && e.id === 'combat',
+      ),
+    ).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M7 — the capture rule, in the catalog where a sweep can move it
+ * ------------------------------------------------------------------ */
+
+describe('the capture rule (M7)', () => {
+  /** `CATALOG` with the capture section replaced by a patch of it. */
+  const withCapture = (patch: Partial<CaptureSpec>): Catalog => ({
+    ...CATALOG,
+    capture: { ...CATALOG.capture, ...patch },
+  });
+
+  /** The `capture` fields validation complained about, ascending as reported. */
+  const captureProblems = (patch: Partial<CaptureSpec>): readonly string[] => {
+    const r = validateRuleset(withCapture(patch), 'tuned');
+    return r.ok
+      ? []
+      : r.error.flatMap((e) =>
+          e.kind === 'invalid-value' && e.catalog === 'capture' ? [e.field] : [],
+        );
+  };
+
+  it("ships M6's divisor unchanged — a relocation, not a rebalance", () => {
+    // **This is M6's number.** `CAPTURE_POPULATION_DIVISOR = 2` lived in
+    // `packages/core/src/cities.ts` until M7 moved it here, and the whole claim of that
+    // move is that the *value* did not move with it: if this assertion changes, the move
+    // became a retune and the five golden state hashes would have to move with it.
+    expect(CAPTURE.populationDivisor).toBe(2);
+  });
+
+  it('is placeholder, unsourced, and says so in its own provenance note', () => {
+    // The provenance rule M6b established for the combat globals, applied to the last
+    // magnitude M6 left in logic: a reader must not be able to mistake a relocation for a
+    // citation, and the note has to name both the old home and the absence of a source.
+    expect(isPlaceholder(CAPTURE.provenance)).toBe(true);
+    expect(CAPTURE.provenance.note).toContain('unsourced');
+    expect(CAPTURE.provenance.note).toContain('relocation');
+    expect(CAPTURE.provenance.note).toContain('Civ 3');
+  });
+
+  it('reaches the validated ruleset unchanged, so the engine reads content and not a copy', () => {
+    const r = validateRuleset(CATALOG, 'tuned');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // The *same object*: `cities.ts`' `captureRulesOf` reads the section off the ruleset a
+    // capture is played under, and nothing between content and the engine re-creates it.
+    expect(r.value.capture).toBe(CATALOG.capture);
+  });
+
+  it('counts as one provenance row, so the report cannot forget the number it moved', () => {
+    // The section is listed in `provenanceSections` — the *one* place that decides which
+    // rows count — which is what makes the relocation auditable rather than a number moved
+    // somewhere the report does not look.
+    const section = provenanceSections(CATALOG).find((each) => each.name === 'capture');
+    expect(section?.rows.map((row) => row.id)).toEqual(['capture']);
+    expect(section?.summary).toEqual({ total: 1, cited: 0, placeholder: 1 });
+    expect(summarizeProvenance(CATALOG).total).toBe(
+      provenanceSections(CATALOG).reduce((count, each) => count + each.summary.total, 0),
+    );
+  });
+
+  it('refuses a non-integer divisor, naming the field', () => {
+    expect(captureProblems({ populationDivisor: 2.5 })).toEqual(['populationDivisor']);
+    expect(captureProblems({ populationDivisor: 1.0000001 })).toEqual(['populationDivisor']);
+  });
+
+  it('refuses a divisor below 1, because 0 is a division by zero', () => {
+    // `Math.floor(4 / 0)` is `Infinity`, which is neither a population nor a value
+    // `canonicalize` will hash; a negative divisor would *grow* the conquered city, which
+    // is not what the field means.
+    expect(captureProblems({ populationDivisor: 0 })).toEqual(['populationDivisor']);
+    expect(captureProblems({ populationDivisor: -2 })).toEqual(['populationDivisor']);
+    // The boundary that IS legal, and the reading it has: "a sack costs the city no
+    // citizens" is a lenient tuning position a sweep must be able to reach.
+    expect(captureProblems({ populationDivisor: 1 })).toEqual([]);
+  });
+
+  it('reports a missing section and a section of the wrong shape rather than crashing', () => {
+    // The validator reads the section as `unknown` for this reason: a catalog that says
+    // nothing about capture is not a catalog with a default capture — it is one a sack
+    // cannot be applied under, and the engine's reader would fall back to `NO_CAPTURE_RULES`.
+    //
+    // Both inputs below are written the way the validator really receives a bad catalog —
+    // as *plain data*, out of a hand-written fixture, a JSON file or a model's answer — and
+    // the one cast is how this test writes JSON rather than a claim about the type: nothing
+    // here can be a `Catalog` literal, because a `Catalog` literal with no `capture` or a
+    // string `capture` does not compile, which is the field's whole point.
+    const asJson = (record: Record<string, unknown>): Catalog =>
+      JSON.parse(JSON.stringify(record)) as Catalog;
+
+    const absent: Record<string, unknown> = { ...CATALOG };
+    delete absent['capture'];
+    expect('capture' in absent).toBe(false);
+
+    for (const input of [absent, { ...CATALOG, capture: 'capture' }]) {
+      const r = validateRuleset(asJson(input), 'tuned');
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.some((e) => e.kind === 'invalid-value' && e.catalog === 'capture')).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  it('refuses the section in cited-only mode, like every other placeholder row', () => {
+    const r = validateRuleset(CATALOG, 'cited-only');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(
+      r.error.some(
+        (e) =>
+          e.kind === 'placeholder-in-cited-only' && e.catalog === 'capture' && e.id === 'capture',
       ),
     ).toBe(true);
   });

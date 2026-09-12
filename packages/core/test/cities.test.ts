@@ -17,21 +17,23 @@
 import { describe, expect, it } from 'vitest';
 import { canonicalize, hashValue } from '@civts/testing';
 import {
-  CAPTURE_POPULATION_DIVISOR,
   CITY_RADIUS,
   FOOD_PER_CITIZEN,
   MIN_CITY_DISTANCE,
+  NO_CAPTURE_RULES,
   autoAssignWorkedTiles,
   buildingCatalog,
   buildingDef,
   buildingsLostToCapture,
   captureCity,
+  captureRulesOf,
   capturedPopulation,
   citiesOf,
   cityAt,
   cityById,
   cityRadius,
   cityYields,
+  type CaptureDef,
   type City,
   type CityYields,
   type ProductionItem,
@@ -772,14 +774,48 @@ const CAPTURE_RULESET: RulesetView = {
 /** The catalog of that view, as `buildingsLostToCapture` takes it. */
 const CAPTURE_CATALOG = CAPTURE_RULESET.buildings ?? [];
 
+/**
+ * The capture rule these fixtures are played under — **the divisor the shipped catalog
+ * declares** (`@civts/rules`' `CATALOG.capture.populationDivisor`, pinned in
+ * `rules.test.ts`), written out here because `core` cannot depend on the content package.
+ *
+ * Every `captureCity` call below passes it explicitly, which is the point of M7: the rule
+ * is data the caller supplies, not a constant this module owns, and a test that forgot to
+ * say where its number came from would not compile.
+ */
+const CAPTURE_RULES: CaptureDef = { populationDivisor: 2 };
+
 describe('capturedPopulation', () => {
-  it('halves, floors and never goes below 1', () => {
+  /** The divisor the shipped catalog declares, passed the way every caller passes it. */
+  const SHIPPED: CaptureDef = { populationDivisor: 2 };
+
+  it('divides, floors and never goes below 1', () => {
     // Pinned as the placeholder rule it is, divisor included: 5 -> 2 (the floor bites),
     // 4 -> 2, 3 -> 1, 2 -> 1, 1 -> 1 (the minimum bites).
-    expect(CAPTURE_POPULATION_DIVISOR).toBe(2);
-    expect([10, 9, 5, 4, 3, 2, 1].map((population) => capturedPopulation(population))).toEqual([
-      5, 4, 2, 2, 1, 1, 1,
-    ]);
+    expect([10, 9, 5, 4, 3, 2, 1].map((population) => capturedPopulation(SHIPPED, population))) //
+      .toEqual([5, 4, 2, 2, 1, 1, 1]);
+  });
+
+  it('takes the divisor from the rules it is handed — the M7 point', () => {
+    // **This is the test that would fail if a literal had been left behind.** M6 shipped
+    // the divisor as `CAPTURE_POPULATION_DIVISOR = 2` in `cities.ts`; M7 moves it into the
+    // catalog's `capture` section, and the whole claim of that move is that this function
+    // has no opinion of its own. Four rules, one population, four different answers —
+    // including divisor 1, which is a legal ruleset statement ("a sack costs the city no
+    // citizens") and is exactly what a fallback reproducing the shipped value would hide.
+    const under = (populationDivisor: number, population: number): number =>
+      capturedPopulation({ populationDivisor }, population);
+
+    expect(under(1, 10)).toBe(10);
+    expect(under(2, 10)).toBe(5);
+    expect(under(3, 10)).toBe(3);
+    expect(under(4, 10)).toBe(2);
+    // A big divisor still cannot take a city below one citizen: the minimum is the rule's
+    // arithmetic, not the ruleset's magnitude.
+    expect(under(100, 10)).toBe(1);
+    // No divisor is a permutation of another here, so the four answers are four *readings*
+    // of the same city rather than one reading reported four times.
+    expect(new Set([under(1, 10), under(2, 10), under(3, 10), under(4, 10)]).size).toBe(4);
   });
 
   it('answers the minimum for a population a real state could not hold', () => {
@@ -787,7 +823,7 @@ describe('capturedPopulation', () => {
     // a positive whole number, and a fraction here would reach `canonicalize` and throw
     // (or, worse, reach a growth step and make a city that never grows).
     for (const population of [0, -1, -100, 1.5, 0.5, NaN, Infinity, -Infinity]) {
-      expect(capturedPopulation(population)).toBe(1);
+      expect(capturedPopulation(SHIPPED, population)).toBe(1);
     }
   });
 
@@ -797,7 +833,7 @@ describe('capturedPopulation', () => {
     // number of citizens at least 1.
     let previous = 1;
     for (let population = 1; population <= 60; population += 1) {
-      const after = capturedPopulation(population);
+      const after = capturedPopulation(SHIPPED, population);
       expect(Number.isInteger(after)).toBe(true);
       expect(after).toBeGreaterThanOrEqual(1);
       expect(after).toBeLessThanOrEqual(population);
@@ -806,11 +842,69 @@ describe('capturedPopulation', () => {
     }
   });
 
-  it('does not read the city — a number in, a number out', () => {
-    // The rule is a function of the population alone, which is what makes it pinnable
-    // without a board. Stated as its own test because the tempting alternative (a
-    // capture that consults buildings, terrain or a granary) would be a different rule.
-    expect(capturedPopulation.length).toBe(1);
+  it('does not read the city — a population and a rule in, a number out', () => {
+    // The rule is a function of the population and the divisor alone, which is what makes
+    // it pinnable without a board. Stated as its own test because the tempting alternative
+    // (a capture that consults buildings, terrain or a granary) would be a different rule.
+    expect(capturedPopulation.length).toBe(2);
+  });
+});
+
+describe('captureRulesOf', () => {
+  /**
+   * A view that carries whatever `capture` say-so the test wants to hand the reader.
+   *
+   * A declared interface rather than a cast: the reader is total over `unknown` precisely
+   * because real callers hand it a hand-built fixture, a foreign object or a JSON patch —
+   * so the test *says* that the field may be anything, and the widening is a subtype
+   * relation rather than an assertion about the data.
+   */
+  interface ViewWithCapture extends RulesetView {
+    readonly capture?: unknown;
+  }
+
+  const viewWith = (capture: unknown): ViewWithCapture => ({ ...CAPTURE_RULESET, capture });
+
+  it('reads the divisor out of the ruleset it is handed', () => {
+    // The one reader of the catalog's `capture` section, and the reason `cities.ts` keeps
+    // no copy of the number: the value comes from the view, whatever the view says.
+    expect(captureRulesOf(viewWith({ populationDivisor: 3 }))).toEqual({ populationDivisor: 3 });
+    expect(captureRulesOf(viewWith({ populationDivisor: 1 }))).toEqual({ populationDivisor: 1 });
+  });
+
+  it('degrades to the degenerate rule when the view declares no capture section', () => {
+    // **Absent is not "use the shipped value".** A view with no section must *change what a
+    // capture does* — a fallback reproducing the shipped 2 would be the dual-source bug
+    // wearing a new costume: moving the catalog's divisor would leave every capture through
+    // a section-less view halving under a number nobody can see or sweep. So the answer is
+    // the degenerate 1 ("a sack costs the city no citizens"), which is stated in
+    // `NO_CAPTURE_RULES` and is *not* 2.
+    expect(captureRulesOf(CAPTURE_RULESET)).toEqual(NO_CAPTURE_RULES);
+    expect(NO_CAPTURE_RULES.populationDivisor).not.toBe(2);
+    expect(captureRulesOf(CAPTURE_RULESET).populationDivisor).toBe(1);
+  });
+
+  it('reads a hostile or malformed section as the degenerate rule rather than as a NaN', () => {
+    // Total over `unknown`, like `combatRulesOf`: a hand-built fixture, a foreign object or
+    // a JSON patch can put anything in the field, and the answer must be a divisor the
+    // arithmetic can use — never `0` (a division by zero) and never a fraction.
+    for (const hostile of [
+      { populationDivisor: 0 },
+      { populationDivisor: -3 },
+      { populationDivisor: 2.5 },
+      { populationDivisor: NaN },
+      { populationDivisor: Infinity },
+      { populationDivisor: '2' },
+      {},
+      null,
+      'capture',
+      [],
+    ]) {
+      const read = captureRulesOf(viewWith(hostile));
+      expect(read).toEqual(NO_CAPTURE_RULES);
+      // …and the degenerate rule is one the capture arithmetic can actually apply.
+      expect(Number.isInteger(capturedPopulation(read, 7))).toBe(true);
+    }
   });
 });
 
@@ -980,7 +1074,7 @@ describe('captureCity', () => {
 
   it('changes hands, keeps its identity, and does not raze the city', () => {
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     expect(capture.city.owner).toBe(asPlayerId(0));
@@ -997,7 +1091,13 @@ describe('captureCity', () => {
   });
 
   it('halves the population and destroys the non-wonder buildings, in one step', () => {
-    const capture = captureCity(board(), CAPTURE_CATALOG, asCityId(0), asPlayerId(2));
+    const capture = captureCity(
+      board(),
+      CAPTURE_CATALOG,
+      asCityId(0),
+      asPlayerId(2),
+      CAPTURE_RULES,
+    );
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     expect(capture.city.population).toBe(2); // floor(5 / 2)
@@ -1012,8 +1112,27 @@ describe('captureCity', () => {
     expect(capture.city.owner).toBe(asPlayerId(2));
   });
 
+  it('leaves the population the ruleset it is played under says — the M7 knob', () => {
+    // **The whole reason the divisor is a parameter.** The same city, the same catalog, the
+    // same capture — three rules, three answers. Under M6's constant all three would have
+    // been 2 (floor(5 / 2)), and a balance sweep could not have moved any of them.
+    const capturedUnder = (populationDivisor: number): number | undefined =>
+      captureCity(board(), CAPTURE_CATALOG, asCityId(0), asPlayerId(0), { populationDivisor })?.city
+        .population;
+
+    expect(capturedUnder(1)).toBe(5); // "a sack costs the city no citizens"
+    expect(capturedUnder(2)).toBe(2); // the shipped placeholder
+    expect(capturedUnder(4)).toBe(1); // floor(5 / 4) = 1, and the minimum agrees
+  });
+
   it('clears the production head and the queue without writing an undefined key', () => {
-    const capture = captureCity(board(), CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(
+      board(),
+      CAPTURE_CATALOG,
+      asCityId(0),
+      asPlayerId(0),
+      CAPTURE_RULES,
+    );
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     // Absent, not present-and-undefined: `production: undefined` is the spelling this
@@ -1027,7 +1146,7 @@ describe('captureCity', () => {
 
   it('clears the worked tiles and frees them for whoever claims them next', () => {
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     expect(capture.city.workedTiles).toEqual([]);
@@ -1040,7 +1159,7 @@ describe('captureCity', () => {
 
   it('leaves the stored food, the stored shields and the tile improvements alone', () => {
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     // M6's list of what a capture changes is ownership, population, buildings, queue
@@ -1056,7 +1175,7 @@ describe('captureCity', () => {
 
   it('bumps the revision by exactly one, and leaves the turn alone', () => {
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     // **M6b's repair.** M6 left the bump to `commands.ts`' `applyCapture`, which is right
@@ -1089,7 +1208,7 @@ describe('captureCity', () => {
     // fixture board has no units, so nothing can see anything: the fold is a *no-op in
     // content* here, which is why the rows are compared entry by entry.
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     expect(capture.state.explored).toStrictEqual(before.explored);
@@ -1114,7 +1233,13 @@ describe('captureCity', () => {
         },
       ],
     };
-    const sacked = captureCity(withUnit, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const sacked = captureCity(
+      withUnit,
+      CAPTURE_CATALOG,
+      asCityId(0),
+      asPlayerId(0),
+      CAPTURE_RULES,
+    );
     if (sacked === undefined) throw new Error('the fixture holds a city with id 0');
 
     expect(isExplored(sacked.state, asPlayerId(0), asTileIndex(CENTRE))).toBe(true);
@@ -1129,7 +1254,7 @@ describe('captureCity', () => {
 
   it('writes nothing else: fog is folded, and the rest of the state is passed through', () => {
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(2));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(2), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     // A barbarian sack of a *hand-built* state: the same rule, the same one-revision
@@ -1143,7 +1268,7 @@ describe('captureCity', () => {
     const before = board();
     const snapshot = structuredClone(before);
 
-    captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
 
     expect(before).toEqual(snapshot);
     // The stored city itself, too: not one field of the input was written.
@@ -1158,14 +1283,18 @@ describe('captureCity', () => {
     // city — a caller cannot conquer what is not there, and inventing an empty capture
     // would hand back a state that looks like a successful one.
     const before = board();
-    expect(captureCity(before, CAPTURE_CATALOG, asCityId(9), asPlayerId(0))).toBeUndefined();
-    expect(captureCity(state([]), CAPTURE_CATALOG, asCityId(0), asPlayerId(0))).toBeUndefined();
+    expect(
+      captureCity(before, CAPTURE_CATALOG, asCityId(9), asPlayerId(0), CAPTURE_RULES),
+    ).toBeUndefined();
+    expect(
+      captureCity(state([]), CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES),
+    ).toBeUndefined();
   });
 
   it('is deterministic and hashes: the same capture twice is the same state', () => {
     const before = board();
-    const first = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
-    const second = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const first = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
+    const second = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (first === undefined || second === undefined) throw new Error('the fixture holds city 0');
 
     expect(second.state).toEqual(first.state);
@@ -1176,7 +1305,7 @@ describe('captureCity', () => {
 
   it('does not consult the RNG: a capture draws nothing', () => {
     const before = board();
-    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0));
+    const capture = captureCity(before, CAPTURE_CATALOG, asCityId(0), asPlayerId(0), CAPTURE_RULES);
     if (capture === undefined) throw new Error('the fixture holds a city with id 0');
 
     expect(capture.state.rng).toEqual(before.rng);

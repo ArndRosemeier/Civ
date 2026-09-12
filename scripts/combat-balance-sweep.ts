@@ -63,12 +63,14 @@
  * magnitude of its own**. The only numbers written here are the grid and the default
  * experiment size, which are experiment parameters rather than claims about the game.
  *
- * Four combat knobs are reachable today:
+ * Five knobs are reachable today:
  *
  * - `warrior-attack` — `units.warrior.attack`;
  * - `grassland-defense` — `terrains.grassland.defenseBonusPct`;
  * - `walls-bonus` — `combat.wallsBonusPct`, the city-wall defence bonus;
  * - `damage-per-round` — `combat.damagePerRound`, the hit points one won round costs.
+ * - `capture-divisor` — `capture.populationDivisor`, the population a taken city is left
+ *   with (M7).
  *
  * **M6b closed the gap this file used to report.** Until then M6's nine combat magnitudes
  * were module constants in `@civts/core` with no `combat` section in `RulesetPatch`, so
@@ -78,10 +80,24 @@
  * end: the report prints the shipped value, the value each variant actually reads inside
  * the patched ruleset, and what moved.
  *
- * What remains unreachable is reported rather than swept (see `UNREACHABLE`), and it is
- * now a short list of things that are genuinely not numbers in this engine: the id
- * convention that decides which building carries walls, and the capture population
- * divisor, which is still a literal in `core/cities.ts`.
+ * **M7 closed the last one.** `CAPTURE_POPULATION_DIVISOR` was a literal in
+ * `packages/core/src/cities.ts` and was the second entry of the "cannot move" list; it is
+ * the catalog's `capture` section now and is swept above. So the list is **empty**, which
+ * is a claim this file checks rather than asserts: `uncoveredMagnitudes` walks the fields
+ * of the `combat` and `capture` sections and fails the run if any of them is neither
+ * swept nor declared. What remains beside it is a separate, honestly labelled list of
+ * combat-adjacent *conventions* — the row id that decides which building carries walls —
+ * which are not numbers and so were never this sweep's to move.
+ *
+ * ## What a flat table means, and how this report decides
+ *
+ * A knob whose values produce identical figures has proved nothing, and there are two
+ * reasons for that which a reader cannot tell apart from the table: the knob does not
+ * matter (a finding), or the knob was never *in play* in these runs (a limitation of the
+ * measurement). The walls bonus spent two milestones looking like the first while being
+ * the second, so the report now counts the exposure itself — the battles a walled
+ * defender actually fought, the cities that actually changed hands — prints it whether or
+ * not the table moved, and says in words which of the two a flat result is.
  *
  * ## Policy dependence, stated because it is load-bearing
  *
@@ -110,8 +126,15 @@ import {
   // M6b: the nine combat magnitudes this file used to import as `@civts/core` constants
   // are read from the *ruleset* below (`ruleset.combat.*`), through `applyOverrides` like
   // every other swept number. Importing them here would be the dual-source bug in the one
-  // program whose job is to prove there is no second source.
-  CAPTURE_POPULATION_DIVISOR,
+  // program whose job is to prove there is no second source. M7 removed the last such
+  // import — `CAPTURE_POPULATION_DIVISOR` — for the same reason, one milestone later.
+  //
+  // `WALLS_BUILDING` is imported and is *not* a magnitude: it is the row id the engine
+  // reads as "this city has defensive walls", which content names and no patch can move.
+  // The sweep uses it to count how many battles a walled defender actually fought — the
+  // difference between "the walls knob did nothing" and "no defender was ever behind a
+  // wall", which is the one sentence this report must never leave out.
+  WALLS_BUILDING,
   DEFAULT_SETTINGS,
   advanceTurn,
   applyCommand,
@@ -207,40 +230,330 @@ const KNOBS: readonly Knob[] = [
     read: (ruleset) => ruleset.combat.damagePerRound,
     meaning: 'the hit points one won combat round costs the loser',
   },
+  {
+    // **M7's knob, and the last magnitude M6 left in logic.** `cities.ts` used to hold
+    // `CAPTURE_POPULATION_DIVISOR = 2` as a module constant, so this sweep could only
+    // *report* that a capture's population was unreachable — the same finding M6b fixed
+    // for the nine combat globals. It is a catalog section now, so it is swept like any
+    // other number: `read` asks the patched ruleset what the divisor is, and the table's
+    // capture column prints the populations the captures actually produced.
+    id: 'capture-divisor',
+    path: 'capture.populationDivisor',
+    values: [1, 2, 3, 4, 8],
+    patchFor: (value) => ({ capture: { populationDivisor: value } }),
+    read: (ruleset) => ruleset.capture.populationDivisor,
+    meaning:
+      'the divisor applied to a captured city’s population (floored, never below one citizen)',
+  },
 ];
 
+/* ------------------------------------------------------------------ *
+ * What a knob has to be *given* before its effect can be measured
+ * ------------------------------------------------------------------ */
+
 /**
- * The combat-adjacent magnitudes **the override surface still cannot move**, read from
- * `@civts/core` so the report cannot drift from the code.
+ * What the run set must contain for the swept knob to have been **exercised at all**.
  *
- * M6b shrank this list from ten entries to two. The nine `combat` magnitudes and
- * `units.*.hitPoints` left it because `RulesetPatch` can now address them — and a list
- * that kept claiming they were unreachable would be this report lying about its own
- * surface, which is worse than not reporting at all. What is left is genuinely not a
- * number a patch could carry, and each row says what would have to change for it to be
- * one.
+ * This is the diagnosis the M7 repair asks for, and the reason it exists is a specific
+ * failure of reporting: the walls-bonus sweep was flat for two milestones, and a flat
+ * table has two entirely different explanations — *the walls bonus does not change this
+ * game* (a finding about the knob) and *no defender in these runs ever stood behind a
+ * wall* (a limitation of the measurement, and of the fixture, and of the policy). A
+ * report that prints the table without saying which one it is invites the reader to
+ * believe the first, which is the more flattering and the less true of the two.
+ *
+ * So every knob declares what it needs, the replay counts it from the event stream, and
+ * the report prints the exposure **whether or not** the table moved. The counters are
+ * read from the same `before` state `commands.ts` computes its own `inCity`/`walls`
+ * flags from, so "a defender behind walls" here means exactly what it means in the odds.
+ */
+interface Exposure {
+  /** What was counted, in the report's words. */
+  readonly name: string;
+  /** How many of what the denominator counts actually had the knob in play. */
+  readonly count: number;
+  /** The denominator — the battles fought, or the captures taken. */
+  readonly of: number;
+  /** What would have had to happen for the knob to be exercised. */
+  readonly needs: string;
+  /** The reading of `count === 0`, in the report's words. */
+  readonly zeroMeans: string;
+}
+
+/** The counters the replay keeps for the exposure of each knob. */
+interface ExposureCounters {
+  readonly battles: number;
+  readonly battlesAtCity: number;
+  readonly battlesBehindWalls: number;
+  readonly captures: number;
+  readonly capturesWithPopulationAboveOne: number;
+}
+
+/** The exposure of the swept knob, read off the report's own totals. */
+const exposureOf = (knob: Knob, counters: ExposureCounters): Exposure => {
+  switch (knob.id) {
+    case 'walls-bonus':
+      return {
+        name: 'battles fought by a defender inside its own walled city',
+        count: counters.battlesBehindWalls,
+        of: counters.battles,
+        needs:
+          'the `walls` building to actually be in a city a defender stands in, and a battle to ' +
+          'be fought there: `combat.ts` reads this bonus only when the defender is in its own ' +
+          'city AND that city holds the walls row',
+        zeroMeans:
+          'the walls bonus never entered a single odds computation in these runs, so this sweep ' +
+          'measures nothing about the knob',
+      };
+    case 'capture-divisor':
+      return {
+        name:
+          'captures of a city holding more than one citizen (the only captures a divisor can ' +
+          'change the answer for)',
+        count: counters.capturesWithPopulationAboveOne,
+        of: counters.captures,
+        needs:
+          'a city with at least two citizens to change hands: the rule is ' +
+          '`max(1, floor(population / divisor))`, so a one-citizen city is left with one citizen ' +
+          'under every legal divisor and proves nothing about which one is set',
+        zeroMeans:
+          'no capture in these runs had more than one citizen to divide: either no city changed ' +
+          'hands at all within the horizon, or every city that did held a single citizen — and a ' +
+          'one-citizen city is left with one citizen by every legal divisor. So the knob was never ' +
+          'in a position to change anything, which is a limitation of these runs rather than a ' +
+          'statement about the knob',
+      };
+    default:
+      return {
+        name: 'battles fought',
+        count: counters.battles,
+        of: counters.battles,
+        needs:
+          'two civilizations to meet in force within the horizon, or the policy to clear its own ' +
+          'odds floor',
+        zeroMeans:
+          'no battle was fought under any value, so there is nothing here for the knob to move',
+      };
+  }
+};
+
+/**
+ * The combat-adjacent magnitudes **the override surface still cannot move**.
+ *
+ * M6b shrank this list from ten entries to two, and **M7 shrinks it to none.** The last
+ * entry was `CAPTURE_POPULATION_DIVISOR`, and it left for the only reason that counts:
+ * it is a `capture` section of the catalog now, `RulesetPatch.capture` reaches it, and
+ * `capture-divisor` sweeps it above. An entry that stayed behind would make this report
+ * lie about its own surface — the failure mode the list was added to prevent.
+ *
+/**
+ * Empty is a *claim*, so it is a claim this file **checks** rather than one it asserts:
+ * `uncoveredMagnitudes` walks every field of the catalog's `combat` and `capture`
+ * sections and reports any that neither a knob above nor an entry here accounts for. A
+ * tenth combat magnitude added to content without a knob fails that check and exits
+ * non-zero — the day this list would otherwise start lying again.
  */
 const UNREACHABLE: readonly {
-  readonly name: string;
+  /** The catalog field, as a `section.field` path. */
+  readonly path: string;
   /** The shipped magnitude, where there is one to read; omitted where the gap is a shape. */
   readonly value?: number;
   readonly needs: string;
-}[] = [
+}[] = [];
+
+/**
+ * The combat-adjacent things that are **not magnitudes at all**, kept beside the list
+ * above so the two are never confused.
+ *
+ * The M7 check on this file was item 2 of the standing-requirement repairs: *verify what
+ * remains of the "cannot move" list and that each remaining entry has a REAL stated
+ * reason*. The one entry M6b left after the nine combat globals was the id convention
+ * that decides which building carries walls, and on inspection its old wording ("nothing
+ * can move it, and nothing should") was half a reason and half a shrug. What is true is
+ * more specific, and it is checkable in the source:
+ *
+ * - the *identity* is a convention, not a number: `core/commands.ts` names
+ *   `WALLS_BUILDING = asBuildingId('walls')` and reads `city.buildings.includes(...)`
+ *   against it. There is no magnitude in that expression to sweep, which is why no patch
+ *   can express it and why "unreachable" was always the wrong list for it.
+ * - the *bonus* it gates is `combat.wallsBonusPct` — content, and swept by `walls-bonus`.
+ * - every **number** on the walls row itself (cost, maintenance, prerequisites, era) is
+ *   already reachable: `RulesetPatch.buildings` patches those rows field by field.
+ *
+ * So this is reported as what it is — a naming convention that is load-bearing and
+ * documented — rather than as a knob somebody cannot turn.
+ */
+const CONVENTIONS: readonly { readonly name: string; readonly reason: string }[] = [
   {
-    name: 'buildings.walls (the id that decides which building carries walls)',
-    needs:
-      'nothing can move it, and nothing should: which *building* grants the wall bonus is a ' +
-      'rows-level convention (`defenderBonusPct` reads the id "walls"), while the bonus itself ' +
-      'is the swept `combat.wallsBonusPct`',
-  },
-  {
-    name: 'CAPTURE_POPULATION_DIVISOR',
-    value: CAPTURE_POPULATION_DIVISOR,
-    needs:
-      'a catalog row: this one magnitude of the capture rule is still a literal in ' +
-      '`packages/core/src/cities.ts`, so no patch can reach it',
+    name: 'which building row is read as defensive walls',
+    reason:
+      'a convention rather than a magnitude: `core/commands.ts` builds its `walls` flag from ' +
+      '`city.buildings.includes(WALLS_BUILDING)`, where `WALLS_BUILDING` is the row id "walls". ' +
+      'There is no number here for a patch to move — the bonus it gates is the swept ' +
+      '`combat.wallsBonusPct`, and every number on the walls row itself (cost, maintenance, ' +
+      'era, prerequisites) is already patchable through `buildings`. A ruleset that renames ' +
+      'that row simply grants no wall bonus, which is why the convention is documented in ' +
+      '`commands.ts` rather than left to be discovered.',
   },
 ];
+
+/** The non-magnitude field of every section, named so the filter below is not a mystery. */
+const NON_MAGNITUDE_FIELDS: readonly string[] = ['provenance'];
+
+/**
+ * Every magnitude the catalog's combat and capture sections declare, as `section.field`.
+ *
+ * `provenance` is filtered out and that is not a loophole: authorship is deliberately
+ * *not* a balance knob (`applyOverrides` carries provenance through a merge rather than
+ * letting a patch rewrite it), so it is a field no sweep should ever be able to move. It
+ * is named here rather than silently skipped.
+ */
+const MAGNITUDE_PATHS: readonly string[] = (['combat', 'capture'] as const).flatMap((section) =>
+  Object.keys(CATALOG[section])
+    .filter((field) => !NON_MAGNITUDE_FIELDS.includes(field))
+    .map((field) => `${section}.${field}`),
+);
+
+/**
+ * **The proof that the list above is empty because it should be**, one entry per magnitude
+ * of the catalog's `combat` and `capture` sections.
+ *
+ * A claim of the form "every magnitude is content now and a sweep can move it" is worth
+ * exactly as much as the machinery that would fail if it stopped being true, and a type is
+ * not that machinery: `RulesetPatch`'s shape is checked at compile time, but *reachability*
+ * is a runtime property of `applyOverrides` — a merge that dropped a field, a validator
+ * that refused a legal value, a section the applier forgot to carry would all compile. So
+ * each entry carries the value to probe the field with and the reader to check the answer
+ * against, and `reachabilityFailures` applies the patch through `applyOverrides`, validates
+ * the result and reads the field back. A magnitude that could not be moved that way — or
+ * that moved and was not read back — is named in the report and exits non-zero.
+ *
+ * Three of these magnitudes also have a curated grid above (`KNOBS`): the walls bonus, the
+ * damage per round and the capture divisor. The rest are proven reachable here and are not
+ * part of this script's experiment, which is a choice about what is interesting to sweep
+ * rather than a limit of the override surface. `uncoveredMagnitudes` compares this list
+ * against the catalog, so a tenth combat magnitude added to content shows up as an
+ * uncovered path rather than as a number nobody noticed.
+ */
+const REACHABILITY: readonly {
+  readonly path: string;
+  readonly patchFor: (value: number) => RulesetPatch;
+  /** The value the probe moves the field to, and the value the reader must then report. */
+  readonly probe: number;
+  /** The field, read out of the *patched* ruleset — never out of the patch. */
+  readonly read: (ruleset: Ruleset) => number;
+}[] = [
+  {
+    path: 'combat.fortifyBonusPct',
+    patchFor: (value) => ({ combat: { fortifyBonusPct: value } }),
+    probe: 7,
+    read: (ruleset) => ruleset.combat.fortifyBonusPct,
+  },
+  {
+    path: 'combat.cityDefenseBonusPct',
+    patchFor: (value) => ({ combat: { cityDefenseBonusPct: value } }),
+    probe: 7,
+    read: (ruleset) => ruleset.combat.cityDefenseBonusPct,
+  },
+  {
+    path: 'combat.wallsBonusPct',
+    patchFor: (value) => ({ combat: { wallsBonusPct: value } }),
+    probe: 7,
+    read: (ruleset) => ruleset.combat.wallsBonusPct,
+  },
+  {
+    path: 'combat.veteranAttackPct',
+    patchFor: (value) => ({ combat: { veteranAttackPct: value } }),
+    probe: 7,
+    read: (ruleset) => ruleset.combat.veteranAttackPct,
+  },
+  {
+    path: 'combat.maxExperience',
+    patchFor: (value) => ({ combat: { maxExperience: value } }),
+    probe: 2,
+    read: (ruleset) => ruleset.combat.maxExperience,
+  },
+  {
+    // 200 rather than 100: the probe has to satisfy the clamp chain
+    // (`1 <= minWinPct <= maxWinPct <= rollBound`) and the shipped `maxWinPct` is 99, so a
+    // probe below that would be refused by validation and would look like an unreachable
+    // magnitude rather than like a badly chosen probe.
+    path: 'combat.rollBound',
+    patchFor: (value) => ({ combat: { rollBound: value } }),
+    probe: 200,
+    read: (ruleset) => ruleset.combat.rollBound,
+  },
+  {
+    path: 'combat.damagePerRound',
+    patchFor: (value) => ({ combat: { damagePerRound: value } }),
+    probe: 2,
+    read: (ruleset) => ruleset.combat.damagePerRound,
+  },
+  {
+    path: 'combat.minWinPct',
+    patchFor: (value) => ({ combat: { minWinPct: value } }),
+    probe: 2,
+    read: (ruleset) => ruleset.combat.minWinPct,
+  },
+  {
+    path: 'combat.maxWinPct',
+    patchFor: (value) => ({ combat: { maxWinPct: value } }),
+    probe: 98,
+    read: (ruleset) => ruleset.combat.maxWinPct,
+  },
+  {
+    path: 'capture.populationDivisor',
+    patchFor: (value) => ({ capture: { populationDivisor: value } }),
+    probe: 3,
+    read: (ruleset) => ruleset.capture.populationDivisor,
+  },
+];
+
+/**
+ * The magnitudes above whose patch did **not** move what it named.
+ *
+ * Run at report time rather than assumed from the type; see `REACHABILITY`. A failure here
+ * is a broken instrument, not a bad result — the report says so and `main` exits non-zero.
+ */
+const reachabilityFailures = (): readonly string[] => {
+  const failures: string[] = [];
+  for (const entry of REACHABILITY) {
+    const patched = applyOverrides(CATALOG, entry.patchFor(entry.probe));
+    const validated = validateRuleset(patched, 'tuned');
+    if (!validated.ok) {
+      failures.push(
+        `${entry.path}: the probe patch was refused by validation (` +
+          `${validated.error.map((issue) => issue.kind).join(', ')})`,
+      );
+      continue;
+    }
+    const read = entry.read(validated.value);
+    if (read !== entry.probe) {
+      failures.push(
+        `${entry.path}: the patch applied but the ruleset reads ${String(read)} back, not ` +
+          `${String(entry.probe)} — the field is not carried through the override`,
+      );
+    }
+  }
+  return failures;
+};
+
+/**
+ * The catalog magnitudes **neither a knob, nor `UNREACHABLE`, nor a probe accounts for**.
+ *
+ * The check that keeps the three lists above honest. It is deliberately computed from the
+ * *catalog* rather than from a list written here: the day content grows a tenth combat
+ * magnitude, this returns its path, the report names it, and the process exits non-zero —
+ * instead of the sweep quietly measuring nine numbers and letting the tenth be a literal
+ * again. That is precisely how M6's nine globals survived a milestone.
+ */
+const uncoveredMagnitudes = (): readonly string[] =>
+  MAGNITUDE_PATHS.filter(
+    (path) =>
+      !KNOBS.some((knob) => knob.path === path) &&
+      !UNREACHABLE.some((row) => row.path === path) &&
+      !REACHABILITY.some((entry) => entry.path === path),
+  );
 
 const DEFAULTS = {
   knob: 'warrior-attack',
@@ -292,6 +605,36 @@ interface Tally {
   unitsLostToUpkeep: number;
   promotions: number;
   citiesCaptured: number;
+  /**
+   * The populations of the captured cities, as the `CityCaptured` events reported them.
+   *
+   * The figure M7's capture divisor moves, and the reason a sweep of that knob can show a
+   * measured effect at all: without it the divisor would only be visible through whatever
+   * the surviving population did to the rest of the game.
+   */
+  capturedPopulation: number;
+  /**
+   * Captures whose city held **more than one citizen before the divisor was applied** —
+   * the only captures in which the divisor's value can change the answer.
+   *
+   * The M7 exposure counter for that knob, and it is exact rather than a proxy: the rule
+   * is `max(1, floor(population / divisor))`, so a one-citizen (or emptier) city is left
+   * with one citizen under *every* legal divisor, and a run set made only of those
+   * captures cannot say anything about the divisor no matter how many of them there are.
+   * The pre-divisor population is read from the state the command was applied to, which is
+   * the state `core/commands.ts` computed the capture from.
+   */
+  capturesWithPopulationAboveOne: number;
+  /**
+   * Battles fought on a tile holding a city owned by the defender — the engine's own
+   * `inCity` condition, counted from the same state the engine read it from.
+   */
+  battlesAtCity: number;
+  /**
+   * Battles where that city also held the walls row: the engine's `walls` flag, and so
+   * the exact set of battles in which `combat.wallsBonusPct` was read. See `Exposure`.
+   */
+  battlesBehindWalls: number;
 }
 
 const emptyTally = (): Tally => ({
@@ -303,6 +646,10 @@ const emptyTally = (): Tally => ({
   unitsLostToUpkeep: 0,
   promotions: 0,
   citiesCaptured: 0,
+  capturedPopulation: 0,
+  capturesWithPopulationAboveOne: 0,
+  battlesAtCity: 0,
+  battlesBehindWalls: 0,
 });
 
 /**
@@ -312,15 +659,30 @@ const emptyTally = (): Tally => ({
  * state, and nothing is counted that the stream did not say. A `CombatResolved` line
  * that says `attacker-wins` is the only thing that increments `attackerWins`, so a
  * resolver that flipped its verdict would move this table — which is the point.
+ *
+ * The one exception is the walls/city exposure of a battle, and it is not an inference
+ * about the event but a **lookup in the state the command was applied to**: which city
+ * stood on the defender's tile, who owned it, and whether that city held the walls row.
+ * That is the same `before` state `core/commands.ts` computes its own `inCity` and
+ * `walls` flags from (`city !== undefined && city.owner === plan.defender.owner`, then
+ * `city.buildings.includes(WALLS_BUILDING)`), so "a battle behind walls" here is the
+ * engine's own condition rather than this script's reading of it. Reading it from the
+ * *post-command* state instead would lose exactly the interesting case — a walled city
+ * that was taken, whose owner is the attacker by the time the event is seen.
  */
-const tallyEvent = (tally: Tally, event: GameEvent): void => {
+const tallyEvent = (tally: Tally, event: GameEvent, before: GameState): void => {
   switch (event.type) {
-    case 'CombatResolved':
+    case 'CombatResolved': {
       tally.battles += 1;
       if (event.outcome === 'attacker-wins') tally.attackerWins += 1;
       else tally.defenderWins += 1;
       tally.combatDamage += event.attackerLost + event.defenderLost;
+      const city = before.cities.find((candidate) => candidate.tile === event.target);
+      const inCity = city !== undefined && city.owner === event.defenderOwner;
+      if (inCity) tally.battlesAtCity += 1;
+      if (inCity && city.buildings.includes(WALLS_BUILDING)) tally.battlesBehindWalls += 1;
       return;
+    }
     case 'UnitDestroyed':
       if (event.reason === 'combat') tally.unitsLostToCombat += 1;
       else tally.unitsLostToUpkeep += 1;
@@ -328,9 +690,16 @@ const tallyEvent = (tally: Tally, event: GameEvent): void => {
     case 'UnitPromoted':
       tally.promotions += 1;
       return;
-    case 'CityCaptured':
+    case 'CityCaptured': {
       tally.citiesCaptured += 1;
+      tally.capturedPopulation += event.population;
+      // The *pre-divisor* population, from the state the capture was applied to: the event
+      // reports what the city was left with, and "was left with one" is not the same
+      // question as "had one to divide".
+      const taken = before.cities.find((candidate) => candidate.id === event.cityId);
+      if (taken !== undefined && taken.population > 1) tally.capturesWithPopulationAboveOne += 1;
       return;
+    }
     default:
       return;
   }
@@ -560,20 +929,25 @@ const replay = (
       };
       for (const command of policy.chooseCommands(ctx)) {
         if (command.type === 'EndTurn') continue;
+        const before = state;
         const outcome = applyCommand(state, player.id, command, ruleset);
         if (!outcome.ok) continue;
         state = outcome.value.state;
         for (const event of outcome.value.events) {
-          tallyEvent(tally, event);
+          tallyEvent(tally, event, before);
           seen.push(event);
         }
       }
     }
 
+    // `before` for the turn boundary is the state the advance was applied to, for the same
+    // reason: a barbarian attack on a walled city must be counted against the city as it
+    // stood when the attack happened.
+    const beforeAdvance = state;
     const advanced = advanceTurn(state, ruleset);
     state = advanced.state;
     for (const event of advanced.events) {
-      tallyEvent(tally, event);
+      tallyEvent(tally, event, beforeAdvance);
       seen.push(event);
     }
     turnsPlayed += 1;
@@ -700,6 +1074,14 @@ interface Variant {
   readonly unitsLostToUpkeep: number;
   readonly promotions: number;
   readonly citiesCaptured: number;
+  /** The populations those captured cities were left with, summed. */
+  readonly capturedPopulation: number;
+  /** Captures whose city held more than one citizen *before* the divisor was applied. */
+  readonly capturesWithPopulationAboveOne: number;
+  /** Battles fought on a tile holding a city owned by the defender (the engine's `inCity`). */
+  readonly battlesAtCity: number;
+  /** …of which the city held the walls row (the engine's `walls` flag). */
+  readonly battlesBehindWalls: number;
   readonly unitsAtHorizon: number;
   readonly citiesAtHorizon: number;
   /** The attacker's share of the battles, in whole percent — absent when none were fought. */
@@ -720,11 +1102,39 @@ interface CombatSweepReport {
   readonly variants: readonly Variant[];
   /** The magnitudes the override surface cannot express, with what would be needed. */
   readonly unreachable: readonly {
-    readonly name: string;
+    readonly path: string;
     /** Absent where the gap is a *shape* rather than a number (see `UNREACHABLE`). */
     readonly value?: number;
     readonly needs: string;
   }[];
+  /**
+   * The combat-adjacent things that are not magnitudes at all (see `CONVENTIONS`), kept
+   * apart from the list above so "nothing is unreachable" cannot be read as "nothing is
+   * unwritten".
+   */
+  readonly conventions: readonly { readonly name: string; readonly reason: string }[];
+  /**
+   * Catalog magnitudes neither a knob, nor `UNREACHABLE`, nor a probe accounts for.
+   * Non-empty means this report is incomplete, and `main` exits non-zero rather than
+   * publishing it.
+   */
+  readonly uncovered: readonly string[];
+  /**
+   * The magnitudes this file proved it can move, by applying a patch through
+   * `applyOverrides` and reading the field back (see `REACHABILITY`). Printed because it is
+   * the evidence behind the empty list above, not a decoration: the count is the whole
+   * argument that "every combat number is content now" is a checked statement.
+   */
+  readonly reachability: {
+    readonly proven: number;
+    readonly total: number;
+    /** The paths proven, in the order they are declared. */
+    readonly paths: readonly string[];
+    /** …and the ones that failed, which make the report worthless — see `main`. */
+    readonly failures: readonly string[];
+  };
+  /** Whether the swept knob was exercised at all — the reading a flat table needs. */
+  readonly exposure: Exposure;
   /** Where the replay disagreed with the harness — fatal, and reported as such. */
   readonly disagreements: readonly string[];
   readonly violations: readonly string[];
@@ -810,6 +1220,10 @@ const buildVariant = (
       unitsLostToUpkeep: sum((run) => run.tally.unitsLostToUpkeep),
       promotions: sum((run) => run.tally.promotions),
       citiesCaptured: sum((run) => run.tally.citiesCaptured),
+      capturedPopulation: sum((run) => run.tally.capturedPopulation),
+      capturesWithPopulationAboveOne: sum((run) => run.tally.capturesWithPopulationAboveOne),
+      battlesAtCity: sum((run) => run.tally.battlesAtCity),
+      battlesBehindWalls: sum((run) => run.tally.battlesBehindWalls),
       unitsAtHorizon: sum((run) => run.unitsAtHorizon),
       citiesAtHorizon: sum((run) => run.citiesAtHorizon),
       // A rate over no battles is not zero, it is *unmeasured* — which is why this is
@@ -879,6 +1293,20 @@ const buildReport = (
       'a small sample, reported as a sum rather than as a mean with a confidence claim',
   ];
 
+  // The exposure is computed from the variants' own counters, so it is a reading of what
+  // the runs did rather than a claim about what they should have done.
+  const totals: ExposureCounters = {
+    battles: variants.reduce((total, variant) => total + variant.battles, 0),
+    battlesAtCity: variants.reduce((total, variant) => total + variant.battlesAtCity, 0),
+    battlesBehindWalls: variants.reduce((total, variant) => total + variant.battlesBehindWalls, 0),
+    captures: variants.reduce((total, variant) => total + variant.citiesCaptured, 0),
+    capturesWithPopulationAboveOne: variants.reduce(
+      (total, variant) => total + variant.capturesWithPopulationAboveOne,
+      0,
+    ),
+  };
+  const exposure = exposureOf(knob, totals);
+
   return {
     knob: knob.path,
     knobMeaning: knob.meaning,
@@ -892,6 +1320,15 @@ const buildReport = (
     attackOddsFloorPct: floor,
     variants,
     unreachable: UNREACHABLE,
+    conventions: CONVENTIONS,
+    uncovered: uncoveredMagnitudes(),
+    reachability: {
+      proven: REACHABILITY.length - reachabilityFailures().length,
+      total: REACHABILITY.length,
+      paths: REACHABILITY.map((entry) => entry.path),
+      failures: reachabilityFailures(),
+    },
+    exposure,
     disagreements,
     violations,
     caveats,
@@ -920,10 +1357,10 @@ const renderReport = (report: CombatSweepReport): string => {
   lines.push('');
 
   lines.push(
-    '  value  eff | turns | battles  atk-win  win% | damage | units lost  (combat/upkeep) | promos | captures | units@H cities@H',
+    '  value  eff | turns | battles  atk-win  win% | damage | units lost  (combat/upkeep) | promos | captures/pop | city/wall | units@H cities@H',
   );
   lines.push(
-    '  -----------+-------+------------------------+--------+---------------------------+--------+----------+-----------------',
+    '  -----------+-------+------------------------+--------+---------------------------+--------+--------------+-----------+-----------------',
   );
   for (const variant of report.variants) {
     lines.push(
@@ -933,7 +1370,9 @@ const renderReport = (report: CombatSweepReport): string => {
         `${cell(variant.combatDamage, 6)} | ` +
         `${cell(variant.unitsLostToCombat + variant.unitsLostToUpkeep, 10)}  ` +
         `(${String(variant.unitsLostToCombat)}/${String(variant.unitsLostToUpkeep)})`.padEnd(17) +
-        ` | ${cell(variant.promotions, 6)} | ${cell(variant.citiesCaptured, 8)} | ` +
+        ` | ${cell(variant.promotions, 6)} | ` +
+        `${cell(variant.citiesCaptured, 6)}/${cell(variant.capturedPopulation, 4)} | ` +
+        `${cell(variant.battlesAtCity, 4)}/${cell(variant.battlesBehindWalls, 4)} | ` +
         `${cell(variant.unitsAtHorizon, 6)} ${cell(variant.citiesAtHorizon, 8)}`,
     );
   }
@@ -950,6 +1389,23 @@ const renderReport = (report: CombatSweepReport): string => {
     '  eff is what the knob reads inside the patched ruleset — a value the override refused would ' +
       'show up here.',
   );
+  lines.push(
+    '  captures/pop is cities taken and the population they were left with; city/wall is battles ' +
+      'fought on a tile holding a city owned by the defender, and how many of those cities held ' +
+      'the walls row. See EXPOSURE below: those two counters are what separate a knob that did ' +
+      'nothing from a knob that was never in play.',
+  );
+  lines.push('');
+
+  // The exposure line, printed **whether or not** the table moved. This is the sentence the
+  // M7 repair asks for: a flat walls table is not evidence until the report says whether any
+  // defender ever stood behind a wall.
+  lines.push('EXPOSURE (what the swept knob was actually given)');
+  lines.push(
+    `  ${report.exposure.name}: ${String(report.exposure.count)} of ${String(report.exposure.of)}`,
+  );
+  lines.push(`  needs: ${report.exposure.needs}`);
+  if (report.exposure.count === 0) lines.push(`  NOT EXERCISED — ${report.exposure.zeroMeans}`);
   lines.push('');
 
   // The knob's receipt: what `applyOverrides` said it did.
@@ -962,12 +1418,48 @@ const renderReport = (report: CombatSweepReport): string => {
   for (const line of record) lines.push(`  ${line}`);
   lines.push('');
 
-  lines.push('combat magnitudes this override surface CANNOT move (reported, not swept)');
+  lines.push(
+    'combat and capture magnitudes this override surface CANNOT move (reported, not swept)',
+  );
+  if (report.unreachable.length === 0) {
+    lines.push(
+      '  (none — every magnitude of the combat and capture sections is content: the applier ' +
+        'carries it and validation accepts it, which is what the reachability check below ' +
+        'measures one field at a time)',
+    );
+  }
   for (const row of report.unreachable) {
     const value = row.value === undefined ? '' : ` = ${String(row.value)}`;
-    lines.push(`  ${row.name}${value}  — needs ${row.needs}`);
+    lines.push(`  ${row.path}${value}  — needs ${row.needs}`);
   }
   lines.push('');
+
+  // The check behind that empty list: each magnitude, patched and read back.
+  lines.push(
+    `reachability of every combat/capture magnitude: ${String(report.reachability.proven)} of ` +
+      `${String(report.reachability.total)} moved through applyOverrides and read back`,
+  );
+  for (const path of report.reachability.paths) lines.push(`  ok   ${path}`);
+  for (const failure of report.reachability.failures) lines.push(`  FAIL ${failure}`);
+  lines.push('');
+
+  // Not magnitudes — reported beside the list above so "nothing is unreachable" cannot be
+  // read as "every combat-adjacent decision is a knob".
+  lines.push('combat-adjacent decisions that are NOT magnitudes (nothing to sweep, by design)');
+  for (const row of report.conventions) lines.push(`  ${row.name}  — ${row.reason}`);
+  lines.push('');
+
+  if (report.uncovered.length > 0) {
+    lines.push(
+      `UNACCOUNTED MAGNITUDES (${String(report.uncovered.length)}) — this report is incomplete`,
+    );
+    lines.push(
+      '  these catalog fields are neither swept by a knob nor declared unreachable, so this ' +
+        'sweep cannot say anything about them:',
+    );
+    for (const path of report.uncovered) lines.push(`  ${path}`);
+    lines.push('');
+  }
 
   if (report.disagreements.length > 0) {
     lines.push(
@@ -1021,6 +1513,13 @@ const measurableEffect = (report: CombatSweepReport): boolean => {
       variant.unitsLostToUpkeep,
       variant.promotions,
       variant.citiesCaptured,
+      // M7: the figure the capture divisor moves. Without it a sweep of that knob would
+      // report "no measurable effect" while the table's own population column moved —
+      // the exact class of quiet false negative this guard exists to prevent.
+      variant.capturedPopulation,
+      variant.capturesWithPopulationAboveOne,
+      variant.battlesAtCity,
+      variant.battlesBehindWalls,
       variant.unitsAtHorizon,
       variant.citiesAtHorizon,
       variant.turnsPlayed,
@@ -1030,19 +1529,76 @@ const measurableEffect = (report: CombatSweepReport): boolean => {
   return report.variants.some((variant) => signature(variant) !== baseline);
 };
 
-/** Why the knob proved nothing, in the report's own words. */
+/**
+ * Whether every value in the grid produced the **same games**, seed by seed, hash for hash.
+ *
+ * The strongest form of "nothing moved", and the one worth stating separately: a knob can
+ * change a number the engine computes (the odds the resolver reports, the clamp it applies)
+ * without changing a single outcome, because the outcome is decided by the roll and the
+ * rolls are drawn regardless of the odds. Identical final hashes say exactly that — the
+ * whole game, not merely this table's columns, is the same one. It is what makes a flat
+ * walls result a statement about *these runs* rather than a suspicious-looking tie.
+ */
+const gamesAreIdentical = (report: CombatSweepReport): boolean => {
+  const first = report.variants[0];
+  if (first === undefined) return true;
+  const shape = (variant: Variant): string =>
+    JSON.stringify(
+      variant.seeds.map((run) => [run.seed, run.turnsPlayed, run.finalHash, run.stoppedBecause]),
+    );
+  const baseline = shape(first);
+  return report.variants.every((variant) => shape(variant) === baseline);
+};
+
+/**
+ * Why the knob proved nothing, in the report's own words — **and which of the two very
+ * different things that means.**
+ *
+ * A flat table has exactly two explanations, and M7's second repair is the reason they
+ * are separated here rather than left to the reader:
+ *
+ * 1. the knob was never **exercised** — no defender stood behind a wall, or no city
+ *    changed hands — in which case the table is a statement about *this run set* and not
+ *    about the knob at all. That is a MEASUREMENT LIMITATION, and the exposure counter
+ *    above says so from the runs themselves rather than from anybody's belief about the
+ *    placeholder policy.
+ * 2. the knob was exercised, repeatedly, and nothing moved anyway — which is a TRUE
+ *    FINDING about the knob in this engine at this sample size, stated as such with the
+ *    exposure that backs it.
+ *
+ * The old text collapsed both into "a wider grid or more turns is what would", which is
+ * advice about the wrong thing in case 2 and an unstated assumption in case 1.
+ */
 const noEffectReason = (report: CombatSweepReport): string => {
-  const battles = report.variants.reduce((total, variant) => total + variant.battles, 0);
-  if (battles === 0) {
+  const { exposure } = report;
+  if (exposure.count === 0) {
     return (
-      'no battle was fought under ANY value of the knob, so there is nothing here to move: the ' +
-      'two civilizations never met in force within the horizon, or the policy never cleared its ' +
-      'own odds floor. More turns, more seeds, a bigger map or a lower --floor is what would.'
+      `MEASUREMENT LIMITATION, not a finding about the knob: ${exposure.zeroMeans}. ` +
+      `The knob would need ${exposure.needs}. What would fix the measurement is a run set in ` +
+      'which that happens — more turns, more seeds, a bigger map, a lower --floor, or (M7) the ' +
+      'real policy, which reaches positions this placeholder never does.'
     );
   }
+
+  const first = report.variants[0];
+  const last = report.variants[report.variants.length - 1];
+  const grid =
+    first === undefined || last === undefined
+      ? 'across the grid'
+      : `even between ${String(first.value)} and ${String(last.value)}`;
+  const identical = gamesAreIdentical(report)
+    ? ' The games are byte-identical as well — the same turns and the same final hash on every ' +
+      'seed under every value — so the knob changed what the engine computed without changing ' +
+      'what it decided.'
+    : '';
   return (
-    'every value produced the same battles, the same losses and the same captures, so this sweep ' +
-    'proves nothing about the knob. A wider grid or more turns is what would.'
+    `TRUE FINDING about the knob in these runs, stated with what it is worth: the knob WAS ` +
+    `exercised — ${exposure.name} ${String(exposure.count)} of ${String(exposure.of)} — and ` +
+    `every value produced the same battles, the same losses, the same captures and the same ` +
+    `populations, ${grid}.${identical} The exposure is the strength of that finding and not ` +
+    'merely its context: read the knob as "it did not move these games", not as "it can never ' +
+    'matter". More exposure (a bigger map, more turns, or the M7 policy) would test it harder; a ' +
+    'wider grid of values cannot, because the games did not move across this one.'
   );
 };
 
@@ -1119,6 +1675,13 @@ const main = (): number => {
       process.stdout.write(`NO MEASURABLE EFFECT: ${noEffectReason(report)}\n`);
     }
   }
+
+  // An unaccounted magnitude means this report described a game it does not fully cover —
+  // the M6 failure, where nine numbers lived in logic and the sweep simply did not mention
+  // them. A failed reachability probe means the surface itself is broken. Both are broken
+  // instruments rather than bad results, so both exit like one.
+  if (report.uncovered.length > 0) return 1;
+  if (report.reachability.failures.length > 0) return 1;
 
   // A disagreement means the replay is not the harness's game, which makes every figure
   // above a statement about this script rather than about the engine. That is a

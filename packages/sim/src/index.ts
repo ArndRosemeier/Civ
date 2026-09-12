@@ -70,9 +70,46 @@ export {
 } from './policies.js';
 export type { SimplePolicyTuning } from './policies.js';
 
+// M7's real opponent, and the weights it reads. Re-exported from the `policies` line above
+// as well, so a caller that already imports `DO_NOTHING_POLICY` from here finds the real AI
+// beside it without learning a second module path — while the AI's own module notes stay
+// under `ai/`, where its weights and its decision code live together.
+export {
+  DEFAULT_SMART_WEIGHTS,
+  SMART_POLICY,
+  SMART_POLICY_NAME,
+  SMART_WEIGHT_GROUPS,
+  SMART_WEIGHTS,
+  mergeSmartWeights,
+  smartPolicy,
+} from './ai/index.js';
+export type { SmartWeightGroup, SmartWeights, SmartWeightsPatch } from './ai/index.js';
+
 export { policyRngFor, runSimulation } from './runner.js';
 
 export { aggregateRuns, runBatch } from './batch.js';
+
+// M7's self-play harness: many games, one policy per seat, and the seats rotated so that no
+// strategy is ever tested from one position only. Exported beside the batch it is built on,
+// because the two answer the two halves of the same question — "how do these numbers move
+// when the world changes" (`runBatch`) and "how do these strategies compare" (this).
+export {
+  DEFAULT_TOURNAMENT_BUDGET_MS,
+  HOST_CLOCK,
+  runTournament,
+  seatPlan,
+  tournamentVerdict,
+} from './tournament.js';
+export type {
+  TournamentClock,
+  TournamentHarness,
+  TournamentOptions,
+  TournamentPolicyTotals,
+  TournamentResult,
+  TournamentSeatTotals,
+  TournamentTotals,
+  TournamentVerdict,
+} from './tournament.js';
 
 export type {
   BatchOptions,

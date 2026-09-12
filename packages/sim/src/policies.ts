@@ -1150,3 +1150,42 @@ export const simplePolicy = (patch: Partial<SimplePolicyTuning> = {}): Policy =>
 
 /** The simple policy at its default tuning. **PLACEHOLDER** for M7's real AI. */
 export const SIMPLE_POLICY: Policy = simplePolicy();
+
+/* ------------------------------------------------------------------ *
+ * M7 — the real AI
+ * ------------------------------------------------------------------ */
+
+/**
+ * **`SMART_POLICY` — the real opponent M7 puts on the board.**
+ *
+ * It is defined in `./ai/smart.js` and re-exported here, which is the whole of this file's
+ * involvement: the AI's decisions, its weights and its own module note live under `ai/`,
+ * where the standing requirement's *Tunable* rule is honoured by putting every magnitude
+ * in `ai/weights.js` rather than in a branch.
+ *
+ * Three things about this re-export are worth stating, because they are what keeps the
+ * *seam* the seam:
+ *
+ * - **Nothing here branches on it.** The list above is exports, not wiring: the engine,
+ *   the runner and the batch aggregator resolve a policy per civilization by *player id*
+ *   and never look at `policy.name`. A default-choices layer that recognised a policy
+ *   would be an engine with an AI inside it, and two policies could no longer be compared
+ *   on one seed.
+ * - **The two placeholders stay.** `DO_NOTHING_POLICY` is the control a balance comparison
+ *   is measured against, and `SIMPLE_POLICY` is what it was measured against before M7;
+ *   both remain exported and unchanged, so nothing that already reaches for them has to
+ *   move, and the M5-era tests that pin their behaviour keep pinning it.
+ * - **Where a caller picks a default is a caller's decision.** This file deliberately does
+ *   not export a `DEFAULT_POLICY`: which policy a tournament or a CLI runs is a choice
+ *   about the *experiment*, and it belongs where the experiment is described (M7 gives
+ *   `@civts/sim`'s tournament its own default; a golden test pins its own), not in the
+ *   module that happens to hold the policies.
+ */
+export { SMART_POLICY, SMART_POLICY_NAME, smartPolicy } from './ai/smart.js';
+export {
+  DEFAULT_SMART_WEIGHTS,
+  SMART_WEIGHT_GROUPS,
+  SMART_WEIGHTS,
+  mergeSmartWeights,
+} from './ai/weights.js';
+export type { SmartWeightGroup, SmartWeights, SmartWeightsPatch } from './ai/weights.js';

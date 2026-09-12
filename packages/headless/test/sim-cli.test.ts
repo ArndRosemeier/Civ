@@ -40,7 +40,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { Result } from '@civts/core';
 import { CATALOG } from '@civts/rules';
-import { CORE_INVARIANTS } from '@civts/sim';
+import { CORE_INVARIANTS, DEFAULT_TOURNAMENT_BUDGET_MS } from '@civts/sim';
 import { describe, expect, it } from 'vitest';
 // The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
 // they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
@@ -55,13 +55,17 @@ import {
   parseSeedSpec,
   parseSimArgs,
   parseSweepArgs,
+  parseTournamentArgs,
   readKnob,
   runSimCommand,
   runSweepCommand,
+  runTournamentCommand,
   type SimReport,
   type SweepCommandDefaults,
   type SweepReport,
   type SweepValueRow,
+  type TournamentFlags,
+  type TournamentReport,
 } from '../src/sim-cli.js';
 
 /* ------------------------------------------------------------------ *
@@ -130,6 +134,7 @@ const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const TSX_CLI = join(REPO_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const CLI = join(REPO_ROOT, 'packages', 'headless', 'src', 'cli.ts');
 const SWEEP_SCRIPT = join(REPO_ROOT, 'scripts', 'balance-sweep.ts');
+const COMBAT_SWEEP_SCRIPT = join(REPO_ROOT, 'scripts', 'combat-balance-sweep.ts');
 
 interface CliRun {
   readonly status: number | null;
@@ -153,6 +158,10 @@ const runCli = (args: readonly string[]): CliRun => runProcess(CLI, args);
 
 /** The sweep script, started the way the principal was told to start it. */
 const runSweepScript = (args: readonly string[]): CliRun => runProcess(SWEEP_SCRIPT, args);
+
+/** M7's combat/capture sweep, started the same way — it is the one that measures battles. */
+const runCombatSweepScript = (args: readonly string[]): CliRun =>
+  runProcess(COMBAT_SWEEP_SCRIPT, args);
 
 /* ------------------------------------------------------------------ *
  * Flags
@@ -394,6 +403,66 @@ describe('the sim command parses its flags, and refuses what it cannot mean', ()
 
     // A path with no field at all is the same complaint, not a crash.
     expect(parseOverrideText('combat.=10').ok).toBe(false);
+  });
+
+  it("addresses M7's singleton capture section, in both of its spellings", () => {
+    // The second singleton, and the reason the singleton branch is now a *list* of
+    // sections rather than an `if` for combat: the rule is about the section's shape, and
+    // a section the CLI cannot spell is a knob a sweep reads about and cannot turn.
+    const short = okOrThrow(parseOverrideText('capture.populationDivisor=4'));
+    expect(short.section).toBe('capture');
+    expect(short.id).toBe('capture');
+    expect(short.field).toBe('populationDivisor');
+    expect(short.value).toStrictEqual({ kind: 'integer', value: 4 });
+
+    const long = okOrThrow(parseOverrideText('capture.capture.populationDivisor=3'));
+    expect(long.id).toBe('capture');
+    expect(long.field).toBe('populationDivisor');
+
+    const patch = okOrThrow(
+      buildRulesetPatch([okOrThrow(parseOverrideText('capture.populationDivisor=4'))]),
+    );
+    expect(patch.capture?.populationDivisor).toBe(4);
+    // The sections the flag did not name stay absent rather than becoming empty claims.
+    expect(patch.combat).toBeUndefined();
+    expect(patch.units).toBeUndefined();
+  });
+
+  it("reads the capture divisor as a sweepable knob, with the catalog's own value", () => {
+    // The knob the M7 evidence names: `--knob capture.populationDivisor` reads the shipped
+    // value *out of* the catalog, so a sweep cannot restate the number it is sweeping —
+    // which is the failure mode a second source in a script would reintroduce.
+    const knob = okOrThrow(readKnob(CATALOG, 'capture.populationDivisor'));
+    expect(knob.section).toBe('capture');
+    expect(knob.id).toBe('capture');
+    expect(knob.setting).toBe('populationDivisor');
+    expect(knob.shipped).toBe(CATALOG.capture.populationDivisor);
+    expect(knob.provenanceKind).toBe('placeholder');
+    expect(knob.provenanceDetail).toBe(CATALOG.capture.provenance.note);
+
+    // An unknown magnitude and a row id the section does not have are both refused rather
+    // than read as zero: a knob that silently became `0` would sweep a ruleset nobody wrote
+    // (and `floor(population / 0)` is `Infinity`).
+    expect(readKnob(CATALOG, 'capture.populationDivizor').ok).toBe(false);
+    expect(readKnob(CATALOG, 'capture.sack.populationDivisor').ok).toBe(false);
+  });
+
+  it('refuses a misspelled capture magnitude, listing the one that would work', () => {
+    const typo = buildRulesetPatch([okOrThrow(parseOverrideText('capture.divisor=4'))]);
+    expect(typo.ok).toBe(false);
+    if (!typo.ok) {
+      expect(typo.error).toContain('divisor');
+      expect(typo.error).toContain('populationDivisor');
+    }
+
+    // A row id is not a thing this section has, and saying so is better than looking for a
+    // row called `sack` and failing with "unknown id".
+    const noSuchRow = parseOverrideText('capture.sack.populationDivisor=4');
+    expect(noSuchRow.ok).toBe(false);
+    if (!noSuchRow.ok) expect(noSuchRow.error).toContain('no id to name');
+
+    // A path with no field at all is the same complaint, not a crash.
+    expect(parseOverrideText('capture.=4').ok).toBe(false);
   });
 });
 
@@ -924,4 +993,466 @@ describe('scripts/balance-sweep.ts', () => {
     expect(help.status).toBe(0);
     expect(help.stdout).toContain('usage: tsx scripts/balance-sweep.ts');
   }, 300_000);
+});
+
+/* ------------------------------------------------------------------ *
+ * The combat/capture sweep, and the sentence a flat table needs (M7)
+ * ------------------------------------------------------------------ */
+
+describe('scripts/combat-balance-sweep.ts', () => {
+  /**
+   * The M7 acceptance evidence — "`CAPTURE_POPULATION_DIVISOR` is in the catalog and
+   * swept" — as a regression rather than as a paragraph in a report.
+   *
+   * Two claims, and both are the kind that rot silently:
+   *
+   * 1. **Every combat and capture magnitude is reachable.** The report proves it field by
+   *    field (each magnitude patched through `applyOverrides` and read back), and the
+   *    count it prints is asserted here to be a full `N of N` — so a magnitude that stops
+   *    being carried, or a validator that starts refusing a legal value, fails this test
+   *    instead of quietly dropping out of a table. The "cannot move" list must be empty,
+   *    which is the milestone's headline claim.
+   * 2. **A flat table always comes with its reading.** The walls-bonus sweep is the M7
+   *    repair's own example: it was flat for two milestones, and whether that is a finding
+   *    about the knob or a limitation of the measurement is exactly what a reader cannot
+   *    tell from the numbers. The script must say which, in words, whenever no effect is
+   *    measurable — never print a flat table on its own.
+   *
+   * Full tier: two subprocess runs of the sweep (~3 s together). The script is deterministic
+   * by construction, so running it twice also pins that the table is a function of its flags.
+   */
+  it.skipIf(!FULL_TIER)(
+    'sweeps the capture divisor, proves every magnitude reachable, and classifies a flat table',
+    () => {
+      const args = [
+        '--knob',
+        'capture-divisor',
+        '--values',
+        '1,2',
+        '--seeds',
+        '1',
+        '--turns',
+        '20',
+      ];
+      const first = runCombatSweepScript(args);
+      const second = runCombatSweepScript(args);
+
+      expect(first.status).toBe(0);
+      expect(first.stderr).toBe('');
+      expect(first.stdout).toBe(second.stdout);
+
+      // The knob really moved: the receipt names the section, the row id and the field, and
+      // the effective column is the *patched* value rather than the shipped one.
+      expect(first.stdout).toContain('knob:      capture.populationDivisor');
+      expect(first.stdout).toContain('capture.capture.populationDivisor: ');
+      expect(first.stdout).toContain('EXPOSURE (what the swept knob was actually given)');
+
+      // Item 1: no magnitude is unreachable, and all of them are proven movable.
+      expect(first.stdout).toContain(
+        'combat and capture magnitudes this override surface CANNOT move',
+      );
+      expect(first.stdout).toContain('(none —');
+      const reachability = /reachability of every combat\/capture magnitude: (\d+) of (\d+)/.exec(
+        first.stdout,
+      );
+      expect(reachability).not.toBeNull();
+      // `N of N`, with N > 0 — the assertion that would fail if a magnitude were dropped
+      // from the probe list, which is how "reachable" would quietly stop being checked.
+      expect(reachability?.[1]).toBe(reachability?.[2]);
+      expect(Number(reachability?.[1])).toBeGreaterThan(0);
+      expect(first.stdout).toContain('ok   capture.populationDivisor');
+
+      // Item 2: the flat-table reading. The walls knob's grid is flat at this size, and the
+      // report must say which of the two things that means rather than leaving it to the
+      // reader. (When the exposure is zero the honest answer is the measurement limitation;
+      // once the real policy reaches walled cities it may become the other one. Either
+      // sentence is accepted here — what is asserted is that one of them is printed.)
+      const flat = runCombatSweepScript([
+        '--knob',
+        'walls-bonus',
+        '--seeds',
+        '1',
+        '--turns',
+        '20',
+        '--values',
+        '0,100',
+      ]);
+      expect(flat.status).toBe(0);
+      if (flat.stdout.includes('NO MEASURABLE EFFECT')) {
+        expect(flat.stdout).toMatch(/MEASUREMENT LIMITATION|TRUE FINDING/);
+      }
+      // …and the exposure is printed either way: whether or not the table moved, the reader
+      // is told how often the knob was in play.
+      expect(flat.stdout).toContain('EXPOSURE (what the swept knob was actually given)');
+      expect(flat.stdout).toContain('battles fought by a defender inside its own walled city');
+    },
+    300_000,
+  );
+
+  it('refuses a knob it does not know, and explains itself when asked', () => {
+    const bad = runCombatSweepScript(['--knob', 'unit-cost']);
+    expect(bad.status).toBe(2);
+    expect(bad.stderr).toContain('unknown knob');
+    expect(bad.stderr).toContain('capture-divisor');
+
+    const help = runCombatSweepScript(['--help']);
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain('usage: npx tsx scripts/combat-balance-sweep.ts');
+    expect(help.stdout).toContain('capture.populationDivisor');
+  }, 300_000);
+});
+
+/* ------------------------------------------------------------------ *
+ * The tournament command
+ *
+ * M7's second command, and the same discipline as `sim`: one structured value, a renderer
+ * that only formats it, and `--json` for `canonicalize` of that value. What this section
+ * proves beyond `sim`'s rules is what a tournament adds — the seat rotation is visible in
+ * the report, the pass/fail condition is the violation count, and the budget verdict is
+ * honest in both directions.
+ * ------------------------------------------------------------------ */
+
+/** A small tournament: two games, two seats, four turns each. Milliseconds to run. */
+const SMALL_TOURNAMENT: readonly string[] = [
+  '--seeds',
+  '1..2',
+  '--turns',
+  '4',
+  '--seats',
+  'simple,none',
+  '--map-size',
+  'duel',
+];
+
+const tournamentReportOf = (args: readonly string[]): TournamentReport => {
+  const output = okOrThrow(runTournamentCommand(args));
+  if (output.report === undefined) throw new Error('the command produced no report');
+  return output.report;
+};
+
+/** The `--json` report as the plain object a pipeline parses out of stdout. */
+const parsedJson = (output: { readonly stdout: string }): Record<string, unknown> => {
+  const parsed: unknown = JSON.parse(output.stdout);
+  if (!isRecord(parsed)) throw new Error('the JSON report is not an object');
+  return parsed;
+};
+
+/**
+ * The report with the **one** field a clock decides replaced.
+ *
+ * `elapsedMs` is a measurement of the harness's own work, so two runs of the same flags
+ * cannot agree on it — there is no honest way to make a wall-clock reading reproducible.
+ * Everything else must be byte-identical, which is what the test below asserts by
+ * comparing the whole report with that one field (and the figure derived from it) pinned.
+ */
+const withoutTiming = (report: Record<string, unknown>): Record<string, unknown> => {
+  const budget = report['budget'];
+  if (!isRecord(budget)) throw new Error('the report has no budget block');
+  return {
+    ...report,
+    budget: { ...budget, elapsedMs: 0, overByMs: 0 },
+  };
+};
+
+describe('the tournament command parses its flags, and refuses what it cannot mean', () => {
+  it('leaves every default absent when no flag is given', () => {
+    const flags: TournamentFlags = okOrThrow(parseTournamentArgs([]));
+    expect(flags.seeds).toBeUndefined();
+    expect(flags.seedSpec).toBeUndefined();
+    expect(flags.seats).toBeUndefined();
+    expect(flags.mapSize).toBeUndefined();
+    expect(flags.civCount).toBeUndefined();
+    expect(flags.turns).toBeUndefined();
+    expect(flags.budgetMs).toBeUndefined();
+    expect(flags.overrides).toStrictEqual([]);
+    expect(flags.faults).toStrictEqual([]);
+    expect(flags.json).toBe(false);
+  });
+
+  it('parses the whole flag set, seats included and in order', () => {
+    const flags = okOrThrow(
+      parseTournamentArgs([
+        '--seeds',
+        '1..3',
+        '--seats',
+        'smart, simple ',
+        '--map-size',
+        'duel',
+        '--civs',
+        '2',
+        '--turns',
+        '6',
+        '--budget-ms',
+        '2500',
+        '--override',
+        'units.settler.cost=4',
+        '--fault',
+        'gate-probe',
+        '--json',
+      ]),
+    );
+
+    expect(flags.seeds).toStrictEqual([1, 2, 3]);
+    expect(flags.seedSpec).toBe('1..3');
+    // Left to right, and "a policy may repeat" needs no special case: this is a list.
+    expect(flags.seats).toStrictEqual(['smart', 'simple']);
+    expect(flags.mapSize).toBe('duel');
+    expect(flags.civCount).toBe(2);
+    expect(flags.turns).toBe(6);
+    expect(flags.budgetMs).toBe(2500);
+    expect(flags.overrides).toStrictEqual(['units.settler.cost=4']);
+    expect(flags.faults).toStrictEqual(['gate-probe']);
+    expect(flags.json).toBe(true);
+  });
+
+  it('refuses a flag it cannot mean, naming the flag', () => {
+    const cases: readonly (readonly [readonly string[], string])[] = [
+      [['--nope'], 'unknown option for the tournament'],
+      [['--seats'], 'needs a value'],
+      [['--seats', 'genius'], '--seats expects a comma-separated list'],
+      [['--seats', 'simple,,none'], 'empty entry'],
+      [['--seats', 'simple,'], 'empty entry'],
+      [['--map-size', 'gigantic'], '--map-size expects one of'],
+      [['--turns', '0'], '--turns must be at least 1'],
+      [['--budget-ms', '-1'], '--budget-ms must be zero or more'],
+      [['--budget-ms', 'soon'], '--budget-ms expects an integer'],
+      [['--fault', 'Not Kebab'], '--fault expects a kebab-case'],
+    ];
+    for (const [args, fragment] of cases) {
+      const parsed = parseTournamentArgs(args);
+      expect(parsed.ok, `args ${args.join(' ')}`).toBe(false);
+      if (!parsed.ok) expect(parsed.error).toContain(fragment);
+    }
+  });
+
+  it('refuses a seat list that does not match the number of civilizations, and exits 2', () => {
+    const output = runTournamentCommand(['--seats', 'simple,none,simple', '--civs', '2']);
+
+    expect(output.ok).toBe(false);
+    if (output.ok) return;
+    expect(output.error.exitCode).toBe(2);
+    expect(output.error.lines.join('\n')).toContain('every seat needs exactly one policy');
+    expect(output.error.lines.join('\n')).toContain('a policy may repeat');
+  });
+
+  it('explains itself when asked, without running a game', () => {
+    const output = okOrThrow(runTournamentCommand(['--help']));
+
+    expect(output.exitCode).toBe(0);
+    expect(output.report).toBeUndefined();
+    expect(output.stdout).toContain('usage: civts tournament');
+    // The rotation is documented where a reader meets the flags, not only in the code.
+    expect(output.stdout).toContain('Seats ROTATE');
+    // ...and the default budget the report will quote is the library's own stated one, so
+    // the help text and the verdict cannot disagree about what a run was judged against.
+    expect(output.stdout).toContain(String(DEFAULT_TOURNAMENT_BUDGET_MS));
+    // Every exit code this command can return is stated, including the one that says a run
+    // was slow rather than broken.
+    expect(output.stdout).toContain('but the run took longer than the budget');
+  });
+
+  it('defaults to the real AI in every seat — a self-play tournament', () => {
+    // One seed and one turn: enough to read the seating off the report, and cheap enough
+    // for the fast tier even though the real policy makes every decision.
+    const report = tournamentReportOf(['--seeds', '1', '--turns', '1', '--map-size', 'duel']);
+
+    expect(report.parameters.seats).toStrictEqual(['smart', 'smart']);
+    expect(report.policies.map((policy) => policy.policy)).toStrictEqual(['smart', 'smart']);
+    // Two seats running policies with one name: the labels keep the two rows apart, so a
+    // self-play report cannot read as one policy reported twice.
+    expect(report.policies.map((policy) => policy.label)).toStrictEqual(['smart #0', 'smart #1']);
+    expect(report.games[0]?.seats).toStrictEqual(['smart #0', 'smart #1']);
+  });
+});
+
+describe('the tournament report is one structured value, rendered', () => {
+  it('reports the games, the rotated seating, the verdict and the budget', () => {
+    const report = tournamentReportOf(SMALL_TOURNAMENT);
+
+    expect(report.kind).toBe('civts-tournament-report');
+    expect(report.status).toBe('ok');
+    expect(report.exitCode).toBe(0);
+    expect(report.games.map((game) => game.seed)).toStrictEqual([1, 2]);
+    expect(report.totals.games).toBe(report.games.length);
+    expect(report.seats.map((seat) => seat.seat)).toStrictEqual([0, 1]);
+    expect(report.policies).toHaveLength(2);
+    expect(report.verdict.passed).toBe(true);
+    expect(report.verdict.accepted).toBe(true);
+    expect(report.violations).toStrictEqual([]);
+
+    // The rotation is in the report, game by game: the two seatings, alternating.
+    expect(report.games.map((game) => game.seats)).toStrictEqual([
+      ['simple-placeholder', 'do-nothing'],
+      ['do-nothing', 'simple-placeholder'],
+    ]);
+    // ...and in the per-policy totals, which is where a reader checks that an experiment was
+    // long enough for its rotation to complete.
+    for (const policy of report.policies) {
+      expect(policy.seatGames).toStrictEqual([1, 1]);
+    }
+  });
+
+  it('prints exactly the figures the structured value holds, for every seat and policy', () => {
+    // One invocation, and the report it produced: comparing a text report with a *second*
+    // run's value would fail on the timing field alone, which is not a rendering bug.
+    const output = okOrThrow(runTournamentCommand([...SMALL_TOURNAMENT]));
+    const report = output.report;
+    if (report === undefined) throw new Error('the command produced no report');
+
+    for (const seat of report.seats) {
+      const noun = seat.games === 1 ? 'game' : 'games';
+      expect(output.stdout).toContain(
+        `seat ${String(seat.seat)} — ${String(seat.games)} ${noun}, played by ${seat.policies.join(', ')}:`,
+      );
+      // Every metric of the seat's stored horizon table is printed under it.
+      expect(seat.horizon.map((total) => total.metric)).toStrictEqual([...HORIZON_METRICS]);
+    }
+
+    for (const policy of report.policies) {
+      expect(output.stdout).toContain(`seats ${policy.seatGames.join('/')}`);
+      expect(output.stdout).toContain(policy.policy);
+    }
+
+    for (const game of report.games) {
+      expect(output.stdout).toContain(game.finalHash);
+      expect(output.stdout).toContain(game.seats.join(', '));
+    }
+
+    // The budget, the check total and the verdict are fields, not recomputations.
+    expect(output.stdout).toContain(`${String(report.budget.budgetMs)}ms stated`);
+    expect(output.stdout).toContain(`${report.budget.elapsedMs.toFixed(1)}ms elapsed`);
+    expect(output.stdout).toContain(String(report.invariants.checks));
+    expect(output.stdout).toContain(report.verdict.summary);
+    expect(output.stdout).toContain(String(report.totals.turnsPlayed));
+    expect(output.stdout).toContain(report.ruleset.hash);
+  });
+
+  it('emits canonical JSON — sorted keys, no undefined, byte-stable across two runs', () => {
+    const first = okOrThrow(runTournamentCommand([...SMALL_TOURNAMENT, '--json']));
+    const second = okOrThrow(runTournamentCommand([...SMALL_TOURNAMENT, '--json']));
+    const firstReport = parsedJson(first);
+    const secondReport = parsedJson(second);
+
+    expectSortedKeys(firstReport, 'tournament');
+    // No key holds `undefined` (JSON would have dropped it) and nothing stringified to
+    // `null` (which is how an `Infinity` budget would travel).
+    expect(first.stdout).not.toContain('null');
+    // The JSON text is the report itself, canonicalised: round-tripping the command's own
+    // value reproduces the bytes it printed.
+    const report = first.report;
+    if (report === undefined) throw new Error('the command produced no report');
+    expect(JSON.parse(JSON.stringify(report))).toStrictEqual(JSON.parse(first.stdout));
+
+    // Byte-stability, stated exactly: `elapsedMs` is a wall-clock measurement of the
+    // harness's own work and cannot be reproducible, and it is the *only* field that is not.
+    expect(second.stdout).not.toBe(first.stdout);
+    expect(withoutTiming(secondReport)).toStrictEqual(withoutTiming(firstReport));
+    expect(secondReport['totals']).toStrictEqual(firstReport['totals']);
+    expect(secondReport['games']).toStrictEqual(firstReport['games']);
+    expect(secondReport['verdict']).toStrictEqual(firstReport['verdict']);
+    // Both runs really did measure a clock, so the one unstable field is live rather than
+    // a constant that happened to match.
+    expect(typeof report.budget.elapsedMs).toBe('number');
+    expect(report.budget.elapsedMs).toBeGreaterThan(0);
+  });
+});
+
+describe('a tournament violation is surfaced loudly, by name, seed and turn', () => {
+  const FAULTY: readonly string[] = [...SMALL_TOURNAMENT, '--fault', 'gate-probe'];
+
+  it('names the invariant, fails the pass condition and exits 1', () => {
+    const output = okOrThrow(runTournamentCommand(FAULTY));
+    const report = tournamentReportOf(FAULTY);
+
+    expect(output.exitCode).toBe(1);
+    expect(report.status).toBe('violations');
+    expect(report.verdict.passed).toBe(false);
+    expect(report.verdict.accepted).toBe(false);
+    expect(report.verdict.violations).toBeGreaterThan(0);
+    expect(report.violations.map((violation) => violation.invariant)).toStrictEqual([
+      'gate-probe',
+      'gate-probe',
+    ]);
+    // A tournament's unit of work is a game, and the banner says so — one seed per game, so
+    // a reader can tell which game to open.
+    expect(output.stdout).toContain('INVARIANT VIOLATIONS');
+    expect(output.stdout).toContain('gate-probe');
+    expect(output.stdout).toContain('seed 1');
+    expect(output.stdout).toContain('seed 2');
+    expect(output.stdout).toContain('has found a bug');
+    // A game stops on the turn that broke, so the tournament is shorter than its horizon —
+    // and the report says which turn each game actually reached.
+    expect(report.games.every((game) => game.stoppedBecause === 'violation')).toBe(true);
+    expect(report.games.every((game) => game.turnsPlayed === 1)).toBe(true);
+  });
+
+  it('keeps stdout machine-readable under --json, and shouts on stderr', () => {
+    const output = okOrThrow(runTournamentCommand([...FAULTY, '--json']));
+
+    expect(output.exitCode).toBe(1);
+    expect(() => JSON.parse(output.stdout) as unknown).not.toThrow();
+    expect(output.stderr).toContain('INVARIANT VIOLATIONS');
+    expect(output.stderr).toContain('gate-probe');
+    expect(output.stdout).not.toContain('INVARIANT VIOLATIONS');
+  });
+});
+
+describe('the tournament budget verdict is honest', () => {
+  it('says OVER BUDGET, still plays every seed, and exits 3', () => {
+    // A budget of zero milliseconds: no real run can be inside it, which is the honest
+    // direction to test — a run that fits is the easy case.
+    const args: readonly string[] = [...SMALL_TOURNAMENT, '--budget-ms', '0'];
+    const output = okOrThrow(runTournamentCommand(args));
+    const report = tournamentReportOf(args);
+
+    expect(output.exitCode).toBe(3);
+    expect(report.status).toBe('over-budget');
+    expect(report.budget.budgetMs).toBe(0);
+    expect(report.budget.withinBudget).toBe(false);
+    expect(report.budget.overByMs).toBeGreaterThan(0);
+    // The seed set is *not* trimmed to fit: both games were played and both are reported.
+    expect(report.games).toHaveLength(2);
+    expect(report.totals.games).toBe(2);
+    expect(report.verdict.passed).toBe(true);
+    expect(report.verdict.withinBudget).toBe(false);
+    expect(report.verdict.accepted).toBe(false);
+
+    expect(output.stdout).toContain('OVER BUDGET');
+    expect(output.stdout).toContain('never trimmed to fit');
+    expect(output.stderr).toBe('');
+  });
+
+  it('reports the defect when a run is both broken and late', () => {
+    // Two failures with two different causes: a broken invariant (exit 1) must win over an
+    // overrun (exit 3), because the defect is the thing to fix first — and the report still
+    // carries the budget verdict rather than dropping it.
+    const args: readonly string[] = [
+      ...SMALL_TOURNAMENT,
+      '--fault',
+      'gate-probe',
+      '--budget-ms',
+      '0',
+    ];
+    const output = okOrThrow(runTournamentCommand(args));
+    const report = tournamentReportOf(args);
+
+    expect(output.exitCode).toBe(1);
+    expect(report.status).toBe('violations');
+    expect(report.verdict.passed).toBe(false);
+    expect(report.budget.withinBudget).toBe(false);
+    expect(report.verdict.accepted).toBe(false);
+    // Both games were still played, and the roll-up counts both failures.
+    expect(report.games).toHaveLength(2);
+    expect(report.verdict.violations).toBe(2);
+  });
+
+  it('reports a met budget when the run is inside a stated one', () => {
+    const args: readonly string[] = [...SMALL_TOURNAMENT, '--budget-ms', '600000'];
+    const report = tournamentReportOf(args);
+
+    expect(report.budget.withinBudget).toBe(true);
+    expect(report.verdict.accepted).toBe(true);
+    expect(report.budget.overByMs).toBe(0);
+    expect(okOrThrow(runTournamentCommand(args)).exitCode).toBe(0);
+  });
 });

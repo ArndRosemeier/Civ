@@ -4209,7 +4209,9 @@ describe('the provenance command', () => {
     // the seventh, `combat` — one singleton row of nine magnitudes that M6 had buried
     // as module constants in `core/combat.ts`, and which are now content like every
     // other number here. Its id is the section's own name (`COMBAT_ROW_ID`), because a
-    // section of nine numbers has no id of its own.
+    // section of nine numbers has no id of its own. M7 adds the eighth, `capture` — the
+    // one magnitude M6 left behind in `core/cities.ts` and the last of them to become
+    // content, with the section's own name as its id for the same reason.
     const rows = printedRows(printed);
     expect(rows.map((row) => row.id)).toEqual([
       ...CATALOG.terrains.map((t) => t.id),
@@ -4219,6 +4221,7 @@ describe('the provenance command', () => {
       ...CATALOG.resources.map((r) => r.id),
       ...CATALOG.techs.map((t) => t.id),
       'combat',
+      'capture',
     ]);
 
     // …which is what makes the table and the totals agree.
@@ -4237,6 +4240,8 @@ describe('the provenance command', () => {
     // M6b adds `combat` as the seventh: it is a catalog section like any other, and a
     // provenance report that skipped it would leave the nine numbers this project was
     // most recently caught hiding exactly where they used to be — unaccounted for.
+    // M7 adds `capture` as the eighth heading, in the catalog's own position, so the
+    // divisor the capture rule reads is a row this report accounts for.
     expect(printed.sections.map((section) => section.name)).toEqual([
       'terrains',
       'units',
@@ -4245,6 +4250,7 @@ describe('the provenance command', () => {
       'resources',
       'techs',
       'combat',
+      'capture',
     ]);
 
     for (const section of printed.sections) {

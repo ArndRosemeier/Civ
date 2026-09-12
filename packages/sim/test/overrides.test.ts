@@ -24,6 +24,7 @@
  */
 
 import { canonicalize, hashValue } from '@civts/testing';
+import { captureRulesOf, capturedPopulation, type RulesetView } from '@civts/core';
 import { CATALOG, validateRuleset, type Catalog } from '@civts/rules';
 import { describe, expect, it } from 'vitest';
 
@@ -382,8 +383,15 @@ describe('an override that breaks the rules fails validation', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * 5. M6b — the combat globals, and the sections no patch may address
+ * 5. M6b/M7 — the singleton sections, and the sections no patch may address
  * ------------------------------------------------------------------ */
+
+/** The shipped `capture` section, and the patch type that addresses it (M7). */
+const CAPTURE = CATALOG.capture;
+type CapturePatch = NonNullable<RulesetPatch['capture']>;
+
+/** The one field of the capture section, walked the way the nine combat ones are. */
+const CAPTURE_FIELDS: readonly (keyof CapturePatch)[] = ['populationDivisor'];
 
 /** The shipped `combat` section, and the patch type that addresses it. */
 const COMBAT = CATALOG.combat;
@@ -497,6 +505,91 @@ describe('the combat section is a patchable section (M6b)', () => {
   });
 });
 
+describe('the capture section is a patchable section (M7)', () => {
+  /** The validated ruleset for a catalog — the shape `captureRulesOf` reads. */
+  const viewOf = (catalog: Catalog): RulesetView => {
+    const validated = validateRuleset(catalog, 'tuned');
+    if (!validated.ok) throw new Error('the shipped catalog must validate at "tuned"');
+    return validated.value;
+  };
+
+  it('moves the divisor the patch names, and is the knob a capture actually reads', () => {
+    // The claim item 1 of the standing requirement makes: a balance pass can vary this
+    // number *without editing content*, and the engine reads the moved number rather than
+    // a copy of the old one. Both halves are asserted — the patched catalog, and the
+    // reader `core/commands.ts` asks before it applies a sack.
+    for (const field of CAPTURE_FIELDS) {
+      const patched = applyOverrides(CATALOG, { capture: { [field]: 4 } });
+      expect(patched.capture[field]).toBe(4);
+      expect(patched.capture.provenance).toBe(CAPTURE.provenance);
+      // The validated ruleset carries the patched value, and so does the reader the
+      // capture rule uses — no literal left behind between content and the engine.
+      expect(captureRulesOf(viewOf(patched)).populationDivisor).toBe(4);
+      // The same population, two rulesets, two answers: this is a *knob*, not a field.
+      expect(capturedPopulation(captureRulesOf(viewOf(patched)), 8)).toBe(2);
+      expect(capturedPopulation(captureRulesOf(viewOf(CATALOG)), 8)).toBe(4);
+    }
+  });
+
+  it('CARRIES the section through a patch that does not name it — it can never be dropped', () => {
+    // The M6b bug class, one section over: a rebuild that dropped `capture` would leave
+    // every swept capture under `NO_CAPTURE_RULES`, so a sweep moving the divisor would be
+    // measuring a game that never applied it.
+    const patched = applyOverrides(CATALOG, { units: { [UNIT_ID]: { cost: UNIT.cost + 1 } } });
+    expect(patched.capture).toBe(CAPTURE);
+    expect(patched.capture.populationDivisor).toBe(2);
+    expect(applyOverrides(CATALOG, {}).capture).toBe(CAPTURE);
+  });
+
+  it('records the field it names, under the section’s own row id', () => {
+    const outcome = tryApplyOverrides(CATALOG, { capture: { populationDivisor: 4 } });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.applied).toEqual([
+      `capture.capture.populationDivisor: ${String(CAPTURE.populationDivisor)} -> 4`,
+    ]);
+    expect(canonicalize(outcome.value.catalog).length).toBeGreaterThan(0);
+  });
+
+  it('reports a misspelled magnitude instead of applying nothing', () => {
+    // `divisor` is not the name, and a sweep file that guessed it must hear so rather than
+    // reading "no effect" for a knob that was never applied.
+    const error = errorOf(jsonPatch('{ "capture": { "divisor": 4 } }'));
+    expect(error.kind).toBe('unknown-field');
+    if (error.kind !== 'unknown-field') return;
+    expect(error.section).toBe('capture');
+    expect(error.id).toBe('capture');
+    expect(error.field).toBe('divisor');
+    expect(error.known).toContain('populationDivisor');
+    expect(error.known).toHaveLength(1);
+
+    const message = formatOverrideError(error);
+    expect(message).toContain('divisor');
+    expect(message).toContain('populationDivisor');
+  });
+
+  it('fails validation exactly like a hand-edited section when the divisor is zero', () => {
+    // `floor(population / 0)` is `Infinity`, so the override path is not a way to bless a
+    // value validation refuses: the patch is applied before `validateRuleset`, and the
+    // complaint is the one a hand-edited catalog would produce, field for field.
+    const overridden = applyOverrides(CATALOG, { capture: { populationDivisor: 0 } });
+    const byHand: Catalog = { ...CATALOG, capture: { ...CAPTURE, populationDivisor: 0 } };
+
+    const fromOverride = validateRuleset(overridden, 'tuned');
+    const fromHand = validateRuleset(byHand, 'tuned');
+    expect(fromOverride.ok).toBe(false);
+    expect(fromHand.ok).toBe(false);
+    if (fromOverride.ok || fromHand.ok) return;
+    expect(fromOverride.error).toEqual(fromHand.error);
+    expect(
+      fromOverride.error.some(
+        (issue) => issue.kind === 'invalid-value' && issue.catalog === 'capture',
+      ),
+    ).toBe(true);
+  });
+});
+
 describe('every catalog section is either patchable or reported', () => {
   /**
    * The sections a patch may address, and the one it may not.
@@ -514,6 +607,7 @@ describe('every catalog section is either patchable or reported', () => {
     'improvements',
     'resources',
     'combat',
+    'capture',
   ];
   const UNPATCHABLE: readonly string[] = ['techs'];
 
@@ -542,6 +636,7 @@ describe('every catalog section is either patchable or reported', () => {
       if (error.kind !== 'unknown-section') return;
       expect(error.section).toBe(name);
       expect(error.known).toContain('combat');
+      expect(error.known).toContain('capture');
       expect(error.known).not.toContain(name);
 
       const message = formatOverrideError(error);
@@ -557,6 +652,7 @@ describe('every catalog section is either patchable or reported', () => {
     expect(error.section).toBe('unit');
     expect(error.known).toEqual([
       'buildings',
+      'capture',
       'combat',
       'improvements',
       'resources',

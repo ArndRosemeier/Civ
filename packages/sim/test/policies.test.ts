@@ -65,9 +65,12 @@ import { describe, expect, it } from 'vitest';
 import {
   DO_NOTHING_POLICY,
   SIMPLE_POLICY,
+  SMART_POLICY,
+  SMART_POLICY_NAME,
   policyRngFor,
   runSimulation,
   simplePolicy,
+  smartPolicy,
   type Policy,
   type PolicyContext,
   type SimulationResult,
@@ -927,5 +930,73 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
       result.finalState.units.map((unit) => String(unit.type));
     expect(types(flipped)).toEqual(types(baseline));
     expect(types(baseline)).not.toContain('galley');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M7 — the real AI observes the same contracts as its predecessors
+ * ------------------------------------------------------------------ *
+ *
+ * `ai.test.ts` is where the AI's own behaviour is evidenced (legality over many seeds,
+ * the comparison against the baseline, the walls measurement, the battle arithmetic).
+ * What is asserted *here* is only the part that belongs to this file's subject: that the
+ * third shipped policy is a member of the same family. Each assertion below is the one
+ * already made about `SIMPLE_POLICY` above, restated for `SMART_POLICY`, so that a
+ * contract the older policies keep cannot be quietly dropped by the new one.
+ */
+describe('M7 — the real AI keeps the policy contracts', () => {
+  it('is pure, deterministic, and returns a fresh list each call', () => {
+    const fresh = freshState(61);
+    const first = SMART_POLICY.chooseCommands(ctxFor(fresh, asPlayerId(0), 61));
+    expect(SMART_POLICY.chooseCommands(ctxFor(fresh, asPlayerId(0), 61))).toEqual(first);
+
+    // Mid-game, where the state is not the opening: the decisions have to be a function of
+    // the state and not of anything the call itself changed.
+    const middle = drive(61, SMART_POLICY, 12).state;
+    for (const player of civPlayers(middle)) {
+      const ctx = ctxFor(middle, player.id, 61);
+      expect(SMART_POLICY.chooseCommands(ctx)).toEqual(SMART_POLICY.chooseCommands(ctx));
+    }
+  });
+
+  it('does not read or write the world RNG while deciding', () => {
+    const before = drive(62, SMART_POLICY, 8).state;
+    const untouched = canonicalize(before.rng);
+    SMART_POLICY.chooseCommands(ctxFor(before, asPlayerId(0), 62));
+    expect(canonicalize(before.rng)).toBe(untouched);
+
+    // And a different stream in the context produces the same answer.
+    expect(SMART_POLICY.chooseCommands(ctxFor(before, asPlayerId(0), 999))).toEqual(
+      SMART_POLICY.chooseCommands(ctxFor(before, asPlayerId(0), 62)),
+    );
+  });
+
+  it('plays through the engine with no refusals, and takes its own RNG stream', () => {
+    const driven = drive(63, SMART_POLICY, 15);
+    expect(driven.refusals).toEqual([]);
+    expect(driven.commands.length).toBeGreaterThan(10);
+    expect(driven.state.cities.length).toBeGreaterThan(0);
+  });
+
+  it('is tunable through the same patch shape, without blanking a default', () => {
+    expect(SMART_POLICY.name).toBe(SMART_POLICY_NAME);
+    expect(SMART_POLICY.name).not.toBe(SIMPLE_POLICY.name);
+    expect(SMART_POLICY.name).not.toBe(DO_NOTHING_POLICY.name);
+    expect(smartPolicy().name).toBe(SMART_POLICY.name);
+    expect(smartPolicy({ city: { threatRadius: 9 } }).name).toBe(SMART_POLICY.name);
+    expect(drive(64, smartPolicy({ city: { threatRadius: 9 } }), 3).refusals).toEqual([]);
+  });
+
+  it('runs to the same verdict through `runSimulation` as the other policies do', () => {
+    const result = runSimulation({
+      seed: 65,
+      settings: settingsFor(65),
+      ruleset: RULESET,
+      policies: [SMART_POLICY, SMART_POLICY],
+      maxTurns: 20,
+    });
+    expect(result.violations).toEqual([]);
+    expect(result.turnsPlayed).toBeGreaterThan(0);
+    expect(result.finalState.cities.length).toBeGreaterThan(0);
   });
 });
