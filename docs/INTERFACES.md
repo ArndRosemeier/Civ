@@ -2094,3 +2094,64 @@ toward another player's conquest.
 - Balance evidence from the harness for at least one new knob (culture rate or victory
   threshold), honest about whether it shows an effect.
 - A played golden that INCLUDES a victory, so the end of a game is covered at hash level.
+
+---
+
+# M11 contracts — FROZEN (save, load, replay) and the alpha audit
+
+A6: golden replays stable; save/load round-trip preserves the state hash; a game resumes
+correctly from a save. The UI already round-trips a hash through `localStorage`, but that is
+one path through one front end, and A6 is about the ENGINE's ability to persist and resume.
+
+## One serialization module, one version
+
+`packages/core/src/serialize.ts`: `serialize(state)` and `deserialize(unknown) -> Result`.
+Not `JSON.stringify` at a call site — one place, because a second serializer is a second
+format and this project has found "two things that must agree" defects seven times now.
+
+The payload carries `{ version, engine, state }` where `engine` names the SCHEMA_VERSION and the
+Node major is checked the way the goldens already check it. Rules:
+
+- `deserialize` is TOTAL: malformed JSON, an unknown version, a missing field, a wrong type, an
+  out-of-range index and a state that VIOLATES AN INVARIANT must each return a typed error and
+  never throw and never silently produce a half-built state.
+- A payload whose `stateHash()` differs from the hash it carries is REJECTED. A save that loads
+  to a different game is worse than a save that fails.
+- Round-trip is exact: `deserialize(serialize(s))` hashes identically to `s`, for every golden
+  and for a played game. Prove it over many states, not one.
+- Optional fields stay absent — never serialized as `undefined` (unhashable).
+
+## Replay
+
+A game is `(seed, settings, ruleset identity, command log)`. `replay(log)` re-runs it and must
+reproduce the recorded hash at every turn boundary, not just at the end — a divergence at turn 5
+that reconverges by turn 20 is still a divergence. A command the engine now refuses must be
+reported with the turn it happened, not swallowed.
+
+CLI: `save`, `load` and `replay` verbs; the REPL too. A replay that diverges exits non-zero.
+
+## The gate budget (carried from M9+M10)
+
+Fast `pnpm verify` measured 78.3 s wall on a shared box against A5's 90 s bound, and roughly
+47 s of that is eslint and prettier, not tests. Re-draw so the fast tier lands at **≤ 70 s** with
+headroom, without deleting coverage: cache the lint, split the slow typed-lint pass into its own
+command if that is what it takes, and REPORT the raw `time` for the command a person runs.
+
+## A7 — the handoff docs
+
+README (how to install, run, play, and where the tests are), GDD with the provenance table,
+ENGINE notes (architecture, the determinism rules, the pipeline, the gate tiers, the invariant
+registry, the lesson ledger), BALANCE report (every measured sweep, including the ones that
+showed NO effect and why), and known-issues / "not in alpha" (the deferred list from §16.3 plus
+every honest limit this project recorded: the walls sweep's exposure, the city screen's internal
+scrolling, the map pixel test that is not evidence about terrain, space race, culture flips,
+corruption, diplomacy, and the §16.4 process lesson). Documentation that overstates is worse
+than none, so every number in the docs must come from a command someone can re-run.
+
+## The alpha audit — the point of this wave
+
+An INDEPENDENT agent must audit every criterion A1-A7 against the running system and report,
+per criterion, PASS/FAIL/PARTIAL with the command and the raw output that proves it. It must
+actively try to falsify each one. A criterion that cannot be demonstrated by a command anyone
+can re-run is a criterion that is not met. Report the alpha claim you would make to a human,
+and every place it would be overstated.

@@ -11,6 +11,8 @@
 
 import { expect, test } from '@playwright/test';
 
+import { SAVE_VERSION, SCHEMA_VERSION } from '@civts/core';
+
 import {
   foundCity,
   loadButton,
@@ -97,7 +99,7 @@ test('A4 save/load: the same save loaded twice produces the same hash, and a fre
   expect(fresh.turn).toBe(1);
 });
 
-test('A4 save/load: the save payload is the engine’s own state and hash, with no clock in it', async ({
+test('A4 save/load: the payload is the engine’s own format — its keys, its version, its hash, no clock', async ({
   page,
 }) => {
   await openApp(page);
@@ -106,10 +108,7 @@ test('A4 save/load: the save payload is the engine’s own state and hash, with 
   const hash = await stateHash(page);
   await saveButton(page).click();
 
-  const payload = await page.evaluate(() => {
-    const raw = window.localStorage.getItem('civts.save.v1');
-    return raw;
-  });
+  const payload = await page.evaluate(() => window.localStorage.getItem('civts.save.v1'));
   expect(payload, 'the save is not under the documented key `civts.save.v1`').not.toBeNull();
   if (payload === null) return;
 
@@ -117,5 +116,83 @@ test('A4 save/load: the save payload is the engine’s own state and hash, with 
   // value the goldens use. The payload carries no timestamp: a save's identity is its hash.
   expect(payload).toContain(hash);
   expect(payload).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+
+  // M11: this is `@civts/core`'s payload — `{ version, engine, hash, state }` — not a format the
+  // panel invented. Four keys, the engine's version, and the state's own schema in `engine`, so
+  // `civts load` (and the REPL's `load`) read exactly this file.
+  const parsed: unknown = JSON.parse(payload);
+  if (typeof parsed !== 'object' || parsed === null) throw new Error('the save is not an object');
+  expect(Object.keys(parsed).sort()).toEqual(['engine', 'hash', 'state', 'version']);
+  // The engine's own constants, not a number written here: `version` is the format's version and
+  // `engine.schemaVersion` is the state's, and both come from `@civts/core`.
+  expect(parsed).toMatchObject({
+    version: SAVE_VERSION,
+    hash,
+    engine: { schemaVersion: SCHEMA_VERSION },
+  });
+  // Absent, never `undefined` — on the wire, where the rule actually has to hold.
+  expect(payload).not.toContain('undefined');
   expect(await stateHash(page)).toBe(hash);
+});
+
+test('A4 save/load: a corrupt, foreign or absent save is refused, and the game is left alone', async ({
+  page,
+}) => {
+  await openApp(page);
+  await seedApp(page, SEED);
+  await foundCity(page);
+  await saveButton(page).click();
+
+  const good = await page.evaluate(() => window.localStorage.getItem('civts.save.v1'));
+  if (good === null) throw new Error('Save game wrote nothing to localStorage');
+  const hash = await stateHash(page);
+  const status = page.getByLabel('Save status');
+
+  // The app's own former envelope, rebuilt from the payload it now writes — with a self-check,
+  // because a rewrite that silently matched nothing would turn this case into a second copy of
+  // "the payload is truncated".
+  const legacy = good.replace(
+    /^\{"version":\d+,"engine":\{[^}]*\},"hash":"([0-9a-f]+)","state":/,
+    '{"schema":1,"hash":"$1","state":',
+  );
+  if (legacy === good) throw new Error('the legacy-envelope rewrite did not apply');
+
+  /** Everything that is not this build's save — including the format the panel used to write. */
+  const BAD: readonly { readonly why: string; readonly text: string | null }[] = [
+    { why: 'there is no save at all', text: null },
+    { why: 'the payload is truncated', text: good.slice(0, Math.floor(good.length / 2)) },
+    { why: 'the payload is not JSON', text: '{"version":' },
+    { why: 'the payload is the app’s old `{schema, hash, state}` envelope', text: legacy },
+    {
+      why: 'the recorded hash is not the state’s',
+      text: good.replace(hash, 'ffffffffffffffff'),
+    },
+  ];
+  // …and the last rewrite is checked the same way: a no-op there would make the case vacuous.
+  if (BAD[4]?.text === good) throw new Error('the hash rewrite did not apply');
+
+  for (const { why, text } of BAD) {
+    await page.evaluate((value) => {
+      if (value === null) window.localStorage.removeItem('civts.save.v1');
+      else window.localStorage.setItem('civts.save.v1', value);
+    }, text);
+
+    await loadButton(page).click();
+    // The refusal is *reported* (a silent button is indistinguishable from a broken one)…
+    await expect(status, why).toContainText('Load failed');
+    // …and the game is exactly where it was: no half-installed state, no rollback to nothing.
+    expect(await stateHash(page), why).toBe(hash);
+    await expect(page.getByRole('button', { name: 'End turn', exact: true })).toBeEnabled();
+  }
+
+  // The good save still loads, so the loop refused the *files* and not the verb.
+  await page.evaluate((value) => {
+    window.localStorage.setItem('civts.save.v1', value);
+  }, good);
+  // …and move the game first, so "it loaded" is distinguishable from "it did nothing".
+  await page.getByRole('button', { name: 'End turn', exact: true }).click();
+  expect(await stateHash(page)).not.toBe(hash);
+  await loadButton(page).click();
+  await expect.poll(async () => stateHash(page)).toBe(hash);
+  await expect(status).toContainText('Loaded');
 });

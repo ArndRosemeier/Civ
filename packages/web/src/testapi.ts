@@ -19,9 +19,12 @@
  *
  * `dispatch` and `seed` take `unknown` from the page, and both **validate** before calling the
  * engine: a non-object, or an object whose `type` is not a member of the frozen command union,
- * is refused here rather than handed to the applier. The validator builds a fresh `Command` from
- * the fields it read, which is why this file needs no `as` — and why a test cannot smuggle a
- * malformed action past the seam and then report the engine as having accepted it.
+ * is refused here rather than handed to the applier. The reader builds a fresh `Command` from the
+ * fields it read, which is why this file needs no `as` — and why a test cannot smuggle a malformed
+ * action past the seam and then report the engine as having accepted it.
+ *
+ * That reader is `commandFrom`, in `@civts/core` — not a switch of this file's own (M11: one
+ * statement of every rule; the history is in `toCommand` below).
  *
  * ## `ready`, and the frame counter
  *
@@ -32,26 +35,18 @@
  */
 
 import {
-  asBuildingId,
   asCityId,
-  asGovernmentId,
-  asImprovementId,
   asPlayerId,
-  asTechId,
-  asTileIndex,
   asUnitId,
-  asUnitTypeId,
   cityProductionOptions,
+  commandFrom,
   legalActions,
   unitActions,
-  type CityId,
   type Command,
   type GameEvent,
   type GameState,
   type PlayerId,
-  type ProductionItem,
   type RulesetView,
-  type UnitId,
 } from '@civts/core';
 import { hashValue } from '@civts/testing';
 
@@ -169,138 +164,30 @@ declare global {
   }
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const numberAt = (source: Record<string, unknown>, key: string): number | undefined => {
-  const value = source[key];
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-};
-
-const stringAt = (source: Record<string, unknown>, key: string): string | undefined => {
-  const value = source[key];
-  return typeof value === 'string' ? value : undefined;
-};
-
 /**
- * Validate the `item` of a `SetProduction` command into the engine's branded `ProductionItem`.
- * `undefined` for anything else, so a caller cannot hand the applier a half-built choice.
- */
-const productionItemOf = (value: unknown): ProductionItem | undefined => {
-  if (!isRecord(value)) return undefined;
-  const id = stringAt(value, 'id');
-  const kind = stringAt(value, 'kind');
-  if (id === undefined) return undefined;
-  if (kind === 'unit') return { kind: 'unit', id: asUnitTypeId(id) };
-  if (kind === 'building') return { kind: 'building', id: asBuildingId(id) };
-  return undefined;
-};
-
-/**
- * Validate an action into a `Command`, or `undefined` when it is not a member of the frozen
- * union. Every field of every member is read and checked; nothing is passed through.
+ * Read an action into a `Command`, or `undefined` when it is not a member of the frozen union.
  *
- * **Every command the UI can dispatch must be a case here**, and this list is the whole reason the
- * keystone property is testable: `applyAction` in `main.ts` and the seam's own `dispatch` both read
- * an action through this function, so a command missing from this switch is refused *before* the
- * engine ever sees it. That is not a theoretical shape — it is how M9's `SetGovernment` first
- * arrived. `commands.ts` accepted it, `government.ts`' panel built it correctly and enabled its
- * button on `planSetGovernment`'s own verdict, and the click dispatched nothing: this reader
- * answered `undefined`, `applyAction` turned that into `'refused'`, and no engine call was ever
- * made. The e2e assertion that caught it is the one that reads the recorded dispatch back
- * (`e2e/m9-m10-ui.spec.ts`, "the menu is the engine’s catalog"): the panel said "the engine accepts
- * Despotism" while the same command sent through the seam came back `refused`. A command added to
- * the engine's union must be added here in the same change, or every control for it is inert.
+ * **This function is a delegation, and that is the point.** It used to be a ninety-line switch of
+ * its own — a second reader of "what is a `Command`", which had to agree with the engine's about
+ * every field of every member and which nobody could keep honest. It did not: M9's `SetGovernment`
+ * was accepted by `applyCommand`, built correctly by its panel, enabled on `planSetGovernment`'s
+ * own verdict — and refused *here*, because this switch had no case for it. The click dispatched
+ * nothing, and the e2e assertion that caught it was the one comparing the recorded dispatch
+ * against the engine.
+ *
+ * M11's rule is one statement of every rule, so the union now has **one** reader: `commandFrom` in
+ * `@civts/core`, which the replay log uses to re-read a recorded command and which this seam uses
+ * to read an action. A command added to the engine is readable here the moment it exists — there
+ * is no list left in this file to fall behind.
+ *
+ * The narrowing to `undefined` is this seam's own: the frozen `dispatch(action: unknown)` reports
+ * `'ok' | 'refused'`, and "this is not a command at all" is the refused half. The reason
+ * `commandFrom` gives is discarded here rather than thrown away everywhere: `replay` is the
+ * caller that needs it (it must say *which* recorded command a log could not read).
  */
 export const toCommand = (raw: unknown): Command | undefined => {
-  if (!isRecord(raw)) return undefined;
-  const type = stringAt(raw, 'type');
-  const unit = (): UnitId | undefined => {
-    const id = numberAt(raw, 'unitId');
-    return id === undefined ? undefined : asUnitId(id);
-  };
-  const city = (): CityId | undefined => {
-    const id = numberAt(raw, 'cityId');
-    return id === undefined ? undefined : asCityId(id);
-  };
-  const tile = (key: string): number | undefined => numberAt(raw, key);
-
-  switch (type) {
-    case 'EndTurn':
-      return { type: 'EndTurn' };
-    case 'MoveUnit': {
-      const unitId = unit();
-      const to = tile('to');
-      return unitId === undefined || to === undefined
-        ? undefined
-        : { type: 'MoveUnit', unitId, to: asTileIndex(to) };
-    }
-    case 'FoundCity': {
-      const unitId = unit();
-      return unitId === undefined ? undefined : { type: 'FoundCity', unitId };
-    }
-    case 'StartWork': {
-      const unitId = unit();
-      const kind = stringAt(raw, 'kind');
-      return unitId === undefined || kind === undefined
-        ? undefined
-        : { type: 'StartWork', unitId, kind: asImprovementId(kind) };
-    }
-    case 'CancelWork': {
-      const unitId = unit();
-      return unitId === undefined ? undefined : { type: 'CancelWork', unitId };
-    }
-    case 'AttackUnit': {
-      const unitId = unit();
-      const target = tile('target');
-      return unitId === undefined || target === undefined
-        ? undefined
-        : { type: 'AttackUnit', unitId, target: asTileIndex(target) };
-    }
-    case 'FortifyUnit': {
-      const unitId = unit();
-      return unitId === undefined ? undefined : { type: 'FortifyUnit', unitId };
-    }
-    case 'SetProduction': {
-      const cityId = city();
-      const item = productionItemOf(raw['item']);
-      return cityId === undefined || item === undefined
-        ? undefined
-        : { type: 'SetProduction', cityId, item };
-    }
-    case 'SetWorkedTiles': {
-      const cityId = city();
-      const tiles = raw['tiles'];
-      if (cityId === undefined || !Array.isArray(tiles)) return undefined;
-      const indices: number[] = [];
-      for (const entry of tiles) {
-        if (typeof entry !== 'number' || !Number.isFinite(entry)) return undefined;
-        indices.push(entry);
-      }
-      return { type: 'SetWorkedTiles', cityId, tiles: indices.map((index) => asTileIndex(index)) };
-    }
-    case 'SetRates': {
-      const rates = raw['rates'];
-      if (!isRecord(rates)) return undefined;
-      const tax = numberAt(rates, 'tax');
-      const science = numberAt(rates, 'science');
-      const luxury = numberAt(rates, 'luxury');
-      if (tax === undefined || science === undefined || luxury === undefined) return undefined;
-      return { type: 'SetRates', rates: { tax, science, luxury } };
-    }
-    case 'SetResearch': {
-      const tech = stringAt(raw, 'tech');
-      return tech === undefined ? undefined : { type: 'SetResearch', tech: asTechId(tech) };
-    }
-    case 'SetGovernment': {
-      const government = stringAt(raw, 'government');
-      return government === undefined
-        ? undefined
-        : { type: 'SetGovernment', government: asGovernmentId(government) };
-    }
-    default:
-      return undefined;
-  }
+  const read = commandFrom(raw);
+  return read.ok ? read.value : undefined;
 };
 
 /**

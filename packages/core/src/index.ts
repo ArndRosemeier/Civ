@@ -73,6 +73,21 @@ export * from './units.js';
 // call it, never the other way round.
 export * from './combat.js';
 export * from './commands.js';
+/**
+ * **M11's save, load and replay**, in reading order: the one serializer, then the thing that
+ * re-runs a recorded game through the same applier.
+ *
+ * - `serialize.ts` — `serialize`/`deserialize` and the save format, the *only* place a save is
+ *   written or read. It sits after `commands.js` in this list because it is the layer that
+ *   persists what every module above it produces; the hash and the invariant registry arrive as
+ *   a `SaveCodec` (this package may not depend on `@civts/testing` or `@civts/sim`, which are
+ *   built on it), so the two functions are pure over what they are handed.
+ * - `replay.ts` — a game as `(seed, settings, ruleset identity, command log)`, re-run and
+ *   checked at every turn boundary, plus the recorder that produces such a log. It imports
+ *   `serialize.ts` for the codec type alone.
+ */
+export * from './serialize.js';
+export * from './replay.js';
 export * from './actions.js';
 export * from './fog.js';
 export * from './textview.js';

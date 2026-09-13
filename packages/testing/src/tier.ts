@@ -15,8 +15,12 @@
  *
  * - **fast** (`pnpm test`, `pnpm verify`) — the default, and what a developer runs
  *   between edits. M7b's bound is on the command, not on the runner: **`time pnpm
- *   verify` ≤ 70 s of wall time**, of which the three non-test steps (`typecheck`,
- *   `lint`, `format:check`) measure about 37 s, leaving the test step about 33 s. The
+ *   verify` ≤ 70 s of wall time**, split into a static step (`typecheck` + `lint` +
+ *   `format:check`, which run as three concurrent processes — see below) and a test
+ *   step. Measured rather than assumed: on 2026-09-13 the four steps summed to
+ *   **70.9 s** run one after another, and **45.2 s of that was the three checks, not
+ *   the tests** — which is why the fix was to stop serialising them rather than to
+ *   move tests. The
  *   long suites are *not in it* for that reason, and neither is the evidence machinery
  *   that does not belong in a gate at all: A3's twenty-seed tournament is
  *   `scripts/tournament-evidence.ts`, run on purpose rather than on every commit. **What
@@ -29,6 +33,38 @@
  * - **full** (`pnpm test:full`, `pnpm verify:full`) — everything in fast **plus** the
  *   long ones. A superset: the full tier is the fast tier with the long tests added,
  *   never a different set of tests.
+ *
+ * ## What the two *commands* run, check by check (O3, 2026-09-13)
+ *
+ * The tier boundary above is about tests. The commands also differ in how the three
+ * static checks are invoked, and that difference is a **coverage** difference, so it is
+ * stated here in full rather than left to the reader of `package.json`:
+ *
+ * | check           | `pnpm verify` (fast)                          | `pnpm verify:full` (full) |
+ * | --------------- | --------------------------------------------- | ------------------------- |
+ * | `typecheck`     | whole project, no cache — identical           | whole project, no cache   |
+ * | `lint`          | every file, but a file whose content and resolved config are unchanged since its last clean lint is **skipped by eslint's cache** | `lint:full`: every file, **no cache** |
+ * | `format:check`  | same cache rule, over prettier's file set     | `format:check:full`: every file, **no cache** |
+ * | tests           | fast tier, skipped tests named in the output  | fast tier **plus** the long tests |
+ *
+ * The three checks are independent, read-only and single-threaded, so `check:static`
+ * runs them as three concurrent processes and waits for all three; a failure in any of
+ * them fails the step. Running them one after another cost 45.2 s of a 70.9 s step
+ * total (measured 2026-09-13: `typecheck` 6.3 s, `lint` 26.4 s, `format:check` 12.6 s,
+ * tests 25.7 s); concurrently the static step is bounded by its slowest member.
+ *
+ * **The one honest gap the cache leaves.** ESLint's cache is keyed on a file's own
+ * content plus its resolved configuration. A typed-lint verdict can also depend on
+ * *another* file's types, so editing a shared type under `packages/…/src` can in principle
+ * change the right answer for a file that did not itself change — and the fast tier
+ * would not re-lint that file. Two things bound it: `pnpm typecheck` runs uncached over
+ * the whole project on every fast gate (so the type graph itself is always checked),
+ * and `pnpm verify:full` re-lints and re-formats **every file with no cache**. The
+ * developer-facing rule that follows: **after changing a shared type, run `pnpm
+ * verify:full`** (or `pnpm lint:full`, which is the same uncached pass on its own)
+ * before believing the lint is green. `--cache-strategy content` is deliberate for the
+ * same reason — the default metadata strategy trusts mtime and size, and this project
+ * mutates files in place with `writeFileSync` when it proves a gate can fail.
  *
  * ## How a suite declares its tier, and why this way
  *
@@ -46,7 +82,10 @@
  * print `7 skipped` per file and never name the seven. `vitest.config.ts` therefore adds
  * one tiny `Reporter` — `skippedTestsReporter`, about forty lines, reading nothing but
  * vitest's own task tree — which prints every deferred test, grouped by file, under the
- * per-file lines. The full tier prints no such block, because it skips nothing.
+ * per-file lines. Both tiers print that block; the full tier's is two lines for the
+ * `CIVTS_MUTATION_CHECK=1` mutation checks (measured 2026-09-13: `2077 passed | 2 skipped`),
+ * which are gated on a second switch and run by `pnpm mutation:check` — nothing is skipped in
+ * the full tier for a *tier* reason, and the block is the evidence rather than a claim.
  *
  * ## What is NOT a tier problem
  *
@@ -66,6 +105,14 @@
  * at "~100 s on an idle machine" and measured at 417 s. It is a four-seed smoke run now,
  * and the twenty seeds are the evidence script's job — which is what the frozen contract
  * asks for, because an experiment that is most of the gate is not a gate test.
+ *
+ * **O3 re-measured this and moved no test.** With the boundary above in place the fast
+ * tier's test step measured 25.7 s for all 61 files (critical path one file, 15.5 s),
+ * while `typecheck` + `lint` + `format:check` measured 45.2 s run one after another —
+ * the checks, not the tests, were the gate. The redraw therefore re-ran the checks
+ * concurrently and cached lint and format; it did not shorten the test set, and no
+ * `skipIf` was added or moved. See the table above for what the cache does and does not
+ * cover in the fast tier.
  *
  * This module reads one environment variable and computes nothing else. It deliberately
  * imports no test framework: `@civts/testing` is shipped code that other packages

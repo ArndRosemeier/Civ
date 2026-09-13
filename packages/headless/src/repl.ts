@@ -199,6 +199,11 @@ import {
   type Command,
   type CommandOutcome,
   type BuildingId,
+  type ReplayError,
+  type ReplayReport,
+  type SaveCodec,
+  type SaveError,
+  type StateInvariant,
   type City,
   type CityId,
   type CityYields,
@@ -228,8 +233,16 @@ import {
   type Unit,
   type UnitId,
   type UnitTypeId,
+  assertNever,
+  deserialize,
+  formatReplayError,
+  formatSaveError,
+  replay,
+  serialize,
 } from '@civts/core';
-import { canonicalize, hashValue } from '@civts/testing';
+import type { Ruleset } from '@civts/rules';
+import { CORE_INVARIANTS } from '@civts/sim';
+import { hashValue } from '@civts/testing';
 
 /* ------------------------------------------------------------------ *
  * Flags — parsed strictly, never guessed (a typo must not play a
@@ -264,18 +277,34 @@ export interface PlayFlags {
   readonly civCount: number | undefined;
   readonly playerIndex: number | undefined;
   readonly scriptPath: string | undefined;
+  /**
+   * Where to write the session's **replay log** — the game as
+   * `(seed, settings, ruleset identity, command log)`, which `civts replay` and the session's
+   * own `replay` verb then re-run and check. Absent means "do not record"; the key is absent
+   * rather than `undefined`, the same rule every optional field in this tree follows.
+   */
+  readonly recordPath?: string;
   /** Render the whole map instead of the acting player's fog (debugging). */
   readonly god: boolean;
 }
 
 export const PLAY_USAGE = `usage: civts play [--seed <int>] [--map-size <size>] [--civs <int>]
-                   [--player <int>] [--script <file>] [--god]
+                   [--player <int>] [--script <file>] [--record <file>] [--god]
 
   --seed <int>        world seed (any integer; default 1)
   --map-size <size>   one of ${MAP_SIZES.join('|')} (default tiny)
   --civs <int>        number of civilizations, 2..16 (default 2)
   --player <int>      which civilization you play, 0-based (default 0)
-  --script <file>     run a command file, print the transcript, exit 0
+  --script <file>     run a command file, print the transcript. Exit 0 unless the script
+                      ran a "replay" that did not reproduce every recorded turn boundary:
+                      "a replay that diverges exits non-zero", and a script is the one place
+                      that can be decided for a whole file.
+  --record <file>     write a REPLAY LOG of the session: the seed, the settings, the
+                      ruleset's own hash and every command the engine accepted, with the
+                      state hash at every turn boundary. "civts replay <file>" re-runs it
+                      and checks every one of those boundaries; so does the session's own
+                      "replay <file>". A session that recorded and a save are two different
+                      things: the save is the state, the log is the game that produced it.
   --god               render the whole map, ignoring fog (debugging only)
 
 Commands inside a session (also documented by "help"):
@@ -285,7 +314,7 @@ Commands inside a session (also documented by "help"):
   work <unitId> <improve>    cancel <unitId>
   rates <tax> <science> <luxury>
   research <techId>          tech
-  end   units   state   save <path>   help   quit
+  end   units   state   save <path>   load <path>   replay <path>   help   quit
 `;
 
 export const parsePlayArgs = (args: readonly string[]): Result<PlayFlags, string> => {
@@ -294,6 +323,7 @@ export const parsePlayArgs = (args: readonly string[]): Result<PlayFlags, string
   let civCount: number | undefined;
   let playerIndex: number | undefined;
   let scriptPath: string | undefined;
+  let recordPath: string | undefined;
   let god = false;
 
   for (let i = 0; i < args.length; i += 1) {
@@ -312,7 +342,8 @@ export const parsePlayArgs = (args: readonly string[]): Result<PlayFlags, string
       flag !== '--map-size' &&
       flag !== '--civs' &&
       flag !== '--player' &&
-      flag !== '--script'
+      flag !== '--script' &&
+      flag !== '--record'
     ) {
       return err(`unknown option for play: "${flag}"`);
     }
@@ -323,6 +354,11 @@ export const parsePlayArgs = (args: readonly string[]): Result<PlayFlags, string
 
     if (flag === '--script') {
       scriptPath = raw;
+      continue;
+    }
+
+    if (flag === '--record') {
+      recordPath = raw;
       continue;
     }
 
@@ -342,7 +378,9 @@ export const parsePlayArgs = (args: readonly string[]): Result<PlayFlags, string
     else playerIndex = value.value;
   }
 
-  return ok({ seed, mapSize, civCount, playerIndex, scriptPath, god });
+  return recordPath === undefined
+    ? ok({ seed, mapSize, civCount, playerIndex, scriptPath, god })
+    : ok({ seed, mapSize, civCount, playerIndex, scriptPath, recordPath, god });
 };
 
 /* ------------------------------------------------------------------ *
@@ -2540,8 +2578,50 @@ export type LineOutcome =
   | { readonly kind: 'unknown-city'; readonly cityId: CityId }
   | { readonly kind: 'malformed'; readonly detail: string }
   | { readonly kind: 'io-error'; readonly detail: string }
+  /**
+   * A load the engine's own serializer refused — a **typed** `SaveError`, so a caller can
+   * assert on `kind` rather than on prose, and so a new failure mode cannot render as a blank
+   * line (the rendering is `formatSaveError`'s exhaustive switch).
+   */
+  | { readonly kind: 'load-refused'; readonly error: SaveError }
+  /**
+   * A replay that diverged, a command the engine now refuses, or a log this build cannot read.
+   * Carried as a value for the same reason, and the one thing `runScript` refuses to exit 0 on:
+   * "a replay that diverges exits non-zero" is the contract's own sentence.
+   */
+  | { readonly kind: 'replay-refused'; readonly error: ReplayError }
   | { readonly kind: 'ignored' }
   | { readonly kind: 'quit' };
+
+/**
+ * The save/load/replay codec for a validated ruleset — **the one place the CLI builds one**.
+ *
+ * `@civts/core` cannot import `@civts/testing` (which is built on it) or `@civts/sim` (which is
+ * built on both), so the engine's digest and the engine's invariant registry arrive as a value.
+ * This function is where that value is assembled, and it is deliberately the only assembly site
+ * in `headless`: a second one would be a second answer to "which invariants does a load check".
+ *
+ * The registry is `@civts/sim`'s `CORE_INVARIANTS` — the same list the simulation runs on every
+ * turn — adapted to the state-only shape the serializer takes. The context's `previous` is
+ * absent (a loaded state has no predecessor: it is not a transition, and pretending otherwise
+ * would let a conservation invariant judge a step that never happened), `events` is empty for
+ * the same reason, and `turn` is the state's own.
+ */
+export const saveCodecOf = (ruleset: Ruleset, view: RulesetView): SaveCodec => ({
+  hash: hashValue,
+  invariants: CORE_INVARIANTS.map((invariant): StateInvariant => ({
+    name: invariant.name,
+    check: (state) =>
+      invariant.check({
+        state,
+        previous: undefined,
+        ruleset,
+        rulesetView: view,
+        events: [],
+        turn: state.turn,
+      }),
+  })),
+});
 
 export interface SessionOptions {
   readonly state: GameState;
@@ -2555,6 +2635,28 @@ export interface SessionOptions {
   readonly god: boolean;
   /** Where everything the session prints goes (stdout in the CLI, a buffer in tests). */
   readonly write: (text: string) => void;
+  /**
+   * The engine's one save format, as this session needs it: the engine's own hasher and the
+   * invariant registry a loaded state must satisfy. M11's rule is that there is **one**
+   * serializer, so the session has no format of its own — `save`, `load` and `replay` are all
+   * this codec, and the same value is handed to the CLI's verbs and to the browser.
+   */
+  readonly codec: SaveCodec;
+  /**
+   * The ruleset's own digest — `hashValue(validatedRuleset)`, the identity `@civts/sim`'s
+   * ruleset-identity test pins. A replay log records it and `replay` compares it, because the
+   * same seed over different content is a different game.
+   */
+  readonly rulesetIdentity: string;
+  /**
+   * The applier every command is sent through: `applyCommand` against this session's own state
+   * by default, or a `ReplayRecorder`'s `apply` when the caller wants the game **recorded**.
+   *
+   * One applier means one application of every command: a session that applied its command and
+   * then replayed it into a recorder would be relying on two applications agreeing, which is
+   * exactly the "two things that must agree" arrangement this milestone exists to remove.
+   */
+  readonly apply?: (player: PlayerId, command: Command) => Result<CommandOutcome, GameError>;
 }
 
 export interface ReplSession {
@@ -2578,7 +2680,7 @@ export const COMMAND_SUMMARY =
   'work <unitId> <improvementId> | cancel <unitId> | ' +
   'rates <tax> <science> <luxury> | research <techId> | tech | ' +
   'government [<governmentId>] | culture | happiness | outcome | ' +
-  'end | units | state | save <path> | help | quit';
+  'end | units | state | save <path> | load <path> | replay <path> | help | quit';
 
 /**
  * The help text, as a **function of the combat rules** (M6b).
@@ -2691,8 +2793,18 @@ const helpText = (rules: CombatDef): string => `commands:
   state                   print seed, turn, revision, map size, RNG, your gold, rates,
                           beakers and luxuries, your research, what your units are doing and
                           the state hash.
-  save <path>             write the state to <path> as canonical JSON (parent
-                          directories are created).
+  save <path>             write the state to <path> in the engine's save format
+                          (parent directories are created).
+  load <path>             read a save back and play on from it. The engine checks
+                          it - the format, every field, every index, the stored
+                          hash and the invariant registry - and a save that fails
+                          any check is REFUSED, leaving this session exactly where
+                          it was. Nothing is half-installed.
+  replay <path>           re-run a recorded game and compare the state hash at
+                          EVERY turn boundary, not only at the end. A divergence
+                          is reported with the turn it happened on; so is a
+                          command the engine now refuses. The session's own game
+                          is not touched.
   help                    print this text.
   quit                    leave the game (alias: exit). End of input also quits, with
                           status 0, so scripted and piped runs are safe.
@@ -2751,14 +2863,16 @@ const bannerText = (
  * `BarbariansSpawned` hit no case in `outcomeText` and printed nothing at all.
  *
  * So every event switch below is exhaustive *without* a `default` clause and ends
- * here: `value` is narrowed to `never` only when every member was handled, and
- * adding a `GameEvent` member therefore stops the build instead of quietly
- * producing that blank line. The throw is unreachable by construction; it exists
- * so the function has a total return type the compiler can check.
+ * with `assertNever`: `value` is narrowed to `never` only when every member was
+ * handled, and adding a `GameEvent` member therefore stops the build instead of
+ * quietly producing that blank line. The throw is unreachable by construction; it
+ * exists so the function has a total return type the compiler can check.
+ *
+ * The function itself is `@civts/core`'s (from `serialize.ts`, where M11's error
+ * renderers use it for the same reason and with the same body), imported rather
+ * than declared a second time here — this file had its own copy, and a helper whose
+ * every correct body is identical is still a second place a reader has to check.
  */
-const assertNever = (value: never): never => {
-  throw new Error(`unhandled union member: ${JSON.stringify(value)}`);
-};
 
 /** `(x,y)` of the tile an event names. */
 const eventPlace = (outcome: CommandOutcome, tile: TileIndex): string =>
@@ -3247,8 +3361,18 @@ const tableRow = (widths: readonly number[], cells: readonly string[]): string =
     .join('  ');
 
 export const createSession = (options: SessionOptions): ReplSession => {
-  const { ruleset, playerId, god, write } = options;
+  const { ruleset, playerId, god, write, codec, rulesetIdentity } = options;
   let state = options.state;
+
+  /**
+   * The one applier. `applyCommand` against this session's own state — the shipped
+   * arrangement, and the only one a session without a recorder needs — or the caller's own,
+   * which is how `play --record` sends every command through a `ReplayRecorder` so the log it
+   * writes is the game that was played rather than a second copy of it.
+   */
+  const applier =
+    options.apply ??
+    ((player: PlayerId, command: Command) => applyCommand(state, player, command, ruleset));
 
   const context = (
     unitId: UnitId | undefined,
@@ -3501,23 +3625,43 @@ export const createSession = (options: SessionOptions): ReplSession => {
     );
   };
 
-  const saveState = (path: string): LineOutcome => {
-    const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
-    const body = `${canonicalize({
-      schemaVersion: state.schemaVersion,
-      engine: 'civts',
-      nodeMajor,
-      state,
-    })}\n`;
-
+  /** Write `body` to `path`, creating its directory — or report why it could not be. */
+  const writeFile = (path: string, body: string): LineOutcome | undefined => {
     try {
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, body, 'utf8');
+      return undefined;
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : 'unknown error';
-      write(`error: save failed - ${detail}\n`);
+      write(`error: write failed - ${detail}\n`);
       return { kind: 'io-error', detail };
     }
+  };
+
+  /** Read `path` — or report why it could not be read. */
+  const readFile = (path: string): string | LineOutcome => {
+    try {
+      return readFileSync(path, 'utf8');
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : 'unknown error';
+      write(`error: read failed - ${detail}\n`);
+      return { kind: 'io-error', detail };
+    }
+  };
+
+  /**
+   * `save <path>` — the state, through **the engine's one serializer**.
+   *
+   * This verb used to write its own envelope (`canonicalize({ schemaVersion, engine: 'civts',
+   * nodeMajor, state })`), which made the REPL the second format in the tree: a save written
+   * here could not be loaded by the web app, and nothing could notice. The envelope, the engine
+   * identity and the hash now all come from `core/serialize.ts`, so this verb is a path and a
+   * file write and no format at all.
+   */
+  const saveState = (path: string): LineOutcome => {
+    const body = `${serialize(state, codec)}\n`;
+    const failed = writeFile(path, body);
+    if (failed !== undefined) return failed;
 
     write(
       `saved: ${path} (${String(Buffer.byteLength(body, 'utf8'))} bytes, ` +
@@ -3526,8 +3670,60 @@ export const createSession = (options: SessionOptions): ReplSession => {
     return { kind: 'inspected', command: 'save' };
   };
 
+  /**
+   * `load <path>` — read a save back through the same serializer, and **fail closed**.
+   *
+   * A refused load writes the engine's own typed reason and leaves the session on the state it
+   * already had: there is no half-installed game, because `deserialize` returns either a checked
+   * state or an error and nothing in between. That is what "the UI must not continue on a wrong
+   * state" means at this layer — a load that failed is a load that changed nothing.
+   */
+  const loadState = (path: string): LineOutcome => {
+    const text = readFile(path);
+    if (typeof text !== 'string') return text;
+
+    const loaded = deserialize(text, codec);
+    if (!loaded.ok) {
+      write(`error: load failed - ${formatSaveError(loaded.error)}\n`);
+      return { kind: 'load-refused', error: loaded.error };
+    }
+
+    state = loaded.value;
+    write(
+      `loaded: ${path} (turn ${String(state.turn)}, seed ${String(state.seed)}, ` +
+        `state hash ${hashValue(state)})\n`,
+    );
+    return { kind: 'inspected', command: 'load' };
+  };
+
+  /**
+   * `replay <path>` — re-run a recorded game and check it against **every** boundary the log
+   * recorded, not only the last one.
+   *
+   * The session's own state is not touched: replaying is a check of a file, and a verb that
+   * quietly rewound the board would be a second, undocumented `load`. The verdict is the
+   * engine's, and a divergence is reported with the turn it happened on.
+   */
+  const replayState = (path: string): LineOutcome => {
+    const text = readFile(path);
+    if (typeof text !== 'string') return text;
+
+    const result = replay(text, { ruleset, rulesetIdentity, codec });
+    if (!result.ok) {
+      write(`error: replay failed - ${formatReplayError(result.error)}\n`);
+      return { kind: 'replay-refused', error: result.error };
+    }
+
+    const report: ReplayReport = result.value;
+    write(
+      `replayed: ${path} (${String(report.boundaries)} turn boundaries reproduced, ` +
+        `${String(report.commands)} commands, final hash ${report.finalHash})\n`,
+    );
+    return { kind: 'inspected', command: 'replay' };
+  };
+
   const applied = (command: Command): LineOutcome => {
-    const result = applyCommand(state, playerId, command, ruleset);
+    const result = applier(playerId, command);
     if (!result.ok) {
       write(
         `${formatGameError(
@@ -3783,6 +3979,28 @@ export const createSession = (options: SessionOptions): ReplSession => {
           );
         }
         return saveState(path);
+      }
+
+      case 'load': {
+        const path = args[0];
+        if (args.length !== 1 || path === undefined) {
+          return malformed(
+            `"load" needs exactly one path (got ${String(args.length)} argument(s))`,
+            'usage: load <path>  (a path cannot contain spaces)',
+          );
+        }
+        return loadState(path);
+      }
+
+      case 'replay': {
+        const path = args[0];
+        if (args.length !== 1 || path === undefined) {
+          return malformed(
+            `"replay" needs exactly one path (got ${String(args.length)} argument(s))`,
+            'usage: replay <path>  (a replay log, as "play --record <path>" writes one)',
+          );
+        }
+        return replayState(path);
       }
 
       /* ---------------- M4b: the economy ---------------- */
@@ -4102,8 +4320,14 @@ export const createSession = (options: SessionOptions): ReplSession => {
  * `p0> <line>` so the transcript reads like a session a human watched.
  *
  * Blank lines are skipped entirely (no echo, no output). Processing stops at
- * `quit`, and end of input is a normal exit — the return value is the process
- * exit code, always 0, which is what makes `--script` safe in a pipeline.
+ * `quit`, and end of input is a normal exit: a scripted run that played is a run
+ * that succeeded, which is what makes `--script` safe in a pipeline.
+ *
+ * **The one thing a script can fail on is a replay.** M11's contract says "a replay that
+ * diverges exits non-zero", and this is the only place a script's exit code is decided — a
+ * script that replayed a log and watched it diverge would otherwise report success, which is
+ * the silent-pass shape this project has already paid for once. Every other refusal (a bad
+ * move, a missing file) stays a printed line with exit 0, exactly as before.
  */
 export const runScript = (
   session: ReplSession,
@@ -4111,6 +4335,7 @@ export const runScript = (
   write: (text: string) => void,
 ): number => {
   const prompt = promptFor(session.playerId);
+  let code = 0;
 
   for (const raw of scriptText.split('\n')) {
     // `trimEnd` folds a CRLF file down to LF, and keeps the echo free of
@@ -4119,10 +4344,12 @@ export const runScript = (
     if (line.trim() === '') continue;
 
     write(`${prompt}${line}\n`);
-    if (session.run(line).kind === 'quit') break;
+    const outcome = session.run(line);
+    if (outcome.kind === 'replay-refused') code = 1;
+    if (outcome.kind === 'quit') break;
   }
 
-  return 0;
+  return code;
 };
 
 /** Read a command file, or explain why it could not be read. */

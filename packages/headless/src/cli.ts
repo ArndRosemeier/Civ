@@ -19,16 +19,29 @@
  *   must not quietly produce a different world than the one asked for.
  */
 
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+
 import {
   MAP_SIZES,
+  createReplayRecorder,
+  deserialize,
   describe,
   err,
+  formatReplayError,
+  formatSaveError,
   loadSettings,
   newGame,
   ok,
+  replay,
+  serialize,
+  type Fidelity,
   type MapSize,
+  type ReplayReport,
   type Result,
   type RulesetView,
+  type SaveCodec,
+  type GameState,
 } from '@civts/core';
 import {
   CATALOG,
@@ -43,6 +56,7 @@ import { hashValue } from '@civts/testing';
 import {
   PLAY_USAGE,
   createSession,
+  saveCodecOf,
   formatSetupError,
   parseIntFlag,
   parsePlayArgs,
@@ -75,6 +89,10 @@ Commands:
                improvements)
   map          generate a world, render it as ASCII, print its state hash
   play         interactive text REPL: play the game from a terminal or a script
+               (--record <file> writes a replay log of the session)
+  save         write a fresh game to a file in the engine's one save format
+  load         read a save back: format, fields, indices, hash and invariants checked
+  replay       re-run a recorded game and check the state hash at EVERY turn boundary
   sim          run a batch of headless games and report per-metric aggregates and
                every invariant's verdict; see "civts sim --help"
   tournament   self-play: the same policies across seeds with the seats ROTATED, so no
@@ -97,7 +115,10 @@ play options:
   --civs <int>        number of civilizations, 2..16       (default: 2)
   --player <int>      which civilization you play, 0-based (default: 0)
   --god               render the whole map and ignore fog  (default: off)
-  --script <file>     run a command file, print the transcript, exit 0
+  --script <file>     run a command file, print the transcript. Exit 0 unless the script
+                      ran a "replay" that did not reproduce every recorded turn boundary:
+                      "a replay that diverges exits non-zero", and a script is the one place
+                      that can be decided for a whole file.
 
 sim options (the full text is in "civts sim --help"):
   --seeds <spec>      games to run: "1..50", "3", "1,4,7", "1..3,9" (default: 1..10)
@@ -428,19 +449,61 @@ const commandPlay = async (args: readonly string[]): Promise<number> => {
     return 2;
   }
 
+  // M11: the session's save/load/replay half. The codec is the engine's own hasher plus the
+  // engine's own invariant registry (`saveCodecOf`), and the identity is the ruleset's digest —
+  // the value a replay log records and `replay` compares. Both are built here, once, and handed
+  // to every verb, so there is no second answer to "what is this game's ruleset".
+  const codec: SaveCodec = saveCodecOf(validated.value, view);
+  const rulesetIdentity = hashValue(validated.value);
+
+  // `--record` starts the game through a `ReplayRecorder` and hands the session the recorder's
+  // own `apply`, so there is **one** application of every command: the log cannot describe a
+  // game other than the one that was played, because the log's state *is* the session's state.
+  const recorder =
+    flags.value.recordPath === undefined
+      ? undefined
+      : createReplayRecorder(settings.value.seed, settings.value, view, rulesetIdentity, codec);
+  if (recorder !== undefined && !recorder.ok) {
+    console.error(`setup failed: ${formatSetupError(recorder.error)}`);
+    return 1;
+  }
+
   const session = createSession({
-    state: state.value,
+    state: recorder === undefined ? state.value : recorder.value.state,
     ruleset: view,
     playerId: player.id,
     god: flags.value.god,
     write: writeOut,
+    codec,
+    rulesetIdentity,
+    ...(recorder === undefined ? {} : { apply: recorder.value.apply }),
   });
 
-  if (script !== undefined) {
-    return runScript(session, script.value, writeOut);
+  const code =
+    script !== undefined
+      ? runScript(session, script.value, writeOut)
+      : await runInteractive(session, writeOut);
+
+  // The log is written after the session ends, whatever the session's own exit code was: the
+  // game that was played is worth having even when a scripted line was refused, and a log that
+  // only appeared on success would be missing exactly the games worth replaying.
+  if (recorder !== undefined && flags.value.recordPath !== undefined) {
+    const body = `${JSON.stringify(recorder.value.log())}\n`;
+    try {
+      mkdirSync(dirname(flags.value.recordPath), { recursive: true });
+      writeFileSync(flags.value.recordPath, body, 'utf8');
+      console.log(
+        `recorded: ${flags.value.recordPath} (${String(recorder.value.log().boundaries.length)} ` +
+          `turn boundaries, ${String(recorder.value.log().commands.length)} commands)`,
+      );
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : 'unknown error';
+      console.error(`error: could not write the replay log - ${detail}`);
+      return 1;
+    }
   }
 
-  return runInteractive(session, writeOut);
+  return code;
 };
 
 /* ------------------------------------------------------------------ *
@@ -509,6 +572,250 @@ const commandTournament = (args: readonly string[]): number => {
   return result.value.exitCode;
 };
 
+/* ------------------------------------------------------------------ *
+ * `save`, `load` and `replay` — the three file verbs M11 names.
+ *
+ * They are thin on purpose: the format, the checks and the report are
+ * `core/serialize.ts` and `core/replay.ts`, and this file decides only which file to read,
+ * which file to write and which exit code an outcome earns. A second opinion about a save
+ * here — a field this file also validates, a hash this file also computes — is exactly the
+ * "two things that must agree" defect the milestone exists to close, so there is none.
+ * ------------------------------------------------------------------ */
+
+const SAVE_USAGE = `usage: civts save <path> [--seed <int>] [--map-size <size>] [--civs <int>]
+
+  Writes a FRESH game to <path> in the engine's one save format:
+  { version, engine: { schemaVersion, nodeMajor }, hash, state }. It is the same file the
+  REPL's "save" verb and the web app write, and the same one "civts load" reads back.
+
+  --seed <int>        world seed (any integer; default 1)
+  --map-size <size>   one of ${MAP_SIZES.join('|')} (default tiny)
+  --civs <int>        number of civilizations, 2..16 (default 2)
+`;
+
+const LOAD_USAGE = `usage: civts load <path>
+
+  Reads a save back, through the engine's own deserializer, and prints what it holds. The
+  format, every field, every index, the stored hash and the invariant registry are checked;
+  a save that fails any of them is REFUSED with a typed reason and a non-zero exit, and no
+  state is ever printed. That distinction is the point: a save that loads to a different
+  game is worse than one that fails.
+`;
+
+const REPLAY_USAGE = `usage: civts replay <path>
+
+  Re-runs a recorded game and compares the state hash at EVERY turn boundary the log
+  recorded — not only at the end. A divergence at turn 5 that reconverges by turn 20 is
+  still a divergence, and it is reported with its turn. A command the engine now refuses is
+  reported with the turn it happened on. Exit 0 means every boundary matched.
+
+  "... play --record <path>" writes such a log; the REPL's "replay <path>" verb runs the
+  same check inside a session.
+`;
+
+/** The settings a `save` writes a fresh game with — the same layered parse `map` and `play` use. */
+const flagsLayer = (args: readonly string[]): Result<Record<string, unknown>, string> => {
+  let seed: number | undefined;
+  let mapSize: MapSize | undefined;
+  let civCount: number | undefined;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const flag = args[i];
+    if (flag === undefined) break;
+    if (flag !== '--seed' && flag !== '--map-size' && flag !== '--civs') {
+      return err(`unknown option: "${flag}"`);
+    }
+    const raw = args[i + 1];
+    if (raw === undefined) return err(`${flag} needs a value`);
+    i += 1;
+
+    if (flag === '--map-size') {
+      const size = MAP_SIZES.find((candidate) => candidate === raw);
+      if (size === undefined) {
+        return err(`--map-size expects one of ${MAP_SIZES.join('|')}, got "${raw}"`);
+      }
+      mapSize = size;
+      continue;
+    }
+
+    const value = parseIntFlag(flag, raw);
+    if (!value.ok) return err(value.error);
+    if (flag === '--seed') seed = value.value;
+    else civCount = value.value;
+  }
+
+  const layer: Record<string, unknown> = {};
+  if (seed !== undefined) layer['seed'] = seed;
+  if (mapSize !== undefined) layer['mapSize'] = mapSize;
+  if (civCount !== undefined) layer['civCount'] = civCount;
+  return ok(layer);
+};
+
+/** The ruleset and codec a file verb works with — built once, the same way `play` builds them. */
+const fileEngine = (
+  fidelity: Fidelity,
+): Result<
+  { readonly view: RulesetView; readonly codec: SaveCodec; readonly identity: string },
+  number
+> => {
+  const validated = validateRuleset(CATALOG, fidelity);
+  if (!validated.ok) {
+    for (const e of validated.error) console.error(`ruleset error: ${formatRulesetError(e)}`);
+    return err(1);
+  }
+  const view: RulesetView = validated.value;
+  return ok({
+    view,
+    codec: saveCodecOf(validated.value, view),
+    identity: hashValue(validated.value),
+  });
+};
+
+const commandSave = (args: readonly string[]): number => {
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(SAVE_USAGE);
+    return 0;
+  }
+  const [path, ...rest] = args;
+  if (path === undefined) {
+    console.error('error: save needs a path');
+    console.error(SAVE_USAGE);
+    return 2;
+  }
+  const layer = flagsLayer(rest);
+  if (!layer.ok) {
+    console.error(`error: ${layer.error}`);
+    console.error(SAVE_USAGE);
+    return 2;
+  }
+
+  const settings = loadSettings(layer.value);
+  if (!settings.ok) {
+    for (const issue of settings.error)
+      console.error(`settings error: ${formatSettingsIssue(issue)}`);
+    return 2;
+  }
+  const engine = fileEngine(settings.value.fidelity);
+  if (!engine.ok) return engine.error;
+
+  const state = newGame(settings.value.seed, settings.value, engine.value.view);
+  if (!state.ok) {
+    console.error(`setup failed: ${formatSetupError(state.error)}`);
+    return 1;
+  }
+
+  const body = `${serialize(state.value, engine.value.codec)}\n`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, body, 'utf8');
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : 'unknown error';
+    console.error(`error: could not write "${path}" - ${detail}`);
+    return 1;
+  }
+
+  console.log(
+    `saved: ${path} (${String(Buffer.byteLength(body, 'utf8'))} bytes, ` +
+      `state hash ${hashValue(state.value)})`,
+  );
+  return 0;
+};
+
+const commandLoad = (args: readonly string[]): number => {
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(LOAD_USAGE);
+    return 0;
+  }
+  const [path, ...rest] = args;
+  if (path === undefined || rest.length > 0) {
+    console.error('error: load needs exactly one path');
+    console.error(LOAD_USAGE);
+    return 2;
+  }
+
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : 'unknown error';
+    console.error(`error: could not read "${path}" - ${detail}`);
+    return 1;
+  }
+
+  // `load` reads a save, and a save does not record which ruleset wrote it — so the content is
+  // this build's shipped catalog, exactly as the browser's loader uses it. `'tuned'` is not a
+  // shortcut around that: `'cited-only'` **refuses the shipped catalog** (every placeholder row
+  // is a `placeholder-in-cited-only` error), so it is the only ruleset this build has. A replay
+  // log is where a ruleset identity is recorded and checked, and `replay` is the verb that does
+  // it — including the refusal when the log was recorded on content this build does not have.
+  const engine = fileEngine('tuned');
+  if (!engine.ok) return engine.error;
+
+  const loaded = deserialize(text, engine.value.codec);
+  if (!loaded.ok) {
+    console.error(`error: ${path} was refused - ${formatSaveError(loaded.error)}`);
+    return 1;
+  }
+
+  const state: GameState = loaded.value;
+  console.log(
+    `loaded: ${path}\n` +
+      `  turn ${String(state.turn)}, revision ${String(state.revision)}, ` +
+      `seed ${String(state.seed)}, schema ${String(state.schemaVersion)}\n` +
+      `  ${state.settings.mapSize} map ${String(state.map.width)}x${String(state.map.height)}, ` +
+      `${String(state.players.length)} players, ${String(state.cities.length)} cities, ` +
+      `${String(state.units.length)} units\n` +
+      `  state hash ${hashValue(state)}`,
+  );
+  return 0;
+};
+
+const commandReplay = (args: readonly string[]): number => {
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(REPLAY_USAGE);
+    return 0;
+  }
+  const [path, ...rest] = args;
+  if (path === undefined || rest.length > 0) {
+    console.error('error: replay needs exactly one path');
+    console.error(REPLAY_USAGE);
+    return 2;
+  }
+
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : 'unknown error';
+    console.error(`error: could not read "${path}" - ${detail}`);
+    return 1;
+  }
+
+  const engine = fileEngine('tuned');
+  if (!engine.ok) return engine.error;
+
+  const result = replay(text, {
+    ruleset: engine.value.view,
+    rulesetIdentity: engine.value.identity,
+    codec: engine.value.codec,
+  });
+  if (!result.ok) {
+    // Non-zero, always: "a replay that diverges exits non-zero". The reason is the engine's own
+    // typed error, rendered by the one renderer, and it names the turn.
+    console.error(`error: ${path} did not replay - ${formatReplayError(result.error)}`);
+    return 1;
+  }
+
+  const report: ReplayReport = result.value;
+  console.log(
+    `replayed: ${path}\n` +
+      `  ${String(report.boundaries)} turn boundaries reproduced, ` +
+      `${String(report.commands)} commands applied\n` +
+      `  final hash ${report.finalHash} (seed ${String(report.seed)})`,
+  );
+  return 0;
+};
+
 const main = async (argv: readonly string[]): Promise<number> => {
   const [command, ...rest] = argv;
 
@@ -524,6 +831,12 @@ const main = async (argv: readonly string[]): Promise<number> => {
       return commandMap(rest);
     case 'play':
       return commandPlay(rest);
+    case 'save':
+      return commandSave(rest);
+    case 'load':
+      return commandLoad(rest);
+    case 'replay':
+      return commandReplay(rest);
     case 'sim':
       return commandSim(rest);
     case 'tournament':

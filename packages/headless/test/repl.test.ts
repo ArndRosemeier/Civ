@@ -95,9 +95,14 @@ import {
   type TileIndex,
   type Unit,
   type UnitDef,
+  SAVE_VERSION,
+  createReplayRecorder,
+  deserialize,
+  serialize,
+  type SaveCodec,
 } from '@civts/core';
 import { CATALOG, validateRuleset } from '@civts/rules';
-import { FULL_TIER, canonicalize, hashValue } from '@civts/testing';
+import { FULL_TIER, hashValue } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -105,6 +110,7 @@ import {
   createSession,
   parsePlayArgs,
   runScript,
+  saveCodecOf,
   type LineOutcome,
   type ReplSession,
 } from '../src/repl.js';
@@ -317,6 +323,11 @@ const open = (options?: {
     write: (text: string) => {
       chunks.push(text);
     },
+    // M11: the engine's one save format and the ruleset's own identity, exactly as `cli.ts`
+    // builds them. A session without them could not save, load or replay, so there is no
+    // default to fall back on.
+    codec: saveCodecOf(validated.value, options?.ruleset ?? RULESET),
+    rulesetIdentity: hashValue(validated.value),
   });
   return {
     session,
@@ -667,7 +678,7 @@ const EXPECTED_TRANSCRIPT = [
   '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | load <path> | replay <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -760,7 +771,7 @@ const EXPECTED_TRANSCRIPT = [
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> wibble',
   'error: unknown command "wibble" - no such command.',
-  '  commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | help | quit',
+  '  commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | load <path> | replay <path> | help | quit',
   '  type "help" for what each one does.',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -836,7 +847,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | load <path> | replay <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -2798,11 +2809,20 @@ describe('inspectors', () => {
       'units',
       'state',
       'save',
+      'load',
+      'replay',
       'help',
       'quit',
     ]) {
       expect(text).toContain(command);
     }
+    // M11's file verbs are documented where a player will look, and the help says what each one
+    // does rather than only naming it: a `load` that a player does not know is checked is a
+    // `load` they will not trust, and a `replay` nobody knows about is not a feature.
+    expect(text).toContain('load <path>');
+    expect(text).toContain('replay <path>');
+    expect(text).toContain('REFUSED, leaving this session exactly where');
+    expect(text).toContain('EVERY turn boundary');
     expect(text).toContain('move <unitId> <x> <y>');
     expect(text).toContain('found <unitId>');
     expect(text).toContain('city <cityId>');
@@ -2831,17 +2851,189 @@ describe('inspectors', () => {
       expect(capture.session.run(`save ${second}`).kind).toBe('inspected');
 
       const body = readFileSync(first, 'utf8');
-      // Canonical JSON: the same state produces the same bytes, so a save is
-      // diffable and hashable like any other state.
+      // The same state produces the same bytes, so a save is diffable like any other state.
       expect(body).toBe(readFileSync(second, 'utf8'));
       expect(body.endsWith('\n')).toBe(true);
 
       const parsed: unknown = JSON.parse(body);
-      const saved = stateOf(parsed);
-      expect(hashValue(saved)).toBe(expected);
-      expect(saved).toEqual(capture.session.state);
-      expect(parsed).toMatchObject({ engine: 'civts', schemaVersion: SCHEMA_VERSION });
-      expect(canonicalize(parsed)).toBe(body.trimEnd());
+      expect(hashValue(stateOf(parsed))).toBe(expected);
+      expect(stateOf(parsed)).toEqual(capture.session.state);
+
+      // M11: the file is the **engine's** format — `core/serialize.ts`'s four keys — rather than
+      // the REPL's own envelope. `save` used to write `{ schemaVersion, engine: 'civts',
+      // nodeMajor, state }`, which no other loader in this tree could read and which nothing
+      // could notice: the milestone's "one serialization module, one version" is exactly this.
+      expect(keysOf(parsed)).toEqual(['engine', 'hash', 'state', 'version']);
+      expect(parsed).toMatchObject({
+        version: SAVE_VERSION,
+        hash: expected,
+        engine: { schemaVersion: SCHEMA_VERSION, nodeMajor },
+      });
+      // Absent, never `undefined`: `JSON.stringify` drops an undefined-valued key, and the rule
+      // holds on both sides of the round trip.
+      expect(body).not.toContain('undefined');
+
+      // **The claim that matters**: the engine's own deserializer accepts the file, and hands
+      // back exactly the state that was saved.
+      const loaded = deserialize(body, codec());
+      if (!loaded.ok)
+        throw new Error(`the engine refused its own save: ${JSON.stringify(loaded.error)}`);
+      expect(loaded.value).toEqual(capture.session.state);
+      expect(hashValue(loaded.value)).toBe(expected);
+      // …and `serialize` of what came back is the same file again, byte for byte.
+      expect(`${serialize(loaded.value, codec())}\n`).toBe(body);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads another session’s save onto the board, and plays on from it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'civts-repl-'));
+    try {
+      // A save written by a *second* session — the case a single session cannot catch, because
+      // writing and reading with the same object is what a format bug survives.
+      const author = open();
+      author.session.run('move 0 1 1');
+      author.session.run('end');
+      const path = join(dir, 'mid-game.json');
+      expect(author.session.run(`save ${path}`).kind).toBe('inspected');
+      const expected = hashValue(author.session.state);
+
+      const reader = open();
+      expect(hashValue(reader.session.state)).not.toBe(expected);
+
+      const outcome = reader.session.run(`load ${path}`);
+      expect(outcome.kind).toBe('inspected');
+      expect(hashValue(reader.session.state)).toBe(expected);
+      expect(reader.session.state).toEqual(author.session.state);
+
+      // It printed where it landed, and the game goes on from there rather than from turn 1.
+      expect(reader.text()).toContain(`loaded: ${path}`);
+      expect(reader.text()).toContain(`turn ${String(author.session.state.turn)}`);
+      const played = reader.session.run('end');
+      expect(played.kind).toBe('applied');
+      expect(reader.session.state.turn).toBe(author.session.state.turn + 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('REFUSES a corrupt save, leaving the session where it was', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'civts-repl-'));
+    try {
+      const capture = open();
+      capture.session.run('move 0 1 1');
+      const before = capture.session.state;
+
+      const good = join(dir, 'good.json');
+      expect(capture.session.run(`save ${good}`).kind).toBe('inspected');
+      const body = readFileSync(good, 'utf8');
+      const parsed: unknown = JSON.parse(body);
+      if (typeof parsed !== 'object' || parsed === null || !('state' in parsed)) {
+        throw new Error('the save has no state field');
+      }
+      const record = parsed as { state: { units: { tile: number }[] } & Record<string, unknown> };
+
+      /** Every way the file can be wrong, and the typed `kind` each one must earn. */
+      const cases: readonly { readonly why: string; readonly text: string }[] = [
+        { why: 'not JSON at all', text: '{ this is not json' },
+        { why: 'not a save', text: '[]' },
+        { why: 'a field removed', text: JSON.stringify({ version: 1, engine: {}, hash: 'x' }) },
+        {
+          why: 'a format version this build does not write',
+          text: JSON.stringify({ ...parsed, version: SAVE_VERSION + 1 }),
+        },
+        {
+          why: 'a state the hash does not describe',
+          text: JSON.stringify({ ...parsed, hash: '0000000000000000' }),
+        },
+        {
+          why: 'the version stripped out of the state',
+          text: JSON.stringify({
+            ...parsed,
+            state: Object.fromEntries(
+              Object.entries(record.state).filter(([key]) => key !== 'schemaVersion'),
+            ),
+          }),
+        },
+        {
+          why: 'a tile out of range',
+          text: JSON.stringify({
+            ...parsed,
+            state: {
+              ...record.state,
+              units: record.state.units.map((unit, index) =>
+                index === 0 ? { ...unit, tile: 10 ** 6 } : unit,
+              ),
+            },
+          }),
+        },
+      ];
+
+      for (const { why, text } of cases) {
+        const path = join(dir, 'broken.json');
+        writeFileSync(path, text, 'utf8');
+        const outcome = capture.session.run(`load ${path}`);
+
+        expect(outcome.kind, why).toBe('load-refused');
+        // The typed error, not a message: a refusal is a value the caller can assert on.
+        expect(outcome.kind === 'load-refused' ? outcome.error.kind : undefined, why).toBeDefined();
+        // Fail closed: the session is exactly where it was, and every later command acts on the
+        // state it had. A loader that half-installed a state is the defect this test is for.
+        expect(capture.session.state, why).toBe(before);
+        expect(hashValue(capture.session.state), why).toBe(hashValue(before));
+        expect(capture.text()).toContain('error: load failed');
+      }
+
+      // And the good file still loads, so the loop above refused the *files* and not the verb.
+      expect(capture.session.run(`load ${good}`).kind).toBe('inspected');
+      expect(hashValue(capture.session.state)).toBe(hashValue(before));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a recorded game from inside a session, and reports divergence with its turn', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'civts-repl-'));
+    try {
+      const log = recordLog(6);
+      const path = join(dir, 'game.log.json');
+      writeFileSync(path, JSON.stringify(log), 'utf8');
+
+      const capture = open();
+      const good = capture.session.run(`replay ${path}`);
+      expect(good.kind).toBe('inspected');
+      expect(capture.text()).toContain('turn boundaries reproduced');
+      // The session's own game is untouched: `replay` checks a file, it does not rewind a board.
+      expect(hashValue(capture.session.state)).toBe(hashValue(syntheticState()));
+
+      // Turn 5's recorded hash, replaced by the last one. A replay that compared only the end
+      // would pass this log; the divergence is at turn 5 and the message has to say so.
+      const boundaries = log.boundaries;
+      const last = boundaries[boundaries.length - 1];
+      if (last === undefined) throw new Error('the log has no boundaries');
+      const tampered = {
+        ...log,
+        boundaries: boundaries.map((b) => (b.turn === 5 ? { turn: 5, hash: last.hash } : b)),
+      };
+      const badPath = join(dir, 'diverged.log.json');
+      writeFileSync(badPath, JSON.stringify(tampered), 'utf8');
+
+      const bad = capture.session.run(`replay ${badPath}`);
+      expect(bad.kind).toBe('replay-refused');
+      expect(bad.kind === 'replay-refused' ? bad.error.kind : undefined).toBe('diverged');
+      expect(
+        bad.kind === 'replay-refused' && bad.error.kind === 'diverged' ? bad.error.turn : 0,
+      ).toBe(5);
+      expect(capture.text()).toContain('turn 5');
+
+      // "A replay that diverges exits non-zero": the one place a script's exit code is decided.
+      const script = open();
+      const code = runScript(script.session, `replay ${badPath}\n`, () => undefined);
+      expect(code).toBe(1);
+      // …and a script whose replays all matched still exits 0.
+      const fine = open();
+      expect(runScript(fine.session, `replay ${path}\n`, () => undefined)).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2854,6 +3046,38 @@ const stateOf = (envelope: unknown): unknown => {
     throw new Error('the save envelope has no "state" field');
   }
   return envelope.state;
+};
+
+/** An object's own keys, sorted — the shape of a payload, asserted without a cast. */
+const keysOf = (value: unknown): readonly string[] => {
+  if (typeof value !== 'object' || value === null) throw new Error('not an object');
+  return Object.keys(value).sort();
+};
+
+/** The Node major, read the way the engine reads it. */
+const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
+
+/** The codec the CLI and every session in this file are built with. */
+const codec = (): SaveCodec => saveCodecOf(validated.value, RULESET);
+
+/**
+ * A replay log of a real game, played through the engine's own recorder — the file
+ * `play --record` writes, without spawning a process to write it.
+ */
+const recordLog = (turns: number) => {
+  const recorder = createReplayRecorder(
+    syntheticState().seed,
+    syntheticState().settings,
+    RULESET,
+    hashValue(validated.value),
+    codec(),
+  );
+  if (!recorder.ok) throw new Error(`the recorder did not start: ${recorder.error.kind}`);
+  for (let turn = 0; turn < turns; turn += 1) {
+    const ended = recorder.value.apply(asPlayerId(0), { type: 'EndTurn' });
+    if (!ended.ok) throw new Error(`the recorder refused a turn: ${ended.error.kind}`);
+  }
+  return recorder.value.log();
 };
 
 /* ------------------------------------------------------------------ *
@@ -4137,6 +4361,8 @@ describe('the play command', () => {
           write: (text: string) => {
             chunks.push(text);
           },
+          codec: saveCodecOf(validated.value, RULESET),
+          rulesetIdentity: hashValue(validated.value),
         });
         const code = runScript(session, `${lines.join('\n')}\n`, (text: string) => {
           chunks.push(text);
@@ -5118,4 +5344,196 @@ describe('an attack that does not apply', () => {
     expect(capture.text()).toContain('CAPTURED by Player 1 (p0)');
     expect(capture.text()).toContain('ok: unit 0 is dug in where it stands');
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * M11: the file verbs — `save`, `load` and `replay`, through the real CLI
+ *
+ * These drive `packages/headless/src/cli.ts` the way a pipeline does, because the verbs are
+ * module-private on purpose: the format, the checks and the reports live in
+ * `@civts/core` (`serialize.ts`, `replay.ts`), and the CLI's half is only *which file, and
+ * which exit code*. A test of the library half would not notice a verb that exits 0 on a
+ * divergence, which is the one outcome the contract names explicitly.
+ * ------------------------------------------------------------------ */
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** A field of a parsed JSON value, without casting it. */
+const atOf = (value: unknown, key: string): unknown => {
+  if (!isRecord(value)) throw new Error(`no object, so no "${key}"`);
+  const found = value[key];
+  if (found === undefined) throw new Error(`the object has no "${key}"`);
+  return found;
+};
+
+/** A list field of a parsed JSON value. */
+const listOf = (value: unknown, key: string): readonly unknown[] => {
+  const found = atOf(value, key);
+  if (!Array.isArray(found)) throw new Error(`"${key}" is not a list`);
+  return Array.from<unknown>(found);
+};
+
+/** A string field of a parsed JSON value. */
+const stringOf = (value: unknown, key: string): string => {
+  const found = atOf(value, key);
+  if (typeof found !== 'string') throw new Error(`"${key}" is not a string`);
+  return found;
+};
+
+describe('the file verbs through the real CLI', () => {
+  it('writes a save with `save` and reads it back with `load`, agreeing on the hash', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'civts-cli-save-'));
+    try {
+      const path = join(dir, 'game.json');
+      const saved = runCli(
+        ['save', path, '--seed', '4242', '--map-size', 'duel', '--civs', '2'],
+        '',
+      );
+      expect(saved.stderr).not.toContain('fatal');
+      expect(saved.status).toBe(0);
+      expect(saved.stdout).toContain(`saved: ${path}`);
+
+      // The file is the ENGINE's format — the same four keys the REPL writes and the browser
+      // writes, which is what makes `civts load` and the panel's `Load game` the same reader.
+      const payload: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      expect(keysOf(payload)).toEqual(['engine', 'hash', 'state', 'version']);
+      const hash = stringOf(payload, 'hash');
+      expect(saved.stdout).toContain(`state hash ${hash}`);
+      expect(readFileSync(path, 'utf8')).not.toContain('undefined');
+
+      const loaded = runCli(['load', path], '');
+      expect(loaded.stderr).not.toContain('fatal');
+      expect(loaded.status).toBe(0);
+      // The same hash `save` printed: the loader hashes the state it read, and the payload's own
+      // hash is what it was checked against.
+      expect(loaded.stdout).toContain(`state hash ${hash}`);
+      expect(loaded.stdout).toContain('seed 4242');
+      expect(loaded.stdout).toContain('turn 1');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('refuses a corrupt save with a non-zero exit and never prints a state', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'civts-cli-load-'));
+    try {
+      const good = join(dir, 'good.json');
+      expect(runCli(['save', good, '--seed', '7'], '').status).toBe(0);
+      const body = readFileSync(good, 'utf8');
+      const payload: unknown = JSON.parse(body);
+      const hash = stringOf(payload, 'hash');
+
+      const broken = join(dir, 'broken.json');
+      writeFileSync(broken, body.slice(0, 40), 'utf8');
+      const tampered = join(dir, 'tampered.json');
+      writeFileSync(tampered, body.replace(hash, 'ffffffffffffffff'), 'utf8');
+      if (readFileSync(tampered, 'utf8') === body)
+        throw new Error('the hash rewrite did not apply');
+
+      for (const [why, path] of [
+        ['a truncated save', broken],
+        ['a save whose hash is not its state’s', tampered],
+        ['a file that is not there', join(dir, 'absent.json')],
+      ] as const) {
+        const run = runCli(['load', path], '');
+        expect(run.status, why).toBe(1);
+        expect(run.stderr, why).toContain('error:');
+        // No half-answer: a refused load prints no state line at all, so nothing downstream can
+        // read a "loaded" summary that was never checked.
+        expect(run.stdout, why).not.toContain('state hash');
+        expect(run.stdout, why).not.toContain('loaded:');
+      }
+
+      // The good file still loads, so the loop above refused the *files*.
+      expect(runCli(['load', good], '').status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('records a game with `play --record` and replays it, boundary by boundary', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'civts-cli-replay-'));
+    try {
+      const script = join(dir, 'session.txt');
+      writeFileSync(
+        script,
+        'state\nend\nend\nend\nend\nend\nend\nsave ' + join(dir, 'state.json') + '\nquit\n',
+        'utf8',
+      );
+      const log = join(dir, 'game.log.json');
+      const played = runCli(
+        [
+          'play',
+          '--seed',
+          '99',
+          '--map-size',
+          'duel',
+          '--civs',
+          '2',
+          '--script',
+          script,
+          '--record',
+          log,
+        ],
+        '',
+      );
+      expect(played.stderr).not.toContain('fatal');
+      expect(played.status).toBe(0);
+      expect(played.stdout).toContain(`recorded: ${log}`);
+
+      // The log is the game, not the state: the seed, the settings, the ruleset's own identity and
+      // every accepted command, with the state hash at each turn boundary.
+      const parsed: unknown = JSON.parse(readFileSync(log, 'utf8'));
+      expect(stringOf(parsed, 'ruleset')).toBe(hashValue(validated.value));
+      const boundaries = listOf(parsed, 'boundaries');
+      expect(boundaries.length).toBe(7); // the opening board, plus six `end`s
+      expect(listOf(parsed, 'commands').length).toBeGreaterThanOrEqual(6);
+
+      const replayed = runCli(['replay', log], '');
+      expect(replayed.stderr).not.toContain('fatal');
+      expect(replayed.status).toBe(0);
+      expect(replayed.stdout).toContain('7 turn boundaries reproduced');
+      expect(replayed.stdout).toContain(`final hash ${stringOf(boundaries[6] ?? {}, 'hash')}`);
+
+      // Turn 5's recorded hash, replaced by turn 7's. Every other boundary — including the last —
+      // is exactly what the game produced, so a replay that compared only the end hash would
+      // report success here. It must not.
+      const lastHash = stringOf(boundaries[6] ?? {}, 'hash');
+      const tampered = Object.assign({}, parsed, {
+        boundaries: boundaries.map((boundary, index) =>
+          index === 4 ? { turn: 5, hash: lastHash } : boundary,
+        ),
+      });
+      const diverged = join(dir, 'diverged.log.json');
+      writeFileSync(diverged, JSON.stringify(tampered), 'utf8');
+
+      const run = runCli(['replay', diverged], '');
+      // "A replay that diverges exits non-zero." This is that sentence, through the real binary.
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain('turn 5');
+      expect(run.stderr).toContain('diverged');
+      expect(run.stdout).not.toContain('turn boundaries reproduced');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('prints usage for each verb, and needs a path to do anything', () => {
+    for (const verb of ['save', 'load', 'replay'] as const) {
+      const help = runCli([verb, '--help'], '');
+      expect(help.status, verb).toBe(0);
+      expect(help.stdout, verb).toContain(`usage: civts ${verb}`);
+    }
+    for (const verb of ['load', 'replay'] as const) {
+      const bare = runCli([verb], '');
+      expect(bare.status, verb).toBe(2);
+      expect(bare.stderr, verb).toContain('exactly one path');
+    }
+    // The top-level usage lists them, so they are discoverable rather than folklore.
+    const usage = runCli(['--help'], '');
+    for (const verb of ['save', 'load', 'replay'] as const) {
+      expect(usage.stdout, verb).toContain(verb);
+    }
+  }, 120_000);
 });

@@ -49,8 +49,11 @@ const resolvePath = (p: string): string => fileURLToPath(new URL(p, import.meta.
  * reported — a run's own stopwatch does not include `typecheck`, `lint` or `format:check`, and
  * it is the whole command that a developer waits for. `pnpm verify` is four steps, and the
  * three that are not vitest cost a measured **37 s** on an idle machine (`typecheck` 5.5 s,
- * `lint` 21.7 s, `format:check` 10.0 s), so the test step's own share of the 70 s target is
- * about 33 s.
+ * `lint` 21.7 s, `format:check` 10.0 s) — kept here as an M7b reading. **O3 replaced that
+ * addition with a maximum**: the three checks are independent, so the fast tier now runs
+ * them as concurrent processes and the static step is bounded by its slowest member. The
+ * measurements that decided it are in the O3 section below, and the one thing a developer
+ * needs from them is that the test step was never the problem.
  *
  * The tier boundary is drawn against a per-file measurement, not a guess. Vitest's JSON
  * reporter gives every file's span; on this machine the fast tier's critical path was two
@@ -122,6 +125,77 @@ const resolvePath = (p: string): string => fileURLToPath(new URL(p, import.meta.
  * readings from two runs, not a drift, and neither figure is a claim about what the tier costs next
  * week.
  *
+ * ## O3 — the gate redrawn by measurement (2026-09-13)
+ *
+ * The wave opened with the fast gate **reported at 78.3 s wall on a shared box** — the figure
+ * in the M11 contract, which this box did not reproduce: the same unmodified command measured
+ * `real 1m5.237s` here at `loadavg` 4.3–5.0, so the two readings differ by the machine rather
+ * than by the gate. Both agree on the diagnosis, which is why the diagnosis is what the redraw
+ * acts on: roughly 45 s of it was eslint and prettier rather than tests. So the first thing
+ * done was to measure the four steps separately, on a frozen
+ * copy of HEAD (`d4e7f72`) rather than on the live tree — other workstreams were
+ * mid-edit, and a red tree that fails in `typecheck` never reaches the test step, which
+ * is not a timing. Every column below is the same frozen tree, driven by the same
+ * commands, with no other job of this workspace running; the `loadavg` printed in the raw
+ * output was 6.9 when the "one after another" column started and 12.4 after the last
+ * `vitest` run — this run's own workers and whatever else the shared machine was doing are
+ * both inside that number, which is why it is quoted rather than offered as a quiet box.
+ *
+ * | step                     | one after another | three at once, cold cache | three at once, warm cache |
+ * | ------------------------ | ----------------- | ------------------------- | ------------------------- |
+ * | `typecheck`              | 6.3 s             | 6.3 s                     | 6.3 s                     |
+ * | `lint`                   | 26.4 s            | 26.5–27.9 s (writes cache) | 1.05 s                   |
+ * | `format:check`           | 12.6 s            | 13.0 s (writes cache)     | 0.71 s                    |
+ * | **static step**          | **45.2 s**        | **31.5 s**                | **6.4 s**                 |
+ * | `test`                   | 25.7 s            | 24.4 s                    | 25.8 s                    |
+ * | **the whole gate, steps** | **70.9 s**       | **55.9 s**                | **32.3 s**                |
+ *
+ * Two of those cells are separate readings rather than spans of the run beside them, and
+ * are labelled so: the cold `lint` cost (26.5 s with eslint's default metadata strategy,
+ * 27.9 s with the content strategy this repo uses) and the cold `format:check` cost
+ * (13.0 s) were timed on the live tree within the same hour, not on the frozen copy. The
+ * **static step** rows are the single measurement that matters, and each is one run.
+ *
+ * The finding is in the two bold rows: **the tests were never the gate.** The whole fast
+ * test set is 61 files and 25.7 s of wall, and its critical path is a single file —
+ * `packages/testing/test/m9-m10-adversarial.test.ts` at 15.5 s, with
+ * `packages/headless/test/sim-cli.test.ts` at 12.9 s next (vitest's JSON reporter, same
+ * run; the 61 files' spans sum to 113.7 s, which is only interesting as proof the work
+ * is spread across workers). Nothing was moved to the full tier, no `skipIf` was added,
+ * and no test was touched. What changed is `package.json`'s three static scripts, which
+ * are now three concurrent processes guarded by an explicit `wait` on each (a bare
+ * `wait` returns 0 and would have turned every lint failure green), and two caches.
+ *
+ * **What the caches do and do not cover is stated once, in `@civts/testing`'s
+ * `tier.ts`** — including the one honest gap (a typed-lint verdict that depends on
+ * another file's types is not re-derived for an unchanged file in the fast tier) and the
+ * developer rule it implies. It is not restated here; this file is loaded by every test
+ * run and is the worst place for a second copy of a rule.
+ *
+ * The two end-to-end readings that bracket all of this, kept because the bound is on the
+ * command and not on the steps, and both taken with `time pnpm verify` — the command a
+ * person runs. **Before:** `real 1m5.237s` on the live tree at `loadavg` 4.3–5.0, green,
+ * `2023 passed | 56 skipped`. **After**, on the live tree again and green both times,
+ * `2095 passed | 56 skipped` (the count is larger because three other workstreams landed
+ * M11 tests in between): `real 0m54.798s` with no `.cache` at `loadavg` 10.7, and
+ * `real 0m32.074s` warm at `loadavg` 12.0. The after pair was measured under **more** load
+ * than the before, which is the wrong direction for a favourable comparison and the right
+ * one for evidence: the command is ~10 s faster cold and ~33 s faster warm than the 65.2 s
+ * before-reading, while carrying ~3.5 % more tests, leaving 15.2 s and 37.9 s of headroom
+ * under the 70 s target on a box that was not quiet. No test was removed to buy it, and the
+ * fast tier still names all 56 skipped tests, one line each.
+ *
+ * **A faster gate that catches nothing would be worse, so it was made to fail on purpose.**
+ * Three probes against a frozen copy of HEAD, each applied to an existing file, each run
+ * *after* the caches had been warmed by a green gate (the state a cache bug would need to
+ * hide in): a type error appended to `packages/core/src/textview.ts` turned the gate red in
+ * `typecheck` (`error TS2322`); a `new Date();` statement appended to the same file turned it
+ * red in `lint` (`no-restricted-syntax`, the determinism guard); a failing test appended to
+ * `packages/core/test/rng.test.ts` turned it red in `test` (`1 failed | 2023 passed | 56
+ * skipped`). Each file was restored from a byte copy, its `sha256` was re-checked as
+ * unchanged, and the gate was re-run green. The cache keys on file content, so the file that
+ * broke was re-checked in every case; that is the property the probes exist to confirm.
+ *
  * ## Why the alias map is exported
  *
  * One entry per workspace package. `@civts/sim` was added when the package landed: its own
@@ -157,9 +231,14 @@ export const testInclude = ['packages/*/test/**/*.test.ts'];
  * So the gate runs one more reporter, and it is deliberately tiny: on finish, walk the collected
  * tree, print every task this run marked `skip` or `todo`, grouped by file, with the names of
  * the suites it sits in. It computes nothing and asserts nothing — the node ids, names and
- * modes are all vitest's own — and in the full tier it prints nothing at all, because nothing
- * is skipped there. That is what makes `full ⊇ fast` checkable by eye: the fast run lists what
- * it deferred, and the full run lists nothing.
+ * modes are all vitest's own — and it prints the same block in both tiers. **The full tier's
+ * block is not empty, and that is a correction rather than a detail**: measured 2026-09-13,
+ * `pnpm verify:full` reports `2077 passed | 2 skipped` and prints a two-line block for the
+ * `CIVTS_MUTATION_CHECK=1` mutation checks in `m9-m10-adversarial.test.ts`, which are gated on
+ * a *second* switch and run by `pnpm mutation:check`. Nothing is skipped in the full tier for
+ * *tier* reasons, and the block is what says so out loud: with one reporter in both tiers,
+ * `full ⊇ fast` is checkable by eye — the fast run's 56 names are all absent from the full
+ * run's list of 2, and those 2 are a different question's answer.
  * ------------------------------------------------------------------ */
 
 /** One skipped test: the file it is in, the suites around it, and its own name. */
