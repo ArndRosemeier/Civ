@@ -84,8 +84,12 @@ const resolvePath = (p: string): string => fileURLToPath(new URL(p, import.meta.
  * Two things this config deliberately does **not** do. It does not exclude files (the header
  * above), and it does not shrink the *work* — the expensive experiments that are evidence
  * rather than regressions left the suite for scripts, where they are run on purpose:
- * `scripts/tournament-evidence.ts` runs A3's twenty seeds at a hundred turns (measured at
- * 519.4 s wall, 26.0 s per game, zero violations), which no per-commit gate can hold. The same
+ * `scripts/tournament-evidence.ts` runs A3's twenty seeds at a hundred turns, which no
+ * per-commit gate can hold. **Its measured cost, and the 1800 s budget it is judged against,
+ * are recorded once in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE` and are named here rather than
+ * repeated.** That is deliberate, and this file is the worst possible place for a second copy:
+ * it is loaded by every test run, and the figure it would quote is exactly the one that went
+ * stale in five files at once (1.66×) when the AI got slower. The same
  * rule applied to the *full* tier, where the twenty-seed sixty-turn tournament in
  * `packages/sim/test/tournament.test.ts` measured 417 s — 85 % of that tier's 489 s — against a
  * comment claiming ~100 s: it is a four-seed smoke run now (9.2 s), and the twenty seeds are the

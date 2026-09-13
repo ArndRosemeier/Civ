@@ -13,13 +13,14 @@
  * ## Why this is a script and not a test (the M7b decision)
  *
  * Alpha criterion A3 asks for a twenty-seed tournament with zero invariant violations inside
- * a stated budget. That experiment is **roughly nine minutes** — measured at 26.0 s per game at
- * a hundred turns, so 519.4 s for the twenty, with the two clocks agreeing to 0.01 % and zero
- * invariant violations in 54 000 checks (the M7 adversarial review measured the same run
- * independently at 26.4 s per game / 527.3 s, which is the same number within noise) — and a
- * per-commit gate cannot hold it: M7b bounds `time pnpm verify` at 70 s, and A3's run alone is
- * almost eight times that. So the run lives here, executed **on purpose**, and its output is
- * what the docs record.
+ * a stated budget. That experiment costs **minutes, not seconds** — the measured figure, the
+ * bound it is judged against and the headroom between them are recorded **once**, in
+ * `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, and this script prints them rather than restating
+ * them (the same figure used to live in five files at once and was stale in all five by 1.66×;
+ * see that record's own note). What matters here is that a per-commit gate cannot hold a run
+ * of that size: M7b bounds `time pnpm verify` at 70 s, and A3's run alone is an order of
+ * magnitude more. So the run lives here, executed **on purpose**, and its output is what the
+ * docs record.
  *
  * What the suite keeps is the *smoke* version of the same machinery: `tournament.test.ts` plays
  * small tournaments (a handful of games, four to six turns) plus one four-seed smoke run of the
@@ -28,6 +29,15 @@
  * and the failure path; this script produces the acceptance number. Nothing was deleted to make
  * the gate faster — the split is visible in the fast run's own output, which names every skipped
  * test.
+ *
+ * ## The recorded figure and the fresh one, side by side
+ *
+ * A timing is evidence only while it is current, and the AI it measures changes every wave, so
+ * the text report ends with **recorded vs measured**: the per-game and whole-run figures from
+ * `A3_TOURNAMENT_EVIDENCE`, beside the ones this process just measured. A drift is not a
+ * failure — nothing exits non-zero for it, and the run's own verdict is unaffected — but it is
+ * printed, because the alternative is exactly how this number went 1.66× stale in five files
+ * without anybody noticing.
  *
  * ## What it measures, and the two clocks it prints
  *
@@ -39,10 +49,16 @@
  * Two clocks appear in the output, and they answer different questions:
  *
  * 1. **`wallMs`** — this process's own bracket around the call, from `process.hrtime.bigint()`.
- *    That is the number a person waiting for the command experiences, and the number the
- *    acceptance line's "about nine minutes" is about.
+ *    That is the number a person waiting for the command experiences, and the number behind the
+ *    per-game figure the record below quotes.
  * 2. **`harnessElapsedMs`** — the tournament harness's own reading, from `@civts/sim`'s
  *    `HOST_CLOCK`, which is the one the **budget verdict** is computed from.
+ *
+ * There is a third timing, and it belongs to the caller rather than to this process: the `time`
+ * figure for `pnpm tournament:evidence` end to end — measured from a quiet shell, with the load
+ * average it ran under recorded beside it, and stored in the record's `commandWallMs`. Three
+ * numbers, each labelled with what it measures: M7b's A5 failure was comparing one against a
+ * bound written for another, so none of them is left to be inferred.
  *
  * Printing both is the point: they are independent measurements of the same work, and
  * `clockAgreementPct` is the difference between them. A run whose two clocks disagreed by more
@@ -64,7 +80,7 @@
  */
 
 import { DEFAULT_SETTINGS } from '@civts/core';
-import { DEFAULT_TOURNAMENT_BUDGET_MS } from '@civts/sim';
+import { A3_TOURNAMENT_EVIDENCE, DEFAULT_TOURNAMENT_BUDGET_MS } from '@civts/sim';
 import { canonicalize } from '@civts/testing';
 
 import { parseIntFlag } from '../packages/headless/src/repl.js';
@@ -102,11 +118,11 @@ export const EVIDENCE_USAGE = `usage: npx tsx scripts/tournament-evidence.ts [--
   --seeds <spec>      the seeds to play: a list, ranges, or both (default ${A3_SEED_SPEC},
                       which is A3's twenty-seed experiment)
   --turns <int>       turns per game, at least 1 (default ${String(A3_TURNS)}, a full game at this engine's
-                      scale — and the reason the default run takes about nine minutes:
-                      measured at 26.0 s per game)
+                      scale — and the reason the default run costs what it does; the recorded
+                      figure is printed under RECORDED COST below)
   --budget-ms <int>   the budget the run is judged against, in milliseconds (default
-                      ${String(DEFAULT_TOURNAMENT_BUDGET_MS)} — fifteen minutes, the stated bound for A3's
-                      experiment). A run that exceeds it SAYS SO; the seed set is never
+                      ${String(DEFAULT_TOURNAMENT_BUDGET_MS)} — ${String(A3_TOURNAMENT_EVIDENCE.budgetMs / 60_000)} minutes, the stated bound for
+                      A3's experiment). A run that exceeds it SAYS SO; the seed set is never
                       trimmed to fit
   --json              print the canonical JSON of the structured result plus this script's own
                       measurement of it, instead of the text report
@@ -120,6 +136,14 @@ invariant registry and the same structured report:
 Exit codes: 0 = zero violations and within budget; 1 = a violation (named loudly, with its
 seed and turn); 2 = the flags are unusable; 3 = every invariant held but the run was over
 budget.
+
+RECORDED COST OF THIS EXPERIMENT — the one record, \`@civts/sim\`'s \`A3_TOURNAMENT_EVIDENCE\`,
+so no figure is restated here and none can go stale on its own:
+
+  ${A3_TOURNAMENT_EVIDENCE.summary}
+
+  (that record also carries the twenty per-game final hashes, and a text run of this script
+  prints the recorded figures beside the fresh ones — a drift is how the old number went stale)
 `;
 
 /* ------------------------------------------------------------------ *
@@ -256,8 +280,76 @@ export const renderEvidence = (evidence: TournamentEvidence): string =>
     `  per game           ${evidence.perGameMs.toFixed(1)}ms over ${String(evidence.report.totals.games)} games`,
     `  verdict            ${evidence.report.verdict.summary}`,
     `  exit code          ${String(evidence.report.exitCode)}`,
+    renderRecordComparison(evidence),
     '',
   ].join('\n');
+
+/**
+ * The recorded figure beside the fresh one — printed, and deliberately not fatal.
+ *
+ * ## Why this exists
+ *
+ * A timing is evidence only while it is current, and the thing being timed (the AI's own
+ * per-turn decision work) changes in almost every wave. The figure this project published went
+ * **1.66× stale in five files at once** because nothing compared a stored number against a
+ * fresh one: each site was edited by hand, and the run that would have contradicted all five
+ * was the expensive one nobody re-ran.
+ *
+ * So every text run prints both, with the record's own `measuredAt` and `loadAverage` beside
+ * it. Nothing here changes the exit code: a drift is information, not a failure — the run's
+ * verdict is about *this* run and its budget, and a busy machine makes a run slower without
+ * making the record wrong. What it does mean is stated in words, because a reader who sees
+ * "+61 %" should not have to work out whether that is noise (it is not) or a broken build (it
+ * is not: it is the AI having moved, and the fix is to re-record `A3_TOURNAMENT_EVIDENCE`).
+ *
+ * The comparison is only made between **like runs**: if this invocation asked for a different
+ * seed set or horizon than the record describes, the two figures are not comparable and the
+ * block says so rather than printing a ratio between different experiments.
+ */
+export const renderRecordComparison = (evidence: TournamentEvidence): string => {
+  const recorded = A3_TOURNAMENT_EVIDENCE;
+  const games = evidence.report.totals.games;
+  const freshPerGameMs = games === 0 ? 0 : evidence.wallMs / games;
+  const recordedPerGameMs = recorded.perGameMs;
+
+  const lines: string[] = [
+    'RECORDED vs MEASURED (the recorded figures live once, in `@civts/sim` A3_TOURNAMENT_EVIDENCE)',
+    `  recorded           ${recordedPerGameMs.toFixed(1)}ms per game over ${String(
+      recorded.games.length,
+    )} games of ${String(recorded.turns)} turns — ${recorded.budgetMs.toFixed(0)}ms budget, ` +
+      `${recorded.headroomMs.toFixed(0)}ms headroom (${recorded.headroomPct.toFixed(1)}%)`,
+    `  recorded under     load average ${recorded.loadAverage} on ${recorded.host}, measured ${recorded.measuredAt}`,
+    `  this run           ${freshPerGameMs.toFixed(1)}ms per game over ${String(games)} games of ${String(
+      evidence.report.parameters.maxTurns,
+    )} turns`,
+  ];
+
+  if (games !== recorded.games.length || evidence.report.parameters.maxTurns !== recorded.turns) {
+    lines.push(
+      '  not comparable     this invocation is not the recorded experiment (different seed count ' +
+        'or horizon), so no drift is computed: the two numbers describe different runs',
+    );
+    return lines.join('\n');
+  }
+
+  // A record with no positive per-game figure is a placeholder rather than a measurement:
+  // there is nothing to compare against, and printing "+0.0 %" beside a zero would read as
+  // agreement between a run and a record that has never been filled in.
+  if (recordedPerGameMs <= 0) {
+    lines.push(
+      '  no record yet      the record carries no measured per-game figure, so there is nothing ' +
+        'to compare this run against — record the numbers from this output',
+    );
+    return lines.join('\n');
+  }
+
+  const driftPct = recordedPerGameMs === 0 ? 0 : (freshPerGameMs / recordedPerGameMs - 1) * 100;
+  lines.push(
+    `  drift              ${driftPct >= 0 ? '+' : ''}${driftPct.toFixed(1)}% per game — a few ` +
+      'percent is machine noise; a factor means the AI moved, and the record needs re-measuring',
+  );
+  return lines.join('\n');
+};
 
 /* ------------------------------------------------------------------ *
  * The run

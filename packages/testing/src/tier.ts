@@ -18,9 +18,14 @@
  *   verify` ≤ 70 s of wall time**, of which the three non-test steps (`typecheck`,
  *   `lint`, `format:check`) measure about 37 s, leaving the test step about 33 s. The
  *   long suites are *not in it* for that reason, and neither is the evidence machinery
- *   that does not belong in a gate at all (A3's twenty-seed tournament is
- *   `scripts/tournament-evidence.ts`, measured at 519.4 s / 26.0 s per game, run on
- *   purpose rather than on every commit).
+ *   that does not belong in a gate at all: A3's twenty-seed tournament is
+ *   `scripts/tournament-evidence.ts`, run on purpose rather than on every commit. **What
+ *   that run costs, and the budget it is judged against, are recorded once — in
+ *   `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE` — and are deliberately not repeated here.**
+ *   This module is imported by every package, `@civts/sim` depends on it and not the other
+ *   way round, so it cannot import that record; it names it instead. A tier document that
+ *   quoted a timing would be a sixth copy of a number that went stale in five files at once
+ *   (1.66×, when the AI got slower and the figure did not).
  * - **full** (`pnpm test:full`, `pnpm verify:full`) — everything in fast **plus** the
  *   long ones. A superset: the full tier is the fast tier with the long tests added,
  *   never a different set of tests.

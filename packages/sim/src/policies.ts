@@ -1182,6 +1182,13 @@ export const SIMPLE_POLICY: Policy = simplePolicy();
  *   module that happens to hold the policies.
  */
 export { SMART_POLICY, SMART_POLICY_NAME, smartPolicy } from './ai/smart.js';
+// The real AI is the one policy that can report a failure, so the seam for reading that
+// report belongs beside the policy itself: a caller holding `SMART_POLICY` from here can
+// ask `plannerFailuresOf(SMART_POLICY)` without importing the AI's own module. Both work on
+// any `Policy` — the two control policies above answer `[]` — so a reporter needs no branch
+// for which policy it is looking at.
+export { describePlannerFailures, plannerFailuresOf } from './ai/smart.js';
+export type { DiagnosedPolicy, PlannerFailure, PlannerPhase, PolicyReport } from './ai/smart.js';
 export {
   DEFAULT_SMART_WEIGHTS,
   SMART_WEIGHT_GROUPS,

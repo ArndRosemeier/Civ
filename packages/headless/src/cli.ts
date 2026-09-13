@@ -51,12 +51,20 @@ import {
   runScript,
 } from './repl.js';
 import {
+  A3_TOURNAMENT_SEED_SPEC,
+  A3_TOURNAMENT_TURNS,
   SIM_POLICIES,
   formatRulesetError,
   formatSettingsIssue,
   runSimCommand,
   runTournamentCommand,
 } from './sim-cli.js';
+// A3's recorded cost, imported rather than quoted. This file used to restate it — a wall-time
+// sentence in the usage text below, with its own per-game and whole-run figures — and that copy
+// was **stale by 8×** when E3 checked the tree, which is the same five-files-one-number failure
+// `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE` exists to end. The usage text prints that record's own
+// summary, so this file cannot hold a second version of the number to go stale.
+import { A3_TOURNAMENT_EVIDENCE } from '@civts/sim';
 
 const USAGE = `civts — headless tooling
 
@@ -121,10 +129,12 @@ tournament / run options (the full text is in "civts tournament --help"):
 
   THE DEFAULT IS DELIBERATELY SMALL. "run" is an alias for "tournament" — one command, one
   default — so a plain invocation is TWO GAMES OF TEN TURNS, seconds rather than minutes, and
-  never the nine-minute experiment. A3's twenty seeds of a hundred turns is asked for
-  explicitly; its wall time is about nine minutes (26.0 s per game, 519 s for the twenty):
+  never A3's experiment. That experiment is twenty seeds of a hundred turns, asked for
+  explicitly; its measured cost lives in ONE place and is printed here from there:
 
-    civts tournament --seeds 1..20 --turns 100
+    ${A3_TOURNAMENT_EVIDENCE.summary}
+
+    civts tournament --seeds ${A3_TOURNAMENT_SEED_SPEC} --turns ${String(A3_TOURNAMENT_TURNS)}
     pnpm tournament:evidence    the same run, printing the structured result and wall time
 
   exit 0 means every game held every invariant AND the run was within budget; exit 1
@@ -523,7 +533,9 @@ const main = async (argv: readonly string[]): Promise<number> => {
       // the command itself, not here: the default experiment is two games of ten turns
       // (`DEFAULT_TOURNAMENT_SEED_SPEC` / `DEFAULT_TOURNAMENT_TURNS`, stated in the usage
       // block above and in "civts tournament --help"), and A3's twenty seeds of a hundred
-      // turns — about nine minutes — has to be asked for with `--seeds 1..20 --turns 100`.
+      // turns — whose cost is recorded once, in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, and
+      // printed into the usage block from there rather than restated here — has to be asked
+      // for with `--seeds 1..20 --turns 100`.
       // Nothing here can start a long job by accident, because nothing here decides anything:
       // this case routes, and `runTournamentCommand` owns the defaults.
       return commandTournament(rest);

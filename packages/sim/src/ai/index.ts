@@ -39,4 +39,16 @@ export {
 } from './weights.js';
 export type { SmartWeightGroup, SmartWeights, SmartWeightsPatch } from './weights.js';
 
-export { SMART_POLICY, SMART_POLICY_NAME, smartPolicy } from './smart.js';
+// A policy that cannot throw and cannot say it went wrong reports a game it did not play.
+// `plannerFailuresOf` and `describePlannerFailures` are how a runner or a CLI asks: they
+// work on any `Policy` (`[]` and `[]` for one that cannot report), so wiring them costs a
+// call and no knowledge of this module.
+
+export {
+  describePlannerFailures,
+  plannerFailuresOf,
+  SMART_POLICY,
+  SMART_POLICY_NAME,
+  smartPolicy,
+} from './smart.js';
+export type { DiagnosedPolicy, PlannerFailure, PlannerPhase, PolicyReport } from './smart.js';

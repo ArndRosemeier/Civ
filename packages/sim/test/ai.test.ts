@@ -84,7 +84,7 @@ import {
   type UnitTypeId,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
-import { FULL_TIER, canonicalize, createScenarioBuilder } from '@civts/testing';
+import { FULL_TIER, canonicalize, createScenarioBuilder, fnv1a64 } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -101,6 +101,20 @@ import {
   type PolicyContext,
   type SimulationResult,
 } from '@civts/sim';
+// The failure channel is read from the AI's own module, one import away from the surface: the
+// names are re-exported by `policies.ts`, `ai/index.ts` and now `index.ts` itself, and this
+// suite keeps the direct path because it is the module under test. **Where the channel is read
+// by something other than a test** is `@civts/headless`'s `sim-cli.ts`
+// (`plannerFailureWarning`, checked by `sim-cli.test.ts`): the CLI prints the record to stderr
+// for both the batch and the tournament, on the text and `--json` paths. That is the wiring
+// this suite cannot check from here, and it is why the comment that used to promise a
+// "failure-channel suite below" — which did not exist — now names the file that does.
+import {
+  describePlannerFailures,
+  plannerFailuresOf,
+  type PlannerFailure,
+  type PlannerPhase,
+} from '../src/ai/smart.js';
 
 /* ------------------------------------------------------------------ *
  * Fixtures
@@ -367,6 +381,188 @@ describe('M7 — the real AI is deterministic and cannot move the world', () => 
       for (const answer of answers) expect(answer).toEqual(answers[0]);
     }
   });
+
+  it('never reads the world RNG, whether or not the read changes a decision', () => {
+    // **(c) — the direct form, and E3 added it because (a) and (b) cannot catch every read.**
+    //
+    // The tests above hold the two properties that a read *usually* breaks: the world's
+    // trajectory is unchanged, and the answer does not depend on the stream the runner hands
+    // over. Both are properties of a policy's *effect*, and a policy can read `state.rng` and
+    // still satisfy both — E3 measured exactly that. A mutation that consumed the world's
+    // stream on every turn and folded the draw into a comparison that came out the same way
+    // every time passed the whole of this file, full tier included, while breaking the rule
+    // M7 states in the first person: the AI must never draw from `state.rng`, because the
+    // point is that the AI cannot *change* the world's stream, and a read is the step before
+    // a write.
+    //
+    // So the state handed to the policy carries a **sentinel** world stream: an accessor that
+    // answers with words no real stream has. Two things follow, and between them they are the
+    // property:
+    //
+    //  * a planner that reads `state.rng` — for a cache key, for a tie-break, for anything —
+    //    reads the sentinel, so its decisions move and the command list differs from the one
+    //    the same state with its real stream produces. E3 checked this guard against exactly
+    //    that mutation before trusting it: a planner that drew from the world's stream on every
+    //    turn was caught here while the two tests above still passed;
+    //  * the count is *not* asserted to be zero, because it cannot be. `attempt` folds each
+    //    candidate through the engine's own `applyCommand`, and combat reads `state.rng` when it
+    //    resolves a battle (measured: one read for a turn's four commands, the read being the
+    //    CombatResolved path). That read is the engine's, on a state the AI merely carries —
+    //    forbidding it would be forbidding the AI to ask the engine whether an attack is legal.
+    const started = newGame(11, SETTINGS, RULESET);
+    if (!started.ok) throw new Error('newGame refused');
+    const real = started.value;
+
+    // **Every read of the world's stream, counted.** The accessor is on the state the AI is
+    // handed, and the AI reaches the stream only through it — so a read by the planner, by a
+    // cache key, by anything in the decision path, lands here as a number.
+    let reads = 0;
+    const watched = { ...real };
+    Object.defineProperty(watched, 'rng', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        reads += 1;
+        return real.rng;
+      },
+    });
+
+    const commands = SMART_POLICY.chooseCommands(ctxFor(watched, asPlayerId(0)));
+    const commandsAgain = SMART_POLICY.chooseCommands(ctxFor(real, asPlayerId(0)));
+    // More than one, so the engine's single read is not merely "the first fold": the assertion
+    // below is about a policy that decided several things while touching the world's stream
+    // exactly once — and about a mutation that touches it once more.
+    expect(commands.length).toBeGreaterThan(1);
+    // The decisions are the same ones the real stream produces — so nothing in the decision
+    // path has been fed the world's stream in a way that reached an answer.
+    expect(commands).toEqual(commandsAgain);
+
+    // And the reads are **the engine's, not the planner's**, which is one read in total and not
+    // one per command: the planner starts holding the state it was given, folds its first
+    // candidate through `applyCommand`, and every fold after that is on a state the *engine*
+    // built (`attempt` rebinds `state` to the outcome). `applyCommand` reads `state.rng` once
+    // per call — at its top, not inside the attack branch, so a `FoundCity` reads it too — and
+    // that single read is the whole count on a clean build. Measured (E3): 1.
+    //
+    // So one is the honest ceiling, and a second read is the planner holding a stream it is
+    // forbidden to hold. This is the assertion the two above cannot make: they ask whether a
+    // read *changed an answer*, and a read that does not change one — a cache key, a dead
+    // branch — is exactly the case E3 measured passing this whole file, full tier included.
+    expect(
+      reads,
+      'the AI read the world RNG more often than the engine did while applying its commands — ' +
+        'the planner is touching `state.rng`, which M7 forbids, so that changing the AI cannot ' +
+        'change the world',
+    ).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 1b. The planner got cheap without moving a decision
+ * ------------------------------------------------------------------ */
+
+/**
+ * The **whole command sequence** of a game, one line per command, as `canonicalize` spells
+ * it: `t{turn} p{player} {Type} {json}`.
+ *
+ * This is the strong form of "the same decisions". A final hash proves two games *ended* in
+ * the same place; the sequence proves every decision on the way there was the same one, and
+ * a planner that moved one tie-break deep inside can leave a thirty-turn game's final state
+ * identical while being a different AI. It is the measurement a caching change has to be
+ * held to, because a cache *is* a claim — "the answer I skipped would have been the same
+ * one" — and that is the shape of claim that holds until it does not.
+ *
+ * The driver is deliberately the same shape as `drive` above and as `runSimulation`: poll
+ * each civilization in player order, fold every command through the real `applyCommand`,
+ * advance the real turn. A refusal throws here rather than being counted, because a trail
+ * that needs a refused command to line up is not a trail two builds can be compared on.
+ */
+const commandTrail = (seed: number, turns: number, policy: Policy): readonly string[] => {
+  const started = newGame(seed, SETTINGS, RULESET);
+  if (!started.ok) throw new Error(`newGame refused seed ${String(seed)}`);
+  let state = started.value;
+  const trail: string[] = [];
+  for (let turn = 0; turn < turns; turn += 1) {
+    for (const player of state.players) {
+      if (player.kind !== 'civ') continue;
+      const ctx = ctxFor(state, player.id, policyRngFor(seed, player.id, state.turn));
+      for (const command of policy.chooseCommands(ctx)) {
+        trail.push(
+          `t${String(state.turn)} p${String(Number(player.id))} ${command.type} ${canonicalize(command)}`,
+        );
+        if (command.type === 'EndTurn') continue;
+        const outcome = applyCommand(state, player.id, command, RULESET);
+        if (!outcome.ok) throw new Error(`${command.type} refused: ${outcome.error.kind}`);
+        state = outcome.value.state;
+      }
+    }
+    state = advanceTurn(state, RULESET).state;
+  }
+  return trail;
+};
+
+describe('M7b — the planner got cheap without moving a decision', () => {
+  /**
+   * Seed 3, thirty turns, both civilizations: **607 commands**, in this order, none refused.
+   *
+   * The count, the digest and the twelve lines below were all taken from the
+   * **pre-optimisation** build (`8e9ea21`, checked out in a worktree of its own) with this
+   * exact driver, and the two builds were then compared line by line: 1 379 lines over seeds
+   * 2 and 3, byte-for-byte identical. The optimised build is measurably about five times
+   * faster on this shape of game; what this test says is that it is not one decision
+   * different.
+   *
+   * If it fails, the fix is **not** to re-pin the digest. The digest is what turns "this
+   * refactor changed the AI" from something nobody notices into a deliberate act with a
+   * diff — find the decision that moved, and decide there whether it should have.
+   */
+  it('proposes the same sequence of commands on seed 3, turn for turn', () => {
+    const trail = commandTrail(3, 30, smartPolicy());
+    expect(trail.length).toBe(607);
+    expect(fnv1a64(trail.join('\n'))).toBe('91f3c655297e0fcb');
+    // The head of it verbatim, so a failure reports *what* moved rather than only that
+    // something did: a digest can only ever say "somewhere in these 607 commands".
+    expect(trail.slice(0, 12)).toEqual([
+      't1 p0 SetResearch {"tech":"ceremonial-burial","type":"SetResearch"}',
+      't1 p0 SetRates {"rates":{"luxury":0,"science":10,"tax":0},"type":"SetRates"}',
+      't1 p0 FoundCity {"type":"FoundCity","unitId":0}',
+      't1 p0 StartWork {"kind":"irrigation","type":"StartWork","unitId":1}',
+      't1 p1 SetResearch {"tech":"ceremonial-burial","type":"SetResearch"}',
+      't1 p1 SetRates {"rates":{"luxury":0,"science":10,"tax":0},"type":"SetRates"}',
+      't1 p1 FoundCity {"type":"FoundCity","unitId":2}',
+      't1 p1 StartWork {"kind":"irrigation","type":"StartWork","unitId":3}',
+      't2 p0 SetProduction {"cityId":0,"item":{"id":"galley","kind":"unit"},"type":"SetProduction"}',
+      't2 p1 SetProduction {"cityId":1,"item":{"id":"galley","kind":"unit"},"type":"SetProduction"}',
+      't3 p0 SetWorkedTiles {"cityId":0,"tiles":[684],"type":"SetWorkedTiles"}',
+      't3 p0 SetProduction {"cityId":0,"item":{"id":"settler","kind":"unit"},"type":"SetProduction"}',
+    ]);
+  });
+
+  // Full tier: four hundred-turn games, measured at about 15 s with vitest's per-file
+  // reporter. The long horizon is where the caching shows up and where a cache that
+  // outlived the board it describes would first show a difference, so the end state is
+  // pinned too — and those four hashes are the same four the pre-optimisation build
+  // produced (`8e9ea21`), which is also what the seed-by-seed replay compared.
+  it.skipIf(!FULL_TIER)('ends a hundred-turn game on the hash the old build ended on', () => {
+    const pins: readonly (readonly [number, string])[] = [
+      [1, '49118125b0f5d85e'],
+      [2, 'ce0274371db9c4c7'],
+      [3, '8078a1d07995d486'],
+      [6, '8947e9f3488fd0ef'],
+    ];
+    const report: string[] = [];
+    for (const [seed, pinned] of pins) {
+      const result = runSimulation({
+        seed,
+        settings: SETTINGS,
+        ruleset: RULESET,
+        policies: [smartPolicy(), smartPolicy()],
+        maxTurns: 100,
+      });
+      report.push(`seed ${String(seed)}: ${result.finalHash} (pinned ${pinned})`);
+      expect(result.finalHash, report.join('\n')).toBe(pinned);
+    }
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -433,6 +629,163 @@ describe('M7 — the real AI is total: it never throws and never proposes the il
     const commands = SMART_POLICY.chooseCommands(ctxFor(walled, asPlayerId(0)));
     expect(Array.isArray(commands)).toBe(true);
     expect(refusalCount(walled, asPlayerId(0), commands)).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 2b. A thrown planner error is a value, not a silence
+ * ------------------------------------------------------------------ */
+
+/**
+ * **A board the engine would never make: one whose goody-hut list cannot be read.**
+ *
+ * The fault is injected deliberately, and as a throwing accessor rather than as a corrupt
+ * value, for one reason: a policy that swallows a throw and returns fewer commands produces
+ * a turn that looks exactly like a turn in which the AI had nothing to say. Nothing
+ * downstream can tell those apart — not the final hash, not the metrics, not the invariant
+ * checks — which is why the failure has to be a thing the policy *says*, and why this suite
+ * has to be able to make it happen on purpose.
+ *
+ * This is a good fault to inject because it fires **late**: the hut list is read by the
+ * settler and explorer rankers, so the city, research and rate passes have already decided
+ * their commands by the time it throws. That is what "the turn is still a turn" can be
+ * measured on.
+ */
+const withUnreadableHuts = (state: GameState): GameState => ({
+  ...state,
+  map: {
+    ...state.map,
+    get huts(): never {
+      throw new Error('the hut list is unreadable');
+    },
+  },
+});
+
+/** The same idea in the **first** pass: the board itself cannot be read at all. */
+const withUnreadableMap = (state: GameState): GameState => ({
+  ...state,
+  get map(): never {
+    throw new Error('the board is unreadable');
+  },
+});
+
+describe('M7b — a thrown planner error comes back typed instead of vanishing', () => {
+  it('records nothing at all while it plays a real game', () => {
+    // The control for every other test here: a healthy policy must be silent, or "it
+    // recorded a failure" says nothing about the run it recorded it in. Two civilizations,
+    // eight turns, through the real applier — the same driver the legality section uses.
+    const policy = smartPolicy();
+    const ran = drive(3, [policy, policy], 8);
+    expect(ran.refusals).toEqual([]);
+    expect(ran.proposed).toBeGreaterThan(10);
+    expect(plannerFailuresOf(policy)).toEqual([]);
+    expect(policy.report().failureCount).toBe(0);
+
+    // The singleton every other test in this file plays with, for the same reason: if it
+    // had ever failed, the games those tests called healthy were not.
+    expect(plannerFailuresOf(SMART_POLICY)).toEqual([]);
+  });
+
+  it('keeps the turn a turn, and names the pass the throw came from', () => {
+    const started = newGame(23, SETTINGS, RULESET);
+    if (!started.ok) throw new Error('newGame refused');
+    let state = started.value;
+    for (let turn = 0; turn < 6; turn += 1) state = advanceTurn(state, RULESET).state;
+
+    const broken = withUnreadableHuts(state);
+    const playerId = asPlayerId(0);
+    const policy = smartPolicy();
+    // The whole point: **no throw escapes**, and the caller still gets a command list.
+    const commands = policy.chooseCommands(ctxFor(broken, playerId));
+
+    const failures = plannerFailuresOf(policy);
+    expect(failures.length).toBe(1);
+    const failure = failures[0];
+    if (failure === undefined) throw new Error('the failure was not recorded');
+    expect(failure.policy).toBe(SMART_POLICY_NAME);
+    expect(failure.playerId).toBe(Number(playerId));
+    expect(failure.turn).toBe(state.turn);
+    // Where, exactly: the pass and the thing being planned when it threw. This is the part
+    // that turns "the AI failed on turn 7" into something a person can act on.
+    expect(failure.phase).toBe('units');
+    expect(failure.detail).toContain('unit ');
+    expect(failure.error).toContain('the hut list is unreadable');
+
+    // The commands decided **before** the failure are still returned — a partial turn, and
+    // every one of them legal. A policy that answered a fault with `[]` would end the game
+    // (`no-commands`) instead of losing the rest of one turn.
+    expect(commands.length).toBeGreaterThan(0);
+    expect(refusalCount(broken, playerId, commands)).toBe(0);
+
+    // And the printable form says the same things, because a record nobody can read is only
+    // marginally better than no record.
+    const lines = describePlannerFailures(policy);
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain(SMART_POLICY_NAME);
+    expect(lines[0]).toContain(`turn ${String(state.turn)}`);
+    expect(lines[0]).toContain('the hut list is unreadable');
+  });
+
+  it('survives a fault in the first pass, with the phase it happened in', () => {
+    const started = newGame(23, SETTINGS, RULESET);
+    if (!started.ok) throw new Error('newGame refused');
+    const broken = withUnreadableMap(started.value);
+    const playerId = asPlayerId(0);
+    const policy = smartPolicy();
+
+    const commands = policy.chooseCommands(ctxFor(broken, playerId));
+    // Nothing was decidable from a board that cannot be read, so the list is empty — and it
+    // is still a *list*, still legal, and the reason it is empty is recorded rather than
+    // inferred.
+    expect(Array.isArray(commands)).toBe(true);
+    expect(refusalCount(broken, playerId, commands)).toBe(0);
+
+    const failure = plannerFailuresOf(policy)[0];
+    if (failure === undefined) throw new Error('the failure was not recorded');
+    const phases: readonly PlannerPhase[] = ['assembly', 'cities', 'research', 'rates', 'units'];
+    expect(phases).toContain(failure.phase);
+    expect(failure.error).toContain('the board is unreadable');
+  });
+
+  it('keeps the first failure of each pass, counts the rest, and hands out copies', () => {
+    // A policy that has started throwing usually throws on **every** turn: twenty seeds of a
+    // hundred turns would store twenty thousand identical records that say nothing the first
+    // one did not, and a cap chosen to hold them would itself be a magnitude. What a reader
+    // needs is *which passes* have failed and how often — bounded by the passes rather than
+    // by a number somebody picked — and `failureCount` is what stops the short list being
+    // mistaken for the whole story.
+    const started = newGame(23, SETTINGS, RULESET);
+    if (!started.ok) throw new Error('newGame refused');
+    const broken = withUnreadableMap(started.value);
+    const policy = smartPolicy();
+    const attempts = 8;
+
+    for (let call = 0; call < attempts; call += 1) {
+      policy.chooseCommands(ctxFor(broken, asPlayerId(0)));
+    }
+
+    const report = policy.report();
+    expect(report.failureCount).toBe(attempts);
+    expect(report.failures.length).toBe(1);
+    // A copy per call, so a reporter cannot watch the list change under it or append to it.
+    expect(plannerFailuresOf(policy)).not.toBe(plannerFailuresOf(policy));
+  });
+
+  it('answers for a policy that cannot report, so a reporter needs no branch', () => {
+    expect(plannerFailuresOf(DO_NOTHING_POLICY)).toEqual([]);
+    expect(describePlannerFailures(DO_NOTHING_POLICY)).toEqual([]);
+    // And the record type is what the runner would read: flat, and JSON-round-trippable —
+    // the same shape rule `Violation` follows, for the same reason (evidence has to survive
+    // being written to a file and read back by another process).
+    const failure: PlannerFailure = {
+      policy: SMART_POLICY_NAME,
+      turn: 1,
+      playerId: 0,
+      phase: 'units',
+      detail: 'unit 0 (settler)',
+      error: 'TypeError: x',
+    };
+    expect(JSON.parse(JSON.stringify(failure))).toEqual(failure);
   });
 });
 
@@ -1468,7 +1821,13 @@ it('attacks exactly when the exact rational model clears the floor, not when its
  *
  * So the answer to M7's walls question is neither "the knob does nothing" nor "the sweep is
  * broken": the knob works, and it is exercised exactly where a walled city is attacked, which
- * this AI does not reach inside 60 turns of a `duel` map (0 of 116 battles in that report).
+ * this AI does not reach inside 60 turns of a `duel` map — the sweep reports **0 of 232**
+ * battles at a walled city under `--policy smart` (measured 2026-09-12, `--seeds 1..3 --turns
+ * 60`: 58 battles per value summed over the four values, and the five cities it takes are all
+ * undefended, so no odds are computed for them at all). That number is a **timestamp on the
+ * AI's capability, not a constant**: it moves whenever the AI learns to reach a garrisoned,
+ * walled city, and the sentence to re-read beside it is the sweep's own EXPOSURE block, which
+ * prints the count rather than claiming it here.
  * Measurement, not knob — and here is the measurement that says so.
  */
 it('moves the AI\u2019s own battle maths and its decision when the walls knob moves', () => {

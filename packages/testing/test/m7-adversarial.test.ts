@@ -74,9 +74,12 @@
  *    count and budget verdict are reported (full tier). The alpha-scale *CLI* run at A3's own
  *    size (twenty seeds, a hundred turns — asked for with `--seeds 1..20 --turns 100`, since
  *    M7b made the CLI's plain default a two-game smoke run; see `scripts/tournament-evidence.ts`)
- *    was measured outside the suite on an idle machine:
- *    527.3 s wall, 26.4 s per game, zero violations, within its fifteen-minute budget — and
- *    **3.4× the per-game time its own comment documents**, which is FINDING E.
+ *    was measured outside the suite, and its figures are kept in **one** place: the exported
+ *    `A3_TOURNAMENT_EVIDENCE` record in `@civts/sim`'s `tournament.ts`, which this file imports
+ *    and section 8's second test validates. The measurement that raised FINDING E (*"3.4× the
+ *    per-game time its own comment documents"*) is the reason that record exists: the same figure
+ *    had been copied into five files, went stale in all five when the AI got slower, and was
+ *    re-recorded once instead of five times.
  *
  * 9. **MUTATION-CHECK THE GATE.** Both mutations were run against the shipped `smart.ts` and
  *    both were watched: the illegal-command mutant turned this file's refusal counter and
@@ -143,23 +146,22 @@
  * section 3 proves the property properly, and section 3d prints the author-style probe's blind
  * spot beside this file's, so the gap is visible in the log rather than merely described.
  *
- * **FINDING E — the tournament's own runtime figure is stale by a factor of 3.4.** The
+ * **FINDING E — the tournament's own runtime figure is stale.** The
  * experiment this measures is A3's — twenty seeds of a hundred turns, which was the CLI's
  * default when this review ran and is now asked for with `--seeds 1..20 --turns 100` (M7b;
  * `scripts/tournament-evidence.ts` is the reproducible home for it) — and `tournament.ts`
- * (lines 293-294) records it as *"about 7.7 s per game on an idle machine, so ~2.6 minutes for
- * the twenty"*. **M7b corrected that figure to this measurement**: 527.3 s wall, 26.4 s per
- * game, 8.8 minutes for the twenty, with the run and the command that reproduces it named in
- * the module's comment.
- * Measured on an idle machine at this commit: **527.3 s wall, 26.4 s per game, 8.8 minutes for
- * the twenty.** The bound it is compared against (fifteen minutes) still holds with 6.2 minutes
- * of headroom, the run reported its own time to 0.1 % of an external wall clock, and it exited 0
- * within budget — so nothing about the *behaviour* is wrong, and this is exactly the honesty
- * section 6 asserts. What is stale is the arithmetic, and the same sentence's "up to four times
- * that when the machine was shared" would, at the measured rate, put a shared machine past the
- * bound rather than comfortably inside it. A bound calibrated to a number 3.4× too small is a
- * bound that will be tripped by machines the comment promises it will not be tripped by — and the
- * reason the number is 3.4× too small is FINDING F below.
+ * (lines 293-294) recorded it as *"about 7.7 s per game on an idle machine, so ~2.6 minutes for
+ * the twenty"* when this review measured 527.3 s wall / 26.4 s per game / 8.8 minutes for the
+ * twenty: **3.4× stale**, with the run itself reporting its time honestly to 0.1 % of an
+ * external clock and exiting 0.
+ *
+ * **The finding's sequel is the one worth keeping.** M7b corrected that arithmetic in the
+ * module comment — and then the AI got smarter and 1.66× slower, and the same figure was stale
+ * again, in five files at once, all of which had copied it by hand. So the wave that follows
+ * fixed the *class* rather than the instances: the measured cost, the bound and the headroom
+ * now live in one exported value, `A3_TOURNAMENT_EVIDENCE`, which this file imports — see
+ * section 8, whose guard test fails if any of those sites starts restating a figure again.
+ * Nothing about the *behaviour* was ever wrong, which is what FINDING F below is about.
  *
  * **FINDING F — the AI's city target is a rank demotion, not a cap, and it expands without
  * bound.** `weights.ts:368-375` says the AI *"builds settlers to reach `settlement.targetCities`
@@ -185,7 +187,9 @@
  *   advantage.
  *
  * Consequences, in order of how much they matter: those games cost 20-40× a capped game (seed 8
- * took 170 s of the 527 s alpha run, against 3-9 s for a normal 100-turn game), which is the root
+ * took 170 s of the 527 s alpha run, against 3-9 s for a normal 100-turn game — figures from the
+ * M7-wave run, quoted here as the *shape* of the cost; the current cost of the whole experiment
+ * is in `A3_TOURNAMENT_EVIDENCE`), which is the root
  * cause of FINDING E; the AI's own documented weight semantics are not achieved at any horizon
  * longer than about twenty turns; and a tournament's per-seat aggregates are dominated by
  * whichever seat happened to run away. None of it breaks an invariant, an engine rule or a
@@ -204,7 +208,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -235,6 +239,7 @@ import { FULL_TIER, canonicalize, hashValue } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
 
 import {
+  A3_TOURNAMENT_EVIDENCE,
   CORE_INVARIANTS,
   DEFAULT_TOURNAMENT_BUDGET_MS,
   DO_NOTHING_POLICY,
@@ -1872,51 +1877,44 @@ describe('8. the tournament at the size alpha names', () => {
   it.skipIf(!FULL_TIER)('plays twenty seeds and reports wall time, invariants and budget', () => {
     // **The alpha-scale CLI run, measured outside this suite** (it is twenty seeds at a hundred
     // turns, and running that inside the gate would spend the gate's own budget measuring it;
-    // M7b then took that size off the CLI's default and made it explicit), on an otherwise idle
-    // machine at this commit. The command line, corrected for M7b — the old `tournament --json`
-    // with no flags now runs the two-game smoke default, so a reader copying it would no longer
-    // reproduce these numbers:
+    // M7b then took that size off the CLI's default and made it explicit). The command line,
+    // corrected for M7b — the old `tournament --json` with no flags now runs the two-game smoke
+    // default, so a reader copying it would no longer reproduce these numbers:
     //
     //   npx tsx packages/headless/src/cli.ts tournament --seeds 1..20 --turns 100 --json
     //   pnpm tournament:evidence        # the same run, plus the wall time and the two-clock check
     //
-    //   seeds 1..20, 100 turns, tiny, 2 civs, seats [smart, smart]
-    //   wall 527.3 s externally bracketed          = 26.4 s per game
-    //   elapsedMs reported by the run: 526_830.6   (agreement with the external clock: 0.1 %)
-    //   20 games, all 100 turns, stoppedBecause "max-turns", twenty distinct final hashes
-    //   violations: 0 — verdict accepted, exit code 0, budgetMs 900_000, overByMs 0
+    // **The figures this run produces are NOT written here.** They live in exactly one place —
+    // `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, imported by this file — together with the
+    // wall time, the harness's own reading, the twenty per-game final hashes, the 1800 s budget
+    // and the headroom between the two, plus the timestamp and load average the measurement was
+    // taken under. Every site that used to restate them (this comment, `tournament.ts`,
+    // `tier.ts`, `vitest.config.ts`, the CLI's `--help`, the evidence script) now references that
+    // record instead, and the test below this one checks that they still do.
     //
-    // **FINDING E, and it is a documentation finding, not a behaviour one.**
-    // `tournament.ts` (lines 293-294) records the same experiment as *"about 7.7 s per game on
-    // an idle machine, so ~2.6 minutes for the twenty"*. Measured here: **26.4 s per game,
-    // 8.8 minutes for the twenty — 3.4× the documented figure.** M7b fixed that arithmetic:
-    // the module comment now carries this measurement, names the command that reproduces it and
-    // says which budget is sized for it. The bound still holds on this
-    // machine (8.8 of 15 minutes, 6.2 minutes of headroom), and the run *reported* its own time
-    // honestly, which is the property section 6 asserts. What did not hold was the arithmetic in
-    // the comment: at the documented "up to four times that when the machine was shared", a
-    // shared machine would be expected to finish in ~35 minutes, where the same 3.4× puts it at
-    // over 15 and the run would be reported over budget. Both statements came from the same
-    // sentence, and the same failure sat one file over: `tournament.test.ts` ran these twenty
-    // seeds at sixty turns and documented it as *"~100 s on an idle machine"*, which M7b
-    // measured at **417 s** — 4.2×, and 85 % of the entire full tier's wall time. M7b shrank
-    // that test to a four-seed smoke run and moved the twenty-seed experiment here and into
-    // `pnpm tournament:evidence`, so the number a reader relies on is now the measured one.
+    // Why that matters, as this file's own history: FINDING E was raised against `tournament.ts`
+    // claiming *"about 7.7 s per game on an idle machine, so ~2.6 minutes for the twenty"* when
+    // the measured figure was 26.4 s per game / 8.8 minutes for the twenty — **3.4× stale**. M7b
+    // corrected it to 519.4 s / 26.0 s per game. Then the AI got smarter and **1.66× slower**,
+    // and the same figure was stale again — in *five* files at once, all of which had copied it
+    // — with the run measuring 861.8 s = 43.09 s per game against the then-900 s bound: 4.2 % of
+    // headroom, and a second run that went 503 ms over budget on a busy box and exited 3. The
+    // conclusion was structural rather than arithmetic: a number copied into five files goes
+    // stale five times, so the number now has one home and the budget is a stated decision
+    // (1800 s, recorded in `tournament.ts` with its reasoning) rather than a value tuned to fit
+    // whichever machine last ran the thing.
     //
-    // M7b re-measured this run independently, through the new evidence script, on a quiet
-    // machine: **519.4 s wall, 26.0 s per game, 0.01 % two-clock agreement, 0 violations,
-    // exit 0** — 1.6 % from the figures above, which is the agreement two independent
-    // measurements of the same twenty games should show, and the reason the module comment's
-    // corrected arithmetic is the number to trust.
-    //
-    // The five hashes this review reproduced independently of the CLI — `runSimulation` on the
-    // same seeds and settings — match the report's `games[i].finalHash` exactly for seeds 1-5
-    // (`652dd0f2cdf089ab`, `fb62f0bd4b49976d`, `8078a1d07995d486`, `91277eeda33641ee`,
-    // `f6ba8b355de76ab5`), which is what makes the timing comparison a comparison of the same
-    // games rather than of two similar-looking ones.
+    // The five hashes below were re-recorded from the shipped code with the rest of the record —
+    // `A3_TOURNAMENT_EVIDENCE.games` carries all twenty. They are a **timestamp, not a
+    // guarantee**: they match the `runSimulation` driver on the same seeds only while the AI and
+    // the catalog are unchanged, so a mismatch after an AI edit means the record is stale (fix:
+    // re-run `pnpm tournament:evidence` and re-record), not that anything regressed. What is
+    // pinned *as a property* is that the driver and the tournament agree on the same seed — which
+    // section 3 asserts against live output, at a horizon the gate can afford, rather than
+    // against a stored hash.
     //
     // What the suite asserts here is the same twenty seeds at a horizon the gate can afford,
-    // plus the CLI wiring check in section 5.
+    // plus the CLI wiring check in section 5, plus the one-record guard below.
     const result = twentySeedTournament();
     const invariants = CORE_INVARIANTS.length;
     console.log(
@@ -1935,6 +1933,190 @@ describe('8. the tournament at the size alpha names', () => {
     // And the count of checks really was the product above: every invariant, every turn, every
     // game — the in-flight property the standing requirement asks for.
     expect(invariants * result.games.length * BIG_TOURNAMENT_TURNS).toBeGreaterThan(5_000);
+  });
+
+  it('keeps the recorded figures in ONE place, and fails when a site starts restating one', () => {
+    // **This is the class fix, checked rather than asserted.** The tournament's cost was
+    // recorded independently in five files and all five went stale by 1.66× at once, because a
+    // number copied by hand goes stale once per copy. The record is `A3_TOURNAMENT_EVIDENCE`,
+    // and this test holds two ends of it:
+    //
+    //  (1) the record is internally consistent and current — every derived figure is computed
+    //      from the raw measurement (so a summary cannot disagree with its own detail), it
+    //      describes A3's actual experiment shape, it was measured against the bound the code
+    //      enforces, and it carries the provenance a timing needs (when, and under what load);
+    //  (2) every site that used to restate the figure *names the record* and states no cost of
+    //      its own — scanned in the shipped bytes, not in a copy this test keeps.
+    //
+    // The second half is a text scan on purpose. A type cannot prevent a comment from quoting a
+    // number, and a comment is exactly where all five copies lived.
+    expect(A3_TOURNAMENT_EVIDENCE.budgetMs).toBe(DEFAULT_TOURNAMENT_BUDGET_MS);
+    expect(A3_TOURNAMENT_EVIDENCE.games.length).toBe(A3_TOURNAMENT_EVIDENCE.seeds.length);
+    expect(A3_TOURNAMENT_EVIDENCE.seeds).toEqual([...A3_SEEDS]);
+    expect(A3_TOURNAMENT_EVIDENCE.turns).toBe(100);
+    expect(A3_TOURNAMENT_EVIDENCE.violations).toBe(0);
+    // Derived, not typed: recomputing them from the raw measurement must give the stored value.
+    const games = A3_TOURNAMENT_EVIDENCE.games.length;
+    expect(A3_TOURNAMENT_EVIDENCE.perGameMs).toBeCloseTo(A3_TOURNAMENT_EVIDENCE.wallMs / games, 9);
+    expect(A3_TOURNAMENT_EVIDENCE.headroomMs).toBe(
+      A3_TOURNAMENT_EVIDENCE.budgetMs - A3_TOURNAMENT_EVIDENCE.wallMs,
+    );
+    expect(A3_TOURNAMENT_EVIDENCE.headroomPct).toBeCloseTo(
+      (A3_TOURNAMENT_EVIDENCE.headroomMs / A3_TOURNAMENT_EVIDENCE.budgetMs) * 100,
+      9,
+    );
+    // The margin the 1800 s decision was made for: not 4.2 %, and not negative. A record whose
+    // run overran its own bound is a record somebody has to re-measure or re-decide.
+    expect(A3_TOURNAMENT_EVIDENCE.headroomPct).toBeGreaterThan(10);
+    // A timing without these is not evidence: it cannot be told from a stale figure. And the
+    // three clocks are three different numbers, each labelled: the call's own bracket, the
+    // harness's reading the verdict uses, and `time`'s end-to-end figure for the command. M7b's
+    // A5 failure was comparing one of them against a bound written for another.
+    expect(A3_TOURNAMENT_EVIDENCE.measuredAt).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} /);
+    expect(A3_TOURNAMENT_EVIDENCE.loadAverage).toMatch(/^\d+\.\d+/);
+    expect(A3_TOURNAMENT_EVIDENCE.commit).toMatch(/^[0-9a-f]{7}/);
+    expect(A3_TOURNAMENT_EVIDENCE.commandWallMs).toBeGreaterThanOrEqual(
+      A3_TOURNAMENT_EVIDENCE.wallMs,
+    );
+    expect(A3_TOURNAMENT_EVIDENCE.harnessElapsedMs).toBeGreaterThan(0);
+    // Twenty distinct games, so "the same games" is checkable: the hashes are the receipt.
+    const hashes = A3_TOURNAMENT_EVIDENCE.games.map((game) => game.finalHash);
+    for (const hash of hashes) expect(hash).toMatch(/^[0-9a-f]{16}$/);
+    expect(new Set(hashes).size).toBe(games);
+
+    // The scan, read from disk — and **recursive**, because the hand-written version of this
+    // check is exactly the failure it exists to prevent. It named four files while
+    // `packages/headless/src/cli.ts` still carried its own copy of the number — "about nine
+    // minutes (26.0 s per game, 519 s for the twenty)", printed into `civts --help` — in a file
+    // the list did not name, so the text scan never read it. A guard that only checks the sites
+    // somebody remembered guards against forgetting, not against not knowing.
+    //
+    // So every shipped source file is walked: `packages/**` and `scripts/**`, minus `test/`
+    // directories (a test may construct a figure on purpose, and a test's prose is not a
+    // document a reader relies on), plus the repo-root config a reader runs. What survives is a
+    // short allowlist, and every entry in it is a file that **explains what replaced** the old
+    // figure rather than one that quietly kept it.
+    const historyQuoters = new Set([
+      'packages/sim/src/tournament.ts', // the record's home: it names the superseded figures
+      'packages/testing/test/m7-adversarial.test.ts', // this review's narrative, dated
+    ]);
+    const root = fileURLToPath(new URL('../../../', import.meta.url));
+    const sourceFiles = (dir: string, out: string[] = []): string[] => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = `${dir}/${entry.name}`;
+        if (entry.isDirectory()) {
+          if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'test') {
+            continue;
+          }
+          sourceFiles(full, out);
+          continue;
+        }
+        if (entry.name.endsWith('.ts')) out.push(full);
+      }
+      return out;
+    };
+    const scanned: readonly string[] = [
+      ...sourceFiles(`${root}packages`),
+      ...sourceFiles(`${root}scripts`),
+      `${root}vitest.config.ts`,
+    ].map((path) => path.slice(root.length));
+
+    // The figures that used to be copied around, plus the prose each copy came wrapped in. Each
+    // one is a *claim about the tournament's cost*; none of them belongs in a site that has the
+    // record available, because a stale sentence is how a stale number gets re-published.
+    const restated = [
+      '519.4',
+      '527.3',
+      '861.8',
+      '43.09',
+      '26.0 s per game',
+      '26.4 s per game',
+      '7.7 s per game',
+      '2.6 minutes for the twenty',
+      '8.8 minutes for the twenty',
+      'nine minutes',
+      'fifteen-minute budget',
+    ];
+    // Non-vacuous: the walk has to have found the tree, or "no file restates the figure" is a
+    // statement about nothing.
+    expect(scanned.length, 'the source walk found no files').toBeGreaterThan(20);
+    expect(scanned).toContain('packages/headless/src/cli.ts');
+    expect(scanned).toContain('packages/sim/src/tournament.ts');
+    expect(scanned).toContain('vitest.config.ts');
+
+    for (const relative of scanned) {
+      if (historyQuoters.has(relative)) continue;
+      const text = readFileSync(`${root}${relative}`, 'utf8');
+      for (const figure of restated) {
+        expect(text, `${relative} restates the tournament cost "${figure}"`).not.toContain(figure);
+      }
+    }
+    // And every file allowed to quote history names the record, so a reader who lands on a
+    // superseded figure is one line away from the current one — the half of the rule a broken
+    // allowlist would quietly drop.
+    for (const quoter of historyQuoters) {
+      const text = readFileSync(`${root}${quoter}`, 'utf8');
+      expect(text, `${quoter} quotes history without naming the record`).toContain(
+        'A3_TOURNAMENT_EVIDENCE',
+      );
+    }
+    // The sites the hand-written list used to name are still held to the stronger rule: they
+    // must name the one record they take their figures from. `cli.ts` is here because it was the
+    // one that was missing — it carried a copy of the number into the usage text.
+    const sites: readonly { readonly file: string; readonly path: string }[] = [
+      { file: 'tier.ts', path: '../src/tier.ts' },
+      { file: 'sim-cli.ts', path: '../../headless/src/sim-cli.ts' },
+      { file: 'tournament-evidence.ts', path: '../../../scripts/tournament-evidence.ts' },
+      { file: 'vitest.config.ts', path: '../../../vitest.config.ts' },
+      { file: 'cli.ts', path: '../../headless/src/cli.ts' },
+    ];
+    for (const site of sites) {
+      const text = readFileSync(fileURLToPath(new URL(site.path, import.meta.url)), 'utf8');
+      expect(text, `${site.file} must name the one record it takes its figures from`).toContain(
+        'A3_TOURNAMENT_EVIDENCE',
+      );
+    }
+
+    // **The property the five recorded hashes used to illustrate, asserted live.** A stored
+    // hash cannot check this: it goes stale the moment the AI moves, which is exactly what
+    // happened to the five literals this test replaced (four of them no longer matched the
+    // shipped code, and nothing could tell that from a regression). Two computed values can:
+    // the tournament's per-game `finalHash` for a seed is the `runSimulation` hash for that same
+    // seed, settings and policies — so a timing taken through the CLI is a timing of the same
+    // games as the driver, which is what made the recorded timing a comparison of one experiment
+    // rather than of two similar-looking ones.
+    //
+    // Five seeds, three turns: the property is about *which games* are played, not about how
+    // long they are, and the fast tier is where this belongs. The record's own hashes stay in
+    // `A3_TOURNAMENT_EVIDENCE` as the timestamp they are.
+    const agreementSeeds = [1, 2, 3, 4, 5];
+    const agreementTurns = 3;
+    const agreeing = runTournament({
+      seeds: agreementSeeds,
+      settings: SETTINGS,
+      ruleset: RULESET,
+      policies: [SMART_POLICY, SMART_POLICY],
+      maxTurns: agreementTurns,
+    });
+    expect(agreeing.games.map((game) => game.seed)).toEqual(agreementSeeds);
+    for (const game of agreeing.games) {
+      const direct = runSimulation({
+        seed: game.seed,
+        settings: SETTINGS,
+        ruleset: RULESET,
+        policies: [SMART_POLICY, SMART_POLICY],
+        maxTurns: agreementTurns,
+      });
+      expect(
+        game.finalHash,
+        `seed ${String(game.seed)}: the tournament and the driver played different games`,
+      ).toBe(direct.finalHash);
+      expect(game.turnsPlayed).toBe(direct.turnsPlayed);
+    }
+    console.log(
+      `8. driver/tournament agreement over ${String(agreementSeeds.length)} seeds × ` +
+        `${String(agreementTurns)} turns: ${agreeing.games.map((game) => game.finalHash).join(' ')}`,
+    );
   });
 });
 

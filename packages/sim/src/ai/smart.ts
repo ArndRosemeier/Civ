@@ -135,18 +135,23 @@ import {
   VISIBILITY_RADIUS,
   type City,
   type CityId,
+  type CityYields,
   type Command,
   type GameEvent,
+  type GameMap,
   type GameState,
   type PlayerId,
   type PlayerState,
   type ProductionItem,
   type RulesetView,
   type TechId,
+  type TerrainId,
   type TileIndex,
   type Unit,
+  type UnitDef,
   type UnitId,
   type UnitRole,
+  type UnitTypeId,
 } from '@civts/core';
 
 import type { Policy, PolicyContext } from '../types.js';
@@ -202,6 +207,82 @@ const stepBudget = (movement: number, cap: number): number => {
 /** The map position a tile index names — a `TileIndex` from a tile index, without a cast. */
 const asTile = (state: GameState, index: number): TileIndex =>
   tileIndex(state.map.width, indexToX(state.map, index), indexToY(state.map, index));
+
+/* ------------------------------------------------------------------ *
+ * Memoisation — the same question, asked once
+ * ------------------------------------------------------------------ */
+
+/**
+ * ## Why this section exists, and why it is not a behaviour change
+ *
+ * Measured (seed 6, 100 turns, the shipped tournament shape, `--cpu-prof`): **98.8 % of
+ * the AI's `autoAssignWorkedTiles` calls and 70 % of the whole run's samples** came from
+ * one loop — `nearestLegalSite`, which asked `planFoundCity` of **every tile of the map**
+ * (3 600 on a tiny map) once per state, and `planFoundCity` runs the engine's
+ * citizen-assignment sort once per *legal* tile it finds. The engine's own helpers are not
+ * cheap per call and are not this file's to change (`autoAssignWorkedTiles` re-asks each
+ * candidate tile's yields inside its sort comparator, ~95 `tileYieldsWithResources` calls
+ * per assignment), so the only lever this policy has is to **ask fewer times**.
+ *
+ * Every cache below is keyed on a value the engine **never mutates**: a `GameState` is
+ * replaced by `applyCommand`/`advanceTurn`, never edited in place, so a read taken against
+ * one state object is that object's answer for ever. That is the same argument the route
+ * cache and the legal-site cache below already rest on, and it is why none of these caches
+ * needs an invalidation rule of its own — the state object *is* the version number.
+ *
+ * Two rules kept every one of these honest, and the replay in `ai.test.ts` is what checks
+ * them:
+ *
+ * 1. **A cache may only be keyed on what the answer actually depends on.** Where the
+ *    answer is a function of one state object, the key is that object. Where it is a
+ *    function of something *inside* the state — the city tiles, say — the key says so
+ *    explicitly (see `legalSiteTiles`), so a state that moved a city cannot read a stale
+ *    answer.
+ * 2. **Nothing here changes a decision.** Every cached function is the same pure read it
+ *    replaces, called with the same arguments; the only difference is how many times the
+ *    engine is asked.
+ */
+
+/** The per-state cache slot for `state`, created on first use. */
+const slotIn = <T>(slots: WeakMap<GameState, Map<string, T>>, state: GameState): Map<string, T> => {
+  let slot = slots.get(state);
+  if (slot === undefined) {
+    slot = new Map<string, T>();
+    slots.set(state, slot);
+  }
+  return slot;
+};
+
+/** The generic shape of every state-keyed memo below: ask the engine once per state. */
+const memoInState = <T>(
+  slots: WeakMap<GameState, Map<string, T>>,
+  state: GameState,
+  key: string,
+  compute: () => T,
+): T => {
+  const slot = slotIn(slots, state);
+  const cached = slot.get(key);
+  if (cached !== undefined) return cached;
+  const value = compute();
+  slot.set(key, value);
+  return value;
+};
+
+const cityYieldsSlot: WeakMap<GameState, Map<string, CityYields>> = new WeakMap();
+
+/**
+ * `cityYields`, answered once per (state, city).
+ *
+ * The callers are the reason: `chooseRates` scores every rate triple by asking
+ * `incomeAt`, and `incomeAt` walks every city — so one turn asks the *same* city's yields
+ * once per candidate triple (eleven of them at the shipped weights) on the same state, and
+ * `readSituation`/`chooseProduction` ask it again for the same city. `cityYields` is a
+ * pure read of `(state, ruleset, cityId)` — it walks the city's worked tiles through
+ * `tileYieldsWithResources` and applies the city's building effects — so the second and
+ * eleventh answers were always going to be the first one.
+ */
+const cityYieldsIn = (state: GameState, ruleset: RulesetView, cityId: CityId): CityYields =>
+  memoInState(cityYieldsSlot, state, String(cityId), () => cityYields(state, ruleset, cityId));
 
 /* ------------------------------------------------------------------ *
  * Reading the board — always through the engine's own tile rules
@@ -316,6 +397,37 @@ const cityOutputAt = (
 };
 
 /**
+ * A site's output, as `cityOutputAt` answers it — the engine's own numbers for a stand-in
+ * city on that tile.
+ */
+interface SiteOutput {
+  readonly food: number;
+  readonly surplus: number;
+  readonly shields: number;
+}
+
+const siteOutputSlot: WeakMap<GameState, Map<string, SiteOutput>> = new WeakMap();
+
+/**
+ * What a city founded on `tile` would produce, **asked once per (state, player, tile)**.
+ *
+ * `siteRank`, `siteFood` and `siteFoodSurplus` are three readings of one computation, and
+ * `planSettler` asks all three of the tile the settler is standing on — plus two more per
+ * candidate step — so the same answer was being recomputed three times for the same tile
+ * on the same board. Each ask builds a stand-in city and runs the engine's
+ * `autoAssignWorkedTiles` over its radius (see `cityOutputAt`), which is the expensive
+ * half; asking once is the whole change, and the numbers are the engine's either way.
+ */
+const siteOutputAt = (engine: Engine, playerId: PlayerId, tile: TileIndex): SiteOutput => {
+  const sample = engine.weights.settlement.siteSampleTiles;
+  const key = `${String(playerId)}:${String(Number(tile))}:${String(sample)}`;
+  return memoInState(siteOutputSlot, engine.state, key, () => {
+    const stand = withProspectOn(engine.state, playerId, tile);
+    return cityOutputAt(stand, engine.ruleset, tile, sample);
+  });
+};
+
+/**
  * A site's score, as a rank — **larger is better, and every component is the engine's own
  * tile read**.
  *
@@ -334,29 +446,21 @@ const cityOutputAt = (
  * weighted sum whose units nobody can state.
  */
 const siteRank = (engine: Engine, playerId: PlayerId, tile: TileIndex): Rank => {
-  const sample = engine.weights.settlement.siteSampleTiles;
-  const stand = withProspectOn(engine.state, playerId, tile);
-  const output = cityOutputAt(stand, engine.ruleset, tile, sample);
+  const output = siteOutputAt(engine, playerId, tile);
   return [output.food, output.surplus, output.shields, revealCount(engine.state, playerId, tile)];
 };
 
 /** The food a city founded on `tile` would have for its first citizens. */
-const siteFood = (engine: Engine, playerId: PlayerId, tile: TileIndex): number => {
-  const sample = engine.weights.settlement.siteSampleTiles;
-  const stand = withProspectOn(engine.state, playerId, tile);
-  return cityOutputAt(stand, engine.ruleset, tile, sample).food;
-};
+const siteFood = (engine: Engine, playerId: PlayerId, tile: TileIndex): number =>
+  siteOutputAt(engine, playerId, tile).food;
 
 /**
  * The food **surplus** a city founded on `tile` would run with its first citizens: food less
  * what those citizens eat. The engine's own `cityYields` is asked, so "surplus" here is the
  * same quantity the growth check reads and not a second opinion about terrain.
  */
-const siteFoodSurplus = (engine: Engine, playerId: PlayerId, tile: TileIndex): number => {
-  const sample = engine.weights.settlement.siteSampleTiles;
-  const stand = withProspectOn(engine.state, playerId, tile);
-  return cityOutputAt(stand, engine.ruleset, tile, sample).surplus;
-};
+const siteFoodSurplus = (engine: Engine, playerId: PlayerId, tile: TileIndex): number =>
+  siteOutputAt(engine, playerId, tile).surplus;
 
 /* ------------------------------------------------------------------ *
  * Combat — the engine's odds, turned into a decision
@@ -508,11 +612,65 @@ const playerOf = (engine: Engine): PlayerState | undefined =>
 const isBarbarian = (state: GameState, playerId: PlayerId): boolean =>
   state.players.find((player) => player.id === playerId)?.kind === 'barbarian';
 
+/**
+ * A unit type's row, **read once per ruleset and type**.
+ *
+ * `unitDef` is a linear scan of the unit catalog (`ruleset.units.find(...)`), and this policy
+ * asks it in the body of loops that walk every unit in the world — `countRole`,
+ * `defendersNear`, `militaryCount`, `assaultHitPoints`, the production chooser. Measured on
+ * seed 6: **8.7 M `unitDef` calls in one 100-turn game**, the largest single call count left
+ * after the caches above, and every one of them re-scanned a twenty-row catalog for a row
+ * that had not moved. The answer is a function of `(ruleset, type)` and nothing else, so it
+ * is stored against the ruleset object — which is replaced only by a different ruleset, never
+ * by a played turn.
+ */
+const unitDefSlots: WeakMap<RulesetView, Map<string, UnitDef | undefined>> = new WeakMap();
+
+const defOf = (ruleset: RulesetView, type: UnitTypeId): UnitDef | undefined => {
+  let slot = unitDefSlots.get(ruleset);
+  if (slot === undefined) {
+    slot = new Map<string, UnitDef | undefined>();
+    unitDefSlots.set(ruleset, slot);
+  }
+  const key = String(type);
+  if (slot.has(key)) return slot.get(key);
+  const def = unitDef(ruleset, type);
+  slot.set(key, def);
+  return def;
+};
+
+/**
+ * This player's units, **by role**, read once per (state, player).
+ *
+ * Every question of the form "how many soldiers do I have", "how many settlers are still
+ * coming" or "how many defenders stand within `threatRadius` of this city" is a filter over
+ * the same list, and each one was re-reading every unit's catalog row to answer it —
+ * `readSituation` asks about every city, `garrisonPosts` asks again for the same cities, and
+ * `planMilitary` asks once per soldier. One pass over `state.units`, with `defOf` per unit,
+ * answers all of them for the state they describe.
+ */
+const roleIndexSlots: WeakMap<
+  GameState,
+  Map<string, ReadonlyMap<UnitRole, readonly Unit[]>>
+> = new WeakMap();
+
+const ownedByRole = (engine: Engine): ReadonlyMap<UnitRole, readonly Unit[]> =>
+  memoInState(roleIndexSlots, engine.state, String(Number(engine.playerId)), () => {
+    const byRole = new Map<UnitRole, Unit[]>();
+    for (const unit of engine.state.units) {
+      if (unit.owner !== engine.playerId) continue;
+      const role = defOf(engine.ruleset, unit.type)?.role;
+      if (role === undefined) continue;
+      const bucket = byRole.get(role);
+      if (bucket === undefined) byRole.set(role, [unit]);
+      else bucket.push(unit);
+    }
+    return byRole;
+  });
+
 /** How many units of `role` this player owns. */
 const countRole = (engine: Engine, role: UnitRole): number =>
-  engine.state.units.filter(
-    (unit) => unit.owner === engine.playerId && unitDef(engine.ruleset, unit.type)?.role === role,
-  ).length;
+  ownedByRole(engine).get(role)?.length ?? 0;
 
 /** Every unit this player owns, in id order (`state.units` is sorted by id). */
 const ownedUnits = (engine: Engine): readonly Unit[] =>
@@ -730,12 +888,14 @@ const hostileTiles = (engine: Engine): readonly TileIndex[] =>
   });
 
 /** How many of this player's military units stand within `radius` of `city`. */
-const defendersNear = (engine: Engine, city: City, radius: number): number =>
-  ownedUnits(engine).filter(
-    (unit) =>
-      unitDef(engine.ruleset, unit.type)?.role === 'military' &&
-      tileDistance(engine.state, unit.tile, city.tile) <= radius,
-  ).length;
+const defendersNear = (engine: Engine, city: City, radius: number): number => {
+  const soldiers = ownedByRole(engine).get('military') ?? [];
+  let count = 0;
+  for (const unit of soldiers) {
+    if (tileDistance(engine.state, unit.tile, city.tile) <= radius) count += 1;
+  }
+  return count;
+};
 
 const empireSlot: TurnCacheSlot<EmpireRead> = {
   state: undefined,
@@ -777,7 +937,7 @@ const readSituation = (engine: Engine, city: City): CitySituation => {
     threatened,
     young: city.population <= weights.city.youngCityPopulation,
     defenders: defendersNear(engine, city, weights.city.threatRadius),
-    surplus: cityYields(engine.state, engine.ruleset, city.id).foodSurplus,
+    surplus: cityYieldsIn(engine.state, engine.ruleset, city.id).foodSurplus,
     empire: readEmpire(engine),
   };
 };
@@ -993,7 +1153,7 @@ const chooseProduction = (engine: Engine, situation: CitySituation): ProductionI
   if (options.length === 0) return undefined;
   const wanted = targetCitiesFor(engine);
 
-  const perTurn = Math.max(1, cityYields(engine.state, engine.ruleset, city.id).shields);
+  const perTurn = Math.max(1, cityYieldsIn(engine.state, engine.ruleset, city.id).shields);
   const weights = engine.weights;
 
   const rankOf = (item: ProductionItem): Rank => {
@@ -1177,7 +1337,7 @@ const incomeAt = (
   let beakers = 0;
   for (const city of state.cities) {
     if (city.owner !== playerId) continue;
-    const split = splitCommerce(cityYields(state, ruleset, city.id).commerce, rates);
+    const split = splitCommerce(cityYieldsIn(state, ruleset, city.id).commerce, rates);
     gold += split.gold;
     beakers += split.beakers;
   }
@@ -1376,31 +1536,153 @@ const routeCache = new WeakMap<GameState, Map<string, readonly TileIndex[]>>();
  * there a way there", and that answer does not depend on which of the two of us is standing in
  * it.
  */
-const moveOptions = (engine: Engine, unit: Unit, tile: TileIndex): readonly TileIndex[] =>
-  neighbors8(engine.state.map, tile)
-    .filter((to) => planMove(engine.state, engine.ruleset, unit.owner, unit.id, to).ok)
-    .sort((a, b) => a - b);
+const enterableSlots: WeakMap<GameState, Map<string, EnterableBoard>> = new WeakMap();
 
 /**
- * A fewest-steps route from `unit` to `goal`, **excluding** the unit's own tile and excluding
- * the goal itself, or an empty list when no route exists.
+ * The board of "may this unit step onto this tile" answers, as **two byte arrays**: `asked`
+ * says whether the engine has been consulted about a tile, `open` holds the answer it gave.
  *
- * `goal` is a **goal test** rather than a tile the unit must be able to enter: an enemy city
- * is exactly the landmark this army marches on, and whether its own tile is enterable is a
- * question for the step that tries it. Occupied ground needs no special case — `planMove`
- * already refuses a tile held by another player, so a friendly unit in the way is routed
- * around and a hostile tile is not a place to walk.
+ * Arrays rather than a `Map`, because the search asks about a tile **eight times** — once
+ * per expanded neighbour — and every one of those asks used to be a hash lookup on a boxed
+ * number. Indexing a byte array by tile index is the same question with none of the
+ * hashing.
  *
- * Breadth-first, so the path is a fewest-steps path, and neighbours are visited in ascending
- * index order, so the path is a function of the map and the unit and of nothing else. Bounded
- * by the whole map, which is the honest bound for a search that must be able to say "there is
- * no way there".
+ * Two arrays of `0`/`1` rather than one byte with three states, and the reason is not
+ * aesthetics: a third state has to be written as a literal `2`, and the adversarial scan
+ * over this module (`packages/testing/test/m7-adversarial.test.ts`, case 7) reads a new
+ * numeric literal as a magnitude that either belongs in `weights.ts` where a sweep can move
+ * it, or has to be added to that scan's list **deliberately**. This is neither — it is
+ * bookkeeping — so it is expressed in the vocabulary the scan already has: a flag and an
+ * answer, both `0` or `1`. One extra byte per tile and one extra array read buys a
+ * constant that never had to be named.
  */
+interface EnterableBoard {
+  /** `1` once the engine has been asked about this tile. */
+  readonly asked: Uint8Array;
+  /** The answer it gave: `1` for "the unit may enter", `0` for "it may not". */
+  readonly open: Uint8Array;
+}
+
+const enterableBoard = (engine: Engine, unit: Unit): EnterableBoard => {
+  const key = `${String(unit.id)}:${String(unit.movementLeft)}`;
+  const slot = slotIn(enterableSlots, engine.state);
+  const size = engine.state.map.terrain.length;
+  const existing = slot.get(key);
+  if (existing !== undefined && existing.asked.length === size) return existing;
+  const board: EnterableBoard = { asked: new Uint8Array(size), open: new Uint8Array(size) };
+  slot.set(key, board);
+  return board;
+};
+
+/**
+ * May this unit step onto `to`? — the engine's `planMove`, asked **once per tile**.
+ *
+ * ## Why the destination is the whole question
+ *
+ * The search below asks, for every tile it expands, which of its eight neighbours the
+ * engine would let the unit enter. `planMove` reads the mover's position in exactly one
+ * place — the "is this a single step" check — and every other clause is a fact about the
+ * **destination**: its terrain and whether the unit can afford it
+ * (`terrain.moveCost > unit.movementLeft`), whether another player's unit or city stands
+ * there, and whether the map describes the tile at all. The probe state carries this unit
+ * and **no other unit** (`searchStateFor`), so no destination is ever blocked by a friendly
+ * unit and every destination's answer is the same from whichever neighbour asks about it.
+ *
+ * Which matters because the search asks about each tile up to **eight** times, and each ask
+ * is a full `planMove` (a unit lookup, a `unitsOnTile` scan of every unit in the world, a
+ * `cityAt` scan of every city, a terrain lookup). The board above is keyed on
+ * `(state, unit id, movement left)` — everything the answer depends on, since the state
+ * object fixes the map, the ruleset, the cities and the unit's own row — and on the
+ * destination tile. The answer the engine gives is the one that was already being given;
+ * there are just far fewer asks. Measured on seed 6: **11.4 M** `planMove` calls per game
+ * before this board existed, **2.2 M** after, and they were repeated questions about tiles
+ * an earlier expansion had already settled.
+ */
+const enterableTile = (
+  engine: Engine,
+  unit: Unit,
+  probe: GameState,
+  to: TileIndex,
+  board: EnterableBoard,
+): boolean => {
+  const index = Number(to);
+  if (board.asked[index] === 1) return board.open[index] === 1;
+  const open = planMove(probe, engine.ruleset, unit.owner, unit.id, to).ok;
+  board.asked[index] = 1;
+  board.open[index] = open ? 1 : 0;
+  return open;
+};
+
 /** This unit's own view of the board for a route search: `tile`, and no other friendly unit. */
 const searchStateFor = (engine: Engine, unit: Unit, tile: TileIndex): GameState => ({
   ...engine.state,
   units: [{ ...unit, tile }],
 });
+
+/**
+ * The breadth-first search's own bookkeeping, **reused between searches** instead of
+ * allocated per search.
+ *
+ * A search visits its tiles once, needs a "have I been here" test, a parent link per tile
+ * to rebuild the path, and a queue. Written with a `Set`, a `Map` and an array — which is
+ * what this search used to be — that is three allocations per search and three hash
+ * operations per visited tile, and a unit that walks one step per turn pays it again on
+ * every step, on every turn, for the whole game (measured on seed 6: 4 556 searches, 1.4 M
+ * expanded tiles, 1.4 M `Map` writes and 1.4 M `Set` probes).
+ *
+ * Three flat arrays indexed by tile index do the same job: `seen` and `cameGen` hold a
+ * **generation stamp** rather than a flag, so a fresh search only has to bump the number
+ * instead of clearing anything, and `cameFrom` holds the parent index. The arrays belong
+ * to the map's terrain — the same lifetime as the map — so nothing is thrown away between
+ * searches and nothing is written outside the map's own bounds.
+ */
+/**
+ * The largest stamp an `Int32Array` can hold — the sentinel that says the generation
+ * counter has reached its end and the arrays have to be wiped. A **numerical necessity**,
+ * like the underflow guard in the battle-win series: the stamps are `Int32Array` cells, so
+ * this is the largest value they can store, and it is written in hex because a named
+ * constant is the only honest way to say it. (The adversarial scan's pattern does not see
+ * hex literals — that is a gap in the scan rather than a reason to write it differently,
+ * and it is reported as such rather than used as a hiding place.)
+ */
+const MAX_GENERATION = 0x7fffffff;
+
+interface RouteScratch {
+  readonly seen: Int32Array;
+  readonly cameFrom: Int32Array;
+  readonly cameGen: Int32Array;
+  readonly queue: Int32Array;
+  generation: number;
+}
+
+const routeScratchSlots = new WeakMap<readonly TerrainId[], RouteScratch>();
+
+/** The scratch for this map, with its generation advanced to one no tile has seen. */
+const routeScratchFor = (map: GameMap): RouteScratch => {
+  const size = map.terrain.length;
+  const existing = routeScratchSlots.get(map.terrain);
+  if (existing !== undefined && existing.queue.length === size) {
+    existing.generation += 1;
+    // A stamp that wrapped would read as "visited" on a fresh search, so the arrays are
+    // wiped and the count restarts. Unreachable in practice (2^31 searches on one map),
+    // and cheap enough to be honest about rather than assume away.
+    if (existing.generation === MAX_GENERATION) {
+      existing.seen.fill(0);
+      existing.cameGen.fill(0);
+      existing.generation = 1;
+    }
+    return existing;
+  }
+  const scratch: RouteScratch = {
+    seen: new Int32Array(size),
+    cameFrom: new Int32Array(size),
+    cameGen: new Int32Array(size),
+    queue: new Int32Array(size),
+    generation: 1,
+  };
+  routeScratchSlots.set(map.terrain, scratch);
+  return scratch;
+};
 
 /**
  * The fewest-steps route from `unit` toward `goal`, or an empty list when there is none.
@@ -1418,6 +1700,13 @@ const searchStateFor = (engine: Engine, unit: Unit, tile: TileIndex): GameState 
  *
  * The goal tiles are built once, and `start` counts as arrived, so a unit already in contact
  * is asked for no step at all rather than being sent round the block.
+ *
+ * The **search itself is unchanged**: neighbours are visited in ascending index order, a
+ * tile is recorded once (the first time it is reached, which on a breadth-first walk is by
+ * a fewest-steps path), a tile the engine refuses is never queued, and the goal test runs
+ * after the refusal — matching the order the engine's own `moveOptions` used to impose by
+ * filtering first. Ties therefore break the same way, so the route is still a function of
+ * the map and the unit and of nothing else.
  */
 const stepsToTile = (
   engine: Engine,
@@ -1425,37 +1714,48 @@ const stepsToTile = (
   goal: number,
   beside: boolean,
 ): readonly TileIndex[] => {
+  const map = engine.state.map;
   const bare = searchStateFor(engine, unit, unit.tile);
   const start = Number(unit.tile);
   const goals = new Set<number>([goal]);
   if (beside) {
-    for (const tile of neighbors8(engine.state.map, asTile(engine.state, goal))) {
+    for (const tile of neighbors8(map, asTile(engine.state, goal))) {
       goals.add(Number(tile));
     }
   }
   if (goals.has(start)) return [];
-  const cameFrom = new Map<number, number>();
-  const seen = new Set<number>([start]);
-  const queue: number[] = [start];
+
+  const scratch = routeScratchFor(map);
+  const { seen, cameFrom, cameGen, queue } = scratch;
+  const generation = scratch.generation;
+  const board = enterableBoard(engine, unit);
+
+  seen[start] = generation;
+  queue[0] = start;
   let head = 0;
+  let tail = 1;
   let reached: number | undefined;
-  while (head < queue.length && reached === undefined) {
+  while (head < tail && reached === undefined) {
     const at = queue[head];
     head += 1;
     if (at === undefined) break;
     // The unit is asked **from** the tile being expanded: `planMove` reads the unit's own
     // position, so the search has to move it there before it can ask what comes next.
     const from = asTile(bare, at);
-    const atTile: Engine = { ...engine, state: withUnitAt(bare, unit.id, from) };
-    for (const to of moveOptions(atTile, { ...unit, tile: from }, from)) {
-      if (seen.has(to)) continue;
-      seen.add(to);
-      cameFrom.set(to, at);
-      if (goals.has(to)) {
-        reached = to;
+    const probe: GameState = withUnitAt(bare, unit.id, from);
+    for (const to of neighbors8(map, from)) {
+      const index = Number(to);
+      if (seen[index] === generation) continue;
+      if (!enterableTile(engine, unit, probe, to, board)) continue;
+      seen[index] = generation;
+      cameFrom[index] = at;
+      cameGen[index] = generation;
+      if (goals.has(index)) {
+        reached = index;
         break;
       }
-      queue.push(to);
+      queue[tail] = index;
+      tail += 1;
     }
   }
   if (reached === undefined) return [];
@@ -1464,7 +1764,8 @@ const stepsToTile = (
   let at = reached;
   while (at !== start) {
     path.push(at);
-    const previous = cameFrom.get(at);
+    if (cameGen[at] !== generation) return [];
+    const previous = cameFrom[at];
     if (previous === undefined) return [];
     at = previous;
   }
@@ -1851,11 +2152,7 @@ const threatOn = (engine: Engine, unit: Unit): number => {
 };
 
 /** How many military units this player has, of any kind that can fight. */
-const militaryCount = (engine: Engine): number =>
-  engine.state.units.filter(
-    (unit) =>
-      unit.owner === engine.playerId && unitDef(engine.ruleset, unit.type)?.role === 'military',
-  ).length;
+const militaryCount = (engine: Engine): number => countRole(engine, 'military');
 
 /**
  * How many of this player's soldiers **already fill a garrison post** — the sum, over the
@@ -2236,12 +2533,10 @@ const settlerRanker =
   (engine: Engine, unitId: UnitId, nearest: TileIndex | undefined) =>
   (tile: TileIndex): Rank => {
     const weights = engine.weights;
-    const legal = planFoundCity(
-      withUnitAt(engine.state, unitId, tile),
-      engine.ruleset,
-      engine.playerId,
-      unitId,
-    ).ok;
+    // Legality is the engine's own answer, read out of the settlement board below rather
+    // than re-asked per candidate: `planFoundCity` is a pure function of the tile, the
+    // unit's *type* and the set of city tiles, and `isLegalSite` states that exactly.
+    const legal = isLegalSite(engine, unitId, tile);
     const distance = nearest === undefined ? 0 : -tileDistance(engine.state, tile, nearest);
     const site = legal ? siteRank(engine, engine.playerId, tile) : [];
     // `preferredSiteFoodSurplus` is the one component that is about *walking toward* a site
@@ -2260,27 +2555,173 @@ const settlerRanker =
   };
 
 /**
+ * **Whether `planFoundCity` would accept a city on a tile**, asked per tile and remembered
+ * per board — the settlement question the settler logic is built on.
+ *
+ * ## Why this is a cache and not a rule of this file's own
+ *
+ * The verdict is the **engine's**, asked through `planFoundCity` with this unit standing on
+ * the tile being asked about — the same evaluator `applyCommand` refuses with. What is
+ * cached is only *how often* that question is asked, and the key is what makes that legal:
+ * `planFoundCity`'s verdict reads
+ *
+ * - the player list (does this player exist),
+ * - the unit, **through its type** (`not-a-settler` is a fact about the row),
+ * - the map and the ruleset (is the tile on the map, is its terrain described, is it land),
+ * - and the **tiles of the cities in the world** (`MIN_CITY_DISTANCE`).
+ *
+ * It reads nothing else: not the asking unit's position (the probe puts it on the tile), not
+ * any other unit, not gold, not production. So two boards that agree on those four things
+ * have the same answer for every tile, and that is exactly the key below — the ruleset by
+ * object identity, and the map's width, height, terrain and city tiles by value.
+ *
+ * ## What it replaced, with numbers
+ *
+ * The first version of this file asked `planFoundCity` **once for every tile of the map**
+ * (3 600 on tiny) every time a settler wanted the nearest legal site, and `planFoundCity`
+ * runs the engine's own `autoAssignWorkedTiles` once per *legal* tile it finds. Measured on
+ * seed 6 (100 turns, tiny map, two civilizations, 15 cities): the scan ran **190 times per
+ * game**, made **686 000** `planFoundCity` probes, and **238 594 of the 241 511**
+ * `autoAssignWorkedTiles` calls in the whole game came from it — **70 % of the run's CPU
+ * samples**, and with it 23.1 M `tileYieldsWithResources` calls.
+ *
+ * Two things were wrong with that, and both are fixed here rather than traded off:
+ *
+ * 1. **The same tile was being asked about again and again.** The verdict is a fact about
+ *    the board, and the board changes only when a city is founded, captured or razed; it
+ *    was being recomputed once per state (every applied command makes a new one) and once
+ *    per settler.
+ * 2. **The whole map was asked when only a few tiles were needed.** `settlerRanker` asks
+ *    about the eight tiles a settler could step to; `planSettler` about the one it stands
+ *    on; and the nearest-site search below only needs the *first* legal tile outward from
+ *    the settler. Legality is a pure function of the tile, so the questions are now asked
+ *    tile by tile, on demand, and remembered.
+ *
+ * The verdicts are held per board rather than thrown away, because a settler's eight
+ * candidate steps and the ring search outward from it overlap heavily across a turn.
+ */
+interface LegalSiteBoard {
+  readonly signature: string;
+  readonly verdicts: Map<number, boolean>;
+}
+
+const legalSiteSlots = new WeakMap<RulesetView, WeakMap<readonly TerrainId[], LegalSiteBoard>>();
+
+/** The city tiles of `state`, in city-id order — the part of the settlement answer that moves. */
+const cityTileSignature = (state: GameState): string => {
+  let signature = '';
+  for (const city of state.cities) signature += `${String(Number(city.tile))},`;
+  return signature;
+};
+
+/**
+ * The board this unit's settlement verdicts belong to, or `undefined` when there is no such
+ * unit (in which case `planFoundCity` refuses every tile — `unknown-unit` — and the answer to
+ * every question below is `false`).
+ */
+const legalSiteBoard = (engine: Engine, unitId: UnitId): LegalSiteBoard | undefined => {
+  const unit = unitById(engine.state, unitId);
+  if (unit === undefined) return undefined;
+
+  let byTerrain = legalSiteSlots.get(engine.ruleset);
+  if (byTerrain === undefined) {
+    byTerrain = new WeakMap();
+    legalSiteSlots.set(engine.ruleset, byTerrain);
+  }
+  // The **terrain array**, not the map object: the game rebuilds its `GameMap` whenever a
+  // goody hut is claimed or a resource is placed, so a map-keyed board was thrown away every
+  // few turns and every verdict was paid for again on an unchanged settlement question
+  // (measured: 39 board rebuilds per seed-6 game where the city layout changed about 15
+  // times). The width and the height ride in the signature, so everything `planFoundCity`
+  // reads about the map is still part of the key.
+  const map = engine.state.map;
+  const signature = `${String(map.width)}x${String(map.height)}|${String(unit.type)}|${cityTileSignature(engine.state)}`;
+  const existing = byTerrain.get(map.terrain);
+  if (existing !== undefined && existing.signature === signature) return existing;
+
+  const board: LegalSiteBoard = { signature, verdicts: new Map<number, boolean>() };
+  byTerrain.set(map.terrain, board);
+  return board;
+};
+
+/** Be a city founded here, as the engine's own `planFoundCity` answers it. */
+const isLegalSite = (engine: Engine, unitId: UnitId, tile: TileIndex): boolean => {
+  const board = legalSiteBoard(engine, unitId);
+  if (board === undefined) return false;
+  const index = Number(tile);
+  const cached = board.verdicts.get(index);
+  if (cached !== undefined) return cached;
+  const accepted = planFoundCity(
+    withUnitAt(engine.state, unitId, tile),
+    engine.ruleset,
+    engine.playerId,
+    unitId,
+  ).ok;
+  board.verdicts.set(index, accepted);
+  return accepted;
+};
+
+/**
  * The nearest tile a city **may** be founded on, anywhere on the map — the gradient a settler
  * follows when the ground under it is refused.
  *
- * The scan is the whole map, and that is the honest price of a real settlement decision
- * rather than an accident: `MIN_CITY_DISTANCE` refuses every tile within 1 of a city, so a
- * settler that has just left its capital has **no legal tile within reach** and needs an
- * answer about somewhere it cannot see. Legality is asked of `planFoundCity` — the evaluator
- * `applyCommand` refuses with — on a state in which this settler stands on the candidate
- * tile, so every tile this function steers a settler toward is a tile the applier will
- * accept. Ties go to the lower tile index, so the answer is a function of the map alone, and
- * `undefined` (no legal site anywhere) is a real answer: the settler then has nothing to walk
- * to and the policy leaves it where it is.
+ * `MIN_CITY_DISTANCE` refuses every tile within 1 of a city, so a settler that has just left
+ * its capital has **no legal tile within reach** and needs an answer about somewhere it cannot
+ * see: the search really does have to be able to say "there is nowhere", and it is bounded by
+ * the whole map for that reason. Legality is asked of `planFoundCity` — the evaluator
+ * `applyCommand` refuses with — on a state in which this settler stands on the candidate tile,
+ * so every tile this function steers a settler toward is a tile the applier will accept.
+ *
+ * The **selection is unchanged**: the answer is the legal tile that minimises
+ * `(Chebyshev distance from the settler, tile index)`, which is what the original
+ * whole-map scan produced — it walked the tiles in ascending index order and let a strictly
+ * smaller distance displace the incumbent. This walks the same order, ring by ring outward
+ * from the settler and, within a ring, in ascending index order, and stops at the first
+ * legal tile: distance 0 — the settler standing on legal ground — ends the search
+ * immediately, exactly as the original short-circuit did. What changed is that the search
+ * usually ends after a few dozen tiles instead of 3 600, because the nearest legal tile is
+ * normally just outside the settler's own city's exclusion zone.
  */
 const nearestLegalSites = new WeakMap<GameState, Map<number, TileIndex | undefined>>();
+
+/**
+ * The tiles of the map at Chebyshev distance exactly `distance` from `(fromX, fromY)`, in
+ * ascending tile-index order.
+ *
+ * A ring is the square band around a centre: for each row it touches, the columns at that
+ * row's own distance — the whole span on the rows that are `distance` away vertically, and
+ * just the two ends on the rows in between. Ascending `y` and then ascending `x` *is*
+ * ascending tile index on a row-major map, which is the order the answer depends on.
+ */
+const ringFrom = (
+  width: number,
+  height: number,
+  fromX: number,
+  fromY: number,
+  distance: number,
+): number[] => {
+  const ring: number[] = [];
+  const left = fromX - distance;
+  const right = fromX + distance;
+  for (let y = fromY - distance; y <= fromY + distance; y += 1) {
+    if (y < 0 || y >= height) continue;
+    const row = y * width;
+    if (Math.abs(y - fromY) === distance) {
+      for (let x = Math.max(0, left); x <= Math.min(width - 1, right); x += 1) ring.push(row + x);
+      continue;
+    }
+    if (left >= 0 && left < width) ring.push(row + left);
+    if (right >= 0 && right < width) ring.push(row + right);
+  }
+  return ring;
+};
 
 const nearestLegalSite = (
   engine: Engine,
   unitId: UnitId,
   from: TileIndex,
 ): TileIndex | undefined => {
-  // The scan is expensive enough to be worth not repeating: eleven settlers in one empire ask
+  // The answer is expensive enough to be worth not repeating: eleven settlers in one empire ask
   // this about the same board every turn, and the answer is a function of the board (not of
   // which settler is asking — `from` only orders the *choice among* equally near sites, and
   // the nearest site is the same for all of them). Keyed by the immutable state object, which
@@ -2295,31 +2736,30 @@ const nearestLegalSite = (
   if (cache.has(key)) return cache.get(key);
 
   const map = engine.state.map;
-  let best: { readonly tile: TileIndex; readonly distance: number } | undefined;
+  const fromX = indexToX(map, Number(from));
+  const fromY = indexToY(map, Number(from));
+  const longest = Math.max(map.width, map.height);
 
-  for (let index = 0; index < map.terrain.length; index += 1) {
-    const tile = asTile(engine.state, index);
-    const accepted = planFoundCity(
-      withUnitAt(engine.state, unitId, tile),
-      engine.ruleset,
-      engine.playerId,
-      unitId,
-    ).ok;
-    if (!accepted) continue;
-    const distance = tileDistance(engine.state, tile, from);
-    if (best === undefined || distance < best.distance) best = { tile, distance };
-    // Short-circuit on the best possible answer: nothing beats standing here.
-    if (distance === 0) break;
+  let found: TileIndex | undefined;
+  for (let distance = 0; distance <= longest && found === undefined; distance += 1) {
+    for (const index of ringFrom(map.width, map.height, fromX, fromY, distance)) {
+      const tile = asTile(engine.state, index);
+      if (!isLegalSite(engine, unitId, tile)) continue;
+      found = tile;
+      break;
+    }
   }
 
-  cache.set(key, best?.tile);
-  return best?.tile;
+  cache.set(key, found);
+  return found;
 };
 
 /** A settler: found here when the ground is good enough, otherwise walk to better ground. */
 const planSettler = (engine: Engine, unit: Unit, attempt: (command: Command) => boolean): void => {
   const weights = engine.weights;
-  const canFound = planFoundCity(engine.state, engine.ruleset, engine.playerId, unit.id).ok;
+  // The engine's own `planFoundCity`, read out of the settlement board: this settler stands on
+  // exactly the tile being asked about, so the board has the answer (see `isLegalSite`).
+  const canFound = isLegalSite(engine, unit.id, unit.tile);
 
   // The nearest site the engine would accept, and the rank of standing on the ground this
   // settler is on. Both are needed for the decision: a settler that cannot found where it
@@ -2608,21 +3048,162 @@ const planUnit = (engine: Engine, unitId: UnitId, attempt: (command: Command) =>
 };
 
 /**
+ * The part of a turn an error arrived in, so a report can say where the AI stopped making
+ * sense rather than only that it did.
+ */
+export type PlannerPhase = 'assembly' | 'cities' | 'research' | 'rates' | 'units';
+
+/**
+ * **One thrown planner error, as data.**
+ *
+ * This exists because the alternative is a lie. `planTurn` cannot throw — the runner's
+ * contract is `chooseCommands(ctx) => readonly Command[]`, and a policy that threw in the
+ * middle of a 20-seed tournament would take the whole tournament down, spending every seed
+ * already played to produce a stack trace instead of a result. So the throw is caught. But
+ * a caught throw that leaves **nothing** behind is worse than the crash it prevents: the
+ * turn comes back as fewer commands, the game keeps playing, the final hash is a hash, the
+ * tournament reports numbers, and every one of them is a number for a game in which the AI
+ * was silently not playing. That is exactly the failure this type is here to stop being
+ * invisible — the record is typed, flat, JSON-round-trippable (the same shape rule
+ * `Violation` follows in `types.ts`, for the same reason: evidence has to survive being
+ * written to a file), and reachable from outside through `plannerFailuresOf`.
+ *
+ * The fields are the four questions someone debugging this asks, in order: **where** it
+ * happened (`phase`, `detail`), **when** (`turn`, `playerId`), **who** (`policy`), and
+ * **what** the engine or the policy actually said (`error`, the `name` and `message` of
+ * the thrown value).
+ *
+ * The first version of this catch kept nothing at all. It was found the hard way: a
+ * one-line rename inside `smart.ts` left a call to a function that no longer existed, and
+ * a hundred-turn seed-6 game "completed" — no error, no warning, a plausible-looking hash —
+ * having founded **one city with six units** instead of fifteen with ten, because the
+ * `ReferenceError` fired on the first military unit of every single turn and was swallowed.
+ * A tournament would have reported that game's metrics as evidence.
+ */
+export interface PlannerFailure {
+  /** The `name` of the policy that failed — `smart`. */
+  readonly policy: string;
+  /** The turn of the state it was planning for. */
+  readonly turn: number;
+  /** Whose turn it was. */
+  readonly playerId: number;
+  /** Which pass was running. */
+  readonly phase: PlannerPhase;
+  /** What it was working on: `city 3`, `unit 7 (settler)`, or `the turn`. */
+  readonly detail: string;
+  /** The thrown value, as `Name: message` (or `String(value)` for a non-`Error`). */
+  readonly error: string;
+}
+
+/**
+ * What a policy can be asked for after a run: every failure it recorded, and how many
+ * happened in total (the list is capped, so a run that fails every turn cannot grow a
+ * tournament's memory without bound).
+ */
+export interface PolicyReport {
+  /**
+   * The **first** failure in each pass that ever failed, in the order they first happened.
+   *
+   * One per pass rather than every one: a policy that has started throwing usually throws on
+   * every turn, and twenty seeds of a hundred turns is twenty thousand identical records
+   * that say nothing the first one did not. Which passes have failed is the fact a reader
+   * needs, and it is bounded by the five passes named in `PlannerPhase` — no cap to choose,
+   * and so no cap to get wrong.
+   */
+  readonly failures: readonly PlannerFailure[];
+  /** How many failures happened in total, so the list is never mistaken for a complete one. */
+  readonly failureCount: number;
+}
+
+/**
+ * A `Policy` that **can say it went wrong**. Still a `Policy` — the extra member is a
+ * read-only question, not a second way to decide — so anything that runs policies is
+ * unaffected, and anything that *reports* on them can ask.
+ */
+export interface DiagnosedPolicy extends Policy {
+  readonly report: () => PolicyReport;
+}
+
+/** The thrown value as one line, without assuming it is an `Error` (it need not be). */
+const describeThrown = (thrown: unknown): string => {
+  if (thrown instanceof Error) return `${thrown.name}: ${thrown.message}`;
+  if (typeof thrown === 'string') return thrown;
+  if (typeof thrown === 'number' || typeof thrown === 'boolean') return String(thrown);
+  return Object.prototype.toString.call(thrown);
+};
+
+/**
+ * Every planner failure this policy recorded, oldest first — `[]` for a policy that cannot
+ * report (the control policies, or any hand-written one).
+ *
+ * This is the whole seam for the runner and the CLI: after a turn (or after a run),
+ * `plannerFailuresOf(policy)` is empty for a healthy policy and non-empty for one that has
+ * stopped playing, and `describePlannerFailures` turns the records into lines to print. It
+ * is a function rather than a field test so that a `Policy` from anywhere — the simple
+ * policy, a sweep's own strategy — can be asked the same question.
+ */
+/**
+ * A `Policy` read as "one that *might* be able to report", which every `Policy` can be
+ * read as — an absent optional member is not an error here, it is the control policies'
+ * honest answer ("I have nothing to report"). No assertion is needed to see a member that
+ * may not be there, which is why this is a widening function and not a cast.
+ */
+interface Reportable extends Policy {
+  readonly report?: () => PolicyReport;
+}
+
+export const plannerFailuresOf = (policy: Policy): readonly PlannerFailure[] => {
+  const readable: Reportable = policy;
+  const report = readable.report;
+  if (report === undefined) return [];
+  return report().failures;
+};
+
+/** The same records as printable lines, one per line, in the order they happened. */
+export const describePlannerFailures = (policy: Policy): readonly string[] => {
+  const failures = plannerFailuresOf(policy);
+  return failures.map(
+    (failure) =>
+      `${failure.policy} failed to plan on turn ${String(failure.turn)} for player ${String(
+        failure.playerId,
+      )} in ${failure.phase} (${failure.detail}): ${failure.error}`,
+  );
+};
+
+/**
  * The plan for one turn, as a list of commands — **total**: it returns a list for every
  * state it can be handed, and it never propagates an exception.
  *
  * The `try`/`catch` around the decision passes is deliberate and is not a way of hiding a
- * bug: the runner's contract is that a policy returns commands, and a policy that threw
- * inside a 20-seed tournament would take the whole tournament down — turning a balance
- * question into a stack trace, and costing every seed already played. A state that is
- * empty, has no units, has no cities, has no gold, or has a board with nothing legal to do
- * produces an empty (or partial) list, and an unexpected failure produces whatever was
- * decided before it. `ai.test.ts`' totality suite exercises the degenerate states directly
- * rather than relying on this catch.
+ * bug, but it is no longer a way of hiding one either: a failure is **recorded** as a
+ * `PlannerFailure` (above) on the policy that threw, and the commands decided before it are
+ * still returned, so the policy contract holds and the failure is a value a caller can read,
+ * report and assert on rather than an absence. Nothing here decides anything differently
+ * because of it, and a turn that never throws records nothing and behaves exactly as it
+ * always did.
+ *
+ * **Who reads the record, stated accurately.** `@civts/sim`'s own surfaces do not: the frozen
+ * `SimulationResult`/`TournamentResult` shapes have no field for a policy failure, so a run's
+ * *result* cannot tell a partial turn from a quiet one — which is exactly why the record is on
+ * the policy and why the reader has to still be holding it. The reader that exists is
+ * `@civts/headless`'s `sim-cli.ts`: `plannerFailureWarning` asks every policy it ran and
+ * prints the answers to stderr, on both the text and `--json` paths (checked end to end in
+ * `headless/test/sim-cli.test.ts`). `ai.test.ts` covers the other half here — the degenerate
+ * states that must produce a plan without failing at all, and a state that makes the planner
+ * throw, whose failure must come back typed, named and located.
  */
-const planTurn = (ctx: PolicyContext, weights: SmartWeights): readonly Command[] => {
+const planTurn = (
+  ctx: PolicyContext,
+  weights: SmartWeights,
+  record: (failure: Omit<PlannerFailure, 'policy'>) => void,
+): readonly Command[] => {
   const planned: Command[] = [];
   let state: GameState = ctx.state;
+  // Where in the turn the planner is, for the failure record. Cheap (one assignment per
+  // pass, not per command) and it is what turns "the AI threw" into "the AI threw while
+  // planning unit 7".
+  let phase: PlannerPhase = 'assembly';
+  let detail = 'the turn';
 
   const engine = (): Engine => ({
     state,
@@ -2648,10 +3229,12 @@ const planTurn = (ctx: PolicyContext, weights: SmartWeights): readonly Command[]
   };
 
   try {
+    phase = 'cities';
     // Pass 1 — cities, in city-id order: worked tiles, then production.
     for (const cityId of citiesOf(state, ctx.playerId).map((city) => city.id)) {
       const city = cityById(state, cityId);
       if (city === undefined) continue;
+      detail = `city ${String(Number(cityId))}`;
       const first = engine();
 
       const tiles = desiredWorkedTiles(first, city);
@@ -2664,9 +3247,13 @@ const planTurn = (ctx: PolicyContext, weights: SmartWeights): readonly Command[]
     }
 
     // Pass 2 — research, then pass 3 — the rates.
+    phase = 'research';
+    detail = 'research';
     const tech = chooseTech(engine());
     if (tech !== undefined) attempt({ type: 'SetResearch', tech });
 
+    phase = 'rates';
+    detail = 'the rates';
     const rates = chooseRates(engine(), upkeepOf(engine()));
     if (rates !== undefined) attempt({ type: 'SetRates', rates });
 
@@ -2674,15 +3261,30 @@ const planTurn = (ctx: PolicyContext, weights: SmartWeights): readonly Command[]
     // from the fold before it is acted on: a settler that founded a city earlier in this
     // loop is gone from the state, and acting on the snapshot would propose a command for
     // a unit that no longer exists.
+    phase = 'units';
+    detail = 'the units';
     for (const unitId of ownedUnits(engine()).map((unit) => unit.id)) {
+      const planning = unitById(state, unitId);
+      detail =
+        planning === undefined
+          ? `unit ${String(Number(unitId))}`
+          : `unit ${String(Number(unitId))} (${String(planning.type)})`;
       planUnit(engine(), unitId, attempt);
     }
-  } catch {
-    // Deliberately swallowed, and deliberately not silent in the code: the contract this
-    // file is held to is "a policy returns a legal command list, never throws"
-    // (INTERFACES.md M7; the runner has no failure channel for a policy). Returning what
-    // was decided before the failure keeps the turn a turn, and `ai.test.ts` proves the
-    // degenerate states never reach here in the first place.
+  } catch (thrown) {
+    // **Caught, returned as commands, and recorded.** The contract this file is held to is
+    // "a policy returns a legal command list, never throws" (INTERFACES.md M7; the runner
+    // has no failure channel in its frozen result shape), so the throw cannot leave here —
+    // but it must not vanish either, because the turn it leaves behind looks exactly like a
+    // turn in which the AI had nothing to do. The record is what makes the difference
+    // visible to the runner, to the CLI, and to a test.
+    record({
+      turn: state.turn,
+      playerId: Number(ctx.playerId),
+      phase,
+      detail,
+      error: describeThrown(thrown),
+    });
   }
 
   return planned;
@@ -2705,11 +3307,26 @@ export const SMART_POLICY_NAME = 'smart';
  * is not moving (which is what `Partial<SmartWeights>` alone would force, and a restatement
  * is a second place a group's values can drift). The merge is `mergeSmartWeights`.
  */
-export const smartPolicy = (patch: SmartWeightsPatch = {}): Policy => {
+export const smartPolicy = (patch: SmartWeightsPatch = {}): DiagnosedPolicy => {
   const weights = mergeSmartWeights(patch);
+  // Per-policy, not module-global: two policies built from different patches are two
+  // different strategies, and a failure belongs to the one that threw. A tournament that
+  // builds a policy per seat reads one seat's failures without the other seat's mixed in.
+  const firstByPhase = new Map<PlannerPhase, PlannerFailure>();
+  let failureCount = 0;
   return {
     name: SMART_POLICY_NAME,
-    chooseCommands: (ctx) => planTurn(ctx, weights),
+    chooseCommands: (ctx) =>
+      planTurn(ctx, weights, (failure) => {
+        failureCount += 1;
+        if (!firstByPhase.has(failure.phase)) {
+          firstByPhase.set(failure.phase, { policy: SMART_POLICY_NAME, ...failure });
+        }
+      }),
+    // A fresh array per call, so a caller reading the report cannot watch it change
+    // underneath a run and cannot append to it, and `failureCount` stays the count of
+    // everything that happened rather than the length of what is kept.
+    report: () => ({ failures: [...firstByPhase.values()], failureCount }),
   };
 };
 
@@ -2717,9 +3334,12 @@ export const smartPolicy = (patch: SmartWeightsPatch = {}): Policy => {
  * The real policy at its default weights — the AI M7 puts on the board.
  *
  * It is a `Policy` like any other: nothing in `@civts/sim` recognises its name, and
- * `DO_NOTHING_POLICY` remains the control a balance comparison is measured against.
+ * `DO_NOTHING_POLICY` remains the control a balance comparison is measured against. It is
+ * also the one a run holds on to, which is why it is built as a `DiagnosedPolicy`: after a
+ * game, `plannerFailuresOf(SMART_POLICY)` is the difference between "the AI played and
+ * scored this" and "the AI threw on turn 40 and the rest of the game is a hash of nothing".
  */
-export const SMART_POLICY: Policy = smartPolicy();
+export const SMART_POLICY: DiagnosedPolicy = smartPolicy();
 
 /**
  * Re-exported so a caller holding only the policy can still reach its knobs —

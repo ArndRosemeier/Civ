@@ -308,7 +308,18 @@ const exposureOf = (knob: Knob, counters: ExposureCounters): Exposure => {
           'city AND that city holds the walls row',
         zeroMeans:
           'the walls bonus never entered a single odds computation in these runs, so this sweep ' +
-          'measures nothing about the knob',
+          'measures nothing about the knob — and the missing ingredient is a DEFENDED city, not ' +
+          'a wall. What the other columns show is why: the cities these runs take are ' +
+          'UNDEFENDED, and an undefended city changes hands on a single command that emits ' +
+          '`CityCaptured` and no `CombatResolved` at all — so no battle, no odds computation and ' +
+          'no wall bonus ever happens there. A wall cannot be read by an odds calculation that ' +
+          'never runs: what would put this knob in play is a garrison standing inside a walled ' +
+          'city while the other policy attacks it. Until a policy leaves one there and the ' +
+          'other attacks it, this table is flat because the measurement has nothing to measure, ' +
+          'not because the knob is inert. The knob itself is proved live elsewhere, on a fixture ' +
+          'where a defender IS inside its own walled city: `packages/sim/test/ai.test.ts` moves ' +
+          '`wallsBonusPct` over this grid and watches the engine per-round odds and the AI ' +
+          'decision move with it.',
       };
     case 'capture-divisor':
       return {

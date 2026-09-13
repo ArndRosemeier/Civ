@@ -100,6 +100,7 @@ import {
   type RulesetError,
 } from '@civts/rules';
 import {
+  A3_TOURNAMENT_EVIDENCE,
   CORE_INVARIANTS,
   DEFAULT_TOURNAMENT_BUDGET_MS,
   DO_NOTHING_POLICY,
@@ -107,6 +108,7 @@ import {
   SIMPLE_POLICY,
   SMART_POLICY,
   formatOverrideError,
+  plannerFailuresOf,
   runBatch,
   runTournament,
   seatPlan,
@@ -1792,13 +1794,18 @@ export const runSimCommand = (
     seeds,
   };
 
+  // One instance per seat, held here rather than built inline at the call: after the batch
+  // this is what can still say whether any policy threw while planning (see
+  // `plannerFailureWarning`), and a policy discarded at the call site has nowhere to say it.
+  const batchPolicies = civPolicies(policy, settings.value.civCount);
+
   let batch: BatchResult;
   try {
     batch = runBatch({
       seeds,
       settings: settings.value,
       ruleset: validated.value,
-      policies: civPolicies(policy, settings.value.civCount),
+      policies: batchPolicies,
       maxTurns,
       sampleEvery,
       invariants,
@@ -1821,10 +1828,13 @@ export const runSimCommand = (
   });
 
   const json = flags.value.json;
+  // The warnings go to stderr on BOTH paths — a result that is parsed by a pipeline is
+  // exactly the one nobody would otherwise read a warning above. See
+  // `plannerFailureWarning` for why a caught planner error needs one at all.
   return ok({
     report,
     stdout: json ? `${canonicalize(report)}\n` : renderSimReport(report),
-    stderr: json ? renderViolationBanner(report) : '',
+    stderr: `${json ? renderViolationBanner(report) : ''}${plannerFailureWarning(batchPolicies)}`,
     exitCode: report.exitCode,
   });
 };
@@ -1857,6 +1867,45 @@ const parseDefaultSeedSpec = (spec: string): readonly number[] => {
  */
 const civPolicies = (policy: Policy, civCount: number): readonly Policy[] =>
   Array.from({ length: civCount }, () => policy);
+
+/**
+ * **A planner that threw, said out loud.**
+ *
+ * `SMART_POLICY` catches a thrown planner error, records it, and returns the commands it had
+ * decided before the throw — which is the right contract (a policy that throws takes a
+ * twenty-seed tournament down with it) but leaves a turn that is *indistinguishable from a
+ * turn in which the AI had nothing to say*: same legal command list, same metrics, same
+ * invariants, same plausible hash. The record exists on the policy, and before this function
+ * existed nothing in this CLI ever asked for it — the seam was built and left unwired.
+ *
+ * So the command that runs policies reads it: `plannerFailuresOf` answers `[]` for the
+ * control policies (they cannot fail) and the first failure of each pass for one that has,
+ * and the lines go to **stderr**, where this CLI already puts what is not the report. Both
+ * paths call it — text and `--json` — because a result a pipeline parses is exactly the
+ * result nobody would otherwise read a warning above.
+ *
+ * What this is not: a new field on the frozen `SimulationResult`/`TournamentResult` shapes,
+ * a new exit code, or a judgement that the run failed. Nothing about the games changes and
+ * the exit code stays the run's own verdict, which is what keeps a *diagnosed* failure from
+ * becoming a silent one without redefining what a green run means.
+ */
+export const plannerFailureWarning = (policies: readonly Policy[]): string => {
+  const lines = policies.flatMap((policy) =>
+    plannerFailuresOf(policy).map(
+      (failure) =>
+        `${failure.policy} threw while planning on turn ${String(failure.turn)} for player ` +
+        `${String(failure.playerId)}, in the ${failure.phase} pass (${failure.detail}): ` +
+        `${failure.error} — it returned the commands decided before the throw, so the run ` +
+        'continued and its numbers describe a game in which part of a turn was not played',
+    ),
+  );
+  if (lines.length === 0) return '';
+  return [
+    'WARNING: the policy reported a planner failure — this run is not a clean one.',
+    ...lines,
+    '',
+  ].join('\n');
+};
 
 /** The `--override` line for a patch the catalog refused, naming what was typed. */
 const overrideFailureLine = (
@@ -1892,8 +1941,9 @@ const overrideFailureLine = (
  *
  * The M7 command shipped with A3's twenty-seed experiment as its default, which made
  * `civts run` — the plainest verb this CLI has, and one that used to print "the M7 self-play
- * harness is not built yet" — start a **nine-minute** job (measured: 26.0 s per game at a
- * hundred turns; see `A3_TOURNAMENT_TURNS`). A default is what happens when nobody decided
+ * harness is not built yet" — start a **multi-minute** job (its measured cost is recorded once,
+ * in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, and printed into this command's `--help` from
+ * there; see `A3_TOURNAMENT_TURNS`). A default is what happens when nobody decided
  * anything, so the thing it does by accident has to be cheap and *stated*: two games is
  * seconds, and two games is also the shortest experiment whose seat rotation completes with
  * the default two seats (`seatPlan`: over `n` games every one of `n` policies plays every
@@ -1938,14 +1988,13 @@ export const A3_TOURNAMENT_SEED_SPEC = '1..20';
  * and fight, and a horizon too short to reach those measures the opening instead of the
  * strategy. A hundred turns is a complete arc at this engine's scale — the real policy has
  * founded its cities, worked its land, finished its early tech tree and fielded an army well
- * inside it. It is expensive, which is exactly why it is not the default: **measured at 26.0 s
- * per game** by the M7b evidence run, so A3's twenty seeds cost about **8.7 minutes** (519.4 s
- * wall, bracketed externally by `scripts/tournament-evidence.ts`, which also prints the two
- * clocks — they agreed to 0.01 %). The M7 adversarial review measured the same experiment
- * independently at 527.3 s / 26.4 s per game, which is the same number within noise. Two
- * hundred turns is affordable too, at roughly twice the cost per game; `--turns` moves the
- * horizon, and the report always states the one it used, so two runs cannot be compared by
- * accident.
+ * inside it. It is expensive, which is exactly why it is not the default: what A3's twenty
+ * seeds cost at this horizon — per game, for the whole run, against the 1800 s bound, with the
+ * headroom left under it — is recorded **once**, in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`,
+ * and this file prints that record into `--help` rather than restating a figure that the next
+ * improvement to the AI would invalidate. Two hundred turns is affordable too, at roughly twice
+ * the cost per game; `--turns` moves the horizon, and the report always states the one it used,
+ * so two runs cannot be compared by accident.
  */
 export const A3_TOURNAMENT_TURNS = 100;
 
@@ -1992,11 +2041,17 @@ export const TOURNAMENT_USAGE = `usage: civts tournament [--seeds <spec>] [--sea
 THE DEFAULT RUN IS SMALL ON PURPOSE: ${DEFAULT_TOURNAMENT_SEED_SPEC} is two games of
 ${String(DEFAULT_TOURNAMENT_TURNS)} turns — seconds, not minutes — because "run" and "tournament" are the same
 command and a plain invocation must not start an experiment nobody asked for. A3's experiment,
-the twenty seeds of a hundred turns the acceptance line names, costs about NINE MINUTES
-(measured at 26.0 s per game, 519 s wall) and is therefore asked for EXPLICITLY:
+the twenty seeds of a hundred turns the acceptance line names, is therefore asked for
+EXPLICITLY:
 
   civts tournament --seeds ${A3_TOURNAMENT_SEED_SPEC} --turns ${String(A3_TOURNAMENT_TURNS)}
   pnpm tournament:evidence        the same run, printing the structured result and wall time
+
+Its cost is recorded once, in \`@civts/sim\`'s \`A3_TOURNAMENT_EVIDENCE\` — the measured figures
+and the bound they are judged against, so this text cannot go stale on its own and neither can
+any other site that quotes it:
+
+  ${A3_TOURNAMENT_EVIDENCE.summary}
 
 Both are the same command; only the horizon differs, and the report always states the one it
 used, so a smoke run cannot be mistaken for the evidence run.
@@ -2618,8 +2673,27 @@ const defaultSeats = (civCount: number): readonly SimPolicyName[] =>
  * discipline, so a catalog number overridden here means what it means there, and the
  * tournament cannot grow a second set of rules about what a knob is.
  */
+/**
+ * The seam that makes the failure channel *testable end to end*, and nothing else.
+ *
+ * A warning nobody can trigger from a test is a warning nobody can keep honest: the shipped
+ * policy only throws on a state the engine would never build, and the fault cannot be injected
+ * from outside this module. So `policyOverrides` lets a test hand this command a policy that
+ * throws — a defective AI, if you like — and lets it exercise the whole path: the run, the
+ * recorded failure, the warning on stderr and the exit code beside it. It changes no default:
+ * an absent map, the empty map and `undefined` all resolve to `policyOf(name)`.
+ *
+ * It is deliberately *not* a CLI flag. A user-facing way to swap a policy in from a string is a
+ * second seat-name mechanism, and `SIM_POLICIES` already exists.
+ */
+export interface TournamentCommandOptions {
+  /** Policies by seat name, in place of the shipped ones — for tests that inject a fault. */
+  readonly policyOverrides?: ReadonlyMap<string, Policy>;
+}
+
 export const runTournamentCommand = (
   args: readonly string[],
+  options: TournamentCommandOptions = {},
 ): Result<TournamentCommandOutput, SimCommandFailure> => {
   if (args.includes('-h') || args.includes('--help')) {
     return ok({ report: undefined, stdout: TOURNAMENT_USAGE, stderr: '', exitCode: 0 });
@@ -2702,6 +2776,13 @@ export const runTournamentCommand = (
     seeds,
   };
 
+  // One instance per seat, held here rather than built inline at the call: after the
+  // tournament this is what can still say whether any policy threw while planning (see
+  // `plannerFailureWarning`), and a policy discarded at the call site has nowhere to say it.
+  const seatPolicies = seatNames.map(
+    (name) => options.policyOverrides?.get(name) ?? policyOf(name),
+  );
+
   let result: TournamentResult;
   try {
     result = runTournament(
@@ -2709,7 +2790,7 @@ export const runTournamentCommand = (
         seeds,
         settings: settings.value,
         ruleset: validated.value,
-        policies: seatNames.map((name) => policyOf(name)),
+        policies: seatPolicies,
         maxTurns,
         ...(flags.value.budgetMs === undefined ? {} : { budgetMs: flags.value.budgetMs }),
       },
@@ -2736,10 +2817,12 @@ export const runTournamentCommand = (
   });
 
   const json = flags.value.json;
+  // On stderr on both paths, for the reason `plannerFailureWarning` states: a run whose games
+  // are a hash of partly-unplayed turns is not one a reader should have to ask about.
   return ok({
     report,
     stdout: json ? `${canonicalize(report)}\n` : renderTournamentReport(report),
-    stderr: json ? renderTournamentBanner(report) : '',
+    stderr: `${json ? renderTournamentBanner(report) : ''}${plannerFailureWarning(seatPolicies)}`,
     exitCode: report.exitCode,
   });
 };
