@@ -146,6 +146,32 @@
  * `PolicyReport.latestFailures` on why it must) and because a position is a seat.
  * `collectPlannerFailures` below states that argument in full.
  *
+ * ## A poll takes only the records it minted (H2-1)
+ *
+ * The key above is not sufficient on its own, and the missing half is the one H2-1 is about:
+ * `latestFailures` is the **instance's** list, and one instance serves every seat — `SMART_POLICY` is a
+ * module-level singleton and `batch`, `tournament` and the CLI each hand one instance to every seat of
+ * every run, which is the supported and shipped usage. So after a poll the list holds the polled seat's
+ * own record *beside* every record the earlier seats' throws left in it, and reading the whole list
+ * therefore hands a later poll records it did not produce: with seat 0 throwing in the cities pass and
+ * seat 1 in the units pass, seat 1's poll re-appended seat 0's record under `1:cities` — **three
+ * entries for two real throws**, the same record object twice, and a `(seat, pass)` named that never
+ * threw. That is what a CLI banner printed as "3 PLANNER FAILURES" with a duplicated line, and what
+ * `--json` carried; over a longer run it grows, because each seat keeps re-appending every other
+ * seat's record under a key of its own that is still new. The count is an instance's count too, so the
+ * same sharing also named a seat that never threw at all, off another seat's throw.
+ *
+ * The fix is that the runner **snapshots `latestFailures` before each poll and takes only the entries
+ * that were not in it** — the records that poll minted, which is exactly the set that can belong to the
+ * seat it polled. `plannerRecordsBeforePoll` takes the snapshot and `collectPlannerFailures` reads it.
+ * The record's own `playerId` plus phase is *not* the fix, and the reason is worth the sentence: a
+ * record's `playerId` cannot distinguish a record minted by another seat's throw during this poll from
+ * one a **previous run** left in the shared list, so a run in which only seat 1 threw would claim the
+ * earlier run's seat-0 record under key `0:<phase>` — the H1/G2-1 defect for the other seat, one layer
+ * along. A snapshot answers both questions at once, because a record an earlier run minted is in it.
+ * `runner.test.ts` drives both shapes: the different-pass count, and a later run that must not inherit
+ * the other seat's record.
+ *
  * The one shape this seam cannot name is a report that moves its count and offers no record at all
  * (a `PolicyReport` written with no `latestFailures`, before the field existed). Reaching back into
  * `failures` there would put another run's turn and pass into this run's result — the defect this
@@ -378,6 +404,13 @@ interface PlannerFailureLog {
    * Per run, and rebuilt by each `startPlannerFailureLog`: a run's log is about that run, and the
    * opposite rule (`PolicyReport.failures`' first-record-per-pass, which never forgets for the life
    * of the instance) is precisely what made a reused instance's re-throw invisible.
+   *
+   * This set is what bounds a run's entries *across* its polls — a second turn that re-throws in a
+   * pass already named is not named again. What bounds a *single* poll is the snapshot
+   * `plannerRecordsBeforePoll` takes: only the records that poll minted are ever offered to the key
+   * below, so no seat can be handed a record another seat's throw minted (H2-1). Both are needed, and
+   * they answer different questions: "has this run named this already?" and "did this poll produce
+   * it?".
    */
   readonly named: Set<string | PlannerFailure>;
 }
@@ -434,15 +467,42 @@ const startPlannerFailureLog = (policies: readonly Policy[]): PlannerFailureLog 
 };
 
 /**
+ * The policy's own latest-per-pass records **as they stand before it is polled** — the snapshot the
+ * collector measures a poll against.
+ *
+ * One read before the poll, and it is the whole input of the H2-1 half of the rule: only a record
+ * that was *not* in this list can have been minted by the poll being collected, and only those
+ * records can belong to the seat that poll was made for. `latestFailures` is the instance's list and
+ * one instance serves every seat, so after a poll it holds the polled seat's record *beside* the
+ * records earlier seats' throws left there — reading the list without this snapshot is what let a
+ * later seat's poll re-append an earlier seat's record under its own key, and let a seat that never
+ * threw be named off another seat's throw. See "Carrying a planner failure" in the module note.
+ *
+ * A policy that cannot report has no records, and `[]` is the honest reading of that: it is also what
+ * `plannerReportOf(policy)?.latestFailures` gives for a report written before that field existed, so
+ * the collector's "minted during this poll" test degenerates to "everything the list offers" exactly
+ * where the list offers nothing.
+ *
+ * The arrays the report hands back are fresh per call and the records in them are never mutated (the
+ * `PolicyReport` contract), so holding this one across the poll is safe and the identity comparison
+ * in the collector is meaningful rather than incidental.
+ */
+const plannerRecordsBeforePoll = (policy: Policy): readonly PlannerFailure[] =>
+  plannerReportOf(policy)?.latestFailures ?? [];
+
+/**
  * Read the policy that was polled for `position` and append whatever it recorded since the last
- * poll. Called straight after the poll, because the record can only change *during* it.
+ * poll. Called straight after the poll, because the record can only change *during* it, and handed
+ * the records the policy held *before* that poll (`plannerRecordsBeforePoll`), because only the ones
+ * after it are this poll's.
  *
  * ## The count decides *whether*, the latest-per-pass record decides *what*
  *
  * Two questions, asked in this order:
  *
  * 1. **Whether.** A policy that cannot report, or one whose `failureCount` has not moved since
- *    the last poll, contributes nothing — a healthy policy costs one read and no allocation. A
+ *    the last poll, contributes nothing — a healthy policy costs two reads of its report (one for
+ *    the snapshot, one for the count) and no allocation of the runner's own. A
  *    moved count means at least one throw happened **during this run**, which is the fact the old
  *    identity baseline could not see: `PolicyReport.failures` keeps one record per pass for the
  *    whole life of the instance, so a second run that throws in a pass the first run already
@@ -451,13 +511,17 @@ const startPlannerFailureLog = (policies: readonly Policy[]): PlannerFailureLog 
  *    record is compared with a reading taken before the run, because a reused instance holds the
  *    *same object* it held when the next run started, and an object-versus-baseline test would call
  *    that run's re-throw clean — the F2-1 silent pass, back again.
- * 2. **What.** The records are the policy's own `latestFailures`, read **after** the count moved:
- *    the newest throw in each pass, whose `turn`, `phase`, `playerId` and `detail` are the ones the
- *    planner wrote while planning this run's turn. That is the whole of the H1/G2-1 fix, because the
- *    throw that made the count move is the throw that wrote these records — a run cannot report an
- *    earlier run's turn and pass. Answering this question from the first-per-pass list is what did:
- *    a frozen entry, printed seed-qualified as `seed 2, turn 4 — smart, player 0, cities pass
- *    (city 0)` for a run whose planner only threw on turns 6, 7 and 8.
+ * 2. **What.** The records are the policy's own `latestFailures`, read **after** the count moved,
+ *    minus the ones that were already there before the poll: the newest throw in each pass *that this
+ *    poll minted*, whose `turn`, `phase`, `playerId` and `detail` are the ones the planner wrote while
+ *    planning this run's turn. That is the whole of the H1/G2-1 fix, because the throw that made the
+ *    count move is the throw that wrote these records — a run cannot report an earlier run's turn and
+ *    pass. Answering this question from the first-per-pass list is what did: a frozen entry, printed
+ *    seed-qualified as `seed 2, turn 4 — smart, player 0, cities pass (city 0)` for a run whose planner
+ *    only threw on turns 6, 7 and 8. And the subtraction is the whole of H2-1, because the count is an
+ *    *instance's* count while the poll is a *seat's* poll: without it, one seat's throw moved the count
+ *    that every later seat's poll — and every later poll that threw nothing at all — was measured
+ *    against, and each of them then read the whole shared list.
  *
  * ## The bound, and why it is a pair rather than a record
  *
@@ -473,13 +537,25 @@ const startPlannerFailureLog = (policies: readonly Policy[]): PlannerFailureLog 
  * The position is in the key because a position is a seat: two seats sharing one instance both throw
  * in the same pass of the same turn, for real, and each gets its line. Collapsing them would report
  * one seat's throw and silently drop the other's, which is the silence this channel exists to end.
+ * The key is read only over records this poll minted, so it can never be filled with another seat's
+ * record — which is the shape H2-1 removed, and the reason the key is the polled *position* rather
+ * than the record's own `playerId`: a record's `playerId` says which seat wrote it, not which poll
+ * produced it, and those two differ for exactly the records that must be skipped.
  *
- * A report that moved its count and holds no record at all adds no entry, so nothing can become an
- * accusation: nothing to name means nothing to append, and the count has already said *that*
- * something happened. The ledger's count is updated first and unconditionally, so the next poll is
- * measured from this one rather than re-counting the same throw.
+ * A report that moved its count and holds no record this poll minted adds no entry, so nothing can
+ * become an accusation: nothing to name means nothing to append, and the count has already said
+ * *that* something happened. That is the same honest answer a report with no list at all gets, and it
+ * is also what a report that hands one record object to two seats gets — a `PolicyReport` mints a
+ * fresh object per throw, and one object can only be named once. The ledger's count is updated first
+ * and unconditionally, so the next poll is measured from this one rather than re-counting the same
+ * throw.
  */
-const collectPlannerFailures = (log: PlannerFailureLog, position: number, policy: Policy): void => {
+const collectPlannerFailures = (
+  log: PlannerFailureLog,
+  position: number,
+  policy: Policy,
+  recordsBeforePoll: readonly PlannerFailure[],
+): void => {
   const report = plannerReportOf(policy);
   if (report === undefined) return;
 
@@ -493,6 +569,18 @@ const collectPlannerFailures = (log: PlannerFailureLog, position: number, policy
   // and never the frozen first-per-pass record an earlier run left behind.
   const latest = report.latestFailures ?? [];
   for (const record of latest) {
+    // **Only what this poll minted** (H2-1). `latestFailures` is shared by every seat the instance
+    // serves, so a record that was already in the list when this poll began was minted by some other
+    // throw — this seat's on an earlier turn, or another seat's on this turn or in an earlier run —
+    // and it is not this poll's to claim. Skipping it is what keeps the count honest: seat 0 throwing
+    // in the cities pass and seat 1 in the units pass is **two** entries, not three, and a seat that
+    // threw nothing is named nothing even though the shared count moved.
+    //
+    // The honest reporter this relies on is the one `PolicyReport.latestFailures` describes: a fresh
+    // object per throw, never mutated. A reporter that hands one object back for two throws can only
+    // be named once, and the count still says a throw happened — the alternative, naming it under both
+    // seats, is the duplicate-record defect itself.
+    if (recordsBeforePoll.includes(record)) continue;
     // **One entry per (seat, pass) per run.** The `(position, phase)` pair is the key, and it is
     // the one the data actually has: `latestFailures` holds one entry per pass, so a pass that
     // throws on every turn of a hundred-turn game is read here a hundred times and named once —
@@ -609,8 +697,14 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
       // planning this turn has already recorded it by the time `chooseCommands` returns,
       // and the commands it returned are the partial turn that has to be visible in the
       // result rather than only in a warning beside it (see "Carrying a planner failure").
+      //
+      // The snapshot is taken **before** the poll and the record is read after it, because the
+      // difference between the two is what makes the record this seat's: `latestFailures` is shared
+      // by every seat the instance serves, so a list read after the poll holds other seats' records
+      // too — reading it whole is H2-1, and `plannerRecordsBeforePoll` is the fix.
+      const recordsBeforePoll = plannerRecordsBeforePoll(policy);
       const proposed = policy.chooseCommands(ctx);
-      collectPlannerFailures(plannerFailures, Number(player.id), policy);
+      collectPlannerFailures(plannerFailures, Number(player.id), policy, recordsBeforePoll);
 
       for (const command of proposed) {
         // The runner owns the turn boundary — see the module note.

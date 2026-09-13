@@ -1,0 +1,326 @@
+/*
+ * The app's stylesheet.
+ *
+ * Presentation only — no rule, no cost and no legality is decided here, and nothing below is read
+ * by a test: the e2e suite targets roles and accessible names, so a restyle cannot break it (that
+ * is the contract's stated reason for freezing the names). This file exists so the panels are
+ * readable next to the map rather than stacked in one narrow column, and so the map keeps its own
+ * fixed box: the camera clamps against that box, and a fluid one would make "which tile is under
+ * this point?" depend on the window size at the moment of the click.
+ *
+ * ## The window is the frame, and an opened panel is DOCKED — it never floats over the game
+ *
+ * An opened panel used to be laid out in the document flow, which put it *below the fold*: a
+ * `<dialog>` opened with `show()` is `position: absolute` from the UA stylesheet with no block
+ * offsets, so it lands at its static position — far down a page whose panel column is taller than
+ * the window — and a player on a 900 px-tall window saw a title and a Close button and nothing
+ * else. That is an A1 failure: a human could not play.
+ *
+ * Floating it back over the game is not the fix either, and that was measured rather than assumed:
+ * centring the dialogs with `position: fixed` turned three green e2e tests red, because a panel
+ * over the middle of the page intercepts the pointer the game needs — `debug.spec.ts` plays on
+ * (found a city, end a turn) while the debug panel is open, and `keystone.spec.ts` measures the
+ * wheel-zoom gesture while a city screen is open, so a dialog over the map swallows both.
+ *
+ * So the layout has three regions and the panel has its own: `[data-layout='map-column']` holds the
+ * map and, under it, `[data-layout='dock']`, which is where the panels' dialogs are moved at mount.
+ * The dock is bounded by the window, the dialog inside it is bounded by the dock (`max-height`,
+ * `overflow: auto`), and neither the map nor the panel column is ever covered — which is what keeps
+ * the map's wheel/drag/click gestures and the action buttons in the panel column working while a
+ * panel is open. `main.ts` states the same rule where the move happens.
+ *
+ * To make that stable, the *document* no longer grows: the app is exactly one window tall, the
+ * panel column scrolls inside itself, and the map's box — the box the camera clamps against and
+ * the hit-test inverts — is in the same place whatever is open. A scrolling page would move the
+ * canvas out from under a pointer between the moment a test computes a tile's screen point and the
+ * moment it clicks it, and would make the dock's position depend on how far the page happened to be
+ * scrolled.
+ */
+
+:root {
+  --bg: #12161c;
+  --panel: #1b2129;
+  --ink: #e8e6df;
+  --muted: #9aa3ad;
+  --accent: #d8c37a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font:
+    14px/1.45 system-ui,
+    'Segoe UI',
+    sans-serif;
+}
+
+#civts-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#civts-app > header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid #2b333d;
+}
+
+#civts-app > header h1 {
+  font-size: 18px;
+  margin: 0;
+  letter-spacing: 0.04em;
+}
+
+main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  padding: 16px;
+  overflow: hidden;
+}
+
+/* The map and the dock share one column, so a docked panel sits under the map. */
+[data-layout='map-column'] {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+[data-panel='map'] {
+  flex: 0 0 auto;
+  border: 1px solid #2b333d;
+  background: #0d1116;
+  line-height: 0;
+}
+
+[data-panel='map'] canvas {
+  cursor: crosshair;
+}
+
+/*
+ * The dock itself: whatever region the map leaves at the bottom of the window. It is a flex
+ * column so two panels opened at once share it, and it never overlaps the map above it or the
+ * panel column beside it.
+ *
+ * `contain: inline-size` is load-bearing rather than decorative. Without it the dock's width —
+ * and with it the whole map column's, which is sized by its contents — comes from what is docked
+ * inside, and a city screen's max-content width runs to thousands of pixels (a `<fieldset>` of
+ * twenty-one worked-tile labels laid out on a single line). Measured: the map column grew to
+ * 3114 px and pushed the panel column off the right of a 1280 px window. Size containment makes
+ * the dock's inline size independent of its contents, so the map column is exactly as wide as the
+ * map and a panel is exactly as wide as the dock — with its own scrollbar when its content needs
+ * one, which is what `dialog`'s `overflow: auto` above provides.
+ */
+[data-layout='dock'] {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+  contain: inline-size;
+}
+
+main > section[aria-label='Panels'] {
+  flex: 1 1 380px;
+  min-width: 340px;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+[data-panel] {
+  background: var(--panel);
+  border: 1px solid #2b333d;
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+
+[data-panel] h2,
+[data-panel] h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 4px 0 6px;
+}
+
+[data-panel='status'] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  font: inherit;
+  color: var(--ink);
+  background: #262e38;
+  border: 1px solid #3a4550;
+  border-radius: 3px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #303a46;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+ul,
+ol {
+  margin: 4px 0;
+  padding-left: 18px;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 4px 0;
+}
+
+dt {
+  color: var(--muted);
+}
+
+dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+[role='group'] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border: 1px solid #2b333d;
+  border-radius: 4px;
+}
+
+/*
+ * A panel, docked under the map (see the module note). `position: static` overrides the UA
+ * stylesheet's `position: absolute`, which is what put an opened panel below the fold; `width` and
+ * `max-height` are the dock's box, so the panel is fully visible inside the window and its own
+ * content scrolls rather than growing past it. Nothing here floats: the map above and the panel
+ * column beside never share a pixel with an open panel, so no gesture aimed at the game can land
+ * on a panel by accident.
+ */
+dialog {
+  position: static;
+  margin: 0;
+  width: 100%;
+  max-width: none;
+  max-height: 100%;
+  flex: 0 1 auto;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid #3a4550;
+  border-radius: 6px;
+  overflow: auto;
+}
+
+/* Non-modal panels have no backdrop (the panels are side screens; see `city.ts`); the rule is
+ * kept because a future modal use must not paint a translucent sheet nothing else declares. */
+dialog::backdrop {
+  background: rgb(0 0 0 / 45%);
+}
+
+/*
+ * The rates row: the editable half of the status strip (see `panels/index.ts`). It takes a row of
+ * its own inside the strip, and the engine's own verdict is the text beside the control.
+ */
+[data-panel='rates'] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  width: 100%;
+  border: 1px solid #2b333d;
+}
+
+[data-panel='rates'] label {
+  color: var(--muted);
+}
+
+[data-panel='rates'] input {
+  font: inherit;
+  width: 4em;
+  color: var(--ink);
+  background: #262e38;
+  border: 1px solid #3a4550;
+  border-radius: 3px;
+  padding: 2px 4px;
+}
+
+[data-panel='rates'] [role='status'] {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+/*
+ * The log's own list numbering has to fit inside the box.
+ *
+ * `padding-left` was 22px, which holds a one-digit marker and nothing wider: `overflow: auto` clips
+ * a marker that reaches past the border box, so a two-digit line number lost its leading digit and
+ * every line past the ninth read "?4." in the frame the advisory screenshots capture. A game emits
+ * hundreds of lines, so the numbers are wrong for essentially the whole game. 36px holds the three
+ * digits `EVENT_LOG_LIMIT` can reach. Presentation only: markers are not part of a line's text, so
+ * nothing the engine emits and nothing a test reads changes.
+ */
+[role='log'] {
+  max-height: 220px;
+  overflow: auto;
+  padding-left: 36px;
+}
+
+[role='log'] li {
+  color: var(--ink);
+}
+
+[data-panel='save'] [role='status'],
+[data-panel='debug'] [role='status'] {
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 2px 8px 2px 0;
+  border-bottom: 1px solid #262e38;
+}

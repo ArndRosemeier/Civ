@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CivTS</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <!--
+      The shell and every panel are built by `src/main.ts`. There is no markup here because there
+      is no second description of the interface: the elements the accessibility contract names are
+      created, labelled and owned by exactly one module each (`panels/index.ts` for the panel set,
+      `main.ts` for the map and the end-turn control), and a static skeleton here would be a
+      second place for them to drift.
+    -->
+    <noscript>CivTS needs JavaScript: the game engine runs in this page.</noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

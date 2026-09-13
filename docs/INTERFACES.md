@@ -1812,3 +1812,134 @@ record changes in one place and everything else follows.
 - The 20-seed A3 run completes with ZERO planner failures, zero violations, and its raw
   wall time under the restored 900 s bound.
 - Fast gate still ≤ 70 s wall; full still ≤ 10 min.
+
+---
+
+# M8 contracts — FROZEN (the web UI)
+
+Alpha criteria A1 (a human plays from the browser to a victory/defeat screen with no CLI)
+and A4 (the UI covers map render + pan/zoom, unit orders, city screen, tech tree, turn/year,
+event log, scoreboard, save/load, debug panel). Victory and defeat screens arrive with M10,
+so M8 delivers playability and A1 is verified once M10 lands.
+
+## Where it lives, and where the game runs
+
+A new package `packages/web` (fits the existing `packages/*` workspace glob — no workspace
+change needed). **The game runs IN THE BROWSER.** `@civts/core` and `@civts/rules` are pure
+TypeScript with no Node dependencies, so the browser is the engine host: no server-side game
+state, no second copy of the rules. A server that owned state would let the UI and the engine
+disagree — the command-versus-generator lesson at a new layer — and M2/M4c/M5 have now found
+that class of defect four times.
+
+The dev/preview server serves STATIC FILES ONLY, binds `127.0.0.1`, and must **not** use port
+3080 (the DSH GUI). Use **4174**. Port 3080 is never touched, never restarted, never proxied.
+
+Dependencies are authorized for this milestone ONLY: `vite` and `@playwright/test` as dev
+dependencies of `packages/web`. Install non-interactively (`pnpm add -D --filter`), never
+`pnpm install` at the root. The Playwright Chromium binary is already cached at
+`~/.cache/ms-playwright/chromium-1243`; **if the installed `@playwright/test` expects a
+different revision, do NOT download browsers** — drive the already-installed Google Chrome
+(`channel: 'chrome'`) instead, and say which you used.
+
+## The UI must not contain game rules
+
+Every action goes through `legalActions` / `applyCommand`. The UI may not compute legality,
+costs or outcomes, and may not offer a control whose action the engine would refuse. This is
+the keystone invariant at the presentation layer and it is directly testable: **every control
+the UI offers must be accepted by the engine, and every action the engine accepts for a unit
+or city must be reachable** from the UI for that unit or city.
+
+## The test seam (frozen — the Playwright suite depends on it)
+
+The app exposes exactly this on `window`:
+
+```ts
+interface CivtsTestApi {
+  readonly ready: boolean;                       // true once the first frame is drawn
+  state(): unknown;                              // the AUTHORITATIVE state object
+  stateHash(): string;                           // the same hash the engine's goldens use
+  dispatch(action: unknown): 'ok' | 'refused';   // through the real applier, no bypass
+  actionsFor(unitId?: number, cityId?: number): unknown[]; // exactly the engine's list
+  settings(): unknown;
+  seed(seed: number, options?: unknown): void;   // new game, deterministic
+  draws(): number;                               // monotonically increasing render counter
+}
+```
+
+Namespace it `window.__CIVTS__`. Tests assert against THIS, never against a guess derived
+from pixels or from a panel's text. `dispatch` must return `'refused'` rather than throw, so a
+test can prove a refusal was the engine's.
+
+## The accessibility contract (frozen — the interface between UI and tests)
+
+Tests target by ROLE and ACCESSIBLE NAME, never by CSS class or DOM position, so the two can
+be built in parallel and the tests survive a restyle. These names are contractual:
+
+| element | role | accessible name |
+|---|---|---|
+| map viewport | `application` | `Map` |
+| end turn | `button` | `End turn` |
+| turn indicator | `status` | `Turn` (text contains `Turn <n>`) |
+| year indicator | `status` | `Year` |
+| treasury/science/luxury | `status` | `Treasury`, `Science`, `Luxury` |
+| event log | `log` | `Events` |
+| scoreboard | `table` | `Scoreboard` |
+| city list | `list` | `Cities` |
+| city screen | `dialog` | `City <name>` |
+| tech tree | `dialog` | `Technology` |
+| save | `button` | `Save game` |
+| load | `button` | `Load game` |
+| debug panel | `dialog` | `Debug` |
+| debug state hash | `status` | `State hash` |
+| unit panel | `region` | `Units` |
+| selected unit actions | `group` | `Actions for unit <id>` |
+
+The map canvas carries an accessible description naming the visible map dimensions and the
+cursor's tile coordinates, updated as the pointer moves, so map interaction is assertable
+without pixels.
+
+## Rendering, and how it is tested (§16.2)
+
+Canvas 2D for the map; DOM for every panel. The canvas must expose a deterministic **draw
+trace** through the test API — an ordered list of what was drawn for the last frame, with the
+tile coordinates and terrain ids, capped and documented. Tests use it to prove the map drew
+the tiles it claims, and pixel sampling to prove colours actually reached the canvas (a draw
+call that never lands on screen is a rendering bug the DOM cannot reveal). Click hit-testing
+converts a page coordinate to a tile through the SAME function the renderer uses — a second
+inverse mapping is a bug waiting to happen and must not exist.
+
+## A4 coverage — every item needs at least one named e2e assertion
+
+map render + pan/zoom · unit orders (move, found city, work, fortify, attack) · city screen
+(worked tiles, production, queue) · tech tree (research selection, known/available/locked) ·
+turn/year indicator · event log · scoreboard · save/load round-trip preserving the state hash ·
+debug panel. Save/load writes to `localStorage` and must round-trip `stateHash()` unchanged.
+
+## Determinism at the UI layer
+
+A fixed seed plus a fixed script of dispatched actions must produce the same `stateHash()` as
+the same script run headless through the engine — that equality is the proof the UI added no
+rules. The UI introduces no randomness, no clock into the simulation, and no floating point.
+
+## Also in this wave
+
+H2-1 (carried from M7f, and the LAST item in that area): with one policy instance shared by
+several seats that threw in different passes, a later seat's poll re-appends an earlier seat's
+record under its own key, so the banner can report more planner failures than occurred. Every
+printed line's own turn/phase/player is still a real throw, so the false-location defect stays
+fixed; the count and the "names each (seat, pass) once" claim do not. Fix by taking only the
+records minted during the current poll (snapshot `latestFailures` before each poll, or key on
+the record's own `playerId` plus phase — the latter needs the runner test's `driven` fixture to
+mint one record per seat).
+
+## Acceptance evidence
+
+- The app builds and serves on 127.0.0.1:4174; a screenshot of a played game is captured and
+  Reviewed, and the runs are advisory evidence, never the primary assertion.
+- The full e2e suite passes headlessly, with the count of passed tests reported.
+- The keystone: no UI control offers an action the engine refuses, and every engine-accepted
+  action for a selected unit/city is reachable — proven by sweeping both directions in a test.
+- A scripted game through the UI produces the same `stateHash()` as the same script through
+  the engine directly.
+- Fast `pnpm verify` still ≤ 70 s wall (the e2e suite does NOT run in the fast tier — it is
+  full-tier or its own command, and the tier split must keep reporting skips by name).

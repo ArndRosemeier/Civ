@@ -632,6 +632,62 @@ const PLANNER_PHASES: readonly PlannerPhase[] = [
   'units',
 ];
 
+/**
+ * **One** policy instance that throws for whichever of its seats are armed, in the pass that seat is
+ * given — the shape H2-1 is made of.
+ *
+ * Modelled on the shipped `smartPolicy` rather than on a convenient fake: `firstByPhase` keeps the
+ * first record of each pass, `latestByPhase` is **replaced** by every throw, `failureCount` counts
+ * every throw, and the report hands out fresh arrays over those records. That last property is the
+ * one the runner reads *through*: a record is a fresh object per throw, as
+ * `PolicyReport.latestFailures` promises.
+ *
+ * It is deliberately **one instance for both seats**, which is the shipped usage — `SMART_POLICY` is
+ * a singleton and `batch`, `tournament` and the CLI all hand one instance to every seat — and the
+ * whole of H2-1 is that the instance's `latestFailures` list is therefore shared: after a poll it
+ * holds the polled seat's record *beside* the records earlier seats' throws left in it. A fixture
+ * with one instance per seat could not show the defect at all.
+ */
+const sharedSeatPolicy = (
+  phaseForSeat: (seat: number) => PlannerPhase,
+): { readonly policy: DiagnosedPolicy; readonly arm: (seats: readonly number[]) => void } => {
+  const firstByPhase = new Map<PlannerPhase, PlannerFailure>();
+  const latestByPhase = new Map<PlannerPhase, PlannerFailure>();
+  let failureCount = 0;
+  let armed: readonly number[] = [];
+  const policy: DiagnosedPolicy = {
+    name: 'shared-seat',
+    chooseCommands: (ctx) => {
+      const seat = Number(ctx.playerId);
+      if (!armed.includes(seat)) return [];
+      const phase = phaseForSeat(seat);
+      failureCount += 1;
+      const record: PlannerFailure = {
+        policy: 'shared-seat',
+        turn: ctx.state.turn,
+        playerId: seat,
+        phase,
+        detail: `seat ${String(seat)}`,
+        error: `Error: seat ${String(seat)} cannot read the board`,
+      };
+      if (!firstByPhase.has(phase)) firstByPhase.set(phase, record);
+      latestByPhase.set(phase, record);
+      return [];
+    },
+    report: () => ({
+      failures: [...firstByPhase.values()],
+      latestFailures: [...latestByPhase.values()],
+      failureCount,
+    }),
+  };
+  return {
+    policy,
+    arm: (seats) => {
+      armed = seats;
+    },
+  };
+};
+
 describe('runSimulation — M7d: a planner failure is carried in the result', () => {
   it('carries an EMPTY list for a policy that legitimately returns no commands', () => {
     // The control, and half of the distinction the field exists to make. `DO_NOTHING_POLICY`
@@ -779,14 +835,24 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
 
     const result = runSimulation(optionsFor(14, [driven, driven], 2));
 
-    // Both seats are polled, and both threw during this run, so both are named — the stale record,
-    // which the frozen first-per-pass list still holds and would happily hand over, is not.
-    expect(result.plannerFailures.map((failure) => failure.error)).toEqual([
-      'Error: fresh',
-      'Error: fresh',
-    ]);
+    // **Re-decided by H2-1: this expectation was `['Error: fresh', 'Error: fresh']` — two entries —
+    // and it is one now, because the old value was not a property of the seam at all: it was the
+    // *same* `fresh` object named twice.** This fixture hands one record object to both seats (it
+    // moves `latest` to `fresh` on the first poll and afterwards only grows the count), while a
+    // `PolicyReport` mints a fresh object per throw and never mutates one. A run now takes only the
+    // records a poll **minted**, so seat 0's poll names `fresh`, and seat 1's poll — which minted
+    // nothing — is named nothing rather than being handed seat 0's record under its own key. That
+    // duplicate-record shape is exactly what H2-1 removes. Nothing is silent about the throw: the
+    // count still moved for both polls, and the run reports what it can prove. The fixture is left
+    // as it is on purpose — this test is about *which* record is read, the run's own `fresh` rather
+    // than the frozen `stale`, and the case where both seats really do mint a record (different
+    // passes, and a reused instance whose seats are swapped between runs) is pinned by the H2-1
+    // tests at the end of this block.
+    expect(result.plannerFailures.map((failure) => failure.error)).toEqual(['Error: fresh']);
     expect(result.plannerFailures).not.toContain(stale);
-    expect(result.plannerFailures.map((failure) => failure.turn)).toEqual([2, 2]);
+    // The surviving entry is the object this run's poll minted, and it names this run's own turn.
+    expect(result.plannerFailures).toContain(fresh);
+    expect(result.plannerFailures.map((failure) => failure.turn)).toEqual([2]);
   });
 
   it('reports a re-throw that the record list cannot show, because the count can (F2-1 and H1)', () => {
@@ -1012,5 +1078,92 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
     expect(frozen.length).toBeGreaterThan(0);
     for (const stale of frozen) expect(stale.turn).toBe(4);
     for (const stale of frozen) expect(runB.plannerFailures).not.toContain(stale);
+  });
+
+  it('names one entry per (seat, pass) when one instance’s seats threw in DIFFERENT passes (H2-1)', () => {
+    // **The defect in the shape it was reported in, and the number it must produce.**
+    //
+    // One instance serves both seats, and the two seats throw in *different* passes: seat 0 in the
+    // cities pass, seat 1 in the units pass. Since `latestFailures` holds one entry per pass for the
+    // whole instance, seat 1's poll was handed seat 0's record beside its own — and the
+    // `(position, phase)` key, which was new for the position, re-appended it. So one run reported
+    // **three entries for two real throws in a one-turn run, and four in this three-turn one**: the
+    // same record object twice, under `0:cities` and `1:cities`, and `1:cities` named a throw seat 1
+    // never made. (It does not stay at three: each seat keeps re-appending the other seat's record
+    // under a key of its own that is still new.) That is what a CLI banner showed as
+    // "3 PLANNER FAILURES" with a duplicated line, and what `--json` carried.
+    //
+    // Two entries is the sound number, and the rule that gives it is "a poll may only take what it
+    // minted": seat 0's poll took the record its own throw minted, seat 1's poll took its own, and
+    // the record that was already in the list when that poll began is not the later seat's to claim.
+    // The rest of the seam's promises are asserted here too, because a count is only worth pinning
+    // beside them: both seats named, one entry per (seat, pass) and **not** per turn (the planner
+    // threw on all three turns of this run), and every entry the seat's own throw.
+    //
+    // Both numbers above are measured, not argued: with the snapshot check in `runner.ts` removed —
+    // the pre-fix read of the whole shared list under the same `(position, phase)` key — this test
+    // reports 4 entries for 2 throws, and the re-decided test above reports the same `fresh` record
+    // twice. Both go green again the moment the check is restored, which is what makes this a
+    // regression test rather than a description.
+    const shared = sharedSeatPolicy((seat) => (seat === 0 ? 'cities' : 'units'));
+    shared.arm([0, 1]);
+
+    const result = runSimulation(optionsFor(19, [shared.policy, shared.policy], 3));
+
+    // **2 entries, not 3** — and no record object twice, which is the same claim stated so that a
+    // duplicated object cannot hide behind a coincidentally equal count.
+    expect(result.plannerFailures).toHaveLength(2);
+    expect(new Set(result.plannerFailures).size).toBe(2);
+    // Each entry is its own seat's throw, in the pass that seat throws in: no entry is seat 0's
+    // record wearing seat 1's key, and no entry is named under a (seat, pass) that never threw.
+    expect(result.plannerFailures.map((failure) => failure.phase)).toEqual(['cities', 'units']);
+    expect(result.plannerFailures.map((failure) => failure.playerId)).toEqual([0, 1]);
+    expect(result.plannerFailures.map((failure) => failure.error)).toEqual([
+      'Error: seat 0 cannot read the board',
+      'Error: seat 1 cannot read the board',
+    ]);
+    // The first throw of each pass, kept: three turns, two entries. A re-throw inside the run is
+    // counted once rather than nagged once per turn.
+    expect(result.plannerFailures.map((failure) => failure.turn)).toEqual([1, 1]);
+  });
+
+  it('does not hand a later run the OTHER seat’s pre-existing record (H2-1)', () => {
+    // The same shared list across two runs, with the seats swapped — the half of H2-1 that survives a
+    // narrower fix and is why the runner snapshots the list instead of keying on the record's own
+    // `playerId`.
+    //
+    // Run 1: only seat 0 throws, in the cities pass, so the instance's list holds seat 0's record.
+    // Run 2: only seat 1 throws, in the units pass. Keying the entries on `record.playerId` would look
+    // right here — the two seats are two keys — and it would be wrong for exactly the record run 2 was
+    // handed: the list still holds **run 1's** seat-0 record, its key `0:cities` is new to run 2's log,
+    // and a run-2 poll that read the whole list would append it. That is the H1/G2-1 defect for the
+    // other seat — a record attributed to a run that did not produce it — and run 2 would report a
+    // seat that did not throw in it at all. Measured, not argued: with the key changed to
+    // `${record.playerId}:${record.phase}` and the snapshot removed, this test's second assertion
+    // received `[0, 1]` — run 1's record claimed by run 2 — while the different-pass count above still
+    // passed, which is why this case is the one that decides between the two candidate fixes. What the
+    // run takes is what its own polls minted, so run 2 names seat 1's throw and nothing else.
+    const shared = sharedSeatPolicy((seat) => (seat === 0 ? 'cities' : 'units'));
+
+    shared.arm([0]);
+    const first = runSimulation(optionsFor(20, [shared.policy, shared.policy], 1));
+    expect(first.plannerFailures.map((failure) => failure.playerId)).toEqual([0]);
+    const seatZeroRecord = first.plannerFailures[0];
+    if (seatZeroRecord === undefined) throw new Error('run 1 reported nothing for seat 0');
+    expect(seatZeroRecord.phase).toBe('cities');
+    expect(seatZeroRecord.turn).toBe(1);
+
+    shared.arm([1]);
+    const second = runSimulation(optionsFor(21, [shared.policy, shared.policy], 1));
+    expect(second.plannerFailures.map((failure) => failure.playerId)).toEqual([1]);
+    expect(second.plannerFailures.map((failure) => failure.phase)).toEqual(['units']);
+    expect(second.plannerFailures).not.toContain(seatZeroRecord);
+
+    // And a run in which nobody threw is clean on the same reused instance whose list still holds both
+    // earlier records: a pre-existing record does not make a later run fail. This is the "healthy
+    // shared instance reports nothing" half, read on an instance that is no longer healthy-in-the-past.
+    shared.arm([]);
+    const third = runSimulation(optionsFor(22, [shared.policy, shared.policy], 1));
+    expect(third.plannerFailures).toEqual([]);
   });
 });

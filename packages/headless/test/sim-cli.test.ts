@@ -1745,6 +1745,91 @@ describe('the CLI says out loud when a planner threw, and fails the run', () => 
     expect(text.exitCode).toBe(1);
   });
 
+  it('counts the failures the run really made when one instance’s seats threw in different passes (H2-1)', () => {
+    // **The defect at the layer it was first seen on: the banner.** Every fixture above throws in the
+    // *same* pass from both seats (`research` — the board is unreadable, so the planner fails at its
+    // first read), which is why the counts beside them were right. One instance serving two seats that
+    // failed in *different* passes is the shape that was wrong: `PolicyReport.latestFailures` holds one
+    // entry per pass for the whole instance, so the later seat's poll was handed the earlier seat's
+    // record beside its own, and the runner's `(position, phase)` key — new for that position —
+    // re-appended it. In the one-turn shape it was reported in, the banner said **3 PLANNER FAILURES**
+    // for two throws and printed the same line twice, and `--json` carried three records; the measured
+    // figure for this four-turn batch is below. Nothing about any single line was wrong (each
+    // one's own turn, pass and player were real throws of that run — the M7f fix holds); what was wrong
+    // was the count and the claim that a run names each (seat, pass) it saw throw exactly once.
+    const differentPasses = (): DiagnosedPolicy => {
+      const firstByPhase = new Map<string, PlannerFailure>();
+      const latestByPhase = new Map<string, PlannerFailure>();
+      let failureCount = 0;
+      return {
+        name: 'smart',
+        chooseCommands: (ctx) => {
+          // A pass per seat, and a fresh record per throw — the shape `PolicyReport` promises.
+          const seat = Number(ctx.playerId);
+          const phase = seat === 0 ? 'cities' : 'units';
+          failureCount += 1;
+          const record: PlannerFailure = {
+            policy: 'smart',
+            turn: ctx.state.turn,
+            playerId: seat,
+            phase,
+            detail: `seat ${String(seat)}`,
+            error: 'Error: the board is unreadable',
+          };
+          if (!firstByPhase.has(phase)) firstByPhase.set(phase, record);
+          latestByPhase.set(phase, record);
+          return [];
+        },
+        report: () => ({
+          failures: [...firstByPhase.values()],
+          latestFailures: [...latestByPhase.values()],
+          failureCount,
+        }),
+      };
+    };
+
+    const output = okOrThrow(
+      runSimCommand([...SMALL, '--policy', 'smart', '--json'], {
+        policyOverrides: new Map([['smart', differentPasses()]]),
+      }),
+    );
+    const failures = parsedJson(output)['plannerFailures'];
+    expect(Array.isArray(failures)).toBe(true);
+    if (!Array.isArray(failures)) throw new Error('the report carries no planner failures');
+    // **One entry per (seat, pass) per run: two seats × two passes × two runs = 4.** The measured
+    // pre-fix count for this batch was **8** — four per run, from the two real throws plus two
+    // re-appended records, measured by removing the snapshot check in `runner.ts` — and that figure
+    // does not stay put either: the duplicate is re-made on every turn that throws until each seat has
+    // re-appended the other's pass under its own key.
+    expect(failures).toHaveLength(4);
+    // Both seats are named, and neither is named twice under the other's pass.
+    const seats = failures.filter(isRecord).map((failure) => failure['playerId']);
+    expect(seats).toStrictEqual([0, 1, 0, 1]);
+    expect(failures.filter(isRecord).map((failure) => failure['phase'])).toStrictEqual([
+      'cities',
+      'units',
+      'cities',
+      'units',
+    ]);
+
+    const text = okOrThrow(
+      runSimCommand([...SMALL, '--policy', 'smart'], {
+        policyOverrides: new Map([['smart', differentPasses()]]),
+      }),
+    );
+    expect(text.stdout).toContain('!! 4 PLANNER FAILURES in 2 of 2 runs');
+    expect(text.stdout).toContain(
+      '4 failures in 2 of 2 runs — the AI did not play part of those games',
+    );
+    // ...and no line printed twice: the banner's per-failure lines are exactly the records, one each.
+    const bannerLines = text.stdout
+      .split('\n')
+      .filter((line) => line.startsWith('!!   seed ') || line.startsWith('!!   knob '));
+    expect(bannerLines).toHaveLength(4);
+    expect(new Set(bannerLines).size).toBe(4);
+    expect(text.exitCode).toBe(1);
+  });
+
   it('is a required, always-present field: empty, never missing, for a clean run', () => {
     // The control, and the other half of the distinction: `DO_NOTHING_POLICY` returns an empty
     // list every turn *by design*, and a healthy run of the real AI decides everything it wants
