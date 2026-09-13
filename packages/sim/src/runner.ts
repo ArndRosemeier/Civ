@@ -50,6 +50,64 @@
  *    alternative (polling everyone against one snapshot) would need a merge rule
  *    the engine does not have: there is no "apply a list of commands atomically"
  *    in the contract, and inventing one here would be a second applier.
+ * 6. **A planner failure is carried in the result, and does not truncate the run.**
+ *    M7d (docs/INTERFACES.md, "a failure the result itself can carry"): a policy is
+ *    required to be **total**, so a turn in which the planner threw is a turn the AI did
+ *    not play — and the commands it returned before the throw look exactly like a turn in
+ *    which it had nothing to say (same legal command list, same metrics, same invariants,
+ *    same plausible hash). The record therefore travels **in the result**, as
+ *    `SimulationResult.plannerFailures`, and the runner is the only thing in a position
+ *    to read it out of the policy that owns it. See "Carrying a planner failure" below
+ *    for how it is read and why it is not a second `violations` list.
+ *
+ * ## Carrying a planner failure
+ *
+ * It is **not** a second `violations` list, and the two differ in the one way that matters
+ * here: a violation **stops** the run (the state that broke has to be inspected where it
+ * happened, and every later number would be a number about a broken world), while a partial
+ * turn leaves a perfectly valid game — the commands that *were* decided applied, the world
+ * advanced, the metrics are the metrics of the turn that was played. Truncating on a planner
+ * failure would also put the batch's horizon rule back on the floor: runs of one batch would
+ * end on different turns and every aggregate folded over them would be a mean over games of
+ * different lengths, which is the M4b/M5 rule this package already paid for once. What a
+ * planner failure changes is the **verdict**, not the length: see `tournamentVerdict` in
+ * `tournament.ts`, where a tournament containing one fails.
+ *
+ * The record lives on the policy (`PolicyReport`, `ai/smart.ts`), because a policy that
+ * catches its own throw is the only thing that can report one, and `plannerFailuresOf(policy)`
+ * is the seam. Three details of that seam are load bearing and are stated here rather than
+ * discovered later:
+ *
+ * - it answers `[]` for a policy that cannot report (the control policies), so calling it
+ *   costs no knowledge of the AI;
+ * - it keeps the **first** failure of each pass, so the list is bounded by the five passes
+ *   rather than by a cap somebody chose — and a policy that failed a pass before this run
+ *   started will not report that pass again;
+ * - a report is *cumulative for the policy instance*, and `SMART_POLICY` is a module-level
+ *   singleton.
+ *
+ * So the runner takes a **baseline** of every policy it is handed, before the first turn, and
+ * collects only failures that appear *after* it — by identity, because `report()` hands back a
+ * fresh array of the same record objects. A failure that predates the run belongs to whichever
+ * run caused it; a caller that wants a per-run answer from a reused instance should build one
+ * instance per run (which is what `sim-cli.ts` does, and why it holds its policies rather than
+ * rebuilding them at each call).
+ *
+ * One consequence of those two rules is visible in a report rather than here, so it is stated
+ * rather than left to be discovered: a batch or a tournament hands the **same** instance to
+ * every seat of every run it plays (one policy per seat, reused across seeds), and a pass's
+ * first failure is recorded once for the instance — so the failure of that pass is carried by
+ * the run in which the policy first made the record, and later runs report nothing rather than
+ * being handed a record they did not produce. The alternative would attribute one run's record
+ * to another run's game, which is worse than an under-count: it would put a turn number and a
+ * player id beside a game they never happened in. The tournament still fails either way, since
+ * its aggregate (`TournamentResult.plannerFailures`) is non-empty, so "which game, turn and
+ * phase failed" is answered by a real record and never by a guess — and that is what
+ * `batch.test.ts`, `tournament.test.ts` and `headless/test/sim-cli.test.ts` pin.
+ *
+ * Nothing about the world changes: no RNG is drawn, no state is touched, and a run whose
+ * policies never throw collects nothing and produces exactly the result it produced before
+ * this field existed.
  *
  * ## The policy RNG stream, and the one thing it must never touch
  *
@@ -95,8 +153,10 @@ import {
 } from '@civts/core';
 import { hashValue } from '@civts/testing';
 
+import { plannerFailuresOf } from './ai/smart.js';
 import { CORE_INVARIANTS, checkInvariants } from './invariants.js';
 import { sampleTurn } from './metrics.js';
+import type { PlannerFailure } from './ai/smart.js';
 import type {
   Policy,
   PolicyContext,
@@ -226,6 +286,49 @@ const policyFor = (policies: readonly Policy[], playerId: PlayerId): Policy => {
   return policy;
 };
 
+/**
+ * What a run has collected so far, plus the set of records it has already counted.
+ *
+ * A small object rather than two closure variables so that the "baseline, then collect"
+ * rule is one place: `baseline` is seeded from every policy **before the first turn**, and
+ * `collect` adds only records it has not seen. Identity is the right key here and it is not
+ * an optimization: `PolicyReport.failures` is a fresh array of the *same* record objects on
+ * every call, so an already-counted failure keeps its identity and a new one cannot collide
+ * with it — where a value comparison would have to pick a key, and every choice of key
+ * (the error text? the turn?) is a way for two genuinely different failures to look alike.
+ */
+interface PlannerFailureLog {
+  readonly collected: PlannerFailure[];
+  readonly seen: Set<PlannerFailure>;
+}
+
+/**
+ * Start the log: collect nothing yet, and count as already-seen every failure the policies
+ * were **already carrying** when the run began.
+ *
+ * This is what keeps a run's `plannerFailures` about *this* run. Nothing in this package
+ * resets a policy's report (it is the policy's own record, and `SMART_POLICY` is a
+ * module-level singleton), so a caller that reuses an instance across runs would otherwise
+ * see a previous run's failure attributed to this one — a false accusation, which is a
+ * different bug from the silence this field exists to end but a bug all the same.
+ */
+const startPlannerFailureLog = (policies: readonly Policy[]): PlannerFailureLog => {
+  const seen = new Set<PlannerFailure>();
+  for (const policy of policies) {
+    for (const failure of plannerFailuresOf(policy)) seen.add(failure);
+  }
+  return { collected: [], seen };
+};
+
+/** Read `policy`'s report and append whatever it has recorded since the run started. */
+const collectPlannerFailures = (log: PlannerFailureLog, policy: Policy): void => {
+  for (const failure of plannerFailuresOf(policy)) {
+    if (log.seen.has(failure)) continue;
+    log.seen.add(failure);
+    log.collected.push(failure);
+  }
+};
+
 /* ------------------------------------------------------------------ *
  * The run
  * ------------------------------------------------------------------ */
@@ -237,12 +340,20 @@ const policyFor = (policies: readonly Policy[], playerId: PlayerId): Policy => {
  * turn played, or — when an invariant fired — the state that broke, which is the
  * point of stopping there rather than carrying on.
  *
- * Throws (there is no failure channel in the frozen result shape) when
- * `newGame` reports a setup failure, when a civilization has no policy, or when
- * `sampleEvery` is not a positive integer. All three are caller bugs that would
- * otherwise produce a *plausible* result — an empty game, a run where one player
- * never acts, a report with no rows — and a plausible wrong number is the worst
- * outcome a balance loop can have.
+ * Throws when `newGame` reports a setup failure, when a civilization has no policy, or when
+ * `sampleEvery` is not a positive integer. All three are caller bugs, and a caller bug has no
+ * field in this result to live in: `plannerFailures` (M7d) is a *policy's* own record of a
+ * throw it caught, which is a different kind of fact, and a run that invented an entry for a
+ * caller's mistake would make the two indistinguishable. All three would otherwise produce a
+ * *plausible* result — an empty game, a run where one player never acts, a report with no
+ * rows — and a plausible wrong number is the worst outcome a balance loop can have.
+ *
+ * A **planner failure is not one of them**, and the distinction is the whole of M7d: a
+ * policy that throws while planning is caught by the policy itself (a policy is required
+ * to be total), and what it returns is a partial turn. That is a fact about the run's
+ * *evidence*, not about its arguments, so it is reported in the result —
+ * `SimulationResult.plannerFailures` — rather than thrown. See "Carrying a planner
+ * failure" above.
  */
 export const runSimulation = (options: SimulationOptions): SimulationResult => {
   const rulesetView: RulesetView = options.ruleset;
@@ -261,6 +372,8 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
   const stride = samplingStride(options.sampleEvery);
   const metrics: TurnMetrics[] = [];
   const violations: Violation[] = [];
+  // Taken before the first turn — see the module note on the baseline.
+  const plannerFailures = startPlannerFailureLog(options.policies);
 
   let state: GameState = created.value;
   let turnsPlayed = 0;
@@ -300,7 +413,15 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
         rng: policyRngFor(seed, player.id, state.turn),
       };
 
-      for (const command of policy.chooseCommands(ctx)) {
+      // The poll, and then the read of the policy's own failure record — in that order,
+      // because the record can only change *during* the poll. A policy that threw while
+      // planning this turn has already recorded it by the time `chooseCommands` returns,
+      // and the commands it returned are the partial turn that has to be visible in the
+      // result rather than only in a warning beside it (see "Carrying a planner failure").
+      const proposed = policy.chooseCommands(ctx);
+      collectPlannerFailures(plannerFailures, policy);
+
+      for (const command of proposed) {
         // The runner owns the turn boundary — see the module note.
         if (command.type === 'EndTurn') continue;
         const outcome = applyCommand(state, player.id, command, rulesetView);
@@ -349,6 +470,11 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
     finalState: state,
     metrics,
     violations,
+    // A fresh array, and an empty one when nothing failed — required and always present,
+    // the same discipline `violations` follows. The log's own array is handed over rather
+    // than copied because the run is over and the log is local to it; nothing else holds a
+    // reference to it.
+    plannerFailures: plannerFailures.collected,
     stoppedBecause: stopped,
   };
 };

@@ -30,6 +30,7 @@ import {
   civPlayers,
   newGame,
   type GameEvent,
+  type GameState,
   type RulesetView,
   type Settings,
 } from '@civts/core';
@@ -47,8 +48,10 @@ import {
   aggregateRuns,
   playerMetrics,
   runBatch,
+  smartPolicy,
   type BatchOptions,
   type BatchResult,
+  type DiagnosedPolicy,
   type MetricAggregate,
   type TurnMetrics,
 } from '@civts/sim';
@@ -93,6 +96,37 @@ const batchOf = (
   });
 
 const NO_EVENTS: readonly GameEvent[] = [];
+
+/**
+ * A policy that throws on every turn it is polled: the real AI, handed a board it cannot read.
+ *
+ * The same fixture `runner.test.ts` and `tournament.test.ts` use, and deliberately a **single**
+ * instance handed to both seats of both runs: that is what a real batch does, and it is what
+ * makes the record's own rule visible — one first failure per planning pass, recorded in the run
+ * where it happened, which is why the two runs below do not report the same failure twice.
+ */
+const boardBlindBatchPolicy = (): DiagnosedPolicy => {
+  const inner = smartPolicy();
+  return {
+    name: inner.name,
+    chooseCommands: (ctx) =>
+      inner.chooseCommands({ ...ctx, state: boardWithoutAReadableMap(ctx.state) }),
+    report: () => inner.report(),
+  };
+};
+
+/** The same state with an unreadable map — a getter, so the throw happens inside the planner. */
+const boardWithoutAReadableMap = (state: GameState): GameState => {
+  const broken = { ...state };
+  Object.defineProperty(broken, 'map', {
+    enumerable: true,
+    configurable: true,
+    get(): never {
+      throw new Error('the board is unreadable');
+    },
+  });
+  return broken;
+};
 
 const rowsOf = (batch: BatchResult): readonly TurnMetrics[] =>
   batch.runs.flatMap((run) => run.metrics);
@@ -265,6 +299,30 @@ describe('BatchResult — what it does not claim', () => {
 
     expect(batch.runs.map((run) => run.stoppedBecause)).toEqual(['no-commands', 'no-commands']);
     expect(batch.runs.every((run) => run.turnsPlayed === 4)).toBe(true);
+  });
+
+  it('carries a planner failure per run, without inventing a batch-level one (M7d)', () => {
+    // A batch has no aggregate for the failure channel and must not grow one: the records are
+    // the runs' own (`BatchResult` stays `runs` + `aggregates`, asserted above), which is what
+    // makes the CLI's aggregation over them a *read* rather than a second statement of the rule.
+    //
+    // The other half is the horizon rule. A planner failure does not stop a run — only a
+    // violation does — so a batch in which every planner threw still folds every aggregate over
+    // one horizon, and that is asserted here rather than assumed: a truncating failure would make
+    // the rows of one batch end on different turns, and a mean over games of different lengths is
+    // the arithmetic the M4b/M5 rule forbids.
+    const broken = boardBlindBatchPolicy();
+    const batch = batchOf([31, 32], 3, [broken, broken]);
+
+    expect(batch.runs.map((run) => run.plannerFailures.length > 0)).toEqual([true, false]);
+    // Nothing the invariants saw was wrong, and nothing stopped early.
+    expect(batch.runs.every((run) => run.violations.length === 0)).toBe(true);
+    expect(batch.runs.every((run) => run.turnsPlayed === 3)).toBe(true);
+    expect(batch.runs.every((run) => run.stoppedBecause !== 'violation')).toBe(true);
+    // One row per civilization per turn, for every run: one horizon, folded whole.
+    const cities = aggregateOf(batch.aggregates, 'cities');
+    expect(cities.count).toBe(2 * 3 * 2);
+    expect(aggregateOf(batch.aggregates, 'units').count).toBe(2 * 3 * 2);
   });
 });
 

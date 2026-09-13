@@ -52,6 +52,18 @@
  * a report cannot invent a softer one, and `accepted` adds the budget's verdict to it.
  * Nothing in this module ever filters, deduplicates, caps or averages a violation.
  *
+ * ## And so are planner failures (M7d)
+ *
+ * `TournamentResult.plannerFailures` gets exactly the same treatment, for the same reason one
+ * layer up: a policy is required to be **total**, so a game in which the planner threw is a game
+ * whose metrics describe an AI that was not playing — and those metrics are indistinguishable
+ * from a game in which the AI had nothing to do. `passed` therefore means **zero violations and
+ * zero planner failures**, and this module still averages neither. The full argument, including
+ * why a planner failure does *not* truncate the run the way a violation does, is on
+ * `TournamentVerdict` below and in `runner.ts`. M7d's acceptance line is what makes it a
+ * verdict rather than a diagnostic: "a policy that throws → a failure that FAILS the
+ * tournament, proven end to end through the CLI's exit code".
+ *
  * ## The budget is reported honestly, and the seed set is never trimmed
  *
  * A tournament plays **every** seed it was given, in ascending order, whatever the clock
@@ -109,6 +121,7 @@ import type { Ruleset } from '@civts/rules';
 import { aggregateRuns } from './batch.js';
 import { CORE_INVARIANTS } from './invariants.js';
 import { runSimulation } from './runner.js';
+import type { PlannerFailure } from './ai/smart.js';
 import type {
   Invariant,
   MetricAggregate,
@@ -204,6 +217,29 @@ export interface TournamentResult {
    * it reports.
    */
   readonly violations: readonly Violation[];
+  /**
+   * Every **planner failure** of every game, in game order — the aggregated equivalent of
+   * `SimulationResult.plannerFailures`, and empty for a tournament the AI actually played.
+   *
+   * M7d: a policy is required to be total, so a game in which the planner threw was not a
+   * valid measurement of the AI at all — and the metrics of such a game look exactly like
+   * the metrics of a game in which the AI had nothing to do. Flat and never filtered, for
+   * the same reason `violations` is: the caller has to confront it.
+   *
+   * Like `Violation`, the record carries no seed of its own (it says `policy`, `turn`,
+   * `playerId`, `phase`, `detail`, `error`); `games[i].plannerFailures` is where a caller
+   * finds which game a given record belongs to, and the CLI qualifies each one with its
+   * seed when it reports.
+   *
+   * It is exactly `games.flatMap((game) => game.plannerFailures)` and nothing else is
+   * computed from it, which is worth knowing when reading a count: a pass whose first
+   * failure was recorded in one game is reported there and not again in the later games that
+   * reused the same record (`runner.ts` states the baseline rule, and why the alternative —
+   * handing a game a record it did not produce — would be a false accusation). One game with
+   * a failure is enough for the whole tournament to fail, which is the property
+   * `tournamentVerdict` is built on.
+   */
+  readonly plannerFailures: readonly PlannerFailure[];
   /** The budget this run was judged against — always stated, never implied. */
   readonly budgetMs: number;
   /** Wall-clock milliseconds spent playing every game. */
@@ -283,54 +319,64 @@ const elapsedSince = (clock: TournamentClock, started: number): number => {
  * ------------------------------------------------------------------ */
 
 /**
- * The budget a tournament is judged against when its caller states none: **1800 s — half an
- * hour.**
+ * The budget a tournament is judged against when its caller states none: **900 s — fifteen
+ * minutes.**
  *
  * **A harness measurement choice, not a rule of the game and not a Civ 3 figure.** It is
  * exported and documented here, in one place, because a budget a balance pass may want to
  * vary is a magnitude like any other: `--budget-ms` and `TournamentOptions.budgetMs` move
  * it, and nothing else in this module mentions a millisecond.
  *
- * ## Why 1800 s: a decision, recorded with its reasoning
+ * ## Why 900 s: restored, and the reason is a measurement rather than a preference
  *
  * It is sized for **A3's experiment** — twenty seeds of a 100-turn game, every decision made
- * by the real AI — and it was raised from 900 s deliberately rather than tuned until a run
- * happened to fit. Three reasons, in the order they were weighed:
+ * by the real AI — and the fitted answer for that experiment today is the multiple of the
+ * recorded run the record itself computes (`A3_TOURNAMENT_EVIDENCE.headroomMs` /
+ * `headroomPct`, and `pnpm tournament:evidence` prints both beside a fresh run's): those
+ * figures are **not restated here**, because they move whenever the AI does and the whole
+ * point of the record is that there is one place to re-measure.
  *
- * 1. **This run is evidence, not a per-commit gate.** The per-commit bound (`time pnpm verify`
- *    ≤ 70 s, `@civts/testing`'s tier split) governs what a developer waits for between edits;
- *    A3's tournament is executed on purpose, by `scripts/tournament-evidence.ts`, and what it
- *    produces is a recorded measurement. A gate has to be tight because it runs constantly; an
- *    evidence run has to be *trustworthy*, and the cheapest way to make a run untrustworthy is
- *    to judge it against a bound that only an idle machine can meet.
- * 2. **It is bound by the AI's own per-turn cost**, which is not this harness's to budget. The
- *    policy is a `Policy` like any other (see the module note) and the genuine AI's decision
- *    work grows with the empire it manages: the AI got *smarter and 1.66× slower* in the M7b
- *    wave alone. A bound written against the harness rather than against the work would have to
- *    be raised every time the opponent improves, and it would say nothing about the games.
- * 3. **The previous bound left 4.2 % of headroom**, so "budget met" depended on the machine
- *    being idle: the same run measured 861.8 s (14 min 21.8 s) against a 900 s bound while a
- *    co-tenant suite ran, and a run that crossed 900 s exited 3 — a verdict that flips on a
- *    shared box is not a criterion, it is a coin toss. Half an hour puts the margin beyond
- *    machine noise instead of inside it.
+ * ## What this bound was, and why the widening was undone
+ *
+ * It was **1800 s** for one wave. The widening was not arbitrary: the AI cost **43.09 s per
+ * game** at the time and the whole run measured **861.8 s against a then-900 s bound — 4.2 %
+ * of headroom**, and a second run with a co-tenant suite on the box went 503 ms **over** and
+ * exited 3. A verdict that flips on machine noise is not a criterion, so the bound was
+ * deliberately doubled to put the margin beyond the noise instead of inside it.
+ *
+ * The reason the 1800 s bound was chosen is now **gone**: the AI's own per-game cost fell by
+ * an order of magnitude (the `perGameMs` the record carries, against the 43.09 s per game
+ * above that the doubling was decided on), because the wave after that one optimised the
+ * policy rather than the experiment. A bound whose justification has evaporated is worse than
+ * no bound, because it is not merely loose, it is *silent*: 1800 s would have tolerated a
+ * **16× regression** in the AI and still reported `withinBudget: true`, and a runaway detector
+ * that cannot detect a 16× runaway is decoration. So the number goes back to **900 s** — still
+ * several times the measured run, and tight enough that a policy which has started costing the
+ * whole run a quarter of an hour is *reported as the failure it is*.
+ *
+ * ## One source, and everywhere else follows
  *
  * The measured cost, this bound and the headroom between them are recorded **together, and
  * once**, in `A3_TOURNAMENT_EVIDENCE` below — which also carries the command that reproduces
  * them. Every other site (this package's index, the CLI's `--help`, the tier documentation,
  * the evidence script, the acceptance tests) references that value instead of restating a
- * number. That rule is not decoration: it is the second time this project has paid for
- * breaking it. A provenance summary that disagreed with its own detail was the first, and the
- * tournament cost was the second — the same figure recorded independently in five files and
- * stale by **1.66×** in all five, because the AI got faster to write about than to re-measure.
+ * number, and the record's `budgetMs` *is* this constant, so moving the bound moves the
+ * recorded headroom with it rather than leaving two numbers to drift apart. That rule is not
+ * decoration: it is the second time this project has paid for breaking it. A provenance
+ * summary that disagreed with its own detail was the first, and the tournament cost was the
+ * second — the same figure recorded independently in five files and stale by **1.66×** in all
+ * five, because the AI got faster to write about than to re-measure.
  *
  * ## Why this is a bound rather than a target
  *
  * The AI's per-turn decision work dominates a tournament by orders of magnitude, and it grows
- * with the empire it is managing: the same twenty seeds cost about 0.06 s per turn in the
- * opening and 0.26 s per turn averaged over a hundred. The engine and the invariant checks are
- * noise beside it. A *bound* is therefore the right shape here rather than a benchmark: a
- * slower or busier machine can, and should, report the run over budget — and the report says
- * so, with the elapsed time beside the stated one, rather than dropping seeds to fit.
+ * with the empire it is managing, so the cost of a run is a fact about the *policy*, not about
+ * this harness: the numbers are in the record below rather than restated here, precisely
+ * because they move whenever the AI does. The engine, the invariant checks and M7d's
+ * planner-failure read are noise beside them. A *bound* is therefore the right shape here
+ * rather than a benchmark: a slower or busier machine can, and should, report the run over
+ * budget — and the report says so, with the elapsed time beside the stated one, rather than
+ * dropping seeds to fit.
  *
  * Note what this default is **not** sized for any more: since M7b the CLI's own default run is
  * a two-game smoke tournament of ten turns (seconds), so a plain `civts run` finishes far
@@ -338,7 +384,7 @@ const elapsedSince = (clock: TournamentClock, started: number): number => {
  * the report always prints the budget it was judged against, so a small run never reads as a
  * near miss against a bound that was not written for it.
  */
-export const DEFAULT_TOURNAMENT_BUDGET_MS = 1_800_000;
+export const DEFAULT_TOURNAMENT_BUDGET_MS = 900_000;
 
 /* ------------------------------------------------------------------ *
  * The evidence record — ONE place every recorded figure lives
@@ -386,6 +432,16 @@ export interface TournamentEvidence {
   readonly games: readonly TournamentEvidenceGame[];
   /** Invariant violations in the run. Zero is A3's pass condition. */
   readonly violations: number;
+  /**
+   * Planner failures the run reported (M7d). Zero is the *other* half of A3's pass condition.
+   *
+   * Carried beside `violations` because they are the two ways a game fails to be evidence — a
+   * broken invariant, or an AI that stopped playing mid-turn — and because A3 claims the AI
+   * plays a **complete** game unaided. A record that said "zero violations" while the planner
+   * had been throwing would be evidence of the wrong thing: the metrics of a game in which the
+   * AI was not playing look exactly like the metrics of a quiet one.
+   */
+  readonly plannerFailures: number;
   /** Invariant checks performed, so "zero violations" can be read against a denominator. */
   readonly invariantChecks: number;
   /** The externally bracketed wall time of the whole run, in milliseconds. */
@@ -435,6 +491,7 @@ export interface TournamentEvidenceInput {
   readonly seats: readonly string[];
   readonly games: readonly TournamentEvidenceGame[];
   readonly violations: number;
+  readonly plannerFailures: number;
   readonly invariantChecks: number;
   readonly wallMs: number;
   readonly harnessElapsedMs: number;
@@ -483,6 +540,18 @@ export const tournamentEvidence = (input: TournamentEvidenceInput): TournamentEv
         'division by zero and the headroom would describe a run that never happened',
     );
   }
+  for (const [name, value] of [
+    ['violations', input.violations],
+    ['plannerFailures', input.plannerFailures],
+    ['invariantChecks', input.invariantChecks],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(
+        `tournamentEvidence: ${name} must be a whole count >= 0, got ${String(value)} (a ` +
+          'negative or fractional count is a record that says a run did something impossible)',
+      );
+    }
+  }
 
   const perGameMs = input.wallMs / games;
   const headroomMs = budgetMs - input.wallMs;
@@ -511,8 +580,10 @@ export const tournamentEvidence = (input: TournamentEvidenceInput): TournamentEv
       `${String(perGameSeconds)} s per game, ${String(wallMinutes)} min of wall time for the ` +
       `whole run (${String(commandWallSeconds)} s for the whole command, \`time\` end to end), ` +
       `against a ${String(budgetMinutes)} min bound — ${String(roundedHeadroomPct)} % ` +
-      `of headroom (${String(headroomMinutes)} min) and ${String(input.violations)} invariant ` +
-      `violations in ${String(input.invariantChecks)} checks. Measured ${input.measuredAt} at ` +
+      `of headroom (${String(headroomMinutes)} min), ${String(input.violations)} invariant ` +
+      `violations in ${String(input.invariantChecks)} checks and ` +
+      `${String(input.plannerFailures)} planner failures (both zero is the pass condition). ` +
+      `Measured ${input.measuredAt} at ` +
       `load average ${input.loadAverage} on ${input.host} at ${input.commit}; reproduce with ` +
       `\`${input.reproduce}\``,
   });
@@ -525,8 +596,18 @@ export const tournamentEvidence = (input: TournamentEvidenceInput): TournamentEv
  * (`civts tournament --seeds 1..20 --turns 100`) and the evidence script that wraps it
  * (`pnpm tournament:evidence`). The fields below are what that run reported: the wall time
  * this process bracketed the call with, the harness's own reading of the same call, the run's
- * violations and invariant checks, and the twenty final hashes — which are what makes "the
- * same games" checkable rather than asserted.
+ * violations, planner failures and invariant checks, and the twenty final hashes — which are
+ * what makes "the same games" checkable rather than asserted.
+ *
+ * **A3's pass condition is both counts at zero**, and since M7d the record carries both: zero
+ * invariant violations says the world never broke a property, and zero **planner failures** says
+ * the AI played every turn of every game it was credited with. A record with only the first
+ * would be evidence of the wrong thing — a policy that threw mid-turn returns a partial turn
+ * whose metrics look exactly like a quiet one's, which is the failure `PlannerFailure` exists to
+ * stop being invisible. Both counts were re-confirmed on the M7d tree by a fresh run of the same
+ * twenty games (the hashes below matched, so the games — and therefore the AI's behaviour — are
+ * the ones this measurement describes); `plannerFailures` is a field of the record rather than a
+ * sentence so that the claim is checked by reading a value.
  *
  * **The hashes are a timestamp, not a guarantee.** They match what the shipped code produces at
  * `commit` under `pnpm tournament:evidence`; the moment the AI or the catalog moves, the games
@@ -551,19 +632,22 @@ export const tournamentEvidence = (input: TournamentEvidenceInput): TournamentEv
  * of the same twenty games should do. The wave after that made the AI smarter and **1.66×
  * slower**, and the run measured **861.8 s = 43.09 s per game** against the then-900 s bound:
  * 4.2 % of headroom, and a second run with a co-tenant suite on the box went 503 ms **over**
- * and exited 3. That is the measurement the 1800 s bound was decided against, and it is why the
- * bound is half an hour rather than fifteen minutes: `DEFAULT_TOURNAMENT_BUDGET_MS` above carries
- * the reasoning, and the headroom it buys is a field of this record rather than a sentence
- * somebody has to re-do the arithmetic for.
+ * and exited 3. That is the measurement the 1800 s bound was decided against — and, one wave
+ * later, the measurement that un-decided it: the AI's cost fell by an order of magnitude, so
+ * the doubling lost its reason and **the bound is back at 900 s**, several times the run
+ * recorded below. `DEFAULT_TOURNAMENT_BUDGET_MS` above carries the reasoning, and the headroom
+ * between the bound and the run is a computed field of this record (`headroomMs`, `headroomPct`,
+ * `perGameMs`) rather than a sentence somebody has to re-do the arithmetic for.
  *
  * **This record's figures are a re-measurement taken after that decision**, on a quiet box, with
  * the wave's AI work in the tree (see `commit`). The per-game cost came down by an order of
  * magnitude — that is E1's optimisation landing, not a change of experiment — so the headroom
- * now reads far wider than the 52 % the 1800 s bound was chosen for. Both numbers are stated,
- * because a reader is entitled to see that the *decision* and the *current cost* are two
- * different facts, and to know that this one moves whenever the AI does. `pnpm
- * tournament:evidence` prints the recorded figures beside a fresh run's for exactly that reason,
- * so a stale record is visible in one line rather than in five files.
+ * against the restored 900 s bound is the `headroomPct` this record computes, where the 1800 s
+ * bound was chosen for 52 %. Both are stated as facts about two different things, because a
+ * reader is entitled to see that the *decision* and the *current cost* are two of them, and to
+ * know that the second moves whenever the AI does.
+ * `pnpm tournament:evidence` prints the recorded figures beside a fresh run's for exactly that
+ * reason, so a stale record is visible in one line rather than in five files.
  *
  * **Three runs of the same twenty games were taken** while this was recorded, and the spread is
  * part of the measurement rather than noise to hide: 108.5 s, 109.3 s and 112.4 s of bracketed
@@ -612,6 +696,7 @@ export const A3_TOURNAMENT_EVIDENCE: TournamentEvidence = tournamentEvidence({
     { seed: 20, finalHash: '9a4c9bec58aeb0e3' },
   ],
   violations: 0,
+  plannerFailures: 0,
   invariantChecks: 54_000,
   wallMs: 112_420.9,
   harnessElapsedMs: 112_396.6,
@@ -731,10 +816,11 @@ const seatOfPolicy = (seatsInGame: readonly number[], policyIndex: number): numb
  * kept state between calls would carry seat 0's history into seat 1's game and would make
  * a tournament unreproducible; such a policy must be constructed per seat by the caller.
  *
- * Throws (there is no failure channel in the frozen result shape) when the caller's
- * arguments describe something that is not a tournament: no policies, a seat list that does
- * not match the number of civilizations, no seeds, or a budget that is not a real bound.
- * Each of those would otherwise produce a *plausible* report — a tournament where a
+ * Throws when the caller's arguments describe something that is not a tournament: no policies,
+ * a seat list that does not match the number of civilizations, no seeds, or a budget that is
+ * not a real bound. A caller bug has no field in the result to live in — `plannerFailures`
+ * (M7d) is a *policy's* own record, not a slot for a mistake made by whoever asked for the
+ * run. Each of those would otherwise produce a *plausible* report — a tournament where a
  * strategy never played, an empty tournament that passes its own invariants vacuously, a
  * verdict that is always the same — and a plausible wrong number is the worst outcome a
  * balance loop can have.
@@ -808,6 +894,11 @@ export const runTournament = (
     totals: totalsFor(games, plan, policies),
     // Flat, in game order, and never filtered: the caller has to look at it.
     violations: games.flatMap((game) => game.violations),
+    // The same treatment for the M7d failure channel: aggregated over games, flat, in game
+    // order, and never filtered. A tournament is evidence about strategies, and a game in
+    // which a planner threw measures an AI that stopped playing mid-turn — so this list is
+    // not a diagnostic beside the result, it is part of the verdict (`tournamentVerdict`).
+    plannerFailures: games.flatMap((game) => game.plannerFailures),
     budgetMs,
     elapsedMs,
     withinBudget: elapsedMs <= budgetMs,
@@ -922,8 +1013,26 @@ const totalsFor = (
  * What a tournament's result amounts to, as a value rather than as an adjective.
  *
  * `passed` is the contract's pass/fail condition and nothing softer: **zero** invariant
- * violations across every game. It is not a rate, not a majority, and not "fewer than
- * last time" — a tournament that mostly holds its invariants has found a bug.
+ * violations *and* **zero** planner failures across every game. It is not a rate, not a
+ * majority, and not "fewer than last time" — a tournament that mostly holds its invariants
+ * has found a bug.
+ *
+ * ## Why a planner failure is part of the pass condition (M7d)
+ *
+ * Because a policy is required to be **total**. It has no legitimate way to throw, so a game
+ * in which the planner threw is not a weak measurement of the AI — it is not a measurement of
+ * the AI at all, and A3 claims the AI plays a *complete* game unaided. The case that made this
+ * concrete was measured, not imagined: during the M7c profiling, a swallowed throw made a
+ * hundred-turn game "complete" in 0.9 s with one city instead of fifteen and a plausible hash,
+ * and a tournament would have reported that game's metrics as evidence.
+ *
+ * So a planner failure is counted **like a violation** by the verdict — and, deliberately,
+ * unlike a violation it does not truncate the run (`runner.ts` states why: a partial turn is
+ * still a complete, hashable game, and truncating would mix horizons in every aggregate). Two
+ * counters rather than one boolean because they are two different defects with two different
+ * fixes: a violation is the engine or the policy breaking a stated property, a planner failure
+ * is the policy not being total. `violatingGames` and `gamesWithPlannerFailures` say how wide
+ * each is.
  *
  * `withinBudget` is the budget's own verdict, reported beside it rather than folded into
  * it, because the two failures have different causes and different fixes: a violation is a
@@ -931,7 +1040,7 @@ const totalsFor = (
  * worked. `accepted` is both, which is the state A3's evidence needs.
  */
 export interface TournamentVerdict {
-  /** The pass/fail condition: zero invariant violations in every game. */
+  /** The pass/fail condition: zero invariant violations and zero planner failures. */
   readonly passed: boolean;
   readonly withinBudget: boolean;
   /** `passed && withinBudget`. */
@@ -940,6 +1049,10 @@ export interface TournamentVerdict {
   readonly violations: number;
   /** How many games produced at least one violation. */
   readonly violatingGames: number;
+  /** Planner failures reported across every game, counted like a violation. */
+  readonly plannerFailures: number;
+  /** How many games had at least one planner failure. */
+  readonly gamesWithPlannerFailures: number;
 }
 
 /**
@@ -952,7 +1065,16 @@ export interface TournamentVerdict {
 export const tournamentVerdict = (result: TournamentResult): TournamentVerdict => {
   const violations = result.violations.length;
   const violatingGames = result.games.filter((game) => game.violations.length > 0).length;
-  const passed = violations === 0;
+  // Counted from the games rather than from the flat list, so that the two fields cannot
+  // disagree about a result somebody assembled by hand: both are reads of the same games.
+  const plannerFailures = result.games.reduce(
+    (total, game) => total + game.plannerFailures.length,
+    0,
+  );
+  const gamesWithPlannerFailures = result.games.filter(
+    (game) => game.plannerFailures.length > 0,
+  ).length;
+  const passed = violations === 0 && plannerFailures === 0;
 
   return {
     passed,
@@ -961,5 +1083,7 @@ export const tournamentVerdict = (result: TournamentResult): TournamentVerdict =
     games: result.games.length,
     violations,
     violatingGames,
+    plannerFailures,
+    gamesWithPlannerFailures,
   };
 };

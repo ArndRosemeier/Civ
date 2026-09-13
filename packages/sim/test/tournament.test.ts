@@ -20,6 +20,11 @@
  *    while still playing *every* seed: the tests assert the game count survives an overrun.
  * 5. **The clock cannot reach a game.** The same tournament run under two wildly different
  *    clocks produces identical games, totals and violations; only the timing fields move.
+ * 6. **A planner failure fails the tournament (M7d).** A policy that threw while planning is
+ *    carried as a typed record on the game it happened in and on the tournament's flat list,
+ *    and `tournamentVerdict(...).passed` is `false` — with **no** invariant violation anywhere,
+ *    which is the case the old behaviour reported as a clean pass. The clean control is
+ *    asserted first here too.
  *
  * The fast tier keeps the small tournaments (a handful of games, four to six turns), and the
  * full tier keeps one smoke tournament of the *real* policy — four seeds at twenty-five turns.
@@ -28,7 +33,7 @@
  * asked for explicitly.
  */
 
-import { DEFAULT_SETTINGS, civPlayers, type Settings } from '@civts/core';
+import { DEFAULT_SETTINGS, civPlayers, type GameState, type Settings } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
 import { FULL_TIER } from '@civts/testing';
 import { describe, expect, it } from 'vitest';
@@ -43,7 +48,9 @@ import {
   SMART_POLICY,
   runTournament,
   seatPlan,
+  smartPolicy,
   tournamentVerdict,
+  type DiagnosedPolicy,
   type Invariant,
   type MetricAggregate,
   type Policy,
@@ -139,10 +146,11 @@ const fakeClock = (start: number, end: number): FakeClock => {
 /** Everything a result says about the games, with the timing fields left out. */
 const gamesOnly = (
   result: TournamentResult,
-): Pick<TournamentResult, 'games' | 'totals' | 'violations'> => ({
+): Pick<TournamentResult, 'games' | 'totals' | 'violations' | 'plannerFailures'> => ({
   games: result.games,
   totals: result.totals,
   violations: result.violations,
+  plannerFailures: result.plannerFailures,
 });
 
 /** The starting tile of one seat of one game — where that seat's civilization began. */
@@ -535,6 +543,142 @@ describe('a violation is a pass/fail condition, not a statistic', () => {
     expect(
       result.games.filter((game) => game.violations.length > 0).map((game) => game.seed),
     ).toStrictEqual([2]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M7d — a planner failure is a pass/fail condition too
+ * ------------------------------------------------------------------ */
+
+/**
+ * A policy that throws on every turn it is polled: the real AI, handed a board it cannot read.
+ *
+ * The same fixture `runner.test.ts` uses, and for the same reason: `state.map` is a throwing
+ * getter, so the first read inside the planner fails, the AI's own `try`/`catch` records a
+ * typed `PlannerFailure`, and the turn it returns is partial. The corrupted board is handed to
+ * the **policy** only — the run's own state, its invariants and its final hash see an ordinary
+ * world, which is what makes this a test of the carrier rather than of a corrupted game.
+ */
+const boardBlindPolicy = (): DiagnosedPolicy => {
+  const inner = smartPolicy();
+  return {
+    name: inner.name,
+    chooseCommands: (ctx) =>
+      inner.chooseCommands({ ...ctx, state: boardWithoutAReadableMap(ctx.state) }),
+    report: () => inner.report(),
+  };
+};
+
+/** The same state with an unreadable map — a getter, so the throw happens inside the planner. */
+const boardWithoutAReadableMap = (state: GameState): GameState => {
+  const broken = { ...state };
+  Object.defineProperty(broken, 'map', {
+    enumerable: true,
+    configurable: true,
+    get(): never {
+      throw new Error('the board is unreadable');
+    },
+  });
+  return broken;
+};
+
+describe('a planner failure is a pass/fail condition (M7d)', () => {
+  it('is empty for a tournament the policies actually played, and the verdict says so', () => {
+    // The control, asserted first: a verdict that is always `false` cannot pass this suite.
+    const clean = tournamentOf({
+      seeds: [1, 2],
+      policies: [SIMPLE_POLICY, DO_NOTHING_POLICY],
+      maxTurns: 4,
+    });
+    const verdict = tournamentVerdict(clean);
+
+    expect(clean.plannerFailures).toStrictEqual([]);
+    expect(verdict.plannerFailures).toBe(0);
+    expect(verdict.gamesWithPlannerFailures).toBe(0);
+    expect(verdict.passed).toBe(true);
+    expect(verdict.accepted).toBe(true);
+  });
+
+  it('FAILS a tournament whose planner threw, with no invariant violation at all', () => {
+    const broken = boardBlindPolicy();
+    const result = tournamentOf({ seeds: [3, 4], policies: [broken, broken], maxTurns: 3 });
+    const verdict = tournamentVerdict(result);
+
+    // Nothing the *invariants* saw was wrong: every game is a valid, hashable game that
+    // played its whole horizon. That is exactly why the old behaviour was a silence.
+    expect(result.violations).toStrictEqual([]);
+    expect(result.games.every((game) => game.violations.length === 0)).toBe(true);
+    expect(result.games.every((game) => game.stoppedBecause !== 'violation')).toBe(true);
+
+    // And yet the tournament is not evidence, because a policy is required to be total.
+    expect(result.plannerFailures.length).toBeGreaterThan(0);
+    expect(verdict.plannerFailures).toBeGreaterThan(0);
+    expect(verdict.gamesWithPlannerFailures).toBeGreaterThan(0);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.accepted).toBe(false);
+
+    // Which game, which turn, which pass: the record is carried by the game it happened in,
+    // so a reader holding the result can say — without a stderr warning to help it.
+    const failing = result.games.filter((game) => game.plannerFailures.length > 0);
+    expect(failing.length).toBeGreaterThan(0);
+    for (const game of failing) {
+      const failure = game.plannerFailures[0];
+      if (failure === undefined) throw new Error(`seed ${String(game.seed)} carried no failure`);
+      expect(failure.policy).toBe(broken.name);
+      expect(failure.turn).toBeGreaterThanOrEqual(1);
+      expect(failure.error).toContain('the board is unreadable');
+      expect(failure.detail.length).toBeGreaterThan(0);
+    }
+    // The tournament's flat list is exactly the games' own records, in game order — the same
+    // relationship `violations` has, so the two channels are read the same way.
+    expect(result.plannerFailures).toStrictEqual(
+      result.games.flatMap((game) => game.plannerFailures),
+    );
+  });
+
+  it('attributes a failure to the game that recorded it, and says so once', () => {
+    // The record lives on the *policy instance*, and `PolicyReport` keeps the first failure of
+    // each pass — so a tournament that shares one instance across its games reports the failure
+    // in the game where it was recorded, not in every later game that reused the same record.
+    // That is the honest reading (the alternative would attribute a record to a game that did
+    // not produce it), the tournament still fails, and the CLI builds one instance per
+    // invocation for exactly this reason.
+    const broken = boardBlindPolicy();
+    const result = tournamentOf({ seeds: [5, 6, 7], policies: [broken, broken], maxTurns: 3 });
+    const verdict = tournamentVerdict(result);
+
+    expect(result.games).toHaveLength(3);
+    expect(verdict.gamesWithPlannerFailures).toBe(1);
+    // The first game is the one that recorded it...
+    expect(result.games[0]?.plannerFailures.length).toBeGreaterThan(0);
+    expect(result.plannerFailures).toStrictEqual(result.games[0]?.plannerFailures);
+    // ...and one game is enough for the whole tournament to fail: "mostly fine" is not a pass.
+    expect(verdict.passed).toBe(false);
+  });
+
+  it('reports the same failing tournament when the seed list is permuted', () => {
+    // The M4b/M5 order-independence rule, extended to the new field: a permuted seed list must
+    // produce the same records, not merely the same count.
+    //
+    // One instance **per tournament**, which is the discipline the CLI follows and the only way
+    // this comparison means anything: a policy carries its records with it, so a second run on
+    // the same instance would start from the first run's failures and report none of its own
+    // (see the attribution test above). "One process, one policy instance, one run" is what the
+    // baseline rule assumes.
+    const ascending = tournamentOf({
+      seeds: [1, 2, 3],
+      policies: [boardBlindPolicy(), boardBlindPolicy()],
+      maxTurns: 3,
+    });
+    const shuffled = tournamentOf({
+      seeds: [3, 1, 2],
+      policies: [boardBlindPolicy(), boardBlindPolicy()],
+      maxTurns: 3,
+    });
+
+    expect(ascending.plannerFailures.length).toBeGreaterThan(0);
+    expect(gamesOnly(shuffled)).toStrictEqual(gamesOnly(ascending));
+    expect(shuffled.plannerFailures).toStrictEqual(ascending.plannerFailures);
   });
 });
 

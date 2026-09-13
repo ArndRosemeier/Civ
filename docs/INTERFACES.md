@@ -1735,3 +1735,80 @@ which of the two it is — knob or measurement — and prove the claim.
   wall time and result are recorded as evidence.
 - The AI attacks a city in a fixed-seed scenario, with the exact outcome asserted, and
   the walls sweep is re-run honestly.
+
+---
+
+# M7d contracts — FROZEN (a failure the result itself can carry)
+
+## The gap
+
+M7c made a thrown planner error a typed `PlannerFailure` instead of a silence, and the
+verifier found the fix was real but **unwired**: the CLI prints a warning to stderr,
+while `SimulationResult` and `TournamentResult` carry nothing — they are frozen and have
+no failure field. So a report reader who holds only the structured result still cannot
+tell a **partial turn** from a **quiet one**. That is the same silent-failure class the
+fix was meant to close, one layer up.
+
+## AMENDMENT to the frozen simulation result (F6: migration owners named)
+
+`SimulationResult` gains:
+
+```ts
+readonly plannerFailures: readonly PlannerFailure[];
+```
+
+**Required and always present — an empty array when there are none**, exactly how
+`violations` already works. Not optional, so a consumer cannot forget it, and never
+`undefined`, because a key written with an explicit `undefined` is unhashable and this
+project has paid for that three times.
+
+**Migration owners, every existing consumer, named before any agent launches** (the F6
+rule). Each of these constructs, transforms, or reads a `SimulationResult` and must be
+updated in the same wave:
+
+| consumer | owner duty |
+|---|---|
+| `packages/sim/src/runner.ts` | producer — populate from the policy's report |
+| `packages/sim/src/batch.ts` | aggregate across games; keep the horizon rule intact |
+| `packages/sim/src/tournament.ts` | aggregate; surface on `TournamentResult` |
+| `packages/sim/src/metrics.ts` | must not silently drop the field |
+| `packages/sim/src/index.ts` | export the type |
+| `packages/headless/src/sim-cli.ts` | render; `--json` must carry it |
+| `packages/headless/src/cli.ts` | render |
+| `packages/testing/**` and `packages/sim/test/**` | any test constructing a result literal |
+| `packages/testing/src/scenario.ts` | if it surfaces a result to a scenario |
+
+`TournamentResult` gains the same, aggregated over games.
+
+## A planner failure is a FAILED game, not a warning
+
+A policy must be total: it has no legitimate way to throw. So a game in which the
+planner threw was **not** a valid measurement of the AI, and A3 claims the AI plays a
+complete game unaided. Therefore:
+
+- a planner failure is counted like a violation, so a tournament containing one exits
+  non-zero and says which game, turn and phase failed;
+- the stderr warning stays, but is no longer the only evidence;
+- the distinction must be provable from the result alone: a policy that legitimately
+  returns no commands yields an empty `plannerFailures`; a policy that throws does not.
+  A test must show both, and show that the second fails a tournament.
+- re-run the 20-seed tournament and confirm zero planner failures — the A3 evidence is
+  only meaningful if the AI completed every turn of every game on its own.
+
+## Budget: restored to 900 s
+
+The 1800 s bound was widened because the AI cost ~26-43 s per game. It now costs ~5.4 s,
+so measured wall time for the full A3 run is ~110 s. The reason for widening is gone, so
+the bound returns to **900 s** — with a measured 8× headroom it is a genuine runaway
+detector again, where 1800 s would have tolerated a 16× regression. Single-source: the
+record changes in one place and everything else follows.
+
+## Acceptance evidence
+
+- Both non-optional fields exist on the real results and are carried through batch,
+  tournament, JSON and the CLI.
+- A policy that returns no commands → empty failures; a policy that throws → a failure
+  that FAILS the tournament, proven end to end through the CLI's exit code.
+- The 20-seed A3 run completes with ZERO planner failures, zero violations, and its raw
+  wall time under the restored 900 s bound.
+- Fast gate still ≤ 70 s wall; full still ≤ 10 min.

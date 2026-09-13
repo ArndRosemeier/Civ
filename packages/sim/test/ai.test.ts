@@ -12,8 +12,10 @@
  *    comparison on that seed would mean anything.
  * 2. **Totality.** An empty state, a state with no units, a state with no cities, a state with
  *    no gold and a **fully blocked board** each produce a legal (possibly empty) command list
- *    and never throw. The runner has no failure channel for a policy, so a throw here is a
- *    broken tournament rather than a bad decision.
+ *    and never throw. A throw here would not be a bad decision but a broken run, and since M7d
+ *    it would be a *visible* one: the runner carries a caught planner failure on the result
+ *    (`SimulationResult.plannerFailures`) and a tournament containing one fails. What this
+ *    section checks is stronger than "the failure is reported" — it is that there is none.
  * 3. **Legality — the keystone invariant, applied to the AI.** Every command the policy
  *    returns is folded through the real `applyCommand` over several seeds and many turns with
  *    **zero refusals**, and the count is non-vacuous (the same driver counts the commands).
@@ -104,11 +106,12 @@ import {
 // The failure channel is read from the AI's own module, one import away from the surface: the
 // names are re-exported by `policies.ts`, `ai/index.ts` and now `index.ts` itself, and this
 // suite keeps the direct path because it is the module under test. **Where the channel is read
-// by something other than a test** is `@civts/headless`'s `sim-cli.ts`
-// (`plannerFailureWarning`, checked by `sim-cli.test.ts`): the CLI prints the record to stderr
-// for both the batch and the tournament, on the text and `--json` paths. That is the wiring
-// this suite cannot check from here, and it is why the comment that used to promise a
-// "failure-channel suite below" — which did not exist — now names the file that does.
+// by something other than a test** is, since M7d, the package itself — `runner.ts` reads it into
+// `SimulationResult.plannerFailures`, `batch.ts` hands it through and `tournament.ts` aggregates
+// it into `TournamentResult.plannerFailures` and the verdict — and then
+// `@civts/headless`'s `sim-cli.ts`, which renders the *report's* field to stderr and fails the
+// run (`sim-cli.test.ts` drives that end to end through the CLI's exit code). `runner.test.ts`
+// and `tournament.test.ts` cover the carrier from this side; this suite covers the record.
 import {
   describePlannerFailures,
   plannerFailuresOf,

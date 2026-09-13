@@ -1886,11 +1886,12 @@ describe('8. the tournament at the size alpha names', () => {
     //
     // **The figures this run produces are NOT written here.** They live in exactly one place —
     // `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, imported by this file — together with the
-    // wall time, the harness's own reading, the twenty per-game final hashes, the 1800 s budget
-    // and the headroom between the two, plus the timestamp and load average the measurement was
-    // taken under. Every site that used to restate them (this comment, `tournament.ts`,
-    // `tier.ts`, `vitest.config.ts`, the CLI's `--help`, the evidence script) now references that
-    // record instead, and the test below this one checks that they still do.
+    // wall time, the harness's own reading, the twenty per-game final hashes, the budget it was
+    // measured against (restored to 900 s by M7d, in `tournament.ts`, with the reasoning and the
+    // re-measured headroom), and the timestamp and load average the measurement was taken under.
+    // Every site that used to restate them (this comment, `tournament.ts`, `tier.ts`, the CLI's
+    // `--help`, the evidence script) now references that record instead, and the test below this
+    // one checks that they still do.
     //
     // Why that matters, as this file's own history: FINDING E was raised against `tournament.ts`
     // claiming *"about 7.7 s per game on an idle machine, so ~2.6 minutes for the twenty"* when
@@ -1901,8 +1902,9 @@ describe('8. the tournament at the size alpha names', () => {
     // headroom, and a second run that went 503 ms over budget on a busy box and exited 3. The
     // conclusion was structural rather than arithmetic: a number copied into five files goes
     // stale five times, so the number now has one home and the budget is a stated decision
-    // (1800 s, recorded in `tournament.ts` with its reasoning) rather than a value tuned to fit
-    // whichever machine last ran the thing.
+    // (recorded in `tournament.ts` with its reasoning, which is how it went to 1800 s and how
+    // M7d brought it back to 900 s) rather than a value tuned to fit whichever machine last ran
+    // the thing.
     //
     // The five hashes below were re-recorded from the shipped code with the rest of the record —
     // `A3_TOURNAMENT_EVIDENCE.games` carries all twenty. They are a **timestamp, not a
@@ -1955,6 +1957,11 @@ describe('8. the tournament at the size alpha names', () => {
     expect(A3_TOURNAMENT_EVIDENCE.seeds).toEqual([...A3_SEEDS]);
     expect(A3_TOURNAMENT_EVIDENCE.turns).toBe(100);
     expect(A3_TOURNAMENT_EVIDENCE.violations).toBe(0);
+    // M7d's *other* half of the same claim, and the one that has no substitute: A3 says the AI
+    // plays a complete game unaided, so a non-zero count here would be a record of the wrong
+    // thing — twenty games that "reported zero violations" while the planner was throwing
+    // mid-turn, leaving partial turns whose metrics look exactly like quiet ones'.
+    expect(A3_TOURNAMENT_EVIDENCE.plannerFailures).toBe(0);
     // Derived, not typed: recomputing them from the raw measurement must give the stored value.
     const games = A3_TOURNAMENT_EVIDENCE.games.length;
     expect(A3_TOURNAMENT_EVIDENCE.perGameMs).toBeCloseTo(A3_TOURNAMENT_EVIDENCE.wallMs / games, 9);
@@ -1965,8 +1972,9 @@ describe('8. the tournament at the size alpha names', () => {
       (A3_TOURNAMENT_EVIDENCE.headroomMs / A3_TOURNAMENT_EVIDENCE.budgetMs) * 100,
       9,
     );
-    // The margin the 1800 s decision was made for: not 4.2 %, and not negative. A record whose
-    // run overran its own bound is a record somebody has to re-measure or re-decide.
+    // The margin the record has to leave under the bound the code enforces: not 4.2 %, and not
+    // negative. A record whose run overran its own bound is a record somebody has to re-measure
+    // or re-decide — which is exactly what happened to it twice, once upward and once back down.
     expect(A3_TOURNAMENT_EVIDENCE.headroomPct).toBeGreaterThan(10);
     // A timing without these is not evidence: it cannot be told from a stale figure. And the
     // three clocks are three different numbers, each labelled: the call's own bracket, the

@@ -22,6 +22,15 @@
  *    run; a violation is reported **by name, with its seed and turn**, loudly, and
  *    the command exits non-zero. `--fault` injects a deliberately failing invariant
  *    so that the reporting path itself can be exercised end to end.
+ * 5. **A failure the result can carry (M7d).** A policy that throws while planning is caught
+ *    by the policy itself (a policy is required to be *total*), so what it returns is a
+ *    partial turn — and that is indistinguishable from a turn in which the AI had nothing to
+ *    say. The record is a **field of every report this file builds** (`plannerFailures`,
+ *    required and empty when there are none, exactly like `violations`), it is rendered
+ *    loudly on both the text and `--json` paths, and it **fails the run**: a batch or a
+ *    tournament containing one exits 1. The stderr warning stayed, but it is no longer the
+ *    only evidence — a reader holding only the structured value can tell a partial turn from
+ *    a quiet one.
  *
  * ## ONE source of truth for output
  *
@@ -106,12 +115,11 @@ import {
   DO_NOTHING_POLICY,
   MEASURED_METRIC_FIELDS,
   SIMPLE_POLICY,
-  SMART_POLICY,
   formatOverrideError,
-  plannerFailuresOf,
   runBatch,
   runTournament,
   seatPlan,
+  smartPolicy,
   tournamentVerdict,
   tryApplyOverrides,
   type BatchResult,
@@ -123,6 +131,8 @@ import {
   type OverrideError,
   type OverrideSection,
   type Policy,
+  type PlannerFailure,
+  type PlannerPhase,
   type ResourcePatch,
   type RulesetPatch,
   type SimulationResult,
@@ -236,10 +246,12 @@ export const SIM_USAGE = `usage: civts sim [--seeds <spec>] [--map-size <size>] 
                       byte-stable for the same flags) instead of the text report
 
 Exit codes:
-  0  every run played and every invariant held
+  0  every run played and every invariant held, and every turn was decided by its policy
   1  something the flags describe could not be run (a ruleset that fails validation),
      or a run broke an invariant — the violation is printed loudly, naming itself, its
-     seed and its turn
+     seed and its turn — or a policy threw while planning (a PLANNER FAILURE, which is
+     the same kind of fact: the run is not evidence). Both are counted like a violation
+     and reported in the --json report as "violations" / "plannerFailures"
   2  the flags themselves are unusable (syntax, an unknown id or field, a bad number)
 `;
 
@@ -268,9 +280,10 @@ difference in the table is the knob's. Each row is summed at the horizon (the la
 sampled turn) over every run and every civilization, and compared against the shipped
 catalog run with no override at all.
 
-Exit codes: 0 = every row ran and held its invariants; 1 = a row broke an invariant
-(printed loudly) or a value produced an invalid ruleset (reported as a rejected row);
-2 = the flags themselves are unusable.
+Exit codes: 0 = every row ran and held its invariants and no policy threw while planning;
+1 = a row broke an invariant (printed loudly), a policy threw while planning (a planner
+failure, printed loudly too), or a value produced an invalid ruleset (reported as a
+rejected row); 2 = the flags themselves are unusable.
 `;
 
 /* ------------------------------------------------------------------ *
@@ -1206,11 +1219,29 @@ export const parseSimArgs = (args: readonly string[]): Result<SimFlags, string> 
  * M7's real opponent, `simple` the placeholder it replaces, `none` the do-nothing control.
  * A switch rather than a map, so adding a name to `SIM_POLICIES` without saying which
  * policy it runs is a type error rather than an `undefined` reaching a run.
+ *
+ * ## Why `smart` is built **fresh** here rather than reusing `SMART_POLICY`
+ *
+ * Since M7d a policy carries a **failure record** — `PolicyReport`, the typed evidence that it
+ * threw while planning — and that record is *cumulative for the instance*: it keeps the first
+ * failure of each pass, for as long as the object lives. `SMART_POLICY` is a module-level
+ * singleton, so two CLI invocations in one process would share one record, and the second
+ * invocation could not report a pass the first one had already failed (the record has no
+ * second entry for that pass, by design — see `PolicyReport`). A diagnostic that can only fire
+ * once per process is exactly the kind of half-wired evidence M7d exists to end.
+ *
+ * So each command builds its own instance, and `runSimulation`'s baseline rule (a run reports
+ * the failures recorded *after* it started) then subtracts nothing: what an invocation reports
+ * is what happened during that invocation. The policy is stateless in every other respect —
+ * its decisions are a pure function of `(state, playerId, ruleset, weights)`, which is why two
+ * instances produce byte-identical games — so this changes the games not at all and the
+ * evidence for the better. The singleton stays exported (`@civts/sim`'s `SMART_POLICY`) for
+ * callers that want the shared one, and the two are constructed identically.
  */
 const policyOf = (name: SimPolicyName): Policy => {
   switch (name) {
     case 'smart':
-      return SMART_POLICY;
+      return smartPolicy();
     case 'simple':
       return SIMPLE_POLICY;
     case 'none':
@@ -1273,6 +1304,35 @@ export interface ReportedViolation {
   readonly value?: number;
 }
 
+/**
+ * **One planner failure, qualified with the game it happened in** — M7d's evidence, as a report
+ * carries it.
+ *
+ * `plannerFailures` is a field of the engine's results (`SimulationResult`, and the aggregate on
+ * `TournamentResult`), and the engine's record already says **who** (`policy`), **when**
+ * (`turn`, `playerId`), **where** (`phase`, `detail`) and **what** (`error`). The one thing it
+ * cannot say is *which game*, because a `SimulationResult` is one game and does not name
+ * itself inside its own records — so the report qualifies each record with its `seed`, exactly
+ * as it does for a violation, and `value` when the report comes from a sweep.
+ *
+ * The M7d acceptance line asks for exactly this: a tournament containing a planner failure
+ * "exits non-zero and says **which game, turn and phase** failed". Every field here is copied
+ * from the engine's record rather than recomputed, `value` is **optional and omitted** when
+ * there is none (an explicit `undefined` is not representable in canonical JSON), and nothing
+ * in this report ever filters, caps or averages the list.
+ */
+export interface ReportedPlannerFailure {
+  readonly seed: number;
+  readonly policy: string;
+  readonly turn: number;
+  readonly playerId: number;
+  readonly phase: PlannerPhase;
+  readonly detail: string;
+  readonly error: string;
+  /** The swept knob value this batch ran, when the report comes from a sweep. */
+  readonly value?: number;
+}
+
 /** The experiment the report describes — everything a run is a function of. */
 export interface SimParameters {
   readonly mapSize: string;
@@ -1313,6 +1373,14 @@ export interface SimRunReport {
   /** The final sampled rows themselves, for a JSON consumer that wants every detail. */
   readonly final: readonly TurnMetrics[];
   readonly violations: readonly ReportedViolation[];
+  /**
+   * Planner failures this run reported — empty for a run the AI actually played.
+   *
+   * Required and always present, exactly like `violations`: M7d's whole point is that a reader
+   * holding only this value can tell a **partial turn** from a **quiet one**, and a field a
+   * report might omit is a field a reader has to remember to check for.
+   */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
 }
 
 export interface SimInvariantReport {
@@ -1328,6 +1396,13 @@ export interface SimTotals {
   readonly turnsPlayed: number;
   readonly metricRows: number;
   readonly violatingRuns: number;
+  /**
+   * How many runs reported at least one planner failure.
+   *
+   * The mirror of `violatingRuns`, and stored for the same reason: the banner a reader sees
+   * names a count of runs, and the renderer must print that count rather than compute it.
+   */
+  readonly plannerFailingRuns: number;
   readonly horizonTurnMin: number;
   readonly horizonTurnMax: number;
   /** True when runs stopped on different turns, so the horizon sums mix horizons. */
@@ -1340,11 +1415,18 @@ export interface SimTotals {
  * `status` and `exitCode` are *part of* the value rather than something the caller
  * works out afterwards, so "did this batch hold?" has exactly one answer and the
  * renderer never decides anything.
+ *
+ * Since M7d the status has **three** ways to fail, and they are one word each so a pipeline
+ * reading `status` needs no arithmetic: `violations` (an invariant broke), `planner-failures`
+ * (a policy threw while planning, so a game in this batch is not a measurement of the AI) and
+ * `ok`. Both failure statuses exit 1 — a planner failure is *counted like a violation*, per
+ * M7d's own words, because either one means the batch is not evidence — and the two are told
+ * apart by which array in the report is non-empty, which is what `--json` is for.
  */
 export interface SimReport {
   readonly kind: 'civts-sim-report';
   readonly reportVersion: number;
-  readonly status: 'ok' | 'violations';
+  readonly status: 'ok' | 'violations' | 'planner-failures';
   readonly exitCode: number;
   readonly parameters: SimParameters;
   readonly ruleset: SimRulesetReport;
@@ -1356,6 +1438,12 @@ export interface SimReport {
   readonly runs: readonly SimRunReport[];
   /** Every violation in the batch, ascending by seed then turn. */
   readonly violations: readonly ReportedViolation[];
+  /**
+   * Every planner failure in the batch, in run order — the batch-level aggregate M7d requires
+   * (`batch.ts` explains why the *engine's* `BatchResult` carries them per run instead of
+   * summarising them: a batch's job is to fold metric rows, and this is not a row).
+   */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
   /** The batch's win counts; the key is absent while the engine has no victory condition. */
   readonly wins?: readonly { readonly outcome: string; readonly count: number }[];
 }
@@ -1401,6 +1489,30 @@ const reportedViolations = (
     ...(knobValue === undefined ? {} : { value: knobValue }),
   }));
 
+/**
+ * The engine's planner-failure records, qualified with the seed of the run that reported them.
+ *
+ * The same shape of transformation `reportedViolations` performs, and for the same reason: the
+ * engine's record is about a *turn*, the report has to say *which game*. Nothing is added,
+ * dropped or recomputed — the six fields are copied — and `value` follows the same
+ * omit-when-absent rule, so the report stays canonicalisable.
+ */
+const reportedPlannerFailures = (
+  seed: number,
+  failures: readonly PlannerFailure[],
+  knobValue?: number,
+): readonly ReportedPlannerFailure[] =>
+  failures.map((failure) => ({
+    seed,
+    policy: failure.policy,
+    turn: failure.turn,
+    playerId: failure.playerId,
+    phase: failure.phase,
+    detail: failure.detail,
+    error: failure.error,
+    ...(knobValue === undefined ? {} : { value: knobValue }),
+  }));
+
 export interface SimReportInput {
   readonly batch: BatchResult;
   readonly parameters: SimParameters;
@@ -1428,11 +1540,15 @@ export const buildSimReport = (input: SimReportInput): SimReport => {
       horizon: metricTotals(rows, HORIZON_METRICS),
       final: rows,
       violations: reportedViolations(run.seed, run.violations),
+      plannerFailures: reportedPlannerFailures(run.seed, run.plannerFailures),
     };
   });
 
   const violations = runs.flatMap((run) => run.violations);
   const violatingRuns = runs.filter((run) => run.violations.length > 0).length;
+  // The M7d channel, folded the same way: flat over the runs, in run order, never filtered.
+  const plannerFailures = runs.flatMap((run) => run.plannerFailures);
+  const plannerFailingRuns = runs.filter((run) => run.plannerFailures.length > 0).length;
   const turnsPlayed = runs.reduce((total, run) => total + run.turnsPlayed, 0);
   const metricRows = runs.reduce((total, run) => total + run.metricRows, 0);
   const invariantCount = input.invariantNames.length;
@@ -1445,8 +1561,11 @@ export const buildSimReport = (input: SimReportInput): SimReport => {
   return {
     kind: 'civts-sim-report',
     reportVersion: SIM_REPORT_VERSION,
-    status: violations.length === 0 ? 'ok' : 'violations',
-    exitCode: violations.length === 0 ? 0 : 1,
+    // A broken invariant is reported first (it is the more specific defect), and either one
+    // means the batch is not evidence — so both exit 1. See the type's own note.
+    status:
+      violations.length > 0 ? 'violations' : plannerFailures.length > 0 ? 'planner-failures' : 'ok',
+    exitCode: violations.length > 0 || plannerFailures.length > 0 ? 1 : 0,
     parameters: input.parameters,
     ruleset: input.ruleset,
     totals: {
@@ -1454,6 +1573,7 @@ export const buildSimReport = (input: SimReportInput): SimReport => {
       turnsPlayed,
       metricRows,
       violatingRuns,
+      plannerFailingRuns,
       horizonTurnMin,
       horizonTurnMax,
       horizonVaries: horizonTurnMin !== horizonTurnMax,
@@ -1468,6 +1588,7 @@ export const buildSimReport = (input: SimReportInput): SimReport => {
     horizonTotals: metricTotals(allHorizonRows, HORIZON_METRICS),
     runs,
     violations,
+    plannerFailures,
     // The key is *omitted* when the batch has no win counts — never written holding
     // `undefined` (unsurvivable JSON) and never as `[]` (which would claim victories
     // were counted while the engine has no victory condition).
@@ -1520,6 +1641,66 @@ const violationBannerLines = (
     '!! a run stops on the first turn that breaks a property, so the state it ended on IS',
   );
   lines.push('!! the state that broke; the same violations are in the --json report');
+  lines.push(bannerRule());
+  return lines;
+};
+
+/**
+ * **The banner M7d added: a policy threw while planning, and the run is not clean evidence.**
+ *
+ * Modelled on `violationBannerLines` deliberately — same rule, same shape, same place in the
+ * output — because the two are the same kind of fact: a run in this set is not what the report
+ * otherwise implies it is. The differences are the ones that matter to a reader:
+ *
+ * - it says **which game** (the seed), because a planner failure is qualified per game exactly
+ *   as a violation is, and "the AI threw" without a seed is not actionable in a batch of 500;
+ * - it says the failure **does not stop the run**: a violating run ends on the turn that broke,
+ *   so its numbers stop there, while a partial turn keeps playing — which is precisely why the
+ *   metrics of such a game look plausible and why the record has to be printed rather than
+ *   inferred from a short run;
+ * - it names the pass, the player and the error, which are the engine's own fields.
+ *
+ * It is rendered from the report's `plannerFailures` — the structured value — never from the
+ * policies, so the text and `--json` cannot disagree about what happened.
+ */
+const plannerFailureBannerLines = (
+  subject: readonly [string, string],
+  runs: number,
+  failingRuns: number,
+  failures: readonly ReportedPlannerFailure[],
+): readonly string[] => {
+  const lines: string[] = [bannerRule()];
+  lines.push(
+    `!! ${String(failures.length)} PLANNER ${failures.length === 1 ? 'FAILURE' : 'FAILURES'} ` +
+      `in ${String(failingRuns)} of ${String(runs)} ${runs === 1 ? subject[0] : subject[1]}`,
+  );
+  lines.push('!!');
+  for (const failure of failures) {
+    const where =
+      failure.value === undefined
+        ? `seed ${String(failure.seed)}, turn ${String(failure.turn)}`
+        : `knob ${String(failure.value)}, seed ${String(failure.seed)}, turn ` +
+          String(failure.turn);
+    lines.push(
+      `!!   ${where} — ${failure.policy}, player ${String(failure.playerId)}, ` +
+        `${failure.phase} pass (${failure.detail})`,
+    );
+    lines.push(`!!     ${failure.error}`);
+  }
+  lines.push('!!');
+  lines.push(
+    '!! a policy has no legitimate way to throw, so this is a defect in the AI, not a quiet',
+  );
+  lines.push(
+    '!! turn: the commands decided before the throw were applied and the run continued, which',
+  );
+  lines.push(
+    '!! is why its metrics look plausible. One line per failed planning pass, and a run taking',
+  );
+  lines.push(
+    '!! part in a batch or a tournament FAILS (exit 1); the same records are in the --json',
+  );
+  lines.push('!! report, as "plannerFailures".');
   lines.push(bannerRule());
   return lines;
 };
@@ -1647,6 +1828,21 @@ export const renderSimReport = (report: SimReport): string => {
     lines.push('');
   }
 
+  // M7d: the same treatment for a planner failure, from the report's own field. A reader of
+  // the *text* report sees it too — the stderr warning is not the only evidence any more, and
+  // a `--json` consumer is not the only reader who needs to know.
+  if (report.plannerFailures.length > 0) {
+    lines.push(
+      ...plannerFailureBannerLines(
+        RUN_SUBJECT,
+        report.totals.runs,
+        report.totals.plannerFailingRuns,
+        report.plannerFailures,
+      ),
+    );
+    lines.push('');
+  }
+
   lines.push(
     `civts sim — ${String(report.totals.runs)} ${report.totals.runs === 1 ? 'game' : 'games'} in one batch`,
     '',
@@ -1684,6 +1880,18 @@ export const renderSimReport = (report: SimReport): string => {
       `${String(report.invariants.checks)} checks, ${String(report.invariants.violations)} violations`,
   );
   lines.push(`  checked: ${report.invariants.names.join(', ')}`);
+  // The second half of the pass condition, on its own line and always printed — a reader must
+  // not have to notice an *absence* of a banner to know the AI played every turn.
+  lines.push(
+    `planners    ${
+      report.plannerFailures.length === 0
+        ? 'no planner failures — every turn of every run was decided by its policy'
+        : `${String(report.plannerFailures.length)} ` +
+          `${report.plannerFailures.length === 1 ? 'failure' : 'failures'} in ` +
+          `${String(report.totals.plannerFailingRuns)} of ${String(report.totals.runs)} ` +
+          `${plural(report.totals.runs, 'run')} — the AI did not play part of those games`
+    }`,
+  );
 
   if (report.wins !== undefined) {
     for (const win of report.wins) {
@@ -1715,6 +1923,19 @@ export interface SimCommandOutput {
 }
 
 /**
+ * The seam that makes the `sim` command's failure channel *testable end to end*, and nothing
+ * else — the same seam, for the same reason, as `TournamentCommandOptions` documents at length
+ * (a warning nobody can trigger from a test is a warning nobody can keep honest, and the shipped
+ * AI only throws on a board the engine would never build). It changes no default: an absent map,
+ * the empty map and `undefined` all resolve to `policyOf(name)`, and it is deliberately not a
+ * CLI flag.
+ */
+export interface SimCommandOptions {
+  /** A policy in place of the shipped one named by `--policy`, for tests that inject a fault. */
+  readonly policyOverrides?: ReadonlyMap<string, Policy>;
+}
+
+/**
  * `civts sim …`, with no I/O: the caller writes `stdout`/`stderr` and exits `exitCode`.
  *
  * Returning the text rather than printing it is what makes the command testable in
@@ -1723,6 +1944,7 @@ export interface SimCommandOutput {
  */
 export const runSimCommand = (
   args: readonly string[],
+  options: SimCommandOptions = {},
 ): Result<SimCommandOutput, SimCommandFailure> => {
   if (args.includes('-h') || args.includes('--help')) {
     return ok({ report: undefined, stdout: SIM_USAGE, stderr: '', exitCode: 0 });
@@ -1776,7 +1998,8 @@ export const runSimCommand = (
   const seedSpec = flags.value.seedSpec ?? DEFAULT_SEED_SPEC;
   const maxTurns = flags.value.turns ?? DEFAULT_TURNS;
   const sampleEvery = flags.value.sampleEvery ?? DEFAULT_SAMPLE_EVERY;
-  const policy = policyOf(flags.value.policy ?? 'simple');
+  const policyName = flags.value.policy ?? 'simple';
+  const policy = options.policyOverrides?.get(policyName) ?? policyOf(policyName);
   const invariants: readonly Invariant[] = [
     ...CORE_INVARIANTS,
     ...flags.value.faults.map((name) => faultInvariant(name)),
@@ -1794,9 +2017,12 @@ export const runSimCommand = (
     seeds,
   };
 
-  // One instance per seat, held here rather than built inline at the call: after the batch
-  // this is what can still say whether any policy threw while planning (see
-  // `plannerFailureWarning`), and a policy discarded at the call site has nowhere to say it.
+  // One instance per invocation, shared by every seat of every run in the batch — that is what
+  // `civPolicies` means, and `policyOf` above is where the instance is built, with the reasoning.
+  // Since M7d a policy carries the typed record of any throw it caught while planning and that
+  // record is cumulative for the instance, which is exactly why `runSimulation` takes a baseline
+  // before its first turn: the report has to say what happened *in this run*. Nothing reads the
+  // policies after the batch — the evidence is the report's own `plannerFailures` field.
   const batchPolicies = civPolicies(policy, settings.value.civCount);
 
   let batch: BatchResult;
@@ -1830,11 +2056,13 @@ export const runSimCommand = (
   const json = flags.value.json;
   // The warnings go to stderr on BOTH paths — a result that is parsed by a pipeline is
   // exactly the one nobody would otherwise read a warning above. See
-  // `plannerFailureWarning` for why a caught planner error needs one at all.
+  // `plannerFailureWarning` for why a caught planner error needs one at all, and note that
+  // since M7d it is no longer the only evidence: the same records are a field of the report
+  // (and a banner in its text form), and they fail the batch's exit code.
   return ok({
     report,
     stdout: json ? `${canonicalize(report)}\n` : renderSimReport(report),
-    stderr: `${json ? renderViolationBanner(report) : ''}${plannerFailureWarning(batchPolicies)}`,
+    stderr: `${json ? renderViolationBanner(report) : ''}${plannerFailureWarning(report.plannerFailures)}`,
     exitCode: report.exitCode,
   });
 };
@@ -1869,36 +2097,41 @@ const civPolicies = (policy: Policy, civCount: number): readonly Policy[] =>
   Array.from({ length: civCount }, () => policy);
 
 /**
- * **A planner that threw, said out loud.**
+ * **A planner that threw, said out loud on stderr.**
  *
  * `SMART_POLICY` catches a thrown planner error, records it, and returns the commands it had
  * decided before the throw — which is the right contract (a policy that throws takes a
  * twenty-seed tournament down with it) but leaves a turn that is *indistinguishable from a
  * turn in which the AI had nothing to say*: same legal command list, same metrics, same
- * invariants, same plausible hash. The record exists on the policy, and before this function
- * existed nothing in this CLI ever asked for it — the seam was built and left unwired.
+ * invariants, same plausible hash. M7c gave that record a type and a reader; **M7d wired it
+ * into the results**, so this warning is no longer the only evidence, and this function is no
+ * longer the only reader.
  *
- * So the command that runs policies reads it: `plannerFailuresOf` answers `[]` for the
- * control policies (they cannot fail) and the first failure of each pass for one that has,
- * and the lines go to **stderr**, where this CLI already puts what is not the report. Both
- * paths call it — text and `--json` — because a result a pipeline parses is exactly the
- * result nobody would otherwise read a warning above.
+ * It takes the **report's own `plannerFailures`** — the structured value's field, already
+ * qualified with the seed of each game — rather than re-asking the policies. That is the M2
+ * rule applied to a warning: a renderer that reads a second source can disagree with the
+ * report it is printed beside, and the failure mode would be a warning on a green report or,
+ * far worse, a clean-looking report whose warning was computed from a policy the run never
+ * used.
  *
- * What this is not: a new field on the frozen `SimulationResult`/`TournamentResult` shapes,
- * a new exit code, or a judgement that the run failed. Nothing about the games changes and
- * the exit code stays the run's own verdict, which is what keeps a *diagnosed* failure from
- * becoming a silent one without redefining what a green run means.
+ * The lines go to **stderr**, on both paths — text and `--json` — because a result a pipeline
+ * parses is exactly the result nobody would otherwise read a warning above. The report itself
+ * carries the same records (a banner in the text report, `plannerFailures` in the JSON), and
+ * the run's exit code is now part of the verdict: a failed planner makes the run fail.
  */
-export const plannerFailureWarning = (policies: readonly Policy[]): string => {
-  const lines = policies.flatMap((policy) =>
-    plannerFailuresOf(policy).map(
-      (failure) =>
-        `${failure.policy} threw while planning on turn ${String(failure.turn)} for player ` +
-        `${String(failure.playerId)}, in the ${failure.phase} pass (${failure.detail}): ` +
-        `${failure.error} — it returned the commands decided before the throw, so the run ` +
-        'continued and its numbers describe a game in which part of a turn was not played',
-    ),
-  );
+export const plannerFailureWarning = (failures: readonly ReportedPlannerFailure[]): string => {
+  const lines = failures.map((failure) => {
+    const where =
+      failure.value === undefined
+        ? `in game ${String(failure.seed)}`
+        : `in the run at knob ${String(failure.value)}, game ${String(failure.seed)}`;
+    return (
+      `${where}, ${failure.policy} threw while planning on turn ${String(failure.turn)} for ` +
+      `player ${String(failure.playerId)}, in the ${failure.phase} pass (${failure.detail}): ` +
+      `${failure.error} — it returned the commands decided before the throw, so the run ` +
+      'continued and its numbers describe a game in which part of a turn was not played'
+    );
+  });
   if (lines.length === 0) return '';
   return [
     'WARNING: the policy reported a planner failure — this run is not a clean one.',
@@ -1989,12 +2222,13 @@ export const A3_TOURNAMENT_SEED_SPEC = '1..20';
  * strategy. A hundred turns is a complete arc at this engine's scale — the real policy has
  * founded its cities, worked its land, finished its early tech tree and fielded an army well
  * inside it. It is expensive, which is exactly why it is not the default: what A3's twenty
- * seeds cost at this horizon — per game, for the whole run, against the 1800 s bound, with the
- * headroom left under it — is recorded **once**, in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`,
- * and this file prints that record into `--help` rather than restating a figure that the next
- * improvement to the AI would invalidate. Two hundred turns is affordable too, at roughly twice
- * the cost per game; `--turns` moves the horizon, and the report always states the one it used,
- * so two runs cannot be compared by accident.
+ * seeds cost at this horizon — per game, for the whole run, against the bound they are judged
+ * against, with the headroom left under it — is recorded **once**, in `@civts/sim`'s
+ * `A3_TOURNAMENT_EVIDENCE`, and this file prints that record into `--help` rather than restating
+ * a figure that the next improvement to the AI would invalidate (which it did twice; the bound
+ * and its own reasoning are on `DEFAULT_TOURNAMENT_BUDGET_MS`). Two hundred turns is affordable
+ * too, at roughly twice the cost per game; `--turns` moves the horizon, and the report always
+ * states the one it used, so two runs cannot be compared by accident.
  */
 export const A3_TOURNAMENT_TURNS = 100;
 
@@ -2062,9 +2296,15 @@ position only. A policy that only wins from seat 0 has not been tested; this com
 be asked to test it that way.
 
 Exit codes:
-  0  every game held every invariant, and the run was within budget
-  1  a game broke an invariant — ZERO violations is the pass condition, not a statistic;
-     the violation is printed loudly, naming itself, its seed and its turn
+  0  every game held every invariant, no policy threw while planning, and the run was
+     within budget
+  1  a game broke an invariant — ZERO violations AND zero planner failures is the pass
+     condition, not a statistic;
+     the violation is printed loudly, naming itself, its seed and its turn — or a policy
+     threw while planning, which is counted the same way as an invariant violation
+     because a game the AI walked out of is not a measurement of the AI. The failure is
+     printed loudly too, naming the game, the turn and the pass, and it is in the
+     --json report as "plannerFailures"
   2  the flags themselves are unusable (syntax, an unknown policy, a seat list that does
      not match the number of civilizations, a bad number)
   3  every invariant held, but the run took longer than the budget it was given
@@ -2256,6 +2496,14 @@ export interface TournamentGameReport {
   readonly finalHash: string;
   readonly metricRows: number;
   readonly violations: readonly ReportedViolation[];
+  /**
+   * Planner failures this game reported, qualified with its seed — required and always present.
+   *
+   * This is the field that answers "which game?" for a tournament-level failure, which is why
+   * the records travel per game as well as flat: M7d's acceptance line is that a tournament
+   * containing one "says which game, turn and phase failed".
+   */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
 }
 
 /** The budget, and the verdict on it — stored, so the renderer prints rather than decides. */
@@ -2271,7 +2519,14 @@ export interface TournamentBudgetReport {
 
 /** The pass/fail condition and the budget's verdict, as one value. */
 export interface TournamentVerdictReport {
-  /** The pass/fail condition: zero invariant violations. */
+  /**
+   * The pass/fail condition: zero invariant violations **and** zero planner failures.
+   *
+   * M7d widened it deliberately. A policy is required to be total, so a game in which the
+   * planner threw is not a weak measurement of the AI — it is not a measurement of it — and A3
+   * claims the AI plays a **complete** game unaided. `@civts/sim`'s `tournamentVerdict` is where
+   * the condition is computed, once; this report only carries its answer.
+   */
   readonly passed: boolean;
   readonly withinBudget: boolean;
   /** `passed && withinBudget` — what A3's evidence needs. */
@@ -2279,6 +2534,10 @@ export interface TournamentVerdictReport {
   readonly games: number;
   readonly violations: number;
   readonly violatingGames: number;
+  /** Planner failures across the tournament, counted like a violation (M7d). */
+  readonly plannerFailures: number;
+  /** How many games had at least one planner failure. */
+  readonly gamesWithPlannerFailures: number;
   /** One line naming both verdicts, for the report's last line. */
   readonly summary: string;
 }
@@ -2326,7 +2585,15 @@ export interface TournamentPolicyReport {
 export interface TournamentReport {
   readonly kind: 'civts-tournament-report';
   readonly reportVersion: number;
-  readonly status: 'ok' | 'violations' | 'over-budget';
+  /**
+   * `planner-failures` is M7d's own value, and it exists because the two defects need
+   * different work: `violations` says the engine or a policy broke a stated property, while
+   * `planner-failures` says the AI stopped playing mid-turn and the games it "played" are not
+   * evidence about it. Both exit 1 — a planner failure is *counted like a violation* — and a
+   * pipeline that wants them apart reads this field, which is what a machine-readable status
+   * is for. A run that is over budget *and* failed reports the failure first, as before.
+   */
+  readonly status: 'ok' | 'violations' | 'planner-failures' | 'over-budget';
   readonly exitCode: number;
   readonly parameters: TournamentParameters;
   readonly ruleset: SimRulesetReport;
@@ -2340,6 +2607,12 @@ export interface TournamentReport {
   readonly games: readonly TournamentGameReport[];
   /** Every violation in the tournament, ascending by seed then turn. */
   readonly violations: readonly ReportedViolation[];
+  /**
+   * Every planner failure in the tournament, in game order — `@civts/sim`'s own aggregate
+   * (`TournamentResult.plannerFailures`), qualified with each game's seed. Never filtered,
+   * capped or averaged, for the same reason `violations` is not.
+   */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
 }
 
 export const TOURNAMENT_REPORT_VERSION = 1;
@@ -2417,6 +2690,7 @@ export const buildTournamentReport = (input: TournamentReportInput): TournamentR
       finalHash: game.finalHash,
       metricRows: game.metrics.length,
       violations: reportedViolations(game.seed, game.violations),
+      plannerFailures: reportedPlannerFailures(game.seed, game.plannerFailures),
     };
   });
 
@@ -2459,33 +2733,50 @@ export const buildTournamentReport = (input: TournamentReportInput): TournamentR
   }));
 
   const violations = games.flatMap((game) => game.violations);
+  const plannerFailures = games.flatMap((game) => game.plannerFailures);
   const verdict = tournamentVerdict(result);
   const invariantCount = input.invariantNames.length;
   const checks = result.games.reduce((total, game) => total + game.turnsPlayed * invariantCount, 0);
 
-  const invariantSentence = verdict.passed
-    ? `every invariant held in all ${String(verdict.games)} ${plural(verdict.games, 'game')}`
-    : `${String(verdict.violations)} invariant ${plural(verdict.violations, 'violation')} in ` +
-      `${String(verdict.violatingGames)} of ${String(verdict.games)} games — a tournament that ` +
-      'mostly holds its invariants has found a bug';
+  const invariantSentence =
+    verdict.violations === 0
+      ? `every invariant held in all ${String(verdict.games)} ${plural(verdict.games, 'game')}`
+      : `${String(verdict.violations)} invariant ${plural(verdict.violations, 'violation')} in ` +
+        `${String(verdict.violatingGames)} of ${String(verdict.games)} games — a tournament that ` +
+        'mostly holds its invariants has found a bug';
+  // M7d's half of the pass condition, stated in the verdict's own sentence as well as in the
+  // boolean: a reader of the last line must not have to notice an absence to know the AI played.
+  const plannerSentence =
+    verdict.plannerFailures === 0
+      ? 'no planner failures — every turn of every game was decided by its policy'
+      : `${String(verdict.plannerFailures)} planner ` +
+        `${plural(verdict.plannerFailures, 'failure')} in ` +
+        `${String(verdict.gamesWithPlannerFailures)} of ${String(verdict.games)} games — the ` +
+        'policy threw while planning, and a policy has no legitimate way to throw, so those ' +
+        'games are not measurements of the AI';
   const budgetSentence = verdict.withinBudget
     ? 'within budget'
     : 'OVER BUDGET, with every seed still played';
 
-  const status: TournamentReport['status'] = !verdict.passed
-    ? 'violations'
-    : verdict.withinBudget
-      ? 'ok'
-      : 'over-budget';
+  const status: TournamentReport['status'] =
+    verdict.violations > 0
+      ? 'violations'
+      : verdict.plannerFailures > 0
+        ? 'planner-failures'
+        : verdict.withinBudget
+          ? 'ok'
+          : 'over-budget';
 
   return {
     kind: 'civts-tournament-report',
     reportVersion: TOURNAMENT_REPORT_VERSION,
     status,
-    // A broken invariant is a defect, an overrun is a slow run: they exit differently so
-    // that a pipeline can tell them apart, and a run that is over budget *and* broken
-    // reports the defect.
-    exitCode: status === 'violations' ? 1 : status === 'over-budget' ? 3 : 0,
+    // A broken invariant is a defect, an overrun is a slow run, and a planner failure is a
+    // defect in the AI: they exit differently so that a pipeline can tell them apart, and a
+    // run that is over budget *and* broken reports the defect. A planner failure shares exit
+    // 1 with a violation because M7d counts it like one — either way this tournament is not
+    // evidence — and the two are distinguished by `status` and by which field is non-empty.
+    exitCode: status === 'over-budget' ? 3 : status === 'ok' ? 0 : 1,
     parameters: input.parameters,
     ruleset: input.ruleset,
     budget: {
@@ -2504,7 +2795,9 @@ export const buildTournamentReport = (input: TournamentReportInput): TournamentR
       games: verdict.games,
       violations: verdict.violations,
       violatingGames: verdict.violatingGames,
-      summary: `${invariantSentence}; ${budgetSentence}`,
+      plannerFailures: verdict.plannerFailures,
+      gamesWithPlannerFailures: verdict.gamesWithPlannerFailures,
+      summary: `${invariantSentence}; ${plannerSentence}; ${budgetSentence}`,
     },
     invariants: {
       names: input.invariantNames,
@@ -2517,6 +2810,7 @@ export const buildTournamentReport = (input: TournamentReportInput): TournamentR
     policies,
     games,
     violations,
+    plannerFailures,
   };
 };
 
@@ -2568,6 +2862,20 @@ export const renderTournamentReport = (report: TournamentReport): string => {
         report.totals.games,
         report.verdict.violatingGames,
         report.violations,
+      ),
+      '',
+    );
+  }
+
+  // M7d: the tournament's own failure banner, from the report's field, so a reader of the text
+  // report learns which game failed without parsing anything.
+  if (report.plannerFailures.length > 0) {
+    lines.push(
+      ...plannerFailureBannerLines(
+        TOURNAMENT_SUBJECT,
+        report.totals.games,
+        report.verdict.gamesWithPlannerFailures,
+        report.plannerFailures,
       ),
       '',
     );
@@ -2634,6 +2942,11 @@ export const renderTournamentReport = (report: TournamentReport): string => {
     `invariants  ${String(report.invariants.count)} named predicates, ` +
       `${String(report.invariants.checks)} checks, ${String(report.invariants.violations)} violations`,
     `  checked: ${report.invariants.names.join(', ')}`,
+    // M7d's count, on its own line and always printed — the other half of the pass condition.
+    `planners    ${String(report.verdict.plannerFailures)} planner ` +
+      `${plural(report.verdict.plannerFailures, 'failure')} in ` +
+      `${String(report.verdict.gamesWithPlannerFailures)} of ${String(report.totals.games)} ` +
+      plural(report.totals.games, 'game'),
     '',
     `verdict     ${report.verdict.summary}`,
   );
@@ -2776,9 +3089,13 @@ export const runTournamentCommand = (
     seeds,
   };
 
-  // One instance per seat, held here rather than built inline at the call: after the
-  // tournament this is what can still say whether any policy threw while planning (see
-  // `plannerFailureWarning`), and a policy discarded at the call site has nowhere to say it.
+  // One instance per seat, one instance per invocation, held here rather than built inline at
+  // the call: since M7d a policy carries the typed record of any throw it caught while planning,
+  // the record is cumulative for the instance, and the report has to be able to say what
+  // happened *in this tournament*. `policyOf` above is where that instance is built, with the
+  // reasoning; `options.policyOverrides` is the test seam (the shipped AI only throws on a board
+  // the engine would never build, so a failure path no test can trigger is a path nobody keeps
+  // honest).
   const seatPolicies = seatNames.map(
     (name) => options.policyOverrides?.get(name) ?? policyOf(name),
   );
@@ -2818,11 +3135,13 @@ export const runTournamentCommand = (
 
   const json = flags.value.json;
   // On stderr on both paths, for the reason `plannerFailureWarning` states: a run whose games
-  // are a hash of partly-unplayed turns is not one a reader should have to ask about.
+  // are a hash of partly-unplayed turns is not one a reader should have to ask about. Since
+  // M7d it is no longer the only evidence — the same records are `plannerFailures` in the
+  // report (and a banner in its text form) and they set the exit code.
   return ok({
     report,
     stdout: json ? `${canonicalize(report)}\n` : renderTournamentReport(report),
-    stderr: `${json ? renderTournamentBanner(report) : ''}${plannerFailureWarning(seatPolicies)}`,
+    stderr: `${json ? renderTournamentBanner(report) : ''}${plannerFailureWarning(report.plannerFailures)}`,
     exitCode: report.exitCode,
   });
 };
@@ -3223,6 +3542,8 @@ export interface SweepValueRow {
   readonly horizonTurnMin: number;
   readonly horizonTurnMax: number;
   readonly violations: readonly ReportedViolation[];
+  /** Planner failures these runs reported (M7d) — empty when the policy played every turn. */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
   readonly horizons: readonly MetricTotal[];
   readonly deltas: readonly MetricDelta[];
 }
@@ -3246,6 +3567,8 @@ export interface SweepBaseline {
   readonly horizonTurnMin: number;
   readonly horizonTurnMax: number;
   readonly violations: readonly ReportedViolation[];
+  /** Planner failures the baseline runs reported (M7d). */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
   readonly horizons: readonly MetricTotal[];
 }
 
@@ -3272,12 +3595,21 @@ export interface SweepTotals {
   readonly runs: number;
   /** Of those, how many runs stopped on a broken property. */
   readonly violatingRuns: number;
+  /** Of those, how many reported at least one planner failure (M7d). */
+  readonly plannerFailingRuns: number;
 }
 
 export interface SweepReport {
   readonly kind: 'civts-balance-sweep';
   readonly reportVersion: number;
-  readonly status: 'ok' | 'violations' | 'rejected-values';
+  /**
+   * `planner-failures` is M7d's value, for the reason the `sim` and tournament reports give:
+   * a knob's effect measured on games the AI walked out of is not a measurement of the knob.
+   * The precedence is stated rather than implied — a value the catalog refused is reported
+   * first (nothing ran), then a broken invariant (the more specific defect), then a planner
+   * failure — and it is the same precedence the other two reports use for the last two.
+   */
+  readonly status: 'ok' | 'violations' | 'planner-failures' | 'rejected-values';
   readonly exitCode: number;
   readonly knob: SweepKnob;
   readonly parameters: SimParameters;
@@ -3288,6 +3620,8 @@ export interface SweepReport {
   /** `no-measurable-effect` is the honest verdict for a sweep that proves nothing. */
   readonly verdict: 'moves-metrics' | 'no-measurable-effect';
   readonly violations: readonly ReportedViolation[];
+  /** Every planner failure in the sweep, in row order — the same records, flat. */
+  readonly plannerFailures: readonly ReportedPlannerFailure[];
 }
 
 export const SWEEP_REPORT_VERSION = 1;
@@ -3309,7 +3643,13 @@ const horizonSummary = (
   knobValue?: number,
 ): Pick<
   SweepBaseline,
-  'runs' | 'turnsPlayed' | 'horizonTurnMin' | 'horizonTurnMax' | 'violations' | 'horizons'
+  | 'runs'
+  | 'turnsPlayed'
+  | 'horizonTurnMin'
+  | 'horizonTurnMax'
+  | 'violations'
+  | 'plannerFailures'
+  | 'horizons'
 > => {
   const turns: number[] = [];
   for (const run of runs) {
@@ -3322,6 +3662,12 @@ const horizonSummary = (
     horizonTurnMin: turns.length === 0 ? 0 : Math.min(...turns),
     horizonTurnMax: turns.length === 0 ? 0 : Math.max(...turns),
     violations: runs.flatMap((run) => reportedViolations(run.seed, run.violations, knobValue)),
+    // M7d: carried through the sweep's own summaries too, for the same reason the violations
+    // are — a sweep whose rows drop the failure would report a table of numbers measured on
+    // games the AI walked out of, with nothing in the table saying so.
+    plannerFailures: runs.flatMap((run) =>
+      reportedPlannerFailures(run.seed, run.plannerFailures, knobValue),
+    ),
     horizons: metricTotals(
       runs.flatMap((run) => horizonRows(run)),
       HORIZON_METRICS,
@@ -3408,6 +3754,7 @@ export const runBalanceSweep = (options: BalanceSweepOptions): Result<SweepRepor
       horizonTurnMin: summary.horizonTurnMin,
       horizonTurnMax: summary.horizonTurnMax,
       violations: summary.violations,
+      plannerFailures: summary.plannerFailures,
       horizons: summary.horizons,
       deltas: summary.horizons.map((total) => ({
         metric: total.metric,
@@ -3435,6 +3782,10 @@ export const runBalanceSweep = (options: BalanceSweepOptions): Result<SweepRepor
     ...baseline.violations,
     ...rows.flatMap((row) => (row.kind === 'measured' ? row.violations : [])),
   ];
+  const plannerFailures = [
+    ...baseline.plannerFailures,
+    ...rows.flatMap((row) => (row.kind === 'measured' ? row.plannerFailures : [])),
+  ];
   const rejected = rows.filter((row) => row.kind === 'rejected').length;
   const measured = rows.filter((row): row is SweepValueRow => row.kind === 'measured');
   const totals = {
@@ -3445,15 +3796,33 @@ export const runBalanceSweep = (options: BalanceSweepOptions): Result<SweepRepor
       (total, row) => total + new Set(row.violations.map((violation) => violation.seed)).size,
       0,
     ),
+    // The same identification for M7d's channel: (knob value, seed) pairs, because a policy
+    // can fail under one swept value and play the same seed cleanly under another.
+    plannerFailingRuns: measured.reduce(
+      (total, row) =>
+        total +
+        new Set(
+          row.plannerFailures.map((failure) => `${String(failure.value)}:${String(failure.seed)}`),
+        ).size,
+      0,
+    ),
   };
   const status: SweepReport['status'] =
-    rejected > 0 ? 'rejected-values' : violations.length > 0 ? 'violations' : 'ok';
+    rejected > 0
+      ? 'rejected-values'
+      : violations.length > 0
+        ? 'violations'
+        : plannerFailures.length > 0
+          ? 'planner-failures'
+          : 'ok';
 
   return ok({
     kind: 'civts-balance-sweep',
     reportVersion: SWEEP_REPORT_VERSION,
     status,
-    exitCode: rejected > 0 ? 2 : violations.length > 0 ? 1 : 0,
+    // A rejected value is a flag error (2), a broken invariant or a planner failure makes the
+    // table not evidence (1), and both failure statuses share the code for M7d's reason.
+    exitCode: rejected > 0 ? 2 : violations.length > 0 || plannerFailures.length > 0 ? 1 : 0,
     knob: options.knob,
     parameters: {
       mapSize: options.settings.mapSize,
@@ -3474,6 +3843,7 @@ export const runBalanceSweep = (options: BalanceSweepOptions): Result<SweepRepor
       ? 'no-measurable-effect'
       : 'moves-metrics',
     violations,
+    plannerFailures,
   });
 };
 
@@ -3489,6 +3859,19 @@ export const renderSweepReport = (report: SweepReport): string => {
         report.totals.runs,
         report.totals.violatingRuns,
         report.violations,
+      ),
+      '',
+    );
+  }
+  // M7d: a swept table measured on games the AI walked out of says so in the same place the
+  // violation banner goes, and with the same shape.
+  if (report.plannerFailures.length > 0) {
+    lines.push(
+      ...plannerFailureBannerLines(
+        RUN_SUBJECT,
+        report.totals.runs,
+        report.totals.plannerFailingRuns,
+        report.plannerFailures,
       ),
       '',
     );
@@ -3597,6 +3980,17 @@ export const renderSweepReport = (report: SweepReport): string => {
       '        so its horizon is shorter than the others — read those rows with the banner above.',
     );
   }
+  if (report.plannerFailures.length > 0) {
+    // Deliberately unlike the violation note: a planner failure does *not* shorten a run, so the
+    // horizon is unaffected — which is exactly why the table looks normal and the banner is the
+    // only thing that says these games were not played by the AI end to end.
+    lines.push(
+      '',
+      '  NOTE: a value whose runs reported a planner failure was measured on games where the AI',
+      '        stopped playing part of a turn. The horizon is unaffected (a planner failure does',
+      '        not stop a run), so the numbers above look ordinary — read them with the banner.',
+    );
+  }
 
   return `${lines.join('\n')}\n`;
 };
@@ -3674,19 +4068,37 @@ export const runSweepCommand = (
   return ok({
     report: report.value,
     stdout: json ? `${canonicalize(report.value)}\n` : renderSweepReport(report.value),
-    stderr: json && report.value.violations.length > 0 ? sweepBanner(report.value) : '',
+    // The sweep puts its shout on `--json`'s stderr only (its text report carries the banners
+    // itself), and since M7d that includes the planner-failure banner beside the violation one.
+    stderr:
+      json && (report.value.violations.length > 0 || report.value.plannerFailures.length > 0)
+        ? sweepBanner(report.value)
+        : '',
     exitCode: report.value.exitCode,
   });
 };
 
 /** The sweep's banner for the `--json` path (stderr), shared with the text report. */
 const sweepBanner = (report: SweepReport): string =>
-  `${violationBannerLines(
-    RUN_SUBJECT,
-    report.totals.runs,
-    report.totals.violatingRuns,
-    report.violations,
-  ).join('\n')}\n`;
+  `${
+    report.violations.length === 0
+      ? ''
+      : `${violationBannerLines(
+          RUN_SUBJECT,
+          report.totals.runs,
+          report.totals.violatingRuns,
+          report.violations,
+        ).join('\n')}\n`
+  }${
+    report.plannerFailures.length === 0
+      ? ''
+      : `${plannerFailureBannerLines(
+          RUN_SUBJECT,
+          report.totals.runs,
+          report.totals.plannerFailingRuns,
+          report.plannerFailures,
+        ).join('\n')}\n`
+  }`;
 
 /* ------------------------------------------------------------------ *
  * One small export for the flag tests — nothing here is a second implementation

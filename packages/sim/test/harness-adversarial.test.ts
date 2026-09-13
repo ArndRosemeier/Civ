@@ -2317,6 +2317,10 @@ const syntheticRun = (seed: number, treasuries: readonly number[]): SimulationRe
     finalState: state,
     metrics: rows,
     violations: [],
+    // Required and always present since M7d: a synthetic run whose policies never threw carries
+    // an empty list, and the empty list is what says so. Written out rather than defaulted,
+    // because the field being *required* is the point — a consumer cannot forget to look.
+    plannerFailures: [],
     stoppedBecause: 'max-turns',
   };
 };

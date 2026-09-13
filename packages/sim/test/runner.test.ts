@@ -35,6 +35,7 @@ import {
   seedRng,
   unitActions,
   type Command,
+  type GameState,
   type RngState,
   type RulesetView,
   type Settings,
@@ -48,9 +49,14 @@ import {
   DO_NOTHING_POLICY,
   METRIC_KEY_ORDER,
   SIMPLE_POLICY,
+  plannerFailuresOf,
   policyRngFor,
   runSimulation,
+  smartPolicy,
+  type DiagnosedPolicy,
   type Invariant,
+  type PlannerFailure,
+  type PlannerPhase,
   type Policy,
   type PolicyContext,
   type SimulationOptions,
@@ -566,5 +572,168 @@ describe('runSimulation — arguments', () => {
       }),
     ).toThrow(/no unit for role "settler"/);
     expect(noUnits.units).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M7d — a planner failure travels in the result
+ *
+ * The gap M7d closes is one layer above M7c's: a thrown planner error was a *typed* record on
+ * the policy, but nothing in the result carried it, so a reader holding only a
+ * `SimulationResult` could not tell a **partial turn** from a **quiet one** — same legal
+ * command list, same metrics, same invariants, same plausible hash. These tests pin both
+ * halves of the distinction and the fact that the carrier is required rather than optional.
+ */
+
+/**
+ * A policy that throws on every turn it is polled: the real AI, handed a board it cannot read.
+ *
+ * The fault is the one a policy cannot avoid and cannot be blamed for *choosing* — `state.map`
+ * is a throwing getter, so the very first read fails — and it is deliberately injected on the
+ * **context** rather than on the run's own state: the runner, its invariants and the final hash
+ * must see an ordinary, hashable world, which is exactly the situation the field has to
+ * describe. `ai.test.ts` covers the record itself; what this file covers is the *carrier*.
+ */
+const boardBlindPolicy = (): DiagnosedPolicy => {
+  const inner = smartPolicy();
+  return {
+    name: inner.name,
+    chooseCommands: (ctx) =>
+      inner.chooseCommands({ ...ctx, state: boardWithoutAReadableMap(ctx.state) }),
+    report: () => inner.report(),
+  };
+};
+
+/**
+ * The same state with an unreadable map, built by a getter rather than by a spread field.
+ *
+ * `Object.defineProperty` rather than an accessor in a literal: an object spread *evaluates*
+ * an accessor, so a spread with a throwing getter would throw while building the fixture
+ * instead of inside the planner.
+ */
+const boardWithoutAReadableMap = (state: GameState): GameState => {
+  const broken = { ...state };
+  Object.defineProperty(broken, 'map', {
+    enumerable: true,
+    configurable: true,
+    get(): never {
+      throw new Error('the board is unreadable');
+    },
+  });
+  return broken;
+};
+
+const PLANNER_PHASES: readonly PlannerPhase[] = [
+  'assembly',
+  'cities',
+  'research',
+  'rates',
+  'units',
+];
+
+describe('runSimulation — M7d: a planner failure is carried in the result', () => {
+  it('carries an EMPTY list for a policy that legitimately returns no commands', () => {
+    // The control, and half of the distinction the field exists to make. `DO_NOTHING_POLICY`
+    // returns an empty list every turn *by design*: it must produce no failures, and the field
+    // must still be there — a reader must not be able to confuse "there were none" with
+    // "nobody looked".
+    const quiet = runSimulation(optionsFor(11, [DO_NOTHING_POLICY, DO_NOTHING_POLICY], 4));
+
+    expect(Object.keys(quiet)).toContain('plannerFailures');
+    expect(quiet.plannerFailures).toEqual([]);
+    // Never a key holding `undefined`: `canonicalize` refuses one, so a report carrying it
+    // could not be written to a file at all.
+    expect(JSON.parse(JSON.stringify(quiet.plannerFailures))).toEqual([]);
+    expect(quiet.stoppedBecause).toBe('no-commands');
+    expect(quiet.turnsPlayed).toBe(4);
+  });
+
+  it('carries the typed record, with the turn and the pass, for a policy that throws', () => {
+    const broken = boardBlindPolicy();
+    const result = runSimulation(optionsFor(11, [broken, broken], 3));
+
+    expect(result.plannerFailures.length).toBeGreaterThan(0);
+    const first = result.plannerFailures[0];
+    if (first === undefined) throw new Error('the run carried no failure');
+    expect(first.policy).toBe(broken.name);
+    expect(first.error).toContain('the board is unreadable');
+    expect(first.detail.length).toBeGreaterThan(0);
+    expect(first.turn).toBeGreaterThanOrEqual(1);
+    expect(PLANNER_PHASES).toContain(first.phase);
+    expect(Number.isInteger(first.playerId)).toBe(true);
+
+    // The result carries the policy's **own** records — the same objects, not a second shape
+    // derived from them — so a reader never has to reconcile two accounts of one throw.
+    expect(result.plannerFailures).toEqual(plannerFailuresOf(broken));
+  });
+
+  it('still plays the whole horizon, so the batch’s aggregates keep one horizon', () => {
+    // A planner failure is *not* a violation and does not stop the run. That is a decision
+    // with a reason: a partial turn leaves a valid, hashable game, while a violated state is
+    // one that broke — and truncating here would make the runs of one batch end on different
+    // turns, which is the mixed-horizon aggregate the M4b/M5 rule forbids.
+    const broken = boardBlindPolicy();
+    const result = runSimulation(optionsFor(11, [broken, broken], 4));
+
+    expect(result.turnsPlayed).toBe(4);
+    expect(result.metrics.at(-1)?.turn).toBe(5);
+    expect(result.violations).toEqual([]);
+    expect(result.plannerFailures.length).toBeGreaterThan(0);
+  });
+
+  it('is the ONLY difference between such a run and a silent one', () => {
+    // The thesis of M7d in one comparison. The AI could decide nothing on a board it cannot
+    // read, so the world it produced is byte-for-byte the world a do-nothing policy produces —
+    // same final hash, same turns, same metrics — and the only thing in the result that says a
+    // planner threw is the field this wave added. Before it, the two were indistinguishable.
+    const broken = boardBlindPolicy();
+    const withThrow = runSimulation(optionsFor(13, [broken, broken], 3));
+    const quiet = runSimulation(optionsFor(13, [DO_NOTHING_POLICY, DO_NOTHING_POLICY], 3));
+
+    expect(withThrow.finalHash).toBe(quiet.finalHash);
+    expect(withThrow.turnsPlayed).toBe(quiet.turnsPlayed);
+    expect(withThrow.metrics).toEqual(quiet.metrics);
+    expect(quiet.plannerFailures).toEqual([]);
+    expect(withThrow.plannerFailures.length).toBeGreaterThan(0);
+  });
+
+  it('reports only the failures that happened after the run started', () => {
+    // The record is cumulative **for the policy instance** — `PolicyReport` keeps the first
+    // failure of each pass, and `SMART_POLICY` is a module-level singleton — so a run must
+    // claim only what happened during it. This drives the seam directly (`plannerFailuresOf`
+    // reads `report()`), which is the only way to tell a stale record from a fresh one
+    // without depending on which pass a corrupted board happens to fail in.
+    const stale: PlannerFailure = {
+      policy: 'driven',
+      turn: 1,
+      playerId: 0,
+      phase: 'cities',
+      detail: 'a run that finished before this one',
+      error: 'Error: stale',
+    };
+    const fresh: PlannerFailure = {
+      policy: 'driven',
+      turn: 1,
+      playerId: 0,
+      phase: 'units',
+      detail: 'this run',
+      error: 'Error: fresh',
+    };
+    let recorded: readonly PlannerFailure[] = [stale];
+    let polls = 0;
+    const driven: DiagnosedPolicy = {
+      name: 'driven',
+      chooseCommands: () => {
+        polls += 1;
+        if (polls === 1) recorded = [stale, fresh];
+        return [];
+      },
+      // A fresh array per call, holding the same records — the shape `PolicyReport` promises.
+      report: () => ({ failures: [...recorded], failureCount: recorded.length }),
+    };
+
+    const result = runSimulation(optionsFor(14, [driven, driven], 2));
+
+    expect(result.plannerFailures.map((failure) => failure.error)).toEqual(['Error: fresh']);
   });
 });

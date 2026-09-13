@@ -11,7 +11,10 @@
  *    `InvariantContext`, `Policy`, `PolicyContext`, `SimulationOptions` and
  *    `SimulationResult` are the contract's, verbatim: same names, same optionality,
  *    same `readonly` modifiers. A change here is a change to a contract another
- *    workstream is coded against, so it is an escalation, not an edit.
+ *    workstream is coded against, so it is an escalation, not an edit. M7d amended
+ *    `SimulationResult` deliberately and in writing (the amendment block at the end of
+ *    `docs/INTERFACES.md`, which also names the owner of every consumer) — that is the
+ *    only way a shape in this file changes, and `plannerFailures` is the amendment.
  * 2. **The rest of the file is the contract's prose made concrete.** The contract
  *    *names* `TurnMetrics`, `Violation`, `BatchOptions`, `BatchResult` and
  *    `RulesetPatch` and says what each must carry ("per turn, per civilization …
@@ -54,6 +57,18 @@ import type {
   UnitRole,
 } from '@civts/core';
 import type { Ruleset } from '@civts/rules';
+
+// **The one import here that is not a shape of this file's own vocabulary, and why it is
+// type-only.** M7d's amendment (docs/INTERFACES.md, "AMENDMENT to the frozen simulation
+// result") gives `SimulationResult` a field of type `readonly PlannerFailure[]`, and
+// `PlannerFailure` is declared in `ai/smart.ts` beside the only code that produces one.
+// Restating the shape here would be a second declaration of a contract field set — and two
+// halves of a contract that disagree on a field name are two contracts, which is the exact
+// failure this file's header warns about. The import is `import type`, so under
+// `verbatimModuleSyntax` it is erased completely: `types.ts` still contributes no runtime
+// edge to the module graph, and `ai/smart.ts`'s own (type-only) import of `PolicyContext`
+// from this file stays a type cycle rather than a runtime one.
+import type { PlannerFailure } from './ai/smart.js';
 
 /* ------------------------------------------------------------------ *
  * Invariants — the frozen contract
@@ -177,6 +192,31 @@ export interface SimulationResult {
   readonly finalState: GameState;
   readonly metrics: readonly TurnMetrics[];
   readonly violations: readonly Violation[];
+  /**
+   * **Every planner failure a policy reported while this run polled it, oldest first.**
+   *
+   * M7c made a thrown planner error a typed `PlannerFailure` instead of a silence, and the
+   * verifier found the fix real but **unwired**: the CLI printed a warning to stderr while
+   * this result carried nothing, so a reader holding only the structured result could not
+   * tell a **partial turn** from a **quiet one**. That is the same silent-failure class one
+   * layer up — a game in which the planner threw is a game whose numbers describe an AI that
+   * was not playing, and the record of it has to be *in the result* rather than in a warning
+   * beside it.
+   *
+   * **Required and always present, an empty array when there are none** — exactly how
+   * `violations` works, so a consumer cannot forget it. Not optional: an optional field is
+   * one a producer may forget and a consumer may skip, which is how the M7c record came to
+   * be read by nobody. And never `undefined`: a key written with an explicit `undefined` is
+   * unhashable (`canonicalize` refuses it by design) and this project has paid for that
+   * mistake three times — the fix belongs in the producer and the type, never in the hasher.
+   *
+   * A **non-empty** value means the run is not valid evidence: the policy is required to be
+   * total, so a throw is a defect in the AI, and `tournamentVerdict` fails the tournament
+   * that contains one. Unlike a violation it does **not** stop the run — see `runner.ts` on
+   * why a partial turn is still a complete, hashable game, while a violated state is a state
+   * that broke and has to be inspected where it happened.
+   */
+  readonly plannerFailures: readonly PlannerFailure[];
   readonly stoppedBecause: StopReason;
 }
 

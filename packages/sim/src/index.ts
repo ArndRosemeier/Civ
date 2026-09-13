@@ -87,15 +87,17 @@ export type { SmartWeightGroup, SmartWeights, SmartWeightsPatch } from './ai/ind
 
 export { policyRngFor, runSimulation } from './runner.js';
 
-// **The AI's failure channel, on the package's surface rather than one module deep.** A policy
-// that catches a throw and keeps playing is the right contract — the runner has no failure
-// channel, and a policy that threw would take a twenty-seed tournament down with it — but the
-// turn it leaves behind looks *exactly* like a turn in which the AI had nothing to say: same
-// legal command list, same metrics, same invariants, same plausible hash. So a runner or a CLI
-// has to be able to ask, and asking through `@civts/sim` is what makes the answer part of the
-// surface a consumer may rely on rather than a detail of one module's internals. `sim-cli.ts`'s
-// `plannerFailureWarning` is that consumer. Both functions work on any `Policy` and answer `[]`
-// for one that cannot report (the controls), so calling them costs no knowledge of the AI.
+// **The AI's failure channel, on the package's surface rather than one module deep, and since
+// M7d a field of the results as well as a question a caller can ask.** A policy that catches a
+// throw and keeps playing is the right contract — a policy that threw would take a twenty-seed
+// tournament down with it — but the turn it leaves behind looks *exactly* like a turn in which
+// the AI had nothing to say: same legal command list, same metrics, same invariants, same
+// plausible hash. M7c gave that record a type and a reader (`plannerFailuresOf`); M7d wired it
+// into `SimulationResult.plannerFailures` and `TournamentResult.plannerFailures`, so a reader
+// holding only the structured result can tell a partial turn from a quiet one and
+// `tournamentVerdict(...).passed` fails a run that contains one. Both functions work on any
+// `Policy` and answer `[]` for one that cannot report (the controls), so calling them costs no
+// knowledge of the AI; `sim-cli.ts` is the consumer that renders them and fails the run.
 export { describePlannerFailures, plannerFailuresOf } from './ai/index.js';
 export type { DiagnosedPolicy, PlannerFailure, PlannerPhase, PolicyReport } from './ai/index.js';
 

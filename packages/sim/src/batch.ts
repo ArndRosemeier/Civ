@@ -53,6 +53,29 @@
  * count: `wins: []` would claim victories were counted and that none happened. When a
  * victory condition exists, the counts go here ordered by outcome name (the type says
  * so); today the honest report is silence.
+ *
+ * ## The planner-failure channel: carried verbatim, never summarised away (M7d)
+ *
+ * Each run's `plannerFailures` travels out of `runSimulation` on the run itself, and
+ * that is deliberate: a batch's job is to fold *metric rows*, and a planner failure is
+ * not a row — it is a fact about the run's **evidence**. Turning it into a rate ("2 % of
+ * turns had a planner failure") would be exactly the averaging-away the contract forbids
+ * of a violation, and folding it into the aggregate table would put a non-metric column
+ * in a table whose every other column is an integer the engine measured.
+ *
+ * So nothing here filters, caps, deduplicates or summarises it; `runs` is handed back
+ * whole, which is the only mechanism that *cannot* drop a field. `BatchResult` gains no
+ * top-level `plannerFailures`: the frozen contract puts that aggregate on
+ * `TournamentResult` (where a single pass/fail verdict needs it), and inventing a second
+ * place for it here would be a second answer to the same question. A caller that wants
+ * the flat list over a batch writes the same one line the tournament does —
+ * `batch.runs.flatMap((run) => run.plannerFailures)` — and `sim-cli.ts` does.
+ *
+ * **The horizon rule is untouched by any of this.** `aggregateRuns` still folds only the
+ * rows it is given, in canonical `(seed, turn, playerId)` order, and a planner failure
+ * still does not truncate a run (`runner.ts` states why), so a batch whose policies
+ * throw produces the same rows, the same aggregates and the same horizon as one whose
+ * policies do not — with the failure visible beside them instead of hidden by them.
  */
 
 import { MEASURED_METRIC_FIELDS, type MeasuredMetricField } from './metrics.js';
@@ -187,6 +210,11 @@ const optionsForSeed = (options: BatchOptions, seed: number): SimulationOptions 
  * no field in `BatchResult` for a game that never existed, and a batch that quietly
  * dropped such a seed would report an aggregate over a set the caller did not ask
  * for.
+ *
+ * A **planner failure does not throw and is not a dropped seed**: the game was played,
+ * its rows are in the aggregate like any other game's, and the typed record rides on the
+ * run (`plannerFailures`) so that the caller can see that one of the games it just
+ * averaged was not a measurement of the AI. See the module note.
  */
 export const runBatch = (options: BatchOptions): BatchResult => {
   const seeds = [...options.seeds].sort((a, b) => a - b);

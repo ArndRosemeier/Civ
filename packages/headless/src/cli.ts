@@ -79,8 +79,9 @@ Commands:
                every invariant's verdict; see "civts sim --help"
   tournament   self-play: the same policies across seeds with the seats ROTATED, so no
                policy is ever tested from one position only; zero invariant violations
-               is the pass condition and the budget is reported; see "civts tournament
-               --help". "run" is an accepted alias for this command.
+               and zero planner failures is the pass condition and the budget is
+               reported; see "civts tournament --help". "run" is an accepted alias for
+               this command.
 
 Options:
   -h, --help   show this help
@@ -112,8 +113,10 @@ sim options (the full text is in "civts sim --help"):
   --json              emit one canonical JSON report (sorted keys) instead of text
 
   a violation anywhere in the batch is named, with its seed and turn, and exits 1;
-  that is the command working, not failing. "exit 0" means every run held every
-  invariant.
+  that is the command working, not failing. A policy that threw while planning is
+  reported the same way (a PLANNER FAILURE, naming the seed, turn and pass) and also
+  exits 1, because a run the AI walked out of is not evidence either. "exit 0" means
+  every run held every invariant and every turn was decided by its policy.
 
 tournament / run options (the full text is in "civts tournament --help"):
   --seeds <spec>      games to play: "1..2", "3", "1,4,7"   (default 1..2 — a smoke run)
@@ -137,8 +140,9 @@ tournament / run options (the full text is in "civts tournament --help"):
     civts tournament --seeds ${A3_TOURNAMENT_SEED_SPEC} --turns ${String(A3_TOURNAMENT_TURNS)}
     pnpm tournament:evidence    the same run, printing the structured result and wall time
 
-  exit 0 means every game held every invariant AND the run was within budget; exit 1
-  names a violation, exit 3 reports an honest overrun.
+  exit 0 means every game held every invariant, no policy threw while planning, AND the
+  run was within budget; exit 1 names a violation or a planner failure, exit 3 reports
+  an honest overrun.
 
 play commands (inside a session; "help" prints the same list with detail):
   move <unitId> <x> <y>      found <unitId>      cities      city <cityId>

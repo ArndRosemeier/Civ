@@ -38,17 +38,14 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_SETTINGS, asPlayerId, newGame, type GameState, type Result } from '@civts/core';
-import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
+import { type GameState, type Result } from '@civts/core';
+import { CATALOG } from '@civts/rules';
 import {
   A3_TOURNAMENT_EVIDENCE,
   CORE_INVARIANTS,
   DEFAULT_TOURNAMENT_BUDGET_MS,
-  plannerFailuresOf,
-  policyRngFor,
-  SMART_POLICY,
   smartPolicy,
-  type PolicyContext,
+  type DiagnosedPolicy,
 } from '@civts/sim';
 import { describe, expect, it } from 'vitest';
 // The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
@@ -859,8 +856,10 @@ describe('the balance sweep', () => {
       expect(new Set(rows.map((row) => row.rulesetHash)).size).toBe(3);
       expect(rows.every((row) => row.overrides.length === 1)).toBe(true);
       expect(report.violations).toStrictEqual([]);
-      // The banner's own sentence is a stored count, not arithmetic the renderer does.
-      expect(report.totals).toStrictEqual({ runs: 6, violatingRuns: 0 });
+      // The banner's own sentence is a stored count, not arithmetic the renderer does — and
+      // since M7d there are two such counts, because a planner failure has a banner of its own.
+      expect(report.totals).toStrictEqual({ runs: 6, violatingRuns: 0, plannerFailingRuns: 0 });
+      expect(report.plannerFailures).toStrictEqual([]);
 
       // The shipped row and the no-override control measure the same numbers: the sweep
       // does not assume that, it displays it — and this is the display, asserted.
@@ -1545,41 +1544,31 @@ describe('the tournament budget verdict is honest', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * The planner's failure channel, as the CLI reports it
+ * The planner's failure channel, as the CLI reports it (M7d)
  *
- * `SMART_POLICY` catches a thrown planner error, records it and returns the commands it had
- * decided before the throw. That is the right contract — the runner has no failure channel,
- * and a policy that threw would take a twenty-seed tournament down with it — but it leaves a
- * turn that is indistinguishable from a turn in which the AI had nothing to say: same legal
- * command list, same metrics, same invariants, same plausible hash.
+ * `smartPolicy()` catches a thrown planner error, records it and returns the commands it had
+ * decided before the throw. That is the right contract — a policy that threw would take a
+ * twenty-seed tournament down with it — but it leaves a turn that is indistinguishable from a
+ * turn in which the AI had nothing to say: same legal command list, same metrics, same
+ * invariants, same plausible hash.
  *
- * So the AI's record has to reach a reader, and this suite is where that is checked from
- * OUTSIDE the policy: a policy that reports a failure must produce a warning, a policy that
- * legitimately returns nothing must produce none, and a healthy run of the shipped AI must
- * produce none either — a warning that fires on healthy games is noise, and noise is how the
- * real one gets ignored.
+ * M7c gave that record a type, a warning on stderr and no reader but this CLI. **M7d wired it
+ * into the results**: the same records are `plannerFailures` in every report this module builds,
+ * they are a banner in the text report, and they **fail the run** (exit 1, the code a violation
+ * uses), because a game the AI walked out of is not a measurement of the AI.
+ *
+ * So this suite checks three things from OUTSIDE the policy, and all three matter:
+ *
+ * 1. the warning still fires, naming the game, the turn, the pass and the error;
+ * 2. a policy that legitimately returns nothing produces **no warning and an empty field** —
+ *    a warning that fires on healthy games is noise, and noise is how the real one is ignored;
+ * 3. the exit code and the structured report carry the failure, so a reader holding only the
+ *    `--json` value can tell a partial turn from a quiet one without reading stderr at all.
  * ------------------------------------------------------------------ */
 
-/** The shipped catalog, validated — the ruleset a real run uses. */
-const TOURNAMENT_RULESET: Ruleset = (() => {
-  const validated = validateRuleset(CATALOG, 'tuned');
-  if (!validated.ok) throw new Error('the shipped catalog does not validate');
-  return validated.value;
-})();
-
-/**
- * A real board with one thing broken: **the map cannot be read**.
- *
- * `map` is redefined as a throwing getter rather than assigned a corrupt value, because a
- * corrupt value is a state the engine could have produced and this is not — it is a fault,
- * and the policy has to survive it. `Object.defineProperty` rather than a getter in the
- * object literal: object spread *evaluates* an accessor, so a spread with a throwing getter
- * would throw while building the fixture instead of inside the planner.
- */
-const stateWithoutAReadableMap = (): GameState => {
-  const started = newGame(5, DEFAULT_SETTINGS, TOURNAMENT_RULESET);
-  if (!started.ok) throw new Error('newGame refused');
-  const broken = { ...started.value };
+/** The same state with an unreadable map — a getter, so the throw happens inside the planner. */
+const withoutAReadableMap = (state: GameState): GameState => {
+  const broken = { ...state };
   Object.defineProperty(broken, 'map', {
     enumerable: true,
     configurable: true,
@@ -1590,97 +1579,196 @@ const stateWithoutAReadableMap = (): GameState => {
   return broken;
 };
 
-describe('the CLI says out loud when a planner threw', () => {
-  it('warns, naming the pass and the error, for a policy that reports a failure', () => {
-    const broken = smartPolicy();
-    const context: PolicyContext = {
-      state: stateWithoutAReadableMap(),
-      playerId: asPlayerId(0),
-      ruleset: TOURNAMENT_RULESET,
-      rng: policyRngFor(1, asPlayerId(0), 1),
-    };
-    // The throw is deliberate, and it is the shape of fault the policy cannot avoid: the board
-    // itself cannot be read. What matters is that it comes back as a *record*, not a throw.
-    const commands = broken.chooseCommands(context);
-    expect(commands).toEqual([]);
-    expect(plannerFailuresOf(broken)).toHaveLength(1);
+/**
+ * The real AI, handed a board it cannot read — **during the run**.
+ *
+ * The corruption is applied to the *context* on every poll rather than to a state built here and
+ * played once. That is the whole difference between a test that exercises this path and one that
+ * only looks like it: a record made *before* the run belongs to whatever produced it, and since
+ * M7d a run claims only the records its own policies make while it plays (see `PlannerFailureLog`
+ * in `@civts/sim`'s runner). Handing the command a policy that was already broken would be
+ * testing the pre-M7d wiring, where the CLI re-asked the policies after the fact.
+ *
+ * It stays a `DiagnosedPolicy` — `report()` is forwarded to the inner policy — because that is
+ * the only channel a policy has to say what it caught, and a wrapper that swallowed it would be
+ * a silent policy in a test about silences.
+ *
+ * `smartPolicy()` is called per wrapper, one instance per invocation, for the same reason.
+ */
+const boardBlindPolicy = (): DiagnosedPolicy => {
+  const inner = smartPolicy();
+  return {
+    name: inner.name,
+    chooseCommands: (ctx) =>
+      inner.chooseCommands({ ...ctx, state: withoutAReadableMap(ctx.state) }),
+    report: () => inner.report(),
+  };
+};
 
-    const warning = plannerFailureWarning([broken]);
-    expect(warning).toContain('WARNING');
-    expect(warning).toContain('the board is unreadable');
-    // And it names the pass it happened in, which is what turns "the AI threw" into something
-    // a person can act on. Here that pass is *research*: the map is the first thing the city
-    // pass reads, so a board that cannot be read at all fails before any city is planned — and
-    // the record says so rather than leaving a reader to guess how far the turn got.
-    expect(warning).toContain('in the research pass');
+describe('the CLI says out loud when a planner threw, and fails the run', () => {
+  it('warns with the game, the turn and the pass, and exits 1, entirely from the report', () => {
+    const output = okOrThrow(
+      runTournamentCommand(['--seeds', '1', '--turns', '2', '--seats', 'smart,smart', '--json'], {
+        policyOverrides: new Map([['smart', boardBlindPolicy()]]),
+      }),
+    );
+
+    // The warning, which is still the fastest thing for a person to read...
+    expect(output.stderr).toContain('WARNING');
+    expect(output.stderr).toContain('the board is unreadable');
+    expect(output.stderr).toContain('in game 1');
+    expect(output.stderr).toContain('while planning on turn');
+    // ...naming the pass it happened in, which is what turns "the AI threw" into something a
+    // person can act on. Here that pass is *research*: the map is the first thing the city pass
+    // reads, so a board that cannot be read at all fails before any city is planned.
+    expect(output.stderr).toContain('in the research pass');
+
+    // ...and the verdict, which is the part M7d added: a planner failure is counted like a
+    // violation, so the run is not a pass and the exit code says so.
+    expect(output.exitCode).toBe(1);
+    expect(output.report?.exitCode).toBe(1);
+    expect(output.report?.status).toBe('planner-failures');
+    expect(output.report?.verdict.passed).toBe(false);
+    // With no invariant violation anywhere — the case the old behaviour called clean.
+    expect(output.report?.violations).toStrictEqual([]);
   });
 
-  it('says nothing for a policy that legitimately has no commands', () => {
-    // The control, and the whole point of the distinction: `DO_NOTHING_POLICY` returns an empty
-    // list every turn *by design*. It must not produce the warning a failure produces — if it
-    // did, "the policy reported a failure" would say nothing.
-    const silent = runSimCommand([...SMALL, '--policy', 'none', '--json']);
-    const quiet = okOrThrow(silent);
+  it('carries the failure in the structured report, so --json alone is enough', () => {
+    // The gap M7d exists to close, asserted on the value a pipeline reads and nothing else: a
+    // reader that never looks at stderr must still be able to tell this tournament from a clean
+    // one, and must be able to say which game, turn and player it happened to.
+    const output = okOrThrow(
+      runTournamentCommand(['--seeds', '1', '--turns', '2', '--seats', 'smart,smart', '--json'], {
+        policyOverrides: new Map([['smart', boardBlindPolicy()]]),
+      }),
+    );
+    const parsed = parsedJson(output);
+
+    const failures = parsed['plannerFailures'];
+    expect(Array.isArray(failures)).toBe(true);
+    if (!Array.isArray(failures) || !isRecord(failures[0])) {
+      throw new Error('the report carries no planner failures');
+    }
+    const first = failures[0];
+    expect(first['seed']).toBe(1);
+    expect(first['policy']).toBe('smart');
+    expect(first['phase']).toBe('research');
+    expect(first['error']).toContain('the board is unreadable');
+    expect(typeof first['turn']).toBe('number');
+    expect(typeof first['playerId']).toBe('number');
+    // The verdict's own counts, which are what the exit code is computed from. A field and a
+    // verdict that could disagree is exactly the un-wired shape this wave is removing.
+    const verdict = parsed['verdict'];
+    if (!isRecord(verdict)) throw new Error('the report carries no verdict');
+    expect(verdict['plannerFailures']).toBe(failures.length);
+    expect(verdict['gamesWithPlannerFailures']).toBe(1);
+    expect(verdict['passed']).toBe(false);
+    // Canonical JSON, still: the new field did not break the sorted-key contract.
+    expectSortedKeys(parsed, '$');
+  });
+
+  it('says the same thing in the text report, as a banner over the table', () => {
+    // Both paths read the same field: the text report cannot compute a figure the structured
+    // value does not contain, and this banner is no exception.
+    const output = okOrThrow(
+      runTournamentCommand(['--seeds', '1', '--turns', '2', '--seats', 'smart,smart'], {
+        policyOverrides: new Map([['smart', boardBlindPolicy()]]),
+      }),
+    );
+
+    expect(output.stdout).toContain('PLANNER FAILURE');
+    expect(output.stdout).toContain('seed 1, turn');
+    expect(output.stdout).toContain('research pass');
+    expect(output.stdout).toContain('the board is unreadable');
+    // The verdict's own last line, printed whether or not anybody reads the banner: a reader must
+    // not have to notice an *absence* to know the AI played the whole game. The counts are the
+    // report's, not the renderer's.
+    expect(output.stdout).toContain('1 planner failure in 1 of 1 game');
+    expect(output.stdout).toContain('not measurements of the AI');
+    expect(output.stdout).toContain('planners    1 planner failure in 1 of 1 game');
+    expect(output.exitCode).toBe(1);
+  });
+
+  it('fails the sim batch too, where the same records are a field of its report', () => {
+    // The `sim` command gets the same treatment on its own path (its own report shape, its own
+    // exit code), so the two commands cannot drift on what a planner failure means.
+    const output = okOrThrow(
+      runSimCommand([...SMALL, '--policy', 'smart', '--json'], {
+        policyOverrides: new Map([['smart', boardBlindPolicy()]]),
+      }),
+    );
+
+    expect(output.exitCode).toBe(1);
+    expect(output.report?.status).toBe('planner-failures');
+    expect(output.stderr).toContain('WARNING');
+    expect(output.stderr).toContain('the board is unreadable');
+    const failures = parsedJson(output)['plannerFailures'];
+    expect(Array.isArray(failures)).toBe(true);
+    if (!Array.isArray(failures)) throw new Error('the report carries no planner failures');
+    // One record, and that is the honest count: the batch hands every seat of every run the same
+    // instance, `PolicyReport` keeps the first failure of each pass, and a run claims only the
+    // records made while it played — so the pass that failed is reported once, in the run where it
+    // was first recorded, rather than once per run of a two-seed batch.
+    expect(failures.length).toBe(1);
+    expect(output.report?.totals.plannerFailingRuns).toBe(1);
+    expect(output.stdout).not.toContain('WARNING');
+
+    const text = okOrThrow(
+      runSimCommand([...SMALL, '--policy', 'smart'], {
+        policyOverrides: new Map([['smart', boardBlindPolicy()]]),
+      }),
+    );
+    expect(text.stdout).toContain('PLANNER FAILURE');
+    expect(text.exitCode).toBe(1);
+  });
+
+  it('is a required, always-present field: empty, never missing, for a clean run', () => {
+    // The control, and the other half of the distinction: `DO_NOTHING_POLICY` returns an empty
+    // list every turn *by design*, and a healthy run of the real AI decides everything it wants
+    // to. Both must produce an **empty array that is present** — not an absent key and not an
+    // explicit `undefined` (which `canonicalize` refuses outright).
+    const quiet = okOrThrow(runSimCommand([...SMALL, '--policy', 'none', '--json']));
     expect(quiet.stderr).not.toContain('WARNING');
+    expect(quiet.exitCode).toBe(0);
+    const quietJson = parsedJson(quiet);
+    expect(Object.keys(quietJson)).toContain('plannerFailures');
+    expect(quietJson['plannerFailures']).toStrictEqual([]);
+    expect(quiet.report?.status).toBe('ok');
 
     // And the same for a healthy run of the real AI, whose games are the ones the rest of this
     // file measures: if a clean run warned, the warning would be worthless on a dirty one.
     const healthy = okOrThrow(
-      runSimCommand(['--seeds', '1..2', '--turns', '3', '--policy', 'smart']),
+      runSimCommand(['--seeds', '1..2', '--turns', '3', '--policy', 'smart', '--json']),
     );
     expect(healthy.stderr).not.toContain('WARNING');
+    expect(healthy.exitCode).toBe(0);
+    expect(parsedJson(healthy)['plannerFailures']).toStrictEqual([]);
+
     const healthyTournament = okOrThrow(
-      runTournamentCommand(['--seeds', '1', '--turns', '3', '--seats', 'smart,smart']),
+      runTournamentCommand(['--seeds', '1', '--turns', '3', '--seats', 'smart,smart', '--json']),
     );
     expect(healthyTournament.stderr).not.toContain('WARNING');
+    expect(healthyTournament.exitCode).toBe(0);
+    expect(parsedJson(healthyTournament)['plannerFailures']).toStrictEqual([]);
+
+    // The warning function itself, on the empty list: no banner, no blank line — a warning that
+    // printed an empty shell would be noise on every clean report.
+    expect(plannerFailureWarning([])).toBe('');
+    expect(plannerFailureWarning(healthy.report?.plannerFailures ?? [])).toBe('');
   });
 
-  it('carries the same warning out of a tournament, on the --json path too', () => {
-    // The tournament is the command A3's evidence runs, and `--json` is how a pipeline reads
-    // it — so this is the path where a swallowed planner error would be least likely to be
-    // noticed: a parsed report, per-seat aggregates, no human reading stderr. The policy is
-    // handed in through `TournamentCommandOptions`, which exists for exactly this: the shipped
-    // AI only throws on a board the engine would never build, and a warning no test can trigger
-    // is a warning nobody can keep honest.
-    const broken = smartPolicy();
-    const context: PolicyContext = {
-      state: stateWithoutAReadableMap(),
-      playerId: asPlayerId(0),
-      ruleset: TOURNAMENT_RULESET,
-      rng: policyRngFor(1, asPlayerId(0), 1),
-    };
-    broken.chooseCommands(context);
-    expect(plannerFailuresOf(broken)).toHaveLength(1);
-
-    const json = okOrThrow(
+  it('keeps the warning off stdout on the text path, where it would corrupt the report', () => {
+    // A warning printed *into* the text report is a line in a table that claims to be the report;
+    // a warning printed nowhere leaves a report that looks clean. stderr, on both paths.
+    const output = okOrThrow(
       runTournamentCommand(['--seeds', '1', '--turns', '2', '--seats', 'smart,smart', '--json'], {
-        policyOverrides: new Map([['smart', broken]]),
+        policyOverrides: new Map([['smart', boardBlindPolicy()]]),
       }),
     );
-    expect(json.stderr).toContain('WARNING');
-    expect(json.stderr).toContain('the board is unreadable');
-    // The structured value is untouched by the warning: a parser sees the same report it
-    // would have seen from a clean run, and the difference is on stderr rather than in a
-    // field nobody declared.
-    expect(parsedJson(json)['kind']).toBe('civts-tournament-report');
-
-    const text = okOrThrow(
-      runTournamentCommand(['--seeds', '1', '--turns', '2', '--seats', 'smart,smart'], {
-        policyOverrides: new Map([['smart', broken]]),
-      }),
-    );
-    expect(text.stderr).toContain('WARNING');
-  });
-
-  it('carries the warning on the --json path too, where a pipeline would never look', () => {
-    // The `--json` result is parsed by programs, so a warning printed *into* it would corrupt
-    // the value; a warning printed nowhere would leave the parsed result looking clean. It goes
-    // to stderr on both paths, and the value stays exactly the structured report.
-    const args: readonly string[] = [...SMALL, '--policy', 'smart', '--json'];
-    const output = okOrThrow(runSimCommand(args));
-    expect(plannerFailureWarning([SMART_POLICY])).toBe('');
-    const parsed = parsedJson(output);
-    expect(Object.keys(parsed)).not.toContain('plannerFailures');
-    expect(parsed['kind']).toBe('civts-sim-report');
+    expect(output.stdout).not.toContain('WARNING');
+    expect(parsedJson(output)['kind']).toBe('civts-tournament-report');
+    expect(
+      okOrThrow(runSimCommand([...SMALL, '--policy', 'smart', '--json'])).stdout,
+    ).not.toContain('WARNING');
   });
 });

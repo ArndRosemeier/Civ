@@ -54,6 +54,26 @@
  * addition is exact in IEEE-754 doubles below 2^53, so the associativity that
  * floating-point addition lacks never arises. `hash` is the one string.
  *
+ * ## What this module deliberately does NOT measure (M7d)
+ *
+ * `SimulationResult.plannerFailures` is **not** a field of `TurnMetrics`, and it must never
+ * become one. Every column here is a per-turn, per-civilization *measurement of the world* —
+ * population, cities, income, the state hash — and a planner failure is not a property of the
+ * world at all: it is a property of the run's **evidence**, saying that some turn of this game
+ * was not decided by the AI the run claims to measure. Giving it a row would be wrong three
+ * ways: it is not per-civilization (the record already names its `playerId`), it has no
+ * meaningful mean (the M7d contract counts it like a *violation*, and a violation has no mean
+ * either), and it would put a column that is not an integer count into `MEASURED_METRIC_FIELDS`,
+ * which `batch.test.ts` checks is exactly the set of aggregate columns.
+ *
+ * So the two guards this module owns are unchanged by M7d, and that is the point: the row
+ * shape, `METRIC_KEY_ORDER`, `MEASURED_METRIC_FIELDS` and every aggregate folded from them are
+ * byte-identical to what they were before the field existed. The failure is carried on the
+ * *result* (`types.ts` explains the shape, `runner.ts` how it is read out of the policy,
+ * `tournament.ts` how it becomes a verdict), which is where a per-run fact belongs — and the
+ * tests in `runner.test.ts` and `batch.test.ts` pin that the carrier exists, is required, and
+ * is empty rather than absent when nothing failed.
+ *
  * ## Provenance
  *
  * No game magnitude is introduced here and nothing here is claimed to be Civ 3's:
