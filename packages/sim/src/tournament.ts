@@ -231,13 +231,12 @@ export interface TournamentResult {
    * finds which game a given record belongs to, and the CLI qualifies each one with its
    * seed when it reports.
    *
-   * It is exactly `games.flatMap((game) => game.plannerFailures)` and nothing else is
-   * computed from it, which is worth knowing when reading a count: a pass whose first
-   * failure was recorded in one game is reported there and not again in the later games that
-   * reused the same record (`runner.ts` states the baseline rule, and why the alternative —
-   * handing a game a record it did not produce — would be a false accusation). One game with
-   * a failure is enough for the whole tournament to fail, which is the property
-   * `tournamentVerdict` is built on.
+   * It is exactly `games.flatMap((game) => game.plannerFailures)` and nothing else is computed
+   * from it. How many entries that is per game is the runner's rule, stated once in `runner.ts`
+   * ("Carrying a planner failure"): a run carries a failure only if the policy's `failureCount`
+   * moved while that run played, and a pass that throws every turn contributes one entry rather
+   * than one per turn. One game with a failure is enough for the whole tournament to fail, which
+   * is the property `tournamentVerdict` is built on.
    */
   readonly plannerFailures: readonly PlannerFailure[];
   /** The budget this run was judged against — always stated, never implied. */

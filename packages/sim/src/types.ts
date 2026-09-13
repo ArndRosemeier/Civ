@@ -203,6 +203,12 @@ export interface SimulationResult {
    * was not playing, and the record of it has to be *in the result* rather than in a warning
    * beside it.
    *
+   * **A failure recorded before this run started is not reported here**, and a pass that throws on
+   * every turn of the run contributes one entry rather than one per turn: the runner reads each
+   * policy's own `failureCount` as its baseline and appends a record only when that count moves
+   * *during* the run. `runner.ts`'s "Carrying a planner failure" states the whole rule, including
+   * why a run has to be measured against the count rather than against the record list.
+   *
    * **Required and always present, an empty array when there are none** — exactly how
    * `violations` works, so a consumer cannot forget it. Not optional: an optional field is
    * one a producer may forget and a consumer may skip, which is how the M7c record came to

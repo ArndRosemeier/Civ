@@ -74,36 +74,55 @@
  * `tournament.ts`, where a tournament containing one fails.
  *
  * The record lives on the policy (`PolicyReport`, `ai/smart.ts`), because a policy that
- * catches its own throw is the only thing that can report one, and `plannerFailuresOf(policy)`
+ * catches its own throw is the only thing that can report one, and `plannerReportOf(policy)`
  * is the seam. Three details of that seam are load bearing and are stated here rather than
  * discovered later:
  *
- * - it answers `[]` for a policy that cannot report (the control policies), so calling it
+ * - it answers `undefined` for a policy that cannot report (the control policies), so calling it
  *   costs no knowledge of the AI;
- * - it keeps the **first** failure of each pass, so the list is bounded by the five passes
- *   rather than by a cap somebody chose — and a policy that failed a pass before this run
- *   started will not report that pass again;
+ * - `failures` keeps the **first** failure of each pass, so the list is bounded by the five
+ *   passes rather than by a cap somebody chose — and a policy that failed a pass before this run
+ *   started will not report a *different* pass record for it;
  * - a report is *cumulative for the policy instance*, and `SMART_POLICY` is a module-level
- *   singleton.
+ *   singleton;
+ * - and `failureCount` counts **every** throw, including the hundreds that the first-per-pass
+ *   list collapsed into one record. It is the only monotone thing a policy hands out.
  *
- * So the runner takes a **baseline** of every policy it is handed, before the first turn, and
- * collects only failures that appear *after* it — by identity, because `report()` hands back a
- * fresh array of the same record objects. A failure that predates the run belongs to whichever
- * run caused it; a caller that wants a per-run answer from a reused instance should build one
- * instance per run (which is what `sim-cli.ts` does, and why it holds its policies rather than
- * rebuilding them at each call).
+ * So the runner reads the count for every policy it is handed, before the first turn, and
+ * collects the failures that appeared *after* that reading. **The count is the baseline, and the
+ * list is not**, because the list alone cannot see a re-throw: a policy whose first failure in a
+ * pass was recorded by an earlier run keeps that pass's record — one record, not one per throw —
+ * so a second run that throws on every single turn reports an unchanged list, and baselining on
+ * the list's contents therefore reported it as a clean run. That is a path where a thrown planner
+ * LOOKS CLEAN, which is the exact silent-pass shape M7d exists to close, so the count leads:
+ * `failureCount` grows on every throw, so a re-throw in a later run stays visible, while a wholly
+ * pre-existing failure moves the count not at all and is still not re-attributed to a run that
+ * did not produce it.
  *
- * One consequence of those two rules is visible in a report rather than here, so it is stated
- * rather than left to be discovered: a batch or a tournament hands the **same** instance to
- * every seat of every run it plays (one policy per seat, reused across seeds), and a pass's
- * first failure is recorded once for the instance — so the failure of that pass is carried by
- * the run in which the policy first made the record, and later runs report nothing rather than
- * being handed a record they did not produce. The alternative would attribute one run's record
- * to another run's game, which is worse than an under-count: it would put a turn number and a
- * player id beside a game they never happened in. The tournament still fails either way, since
- * its aggregate (`TournamentResult.plannerFailures`) is non-empty, so "which game, turn and
- * phase failed" is answered by a real record and never by a guess — and that is what
- * `batch.test.ts`, `tournament.test.ts` and `headless/test/sim-cli.test.ts` pin.
+ * ## What the count decides, and what the record still says
+ *
+ * The count answers *whether* something happened during this run; the record answers *what*. Both
+ * are needed and neither is redundant. A failure whose count moved is a real throw, so the run
+ * reports it — that is what closes F2-1. The entry it reports is the policy's **own** current
+ * record for the pass that failed, appended and never minted: a turn number nobody observed,
+ * attached to a game the throw may not have happened in, would be a guess dressed as evidence, and
+ * this field exists precisely because a plausible-looking claim about the AI is the worst outcome
+ * here.
+ *
+ * Because the policy collapses every throw of one pass into a single record, a run takes at most
+ * one entry per distinct record — the same "one per pass" bound `PolicyReport` states, seen from
+ * the runner's side. A pass that throws on every turn of a hundred-turn game therefore reports
+ * **once**, not a hundred times.
+ *
+ * What the seam guarantees, in three lines:
+ *
+ * - a failure is attributed to the policy whose count moved, and to the run in which it moved;
+ * - a re-throw is visible in every run that re-threw, so no run is silent about its own throw;
+ * - a failure recorded before the run started moves no count and adds no entry, so no game is
+ *   accused of a failure it did not cause.
+ *
+ * `batch.test.ts`, `tournament.test.ts` and `headless/test/sim-cli.test.ts` pin those three
+ * properties, and `tournament.test.ts` pins the reused-instance case directly.
  *
  * Nothing about the world changes: no RNG is drawn, no state is touched, and a run whose
  * policies never throw collects nothing and produces exactly the result it produced before
@@ -153,7 +172,7 @@ import {
 } from '@civts/core';
 import { hashValue } from '@civts/testing';
 
-import { plannerFailuresOf } from './ai/smart.js';
+import { plannerReportOf } from './ai/smart.js';
 import { CORE_INVARIANTS, checkInvariants } from './invariants.js';
 import { sampleTurn } from './metrics.js';
 import type { PlannerFailure } from './ai/smart.js';
@@ -287,46 +306,133 @@ const policyFor = (policies: readonly Policy[], playerId: PlayerId): Policy => {
 };
 
 /**
- * What a run has collected so far, plus the set of records it has already counted.
+ * What a run has collected so far, where each policy's `failureCount` stood when the run began,
+ * and which records it has already taken.
  *
- * A small object rather than two closure variables so that the "baseline, then collect"
- * rule is one place: `baseline` is seeded from every policy **before the first turn**, and
- * `collect` adds only records it has not seen. Identity is the right key here and it is not
- * an optimization: `PolicyReport.failures` is a fresh array of the *same* record objects on
- * every call, so an already-counted failure keeps its identity and a new one cannot collide
- * with it — where a value comparison would have to pick a key, and every choice of key
- * (the error text? the turn?) is a way for two genuinely different failures to look alike.
+ * A small object rather than three closure variables so that the "read the count, then collect"
+ * rule is one place: the count is read for every policy **before the first turn**, and `collect`
+ * adds only what has happened since. The **count** is the key, not the record identity, and the
+ * difference is a silent pass rather than a saving: `PolicyReport.failures` keeps one record per
+ * pass for the whole life of the instance, so a second run on the same instance that throws in a
+ * pass the first run already recorded produces *the same record*, and comparing identities would
+ * call that run clean — the F2-1 finding, which `tournament.test.ts` pins. `failureCount` is
+ * monotone, so it moves on every throw, whatever the list is holding.
  */
 interface PlannerFailureLog {
   readonly collected: PlannerFailure[];
-  readonly seen: Set<PlannerFailure>;
+  /**
+   * One ledger per **policy list position** — which in a run is the player id, the same index
+   * `policyFor` resolves with. An array rather than a map keyed by the policy object, and
+   * deliberately: a caller may hand the *same* instance to several seats (a tournament does), and
+   * two seats are two polls whose counts have to be read separately. Both spellings are total —
+   * the runner refuses a run whose policy list has no entry for a civilization — and this one
+   * needs no lookup to resolve.
+   */
+  readonly ledgers: PolicyFailureLedger[];
+  /**
+   * The records this run has already taken, **however many policies or seats handed them over**:
+   * one entry in `collected` per distinct record, so a pass that throws on every turn of a
+   * hundred-turn game contributes one entry rather than a hundred — and two seats sharing one
+   * instance do not each report the same throw.
+   *
+   * Per run, and rebuilt by each `startPlannerFailureLog`: a run's log is about that run, and the
+   * opposite rule (`PolicyReport.failures`' first-record-per-pass, which never forgets) is
+   * precisely what made a reused instance's re-throw invisible.
+   */
+  readonly named: Set<PlannerFailure>;
 }
 
-/**
- * Start the log: collect nothing yet, and count as already-seen every failure the policies
- * were **already carrying** when the run began.
- *
- * This is what keeps a run's `plannerFailures` about *this* run. Nothing in this package
- * resets a policy's report (it is the policy's own record, and `SMART_POLICY` is a
- * module-level singleton), so a caller that reuses an instance across runs would otherwise
- * see a previous run's failure attributed to this one — a false accusation, which is a
- * different bug from the silence this field exists to end but a bug all the same.
- */
-const startPlannerFailureLog = (policies: readonly Policy[]): PlannerFailureLog => {
-  const seen = new Set<PlannerFailure>();
-  for (const policy of policies) {
-    for (const failure of plannerFailuresOf(policy)) seen.add(failure);
+/** One position's line in the log: the baseline reading, and nothing that remembers a record. */
+interface PolicyFailureLedger {
+  /**
+   * `PolicyReport.failureCount` as it stood at the **baseline** and after every poll since —
+   * "has anything happened?" is the only question ever asked of it, so one number does the work
+   * of both readings.
+   */
+  countAtLastPoll: number;
+}
+
+/** The ledger for the policy polled at `position`, which the baseline always built one of. */
+const ledgerAt = (log: PlannerFailureLog, position: number): PolicyFailureLedger => {
+  const ledger = log.ledgers[position];
+  if (ledger === undefined) {
+    // Unreachable: `startPlannerFailureLog` fills this for every entry of the policy list, and the
+    // runner resolves each civilization's policy (refusing a missing one) before it ever polls.
+    // Written out rather than asserted away with `!`, so a change that broke that invariant says
+    // so here instead of reading `undefined.countAtLastPoll`.
+    throw new Error(
+      `runSimulation: internal — no planner-failure ledger for policy ${String(position)}, and ` +
+        'the baseline builds one for every entry of the policy list',
+    );
   }
-  return { collected: [], seen };
+  return ledger;
 };
 
-/** Read `policy`'s report and append whatever it has recorded since the run started. */
-const collectPlannerFailures = (log: PlannerFailureLog, policy: Policy): void => {
-  for (const failure of plannerFailuresOf(policy)) {
-    if (log.seen.has(failure)) continue;
-    log.seen.add(failure);
-    log.collected.push(failure);
-  }
+/**
+ * Start the log: collect nothing yet, and record every policy's failure count as it stands
+ * **before the first turn**.
+ *
+ * This is the whole of the baseline, and it is what keeps a run's `plannerFailures` about *this*
+ * run. Nothing in this package resets a policy's report (it is the policy's own record, and
+ * `SMART_POLICY` is a module-level singleton), so a caller that reuses an instance across runs
+ * would otherwise see a previous run's failure attributed to this one — a false accusation, which
+ * is a different bug from the silence this field exists to end but a bug all the same.
+ *
+ * A policy that cannot report (`plannerReportOf` answers `undefined`) baselines at zero and is
+ * never read again, so it contributes nothing: that is the ordinary case for the control
+ * policies, and it costs no knowledge of the AI.
+ */
+const startPlannerFailureLog = (policies: readonly Policy[]): PlannerFailureLog => {
+  return {
+    collected: [],
+    named: new Set(),
+    ledgers: policies.map((policy) => ({
+      countAtLastPoll: plannerReportOf(policy)?.failureCount ?? 0,
+    })),
+  };
+};
+
+/**
+ * Read the policy that was polled for `position` and append whatever it recorded since the last
+ * poll. Called straight after the poll, because the record can only change *during* it.
+ *
+ * ## The count decides *whether*, the record decides *what*
+ *
+ * Two different questions, asked in this order:
+ *
+ * 1. **Whether.** A policy that cannot report, or one whose `failureCount` has not moved since
+ *    the last poll, contributes nothing — a healthy policy costs one read and no allocation. A
+ *    moved count means at least one throw happened **during this run**, which is the fact the old
+ *    identity baseline could not see: `PolicyReport.failures` keeps one record per pass for the
+ *    whole life of the instance, so a second run that throws in a pass the first run already
+ *    recorded hands back *the same record*, and a run compared against the list alone looks clean.
+ *    That was F2-1, and it is why the count leads.
+ * 2. **What.** The entry appended is the policy's own current record for the pass that failed —
+ *    appended, never minted. A record this run has already taken is not appended again: the
+ *    policy collapses every throw of one pass into one record, so a policy that throws on every
+ *    turn of a hundred-turn game would otherwise add a hundred identical entries, and "which pass
+ *    failed" does not become truer by repetition. This is the one place identity still matters,
+ *    and within one run only.
+ *
+ * A report that moved its count and still hands out no records at all adds no entry, so an empty
+ * report cannot become an accusation: nothing to name means nothing to append. The ledger's count
+ * is updated first and unconditionally, so the next poll is measured from this one rather than
+ * re-counting the same throw — including when the record was one this run had already taken.
+ */
+const collectPlannerFailures = (log: PlannerFailureLog, position: number, policy: Policy): void => {
+  const report = plannerReportOf(policy);
+  if (report === undefined) return;
+
+  const ledger = ledgerAt(log, position);
+  const count = report.failureCount;
+  if (count <= ledger.countAtLastPoll) return;
+  ledger.countAtLastPoll = count;
+
+  const named = report.failures[report.failures.length - 1];
+  if (named === undefined || log.named.has(named)) return;
+
+  log.named.add(named);
+  log.collected.push(named);
 };
 
 /* ------------------------------------------------------------------ *
@@ -419,7 +525,7 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
       // and the commands it returned are the partial turn that has to be visible in the
       // result rather than only in a warning beside it (see "Carrying a planner failure").
       const proposed = policy.chooseCommands(ctx);
-      collectPlannerFailures(plannerFailures, policy);
+      collectPlannerFailures(plannerFailures, Number(player.id), policy);
 
       for (const command of proposed) {
         // The runner owns the turn boundary — see the module note.

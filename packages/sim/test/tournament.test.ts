@@ -636,35 +636,86 @@ describe('a planner failure is a pass/fail condition (M7d)', () => {
     );
   });
 
-  it('attributes a failure to the game that recorded it, and says so once', () => {
-    // The record lives on the *policy instance*, and `PolicyReport` keeps the first failure of
-    // each pass — so a tournament that shares one instance across its games reports the failure
-    // in the game where it was recorded, not in every later game that reused the same record.
-    // That is the honest reading (the alternative would attribute a record to a game that did
-    // not produce it), the tournament still fails, and the CLI builds one instance per
-    // invocation for exactly this reason.
+  it('attributes a failure to each game that suffered it, once per game', () => {
+    // The record lives on the *policy instance* and `PolicyReport` keeps the first failure of each
+    // pass, so this test is about the two rules meeting: the pass record is the policy's (one per
+    // pass, for the life of the instance), while **whether a game threw at all** is the runner's,
+    // read from the monotone `failureCount` (`runner.ts`, "Carrying a planner failure").
+    //
+    // **Re-decided in M7d's follow-up (F2-1): this expectation was `1` game with a failure, and
+    // the assertions below said the first game was the only one that had one.** That was a silent
+    // pass, not a reading: all three games throw on every turn, but the old runner baselined the
+    // policy's log on record *identity*, and since a pass keeps only its first record, games 2 and
+    // 3 were handed the record game 1 had produced and reported nothing — a tournament whose
+    // planner threw in every game of every turn could therefore read as clean. Counting the
+    // failures instead of the records says what actually happened, and the old value is kept here
+    // so the change is auditable rather than a quietly loosened assertion.
+    //
+    // What must stay true is asserted too: each game carries its own failure (one entry, not one
+    // per turn — a policy that throws on every turn of a hundred-turn game must not nag a hundred
+    // times), and no game is accused of a failure it did not cause.
     const broken = boardBlindPolicy();
     const result = tournamentOf({ seeds: [5, 6, 7], policies: [broken, broken], maxTurns: 3 });
     const verdict = tournamentVerdict(result);
 
     expect(result.games).toHaveLength(3);
-    expect(verdict.gamesWithPlannerFailures).toBe(1);
-    // The first game is the one that recorded it...
-    expect(result.games[0]?.plannerFailures.length).toBeGreaterThan(0);
-    expect(result.plannerFailures).toStrictEqual(result.games[0]?.plannerFailures);
+    expect(verdict.gamesWithPlannerFailures).toBe(3);
+    // Every game threw, and each says so exactly once — never once per turn per seat.
+    expect(result.games.map((game) => game.plannerFailures.length)).toStrictEqual([1, 1, 1]);
+    // The tournament's flat list is still exactly the games' own records, in game order.
+    expect(result.plannerFailures).toStrictEqual(
+      result.games.flatMap((game) => game.plannerFailures),
+    );
     // ...and one game is enough for the whole tournament to fail: "mostly fine" is not a pass.
     expect(verdict.passed).toBe(false);
+  });
+
+  it('reports a re-throw by a REUSED policy instance, in the later run that threw (F2-1)', () => {
+    // The finding this pins: a programmatic caller that reuses one instance across two
+    // tournaments — exactly what a verification harness does — used to get **passed: true** for
+    // the second one even though its planner threw every turn, because the first run had already
+    // recorded that pass and the runner baselined on record identity. A thrown planner that looks
+    // clean is the silent-pass shape M7d exists to close, so the second run now reports its own
+    // throw: the count moved during it, and that is what the baseline is taken against.
+    //
+    // Note the instance is shared across BOTH runs and is the same object the CLI would hold:
+    // nothing here resets a report, and nothing needs to.
+    const shared = boardBlindPolicy();
+    const first = tournamentOf({ seeds: [1, 2], policies: [shared, shared], maxTurns: 3 });
+    const second = tournamentOf({ seeds: [3, 4], policies: [shared, shared], maxTurns: 3 });
+
+    // Both runs are about their own throws, and the later one is not silent.
+    expect(tournamentVerdict(first).passed).toBe(false);
+    expect(tournamentVerdict(second).passed).toBe(false);
+    expect(second.plannerFailures.length).toBeGreaterThan(0);
+    expect(tournamentVerdict(second).gamesWithPlannerFailures).toBe(second.games.length);
+    // The policy's own report is unchanged in shape by any of this: one record per pass, and a
+    // count that grew with every throw — which is the number the baseline reads.
+    expect(shared.report().failures).toHaveLength(1);
+    expect(shared.report().failureCount).toBeGreaterThan(
+      first.plannerFailures.length + second.plannerFailures.length,
+    );
+    // ...and it stops there: a healthy policy on a reused instance reports nothing in either run,
+    // so the fix cannot have made every reused policy look broken. `SIMPLE_POLICY` cannot report
+    // at all (no `report()`), so the *diagnosed* control is the real AI at its own weights.
+    const healthy = smartPolicy();
+    const cleanFirst = tournamentOf({ seeds: [8], policies: [healthy, healthy], maxTurns: 2 });
+    const cleanSecond = tournamentOf({ seeds: [9], policies: [healthy, healthy], maxTurns: 2 });
+    expect(cleanFirst.plannerFailures).toStrictEqual([]);
+    expect(cleanSecond.plannerFailures).toStrictEqual([]);
+    expect(healthy.report().failureCount).toBe(0);
   });
 
   it('reports the same failing tournament when the seed list is permuted', () => {
     // The M4b/M5 order-independence rule, extended to the new field: a permuted seed list must
     // produce the same records, not merely the same count.
     //
-    // One instance **per tournament**, which is the discipline the CLI follows and the only way
-    // this comparison means anything: a policy carries its records with it, so a second run on
-    // the same instance would start from the first run's failures and report none of its own
-    // (see the attribution test above). "One process, one policy instance, one run" is what the
-    // baseline rule assumes.
+    // One instance **per tournament** — the discipline the CLI follows — which is what makes this
+    // a comparison of two *equal* experiments rather than of a first run against a second. Since
+    // F2-1 the runner would report a reused instance's re-throw correctly either way (the test
+    // above pins that), but two fresh instances keep this test about the seed permutation and
+    // nothing else: with a shared instance the second run's records would legitimately be about
+    // its own throws, which is a different question from whether permutation changes the games.
     const ascending = tournamentOf({
       seeds: [1, 2, 3],
       policies: [boardBlindPolicy(), boardBlindPolicy()],

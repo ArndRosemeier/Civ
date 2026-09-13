@@ -736,4 +736,73 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
 
     expect(result.plannerFailures.map((failure) => failure.error)).toEqual(['Error: fresh']);
   });
+
+  it('reports a re-throw that the record list cannot show, because the count can (F2-1)', () => {
+    // The failure the runner baselines against is `failureCount`, not the identity of the records
+    // in `failures`, and this is the case that separates them: the list holds ONE record for the
+    // whole life of the instance (which is what `smartPolicy` does — one record per pass), while
+    // the count grows with every throw. Baselining on the list calls the second run clean, which
+    // is a silent pass; baselining on the count reports it.
+    //
+    // Two instances, reused across BOTH runs, one turn each. Each keeps a single-element
+    // `failures` list for its whole life — like `firstByPhase` — and rewrites that record on each
+    // throw, so the two runs are distinguishable by what they read: run 1's report says "throw 1",
+    // run 2's says "throw 2". A record is a snapshot in the real policy too; the count is the only
+    // thing that says a *second* throw happened at all.
+    const driven = (playerId: number): DiagnosedPolicy => {
+      let count = 0;
+      let latest: PlannerFailure = {
+        policy: 'driven',
+        turn: 1,
+        playerId,
+        phase: 'units',
+        detail: 'the units',
+        // The pre-run state: nothing has failed, and this record is never handed to a run.
+        error: 'Error: nothing has failed yet',
+      };
+      return {
+        name: 'driven',
+        chooseCommands: () => {
+          count += 1;
+          latest = {
+            ...latest,
+            error: `Error: the board is unreadable for seat ${String(playerId)} (throw ${String(count)})`,
+          };
+          return [];
+        },
+        // One record, ever — a fresh array holding exactly that record, like `firstByPhase`.
+        report: () => ({ failures: [latest], failureCount: count }),
+      };
+    };
+    const seats = [driven(0), driven(1)];
+
+    // Run 1: each seat's record is still new to the run, so both are collected.
+    const first = runSimulation(optionsFor(15, seats, 1));
+    expect(first.plannerFailures.map((failure) => failure.error)).toEqual([
+      'Error: the board is unreadable for seat 0 (throw 1)',
+      'Error: the board is unreadable for seat 1 (throw 1)',
+    ]);
+
+    // Run 2 re-throws in the pass run 1 already recorded, and the list it is handed is still that
+    // one record — nothing about its *shape* says a new throw happened. The counts moved, so the
+    // run reports them, and the record it reports is the policy's own latest.
+    const second = runSimulation(optionsFor(16, seats, 1));
+    expect(second.plannerFailures.map((failure) => failure.error)).toEqual([
+      'Error: the board is unreadable for seat 0 (throw 2)',
+      'Error: the board is unreadable for seat 1 (throw 2)',
+    ]);
+    // Run 1 is not retroactively rewritten by run 2: each run kept the record it read.
+    expect(first.plannerFailures).not.toStrictEqual(second.plannerFailures);
+    expect(first.plannerFailures.map((failure) => failure.error)).toEqual([
+      'Error: the board is unreadable for seat 0 (throw 1)',
+      'Error: the board is unreadable for seat 1 (throw 1)',
+    ]);
+
+    // The count is exactly why: it grew during each run, while each `failures` list stayed at one
+    // record — so `failureCount` is the only thing a later run can measure against.
+    for (const seat of seats) {
+      expect(seat.report().failures).toHaveLength(1);
+      expect(seat.report().failureCount).toBe(2);
+    }
+  });
 });

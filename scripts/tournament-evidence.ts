@@ -133,9 +133,11 @@ invariant registry and the same structured report:
 
   civts tournament --seeds ${A3_SEED_SPEC} --turns ${String(A3_TURNS)} --json
 
-Exit codes: 0 = zero violations and within budget; 1 = a violation (named loudly, with its
-seed and turn); 2 = the flags are unusable; 3 = every invariant held but the run was over
-budget.
+Exit codes: 0 = zero violations, zero planner failures, and within budget; 1 = a violation, a
+planner failure, or both (each is named loudly — the violation with its seed and turn, the planner
+failure with its seed, turn and pass; M7d counts a planner failure like a violation, because a run
+whose AI stopped playing mid-turn is not evidence either); 2 = the flags are unusable; 3 = every
+invariant held and no policy threw, but the run was over budget.
 
 RECORDED COST OF THIS EXPERIMENT — the one record, \`@civts/sim\`'s \`A3_TOURNAMENT_EVIDENCE\`,
 so no figure is restated here and none can go stale on its own:

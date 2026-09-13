@@ -101,9 +101,11 @@ const NO_EVENTS: readonly GameEvent[] = [];
  * A policy that throws on every turn it is polled: the real AI, handed a board it cannot read.
  *
  * The same fixture `runner.test.ts` and `tournament.test.ts` use, and deliberately a **single**
- * instance handed to both seats of both runs: that is what a real batch does, and it is what
- * makes the record's own rule visible — one first failure per planning pass, recorded in the run
- * where it happened, which is why the two runs below do not report the same failure twice.
+ * instance handed to both seats of both runs: that is what a real batch does, and it is what makes
+ * the record's own rule visible — one first failure per planning pass, recorded in the run where
+ * it happened — while the runner's own rule (`failureCount`, not record identity) is what keeps
+ * the *second* run's throw from being mistaken for a clean one. See the expectation below, which
+ * was re-decided for exactly that reason.
  */
 const boardBlindBatchPolicy = (): DiagnosedPolicy => {
   const inner = smartPolicy();
@@ -314,7 +316,27 @@ describe('BatchResult — what it does not claim', () => {
     const broken = boardBlindBatchPolicy();
     const batch = batchOf([31, 32], 3, [broken, broken]);
 
-    expect(batch.runs.map((run) => run.plannerFailures.length > 0)).toEqual([true, false]);
+    // **Re-decided in M7d's follow-up (F2-1): this expectation was `[true, false]`.**
+    //
+    // It pinned a *silent pass*. The fixture hands ONE policy instance to both runs, and the
+    // planner throws on every turn of both: the runner used to baseline the policy's failure log
+    // on record *identity*, while `PolicyReport.failures` keeps only the first failure per pass
+    // for the life of the instance — so run 2 re-threw in a pass run 1 had already recorded, was
+    // handed the same record object, and reported *nothing*. A path where a thrown planner looks
+    // clean is the same silent-pass shape M7d exists to close, so the runner now baselines on the
+    // monotone `PolicyReport.failureCount` (`runner.ts`, "Carrying a planner failure") and the
+    // second run reports its own throw. The old value is recorded here rather than deleted: the
+    // change is auditable, and this is a *corrected* expectation, not a loosened one.
+    //
+    // Still true, and deliberately: the record is attributed to the run that produced it (run 1
+    // is not handed run 2's), a re-throw inside one run is counted once rather than nagged once
+    // per turn — each run carries exactly one entry even though both threw on all three turns of
+    // two seats — and a game is never accused of a failure it did not cause.
+    expect(batch.runs.map((run) => run.plannerFailures.length)).toEqual([1, 1]);
+    expect(batch.runs.map((run) => run.plannerFailures[0]?.error)).toEqual([
+      'Error: the board is unreadable',
+      'Error: the board is unreadable',
+    ]);
     // Nothing the invariants saw was wrong, and nothing stopped early.
     expect(batch.runs.every((run) => run.violations.length === 0)).toBe(true);
     expect(batch.runs.every((run) => run.turnsPlayed === 3)).toBe(true);

@@ -1705,12 +1705,21 @@ describe('the CLI says out loud when a planner threw, and fails the run', () => 
     const failures = parsedJson(output)['plannerFailures'];
     expect(Array.isArray(failures)).toBe(true);
     if (!Array.isArray(failures)) throw new Error('the report carries no planner failures');
-    // One record, and that is the honest count: the batch hands every seat of every run the same
-    // instance, `PolicyReport` keeps the first failure of each pass, and a run claims only the
-    // records made while it played — so the pass that failed is reported once, in the run where it
-    // was first recorded, rather than once per run of a two-seed batch.
-    expect(failures.length).toBe(1);
-    expect(output.report?.totals.plannerFailingRuns).toBe(1);
+    // **Re-decided with F2-1: these two expectations were both `1`.**
+    //
+    // They pinned a *silent pass*. The batch hands every seat of every run the same instance, and
+    // this planner throws on every turn of both games of the two-seed batch, but the runner used to
+    // baseline the policy's failure log on record *identity* while `PolicyReport` keeps only the
+    // first failure per pass for the life of the instance — so the second game re-threw in a pass
+    // the first had already recorded, got the same record object back, and reported nothing. One
+    // game was named; the other was reported as clean although its AI threw throughout. A path
+    // where a thrown planner looks clean is the silent-pass shape M7d exists to close, so the
+    // runner now baselines on the monotone `PolicyReport.failureCount`, and each game reports its
+    // own throw: two records, in two games. Still one entry per game rather than one per turn,
+    // which is why each of the four-turn games contributes one.
+    expect(failures.length).toBe(2);
+    expect(output.report?.totals.plannerFailingRuns).toBe(2);
+    expect(output.report?.runs.map((run) => run.plannerFailures.length)).toStrictEqual([1, 1]);
     expect(output.stdout).not.toContain('WARNING');
 
     const text = okOrThrow(

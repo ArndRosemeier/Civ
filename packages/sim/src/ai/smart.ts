@@ -3133,16 +3133,6 @@ const describeThrown = (thrown: unknown): string => {
 };
 
 /**
- * Every planner failure this policy recorded, oldest first — `[]` for a policy that cannot
- * report (the control policies, or any hand-written one).
- *
- * This is the whole seam for the runner and the CLI: after a turn (or after a run),
- * `plannerFailuresOf(policy)` is empty for a healthy policy and non-empty for one that has
- * stopped playing, and `describePlannerFailures` turns the records into lines to print. It
- * is a function rather than a field test so that a `Policy` from anywhere — the simple
- * policy, a sweep's own strategy — can be asked the same question.
- */
-/**
  * A `Policy` read as "one that *might* be able to report", which every `Policy` can be
  * read as — an absent optional member is not an error here, it is the control policies'
  * honest answer ("I have nothing to report"). No assertion is needed to see a member that
@@ -3152,12 +3142,38 @@ interface Reportable extends Policy {
   readonly report?: () => PolicyReport;
 }
 
-export const plannerFailuresOf = (policy: Policy): readonly PlannerFailure[] => {
+/**
+ * **The whole seam**, in its widest form: this policy's `PolicyReport`, or `undefined` for a
+ * policy that cannot report at all (the control policies, or any hand-written one).
+ *
+ * It exists because a reader needs both halves of the report and they answer different
+ * questions: `failures` is *which* passes failed, and `failureCount` is *how many times* the
+ * planner threw — which is not the length of the list (see `PolicyReport`), and is the only
+ * monotone thing a policy hands out. The runner baselines on the count for exactly that
+ * reason (`runner.ts`, "Carrying a planner failure"): a pass that threw before a run started
+ * is a fact about an earlier run, while a pass that throws *again* during this one is a fact
+ * about this one, and only the count can tell the two apart once the list has stopped growing.
+ */
+export const plannerReportOf = (policy: Policy): PolicyReport | undefined => {
   const readable: Reportable = policy;
   const report = readable.report;
-  if (report === undefined) return [];
-  return report().failures;
+  if (report === undefined) return undefined;
+  return report();
 };
+
+/**
+ * Every planner failure this policy recorded, oldest first — `[]` for a policy that cannot
+ * report (the control policies, or any hand-written one).
+ *
+ * This is the seam a report reads: after a turn (or after a run), `plannerFailuresOf(policy)`
+ * is empty for a healthy policy and non-empty for one that has stopped playing, and
+ * `describePlannerFailures` turns the records into lines to print. It is a function rather
+ * than a field test so that a `Policy` from anywhere — the simple policy, a sweep's own
+ * strategy — can be asked the same question. A caller that needs the count as well as the list
+ * asks `plannerReportOf` instead.
+ */
+export const plannerFailuresOf = (policy: Policy): readonly PlannerFailure[] =>
+  plannerReportOf(policy)?.failures ?? [];
 
 /** The same records as printable lines, one per line, in the order they happened. */
 export const describePlannerFailures = (policy: Policy): readonly string[] => {
@@ -3182,15 +3198,16 @@ export const describePlannerFailures = (policy: Policy): readonly string[] => {
  * because of it, and a turn that never throws records nothing and behaves exactly as it
  * always did.
  *
- * **Who reads the record, stated accurately.** `@civts/sim`'s own surfaces do not: the frozen
- * `SimulationResult`/`TournamentResult` shapes have no field for a policy failure, so a run's
- * *result* cannot tell a partial turn from a quiet one — which is exactly why the record is on
- * the policy and why the reader has to still be holding it. The reader that exists is
- * `@civts/headless`'s `sim-cli.ts`: `plannerFailureWarning` asks every policy it ran and
- * prints the answers to stderr, on both the text and `--json` paths (checked end to end in
- * `headless/test/sim-cli.test.ts`). `ai.test.ts` covers the other half here — the degenerate
- * states that must produce a plan without failing at all, and a state that makes the planner
- * throw, whose failure must come back typed, named and located.
+ * **Who reads the record, stated accurately.** Since M7d the record is carried by the results
+ * themselves: `SimulationResult.plannerFailures` and `TournamentResult.plannerFailures` are
+ * required fields, filled by the runner from this policy's own report, so a reader holding only
+ * a structured result can tell a partial turn from a quiet one — `index.ts` states the chain,
+ * and `types.ts` the fields. The reader that *prints* it is `@civts/headless`'s `sim-cli.ts`:
+ * `plannerFailureWarning` renders the failures **off the report it just built** (never by asking
+ * the policies again) to stderr, on both the text and `--json` paths, and they fail the exit
+ * code (checked end to end in `headless/test/sim-cli.test.ts`). `ai.test.ts` covers the other
+ * half here — the degenerate states that must produce a plan without failing at all, and a state
+ * that makes the planner throw, whose failure must come back typed, named and located.
  */
 const planTurn = (
   ctx: PolicyContext,
@@ -3273,11 +3290,12 @@ const planTurn = (
     }
   } catch (thrown) {
     // **Caught, returned as commands, and recorded.** The contract this file is held to is
-    // "a policy returns a legal command list, never throws" (INTERFACES.md M7; the runner
-    // has no failure channel in its frozen result shape), so the throw cannot leave here —
-    // but it must not vanish either, because the turn it leaves behind looks exactly like a
-    // turn in which the AI had nothing to do. The record is what makes the difference
-    // visible to the runner, to the CLI, and to a test.
+    // "a policy returns a legal command list, never throws" (INTERFACES.md M7), so the throw
+    // cannot leave here — but it must not vanish either, because the turn it leaves behind
+    // looks exactly like a turn in which the AI had nothing to do. The record is what makes
+    // the difference visible: to the runner, which reads it out of the policy and carries it in
+    // the result (`SimulationResult.plannerFailures`, M7d), to the CLI, which renders that
+    // result's own field, and to a test.
     record({
       turn: state.turn,
       playerId: Number(ctx.playerId),

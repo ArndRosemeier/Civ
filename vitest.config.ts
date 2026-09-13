@@ -85,12 +85,14 @@ const resolvePath = (p: string): string => fileURLToPath(new URL(p, import.meta.
  * above), and it does not shrink the *work* — the expensive experiments that are evidence
  * rather than regressions left the suite for scripts, where they are run on purpose:
  * `scripts/tournament-evidence.ts` runs A3's twenty seeds at a hundred turns, which no
- * per-commit gate can hold. **Its measured cost, and the 1800 s budget it is judged against,
- * are recorded once in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE` and are named here rather than
- * repeated.** That is deliberate, and this file is the worst possible place for a second copy:
- * it is loaded by every test run, and the figure it would quote is exactly the one that went
- * stale in five files at once (1.66×) when the AI got slower. The same
- * rule applied to the *full* tier, where the twenty-seed sixty-turn tournament in
+ * per-commit gate can hold. **Its measured cost, and the budget it is judged against, are recorded
+ * once in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE` and are named here rather than repeated.** That
+ * is deliberate, and this file is the worst possible place for a second copy: it is loaded by
+ * every test run, and the figure it would quote is exactly the one that went stale in five files
+ * at once (1.66×) when the AI got slower — and then stale a second time here when the budget
+ * returned to 900 s (M7d; see `DEFAULT_TOURNAMENT_BUDGET_MS`, which is the one place the bound
+ * itself lives). **No budget figure is restated in this file at all**, so there is no third time.
+ * The same rule applied to the *full* tier, where the twenty-seed sixty-turn tournament in
  * `packages/sim/test/tournament.test.ts` measured 417 s — 85 % of that tier's 489 s — against a
  * comment claiming ~100 s: it is a four-seed smoke run now (9.2 s), and the twenty seeds are the
  * evidence script's job. That tier now measures `real 2m58.085s`.
