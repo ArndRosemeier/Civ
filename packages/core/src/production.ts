@@ -96,6 +96,9 @@ import {
 // of a second copy of it here.
 import { mayStartBuilding } from './buildings.js';
 import type { GameEvent } from './commands.js';
+// M9: a wonder's one-off culture on completion. The read and the write are one call, so
+// this pass cannot apply an amount it did not read from the row it just completed.
+import { applyCompletionBonus } from './culture.js';
 import type { CityId, TileIndex } from './ids.js';
 import { neighbors8, type RulesetView } from './map.js';
 // M5: the availability gate, asked here and in `actions.ts`' menu so the two cannot
@@ -302,6 +305,29 @@ export const applyProduction = (state: GameState, ruleset: RulesetView): Product
         item,
         shields: shields - cost,
       });
+
+      // M9: **a wonder's one-off culture lands the turn it completes**, and it lands
+      // here rather than in the culture pass for the same reason growth runs before
+      // production: the contract says the accumulation step sits after production so
+      // that "a temple finished this turn contributes this turn (the M4c rule)", and a
+      // one-off that waited for the *next* turn's pass would be the one building effect
+      // in the engine that arrives a turn late.
+      //
+      // The read and the write are one call (`culture.ts`' `applyCompletionBonus`), so
+      // the amount the event reports is the amount the state received; a row that is
+      // not a wonder, or that declares no bonus, applies nothing and emits nothing
+      // beyond the `CityProduced` above.
+      const bonus = applyCompletionBonus(current, ruleset, cityId, item.id);
+      if (bonus.applied > 0) {
+        current = bonus.state;
+        events.push({
+          type: 'CityCultureGained',
+          cityId,
+          owner: city.owner,
+          bonus: bonus.applied,
+          building: item.id,
+        });
+      }
       continue;
     }
 

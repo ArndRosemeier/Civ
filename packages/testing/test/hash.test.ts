@@ -1,4 +1,5 @@
 import {
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
   asTileIndex,
@@ -479,6 +480,10 @@ describe('the M4b money fields are part of the hashed input', () => {
     id: 0,
     name: 'Player 1',
     kind: 'civ',
+    // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+    // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+    // this literal is a hand-built state, so it states the id rather than deriving it.
+    government: asGovernmentId('despotism'),
     treasury: money.treasury,
     rates: money.rates,
     beakers: money.beakers,

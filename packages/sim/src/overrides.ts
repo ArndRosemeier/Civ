@@ -54,22 +54,34 @@ import type {
   CaptureSpec,
   Catalog,
   CombatSpec,
+  CultureSpec,
+  GovernmentRateCaps,
+  GovernmentSpec,
   ImprovementSpec,
   ResourceSpec,
+  ScoreSpec,
   TerrainSpec,
   UnitSpec,
+  UnhappyThresholdSpec,
+  VictorySpec,
 } from '@civts/rules';
 
 import type {
   BuildingPatch,
   CapturePatch,
   CombatPatch,
+  CulturePatch,
+  GovernmentPatch,
   ImprovementPatch,
   OverrideSection,
   ResourcePatch,
   RulesetPatch,
+  ScorePatch,
   TerrainPatch,
   UnitPatch,
+  GovernmentRateCapsPatch,
+  UnhappyThresholdPatch,
+  VictoryPatch,
   YieldsPatch,
 } from './types.js';
 
@@ -182,6 +194,10 @@ export const OVERRIDE_SECTIONS: readonly OverrideSection[] = [
   'buildings',
   'improvements',
   'resources',
+  // M9: `governments` joins the row sections rather than the singletons, because it *is* a
+  // row list — three rows, each addressed by id, each carrying its own tuning claim. It
+  // sits last so every pre-M9 patch's record lines keep their order.
+  'governments',
 ];
 
 /**
@@ -206,6 +222,17 @@ const COMBAT_ROW_ID = 'combat';
 const CAPTURE_ROW_ID = 'capture';
 
 /**
+ * **The id a singleton section's patch is recorded under** (M9+M10).
+ *
+ * One helper rather than four more constants, because these four sections are one case:
+ * each is a table of related magnitudes with no row id of its own, each is filed in the
+ * override record under the catalog's own field name, and each is the same string
+ * `@civts/rules` files its provenance under. Written as a function so the *rule* ("a
+ * singleton files under its section name") is stated once rather than four times.
+ */
+const sectionRowId = (section: OverrideSection): string => section;
+
+/**
  * Every section a patch may address, ascending — the *whole* surface, row sections and
  * the singletons together.
  *
@@ -219,6 +246,10 @@ export const PATCH_SECTIONS: readonly OverrideSection[] = [
   ...OVERRIDE_SECTIONS,
   'combat',
   'capture',
+  // M9+M10's three singleton sections and the one row section, in catalog order.
+  'culture',
+  'score',
+  'victory',
 ];
 
 /**
@@ -291,6 +322,12 @@ const BUILDING_FIELDS: readonly (keyof BuildingPatch)[] = [
   'cost',
   'maintenance',
   'effects',
+  // M9's three. Named here for the reason this list exists: a rebuild that forgot
+  // `culturePerTurn` would silently reset every building's culture to none the moment a
+  // patch named any *other* field — the M6 `hitPoints` bug, one milestone later.
+  'culturePerTurn',
+  'cultureBonus',
+  'happiness',
   'wonder',
   'requiresTech',
 ];
@@ -335,6 +372,55 @@ const COMBAT_FIELDS: readonly (keyof CombatPatch)[] = [
  */
 const CAPTURE_FIELDS: readonly (keyof CapturePatch)[] = ['populationDivisor'];
 
+/**
+ * M9's contentment and border model — **every field of the section**, which `keyof` keeps
+ * whole. See `CulturePatch` in `types.ts` for why a sweep wants all six.
+ */
+const CULTURE_FIELDS: readonly (keyof CulturePatch)[] = [
+  'borderRadius2Culture',
+  'borderRadius3Culture',
+  'unhappyThresholds',
+  'luxuriesPerHappyCitizen',
+  'happyPerLuxuryResource',
+];
+
+/**
+ * M9's government rows — **every field of the row**. `keyof` on the patch type is what
+ * keeps this list complete, so a field added to `GovernmentPatch` without a matching entry
+ * fails the compile rather than going quietly unsweepable.
+ */
+const GOVERNMENT_FIELDS: readonly (keyof GovernmentPatch)[] = [
+  'name',
+  'rateCaps',
+  'freeUnitsPerCity',
+  'unitSupportCost',
+  'happinessModifier',
+  'requiresTech',
+];
+
+/** The three channels of a government's rate caps, in the order a record writes them. */
+const RATE_CAP_FIELDS: readonly (keyof GovernmentRateCapsPatch)[] = ['tax', 'science', 'luxury'];
+
+/** `['rateCaps.tax', 'rateCaps.science', 'rateCaps.luxury']` — the dotted nested names. */
+const RATE_CAP_KEYS: readonly string[] = RATE_CAP_FIELDS.map((slider) => `rateCaps.${slider}`);
+
+/** M10's five score weights — **all five**, kept whole by `keyof`. */
+const SCORE_FIELDS: readonly (keyof ScorePatch)[] = [
+  'perPopulation',
+  'perCity',
+  'perTech',
+  'perCulture',
+  'perWonder',
+];
+
+/** M10's four victory thresholds — **all four**, kept whole by `keyof`. */
+const VICTORY_FIELDS: readonly (keyof VictoryPatch)[] = [
+  'dominationLandPct',
+  'dominationPopPct',
+  'culturalVictoryCulture',
+  'scoreVictoryTurn',
+];
+
 /** The three channels of a yield partial, in the order a record writes them. */
 const YIELDS_FIELDS: readonly (keyof YieldsPatch)[] = ['food', 'shields', 'commerce'];
 
@@ -352,6 +438,7 @@ const UNIT_ALLOWED: readonly string[] = [...UNIT_FIELDS];
 const BUILDING_ALLOWED: readonly string[] = [...BUILDING_FIELDS];
 const IMPROVEMENT_ALLOWED: readonly string[] = [...IMPROVEMENT_FIELDS, 'yields', ...YIELDS_KEYS];
 const RESOURCE_ALLOWED: readonly string[] = [...RESOURCE_FIELDS, 'yields', ...YIELDS_KEYS];
+const GOVERNMENT_ALLOWED: readonly string[] = [...GOVERNMENT_FIELDS, 'rateCaps', ...RATE_CAP_KEYS];
 
 /* ------------------------------------------------------------------ *
  * Small pure helpers
@@ -392,6 +479,27 @@ const recordFields = (
 /** The dotted keys a patch names, including the channels of its `yields` partial. */
 const yieldsKeys = (yields: YieldsPatch | undefined): readonly string[] =>
   yields === undefined ? [] : Object.keys(yields).map((channel) => `yields.${channel}`);
+
+/** The dotted keys a government patch names, including the sliders of its `rateCaps`. */
+const rateCapKeys = (caps: GovernmentRateCapsPatch | undefined): readonly string[] =>
+  caps === undefined ? [] : Object.keys(caps).map((slider) => `rateCaps.${slider}`);
+
+/**
+ * A patched ladder rung as a full spec rung.
+ *
+ * **A partial rung fills its missing half with the degenerate value**, which is stated here
+ * rather than left to a reader: a rung that names only `minPopulation` says "from this size
+ * on, nobody is unhappy", which is the identity of the `unhappy` channel, and a rung that
+ * names only `unhappy` says "from size 1 on, this many are unhappy", which is the identity
+ * of the `minPopulation` channel. Validation then checks the result exactly as it checks a
+ * hand-written catalog's ladder: ascending, non-empty, and beginning at `<= 1`. A rung that
+ * fills a default and produces an invalid ladder is refused there rather than silently
+ * accepted here.
+ */
+const rungOf = (patch: UnhappyThresholdPatch | undefined): UnhappyThresholdSpec => ({
+  minPopulation: patch?.minPopulation ?? 1,
+  unhappy: patch?.unhappy ?? 0,
+});
 
 /** The first key a patch names that is not patchable, if any. */
 const unknownFieldOf = (
@@ -582,23 +690,39 @@ const mergeBuilding = (
   const bad = unknownFieldOf('buildings', id, Object.keys(patch), BUILDING_ALLOWED);
   if (bad !== undefined) return err(bad);
 
+  const culturePerTurn = patch.culturePerTurn ?? row.culturePerTurn;
+  const cultureBonus = patch.cultureBonus ?? row.cultureBonus;
+  const happiness = patch['happiness'] ?? row['happiness'];
   recordFields(notes, 'buildings', id, [
     ['name', row.name, patch.name],
     ['cost', row.cost, patch.cost],
     ['maintenance', row.maintenance, patch.maintenance],
     ['effects', row.effects, patch.effects],
+    ['culturePerTurn', row.culturePerTurn, patch.culturePerTurn],
+    ['cultureBonus', row.cultureBonus, patch.cultureBonus],
+    ['happiness', row['happiness'], patch['happiness']],
     ['wonder', row.wonder, patch.wonder],
     ['requiresTech', row.requiresTech, patch.requiresTech],
   ]);
 
   const wonder = patch.wonder ?? row.wonder;
   const requiresTech = patch.requiresTech ?? row.requiresTech;
+  // M9's three fields are written with `??` like every other channel, and their `undefined`
+  // case is handled by the row itself rather than by a conditional spread: `culturePerTurn`
+  // and `happiness` are required on a *validated* row but optional on the structural
+  // `BuildingSpec` the engine's `BuildingDef` declares, so a hand-written catalog that
+  // omitted one is patched into a row that still omits it — and `validateRuleset` is what
+  // refuses it, exactly as it refuses the unpatched catalog. A patch never *invents* a
+  // value the row did not state.
   return ok({
     id: row.id,
     name: patch.name ?? row.name,
     cost: patch.cost ?? row.cost,
     maintenance: patch.maintenance ?? row.maintenance,
     effects: patch.effects ?? row.effects,
+    ...(culturePerTurn === undefined ? {} : { culturePerTurn }),
+    ...(cultureBonus === undefined ? {} : { cultureBonus }),
+    ...(happiness === undefined ? {} : { happiness }),
     ...(wonder === undefined ? {} : { wonder }),
     ...(requiresTech === undefined ? {} : { requiresTech }),
     provenance: row.provenance,
@@ -777,6 +901,181 @@ const mergeCaptureSection = (
   patch === undefined ? ok(row) : mergeCapture(row, patch, notes);
 
 /**
+ * **M9's government row, merged field by field** — the same discipline as every other row
+ * merge in this file, and the field list is `keyof GovernmentPatch` so a field added to
+ * one without the other is a compile error.
+ *
+ * `rateCaps` is the one nested partial, and it is merged with the same "absent channel
+ * keeps the row's" rule `mergeYields` applies to a yield triple — written out again rather
+ * than shared, because the two triples are different magnitudes with different validation
+ * and a shared helper would need the field names passed in, which is the generic merge
+ * this module refuses.
+ */
+const mergeGovernment = (
+  row: GovernmentSpec,
+  patch: GovernmentPatch,
+  notes: string[],
+): Result<GovernmentSpec, OverrideError> => {
+  const id = String(row.id);
+  const bad = unknownFieldOf(
+    'governments',
+    id,
+    [...Object.keys(patch), ...rateCapKeys(patch.rateCaps)],
+    GOVERNMENT_ALLOWED,
+  );
+  if (bad !== undefined) return err(bad);
+
+  const caps = patch.rateCaps;
+  const rateCaps: GovernmentRateCaps = {
+    tax: caps?.tax ?? row.rateCaps.tax,
+    science: caps?.science ?? row.rateCaps.science,
+    luxury: caps?.luxury ?? row.rateCaps.luxury,
+  };
+
+  recordFields(notes, 'governments', id, [
+    ['name', row.name, patch.name],
+    ['rateCaps.tax', row.rateCaps.tax, caps?.tax],
+    ['rateCaps.science', row.rateCaps.science, caps?.science],
+    ['rateCaps.luxury', row.rateCaps.luxury, caps?.luxury],
+    ['freeUnitsPerCity', row.freeUnitsPerCity, patch.freeUnitsPerCity],
+    ['unitSupportCost', row.unitSupportCost, patch.unitSupportCost],
+    ['happinessModifier', row.happinessModifier, patch.happinessModifier],
+    ['requiresTech', row.requiresTech, patch.requiresTech],
+  ]);
+
+  const requiresTech = patch.requiresTech ?? row.requiresTech;
+  return ok({
+    id: row.id,
+    name: patch.name ?? row.name,
+    rateCaps,
+    freeUnitsPerCity: patch.freeUnitsPerCity ?? row.freeUnitsPerCity,
+    unitSupportCost: patch.unitSupportCost ?? row.unitSupportCost,
+    happinessModifier: patch.happinessModifier ?? row.happinessModifier,
+    ...(requiresTech === undefined ? {} : { requiresTech }),
+    provenance: row.provenance,
+  });
+};
+
+/**
+ * **M9's culture and contentment section, merged field by field.**
+ *
+ * `unhappyThresholds` is replaced wholesale rather than merged, and that is the one place
+ * in this file a patch *replaces* a list without an id — see `CulturePatch` in `types.ts`
+ * for why a partial of an order-significant ladder cannot be expressed by a merge.
+ */
+const mergeCulture = (
+  row: CultureSpec,
+  patch: CulturePatch,
+  notes: string[],
+): Result<CultureSpec, OverrideError> => {
+  const id = sectionRowId('culture');
+  const bad = unknownFieldOf('culture', id, Object.keys(patch), CULTURE_FIELDS);
+  if (bad !== undefined) return err(bad);
+
+  recordFields(notes, 'culture', id, [
+    ['borderRadius2Culture', row.borderRadius2Culture, patch.borderRadius2Culture],
+    ['borderRadius3Culture', row.borderRadius3Culture, patch.borderRadius3Culture],
+    ['unhappyThresholds', row.unhappyThresholds, patch.unhappyThresholds],
+    ['luxuriesPerHappyCitizen', row.luxuriesPerHappyCitizen, patch.luxuriesPerHappyCitizen],
+    ['happyPerLuxuryResource', row.happyPerLuxuryResource, patch.happyPerLuxuryResource],
+  ]);
+
+  return ok({
+    borderRadius2Culture: patch.borderRadius2Culture ?? row.borderRadius2Culture,
+    borderRadius3Culture: patch.borderRadius3Culture ?? row.borderRadius3Culture,
+    unhappyThresholds:
+      patch.unhappyThresholds === undefined
+        ? row.unhappyThresholds
+        : patch.unhappyThresholds.map(rungOf),
+    luxuriesPerHappyCitizen: patch.luxuriesPerHappyCitizen ?? row.luxuriesPerHappyCitizen,
+    happyPerLuxuryResource: patch.happyPerLuxuryResource ?? row.happyPerLuxuryResource,
+    provenance: row.provenance,
+  });
+};
+
+/** The culture section merged, or the catalog's own section when the patch says nothing. */
+const mergeCultureSection = (
+  row: CultureSpec,
+  patch: CulturePatch | undefined,
+  notes: string[],
+): Result<CultureSpec, OverrideError> =>
+  patch === undefined ? ok(row) : mergeCulture(row, patch, notes);
+
+/** **M10's score weights, merged field by field** — five numbers, no rule of their own. */
+const mergeScore = (
+  row: ScoreSpec,
+  patch: ScorePatch,
+  notes: string[],
+): Result<ScoreSpec, OverrideError> => {
+  const id = sectionRowId('score');
+  const bad = unknownFieldOf('score', id, Object.keys(patch), SCORE_FIELDS);
+  if (bad !== undefined) return err(bad);
+
+  recordFields(notes, 'score', id, [
+    ['perPopulation', row.perPopulation, patch.perPopulation],
+    ['perCity', row.perCity, patch.perCity],
+    ['perTech', row.perTech, patch.perTech],
+    ['perCulture', row.perCulture, patch.perCulture],
+    ['perWonder', row.perWonder, patch.perWonder],
+  ]);
+
+  return ok({
+    perPopulation: patch.perPopulation ?? row.perPopulation,
+    perCity: patch.perCity ?? row.perCity,
+    perTech: patch.perTech ?? row.perTech,
+    perCulture: patch.perCulture ?? row.perCulture,
+    perWonder: patch.perWonder ?? row.perWonder,
+    provenance: row.provenance,
+  });
+};
+
+/** The score section merged, or the catalog's own section when the patch says nothing. */
+const mergeScoreSection = (
+  row: ScoreSpec,
+  patch: ScorePatch | undefined,
+  notes: string[],
+): Result<ScoreSpec, OverrideError> =>
+  patch === undefined ? ok(row) : mergeScore(row, patch, notes);
+
+/**
+ * **M10's victory thresholds, merged field by field.** Four numbers, and each is the
+ * threshold its own condition is tested against — see `VictoryPatch` for why a sweep
+ * reaches for this section first.
+ */
+const mergeVictory = (
+  row: VictorySpec,
+  patch: VictoryPatch,
+  notes: string[],
+): Result<VictorySpec, OverrideError> => {
+  const id = sectionRowId('victory');
+  const bad = unknownFieldOf('victory', id, Object.keys(patch), VICTORY_FIELDS);
+  if (bad !== undefined) return err(bad);
+
+  recordFields(notes, 'victory', id, [
+    ['dominationLandPct', row.dominationLandPct, patch.dominationLandPct],
+    ['dominationPopPct', row.dominationPopPct, patch.dominationPopPct],
+    ['culturalVictoryCulture', row.culturalVictoryCulture, patch.culturalVictoryCulture],
+    ['scoreVictoryTurn', row.scoreVictoryTurn, patch.scoreVictoryTurn],
+  ]);
+
+  return ok({
+    dominationLandPct: patch.dominationLandPct ?? row.dominationLandPct,
+    dominationPopPct: patch.dominationPopPct ?? row.dominationPopPct,
+    culturalVictoryCulture: patch.culturalVictoryCulture ?? row.culturalVictoryCulture,
+    scoreVictoryTurn: patch.scoreVictoryTurn ?? row.scoreVictoryTurn,
+    provenance: row.provenance,
+  });
+};
+
+/** The victory section merged, or the catalog's own section when the patch says nothing. */
+const mergeVictorySection = (
+  row: VictorySpec,
+  patch: VictoryPatch | undefined,
+  notes: string[],
+): Result<VictorySpec, OverrideError> =>
+  patch === undefined ? ok(row) : mergeVictory(row, patch, notes);
+
+/**
  * The first section a patch names that this surface cannot address, if any.
  *
  * Sorted, so a patch with two bad keys always reports the same one — the same determinism
@@ -871,6 +1170,32 @@ export const tryApplyOverrides = (
   const capture = mergeCaptureSection(catalog.capture, patch.capture, notes);
   if (!capture.ok) return capture;
 
+  // M9: the government rows are a *row* section, so they go through `patchSection` like
+  // units and buildings — after the five M1–M4c row catalogs, which is the order
+  // `OVERRIDE_SECTIONS` declares and the order the record is written in.
+  const governments = patchSection(
+    'governments',
+    catalog.governments,
+    patch.governments,
+    mergeGovernment,
+    notes,
+  );
+  if (!governments.ok) return governments;
+
+  // M9+M10's three singleton sections, last and in catalog order. Each carries its
+  // section through **unchanged when the patch says nothing**, which is the wire M6b and
+  // M7 argue for: a rebuild that forgot one would leave every border threshold, every
+  // score weight and every victory condition read out of `NO_*` degenerate rows, and a
+  // sweep would report a large effect from a knob that was never applied.
+  const culture = mergeCultureSection(catalog.culture, patch.culture, notes);
+  if (!culture.ok) return culture;
+
+  const score = mergeScoreSection(catalog.score, patch.score, notes);
+  if (!score.ok) return score;
+
+  const victory = mergeVictorySection(catalog.victory, patch.victory, notes);
+  if (!victory.ok) return victory;
+
   return ok({
     catalog: {
       terrains: terrains.value,
@@ -880,6 +1205,10 @@ export const tryApplyOverrides = (
       resources: resources.value,
       combat: combat.value,
       capture: capture.value,
+      culture: culture.value,
+      governments: governments.value,
+      score: score.value,
+      victory: victory.value,
       // M5's tech tree is carried through **unchanged**, and that is stated rather
       // than left to look like an oversight: `RulesetPatch` has no `techs` section yet,
       // so no patch can move a tech's price through this surface. The catalog is still

@@ -62,6 +62,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  asGovernmentId,
   asPlayerId,
   asResourceId,
   asTechId,
@@ -88,6 +89,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import { describe as describeState, workSummary } from '../src/textview.js';
 import { withWork, type Unit, type UnitDef, type UnitWork } from '../src/units.js';
 
@@ -288,6 +290,10 @@ const player = (index: number, tile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   techs: [],
   // M4b: `RATE_TOTAL` is 10, so 7/3/0 is a legal split (any other sum is refused by
   // the command layer) and an arbitrary one — `describe` reads the treasury alone,
@@ -343,6 +349,11 @@ const syntheticState = (
   units: startingUnits(players),
   explored: explored ?? players.map(() => fogRow([])),
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   // M4a: nothing is built at setup, and the key is an *empty array* rather than
   // absent — it is part of every state hash, and `canonicalize` refuses
@@ -408,6 +419,7 @@ const barbarianPlayer = (index: number, tile: number): PlayerState => ({
   startingTile: asTileIndex(tile),
   kind: 'barbarian',
   techs: [],
+  government: asGovernmentId('despotism'),
   treasury: GOLD,
   rates: { tax: 7, science: 3, luxury: 0 },
   beakers: 0,

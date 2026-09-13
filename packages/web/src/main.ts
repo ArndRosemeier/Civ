@@ -48,6 +48,7 @@ import {
   asUnitId,
   indexToX,
   indexToY,
+  isGameOver,
   neighbors8,
   newGame,
   parseSettings,
@@ -362,6 +363,9 @@ const start = (): void => {
       viewport: size,
       units: unitMarkers(state, panels.selection().unitId),
       cities: cityMarkers(state),
+      // The ONE colour lookup for a player, shared with the markers above and with the territory
+      // tint the renderer draws: a player is one colour all over the canvas (M9's borders).
+      ownerColour: (owner) => colourOfPlayer(state, owner),
       cursor,
     });
     trace = frame;
@@ -394,6 +398,10 @@ const start = (): void => {
 
   /** The end of every state or camera change: one synchronous frame, and `ready` after it. */
   const redraw = (): void => {
+    // M10: a finished game refuses every command (`game-over`), so the turn button closes with it —
+    // asked of the engine's own `isGameOver` on every frame rather than remembered in a flag, so a
+    // load or a new game re-opens it and the button can never be out of step with the state.
+    shell.endTurn.disabled = isGameOver(state, ruleset);
     draw();
     ready = true;
   };
@@ -469,6 +477,10 @@ const start = (): void => {
    * exactly what the two green tests that a floating layout broke are asserting.
    */
   shell.dock.append(
+    // M10's outcome screen goes first: it is the one dialog that is opened BY the game rather than
+    // by the player, and it should land at the top of the dock, under the map's lower edge, where
+    // the end of a game is impossible to miss.
+    panels.elements.outcomeDialog,
     panels.elements.cityDialog,
     panels.elements.techDialog,
     panels.elements.debugDialog,
@@ -491,10 +503,14 @@ const start = (): void => {
       return;
     }
     abilities.setAttribute('aria-label', `Abilities for unit ${String(unitId)}`);
+    // M10: on a finished game the orders are still listed — they are what this unit could have done
+    // — but they are closed, because `applyCommand` would refuse every one of them with `game-over`.
+    const closed = isGameOver(state, ruleset);
     for (const command of abilityCommands(state, ruleset, humanSeatOf(state), unitId)) {
       const button = el(doc, 'button', abilityLabel(state, command));
       button.type = 'button';
       button.dataset['command'] = command.type;
+      button.disabled = closed;
       button.addEventListener('click', () => {
         armDispatch(command);
       });
@@ -684,8 +700,10 @@ const start = (): void => {
    *    state alone rather than asking the engine a question whose answer is already known.
    */
   canvas.addEventListener('click', (event) => {
-    // The release that ended a pan is not a map click: the gesture was scrolling (see
-    // `travelled`). The threshold is a few pixels so a shaky hand still lands an order.
+    // M10: an ended game issues no orders. A map click is a command like any other, so it stops
+    // here rather than being dispatched and refused — the map is still there to be looked at, and
+    // selecting a unit or opening one of your cities below is navigation, not a command, so those
+    // two remain (see the guards on the branches themselves).
     if (travelled > DRAG_CLICK_TOLERANCE_PX) {
       travelled = 0;
       return;
@@ -697,6 +715,11 @@ const start = (): void => {
     const seat = humanSeatOf(state);
     const selection = panels.selection();
     const selected = selection.unitId;
+    // M10: the engine refuses every command once a game has ended, so the two branches below that
+    // would ISSUE an order are skipped. The two that only LOOK — opening one of your own cities and
+    // selecting one of your own units — still run: a final position is a position a player is
+    // entitled to inspect, and neither of them dispatches anything.
+    const over = isGameOver(state, ruleset);
 
     // One of the seat's own cities: the click opens that city's screen, whether or not the
     // selected unit could also walk onto the tile. `orders.spec.ts` states the rule the whole
@@ -714,7 +737,7 @@ const start = (): void => {
 
     // The unit's own action list decides whether this click is an order. `unitActions` is the
     // engine's answer, so a destination that appears here is one `applyCommand` accepts.
-    if (selected !== undefined) {
+    if (!over && selected !== undefined) {
       const ordered = unitActions(state, ruleset, selected).find(
         (command) => commandTile(command) === index,
       );
@@ -735,7 +758,7 @@ const start = (): void => {
     const occupied =
       state.units.some((unit) => unit.tile === index) ||
       state.cities.some((candidate) => candidate.tile === index);
-    if (occupied) return;
+    if (occupied || over) return;
 
     // An empty tile the unit's own list did not name: the command is issued anyway so the engine
     // can refuse it out loud. The index is inside the map — `screenToTile` returned it — and

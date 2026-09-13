@@ -111,6 +111,7 @@ import {
   type GameError,
 } from '../src/commands.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asCityId,
   asPlayerId,
@@ -159,6 +160,45 @@ import {
   type UnitRole,
   type UnitWork,
 } from '../src/units.js';
+
+/**
+ * **M9+M10's four catalog sections, as this file's hand-built views state them.**
+ *
+ * `RulesetView` makes all four optional and the engine is total over a view that declares none
+ * — but each absence is a *deliberately degenerate* rule rather than a neutral default, and
+ * three of the four absences would change what this file measures:
+ *
+ * - no `culture` section means every city claims radius 1 for ever (`NO_BORDER_RULES`) and
+ *   nobody is ever unhappy (`NO_HAPPINESS_RULES`), so a fixture written for M3's two-ring
+ *   working radius would have half its tiles refused;
+ * - no `victory` section still lets **conquest** fire (that condition has no threshold), so a
+ *   board where one civilization happens to hold every city would end the game mid-test;
+ * - no `score` section makes every score 0, which is honest but makes the score column
+ *   unreadable.
+ *
+ * So this file states them, once, here — the numbers are visible in one place instead of being
+ * implied by an absence. The unhappy ladder is **empty** (nobody riots, so the M4b numbers this
+ * file pins are still the M4b numbers) and the victory thresholds are **unreachable**, because
+ * this file is not about who wins: M10's own acceptance evidence plays real games through the
+ * shipped catalog, where every threshold is a real one. The score weights are the shipped
+ * five, so a score this file reads is a score a game would show.
+ */
+const HAND_BUILT_SECTIONS = {
+  culture: {
+    borderRadius2Culture: 10,
+    borderRadius3Culture: 100,
+    unhappyThresholds: [],
+    luxuriesPerHappyCitizen: 2,
+    happyPerLuxuryResource: 1,
+  },
+  score: { perPopulation: 2, perCity: 3, perTech: 4, perCulture: 1, perWonder: 8 },
+  victory: {
+    dominationLandPct: 101,
+    dominationPopPct: 101,
+    culturalVictoryCulture: Number.MAX_SAFE_INTEGER,
+    scoreVictoryTurn: Number.MAX_SAFE_INTEGER,
+  },
+} as const;
 
 const TERRAIN_ROWS: readonly (readonly [TerrainRole, number, boolean])[] = [
   ['ocean', 1, true],
@@ -320,6 +360,7 @@ const RULESET: RulesetView = {
   ],
   improvements: IMPROVEMENTS,
   resources: RESOURCES,
+  ...HAND_BUILT_SECTIONS,
   fidelity: 'tuned',
 };
 
@@ -370,6 +411,10 @@ const player = (index: number, startingTile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(startingTile),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   // M4b: the money fields, spelled out like every other field of a fixture. The
   // rates every player starts with (`RATE_TOTAL` split six/four/nothing), and a
   // treasury the *turns* below move — these boards assert command behaviour, not
@@ -398,6 +443,10 @@ const city = (id: number, owner: number, tile: number, overrides: Partial<City> 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
@@ -435,6 +484,11 @@ const STATE: GameState = {
   ],
   explored: [seen(false), seen(false)],
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
 };
@@ -602,6 +656,7 @@ const GEN_RULESET: RulesetView = {
   // every existing count on those boards is unchanged by M4a: a new game still
   // starts with an empty `improvements` list and a settler that cannot work.
   improvements: [],
+  ...HAND_BUILT_SECTIONS,
   fidelity: 'tuned',
 };
 
@@ -735,6 +790,12 @@ const commandKey = (cmd: Command): string => {
       return `AttackUnit:${String(Number(cmd.unitId))}:${String(Number(cmd.target))}`;
     case 'FortifyUnit':
       return `FortifyUnit:${String(Number(cmd.unitId))}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 
@@ -1237,7 +1298,7 @@ const assertRatesAgreement = (
     checked += 1;
     if (cmd.type !== 'SetRates') throw new Error(`not a rate command: ${cmd.type}`);
     const applied = applyCommand(state, playerId, cmd, ruleset);
-    const planned = planSetRates(state, playerId, cmd.rates);
+    const planned = planSetRates(state, ruleset, playerId, cmd.rates);
 
     expect(applied.ok).toBe(planned.ok);
     if (!applied.ok && !planned.ok) expect(applied.error).toStrictEqual(planned.error);

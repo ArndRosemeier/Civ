@@ -13,6 +13,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:full": "CIVTS_TEST_TIER=full vitest run",
+    "mutation:check": "CIVTS_MUTATION_CHECK=1 vitest run packages/testing/test/m9-m10-adversarial.test.ts --no-file-parallelism",
     "rules:provenance": "tsx packages/headless/src/cli.ts provenance",
     "map": "tsx packages/headless/src/cli.ts map",
     "play": "tsx packages/headless/src/cli.ts play",

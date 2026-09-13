@@ -1943,3 +1943,154 @@ mint one record per seat).
   the engine directly.
 - Fast `pnpm verify` still ≤ 70 s wall (the e2e suite does NOT run in the fast tier — it is
   full-tier or its own command, and the tier split must keep reporting skips by name).
+
+---
+
+# M9+M10 contracts — FROZEN (culture, borders, governments, happiness, victory, score)
+
+A2 requires "culture + borders + governments + happiness, victory conditions, score"; §16.3
+defers only *culture-FLIPS* (a captured city changing hands by culture), corruption, and full
+diplomacy. Victory and score also close A1 ("play to a victory/defeat screen") and A3 ("at
+least one victory condition demonstrated ending a real game").
+
+These two milestones share a state-schema change, so they land as ONE wave: one
+`SCHEMA_VERSION` bump, one golden regeneration, one rehash.
+
+## Culture
+
+`City` gains `culture: number` (accumulated, integer, never decreases). The player's total is
+DERIVED by summing their cities — never stored separately, because two numbers that must agree
+are two numbers that will disagree (the M2 provenance-summary lesson).
+
+`BuildingSpec` gains `culturePerTurn: number` (integer ≥ 0); a wonder may also declare
+`cultureBonus: number` (a one-off on completion, integer ≥ 0). Culture accumulates as a
+pipeline step AFTER production and BEFORE research, so a temple finished this turn contributes
+this turn (the M4c rule).
+
+## Borders
+
+The map gains an ownership layer: `readonly tileOwner: Int8Array` (length =
+`width * height`), where `-1` means unowned and any other value is a `PlayerId`. It is part of
+the hashable state and must canonicalize deterministically — store it as a plain array of
+numbers when serializing, never as a typed array with implicit byte order, and say which you
+chose and why.
+
+A city claims tiles within its **culture radius**, which grows with the city's own culture:
+
+| city culture ≥ | claimed radius |
+|---|---|
+| 0 | 1 |
+| `BORDER_RADIUS_2_CULTURE` | 2 |
+| `BORDER_RADIUS_3_CULTURE` | 3 |
+
+(both thresholds are placeholder catalog values). A tile inside two cities' ranges belongs to
+the city with MORE culture; ties go to the LOWER city id — never to iteration order, because
+M5 proved catalog/iteration order is a real input to behaviour.
+
+Rules that make borders mean something, all enforced in ONE place and asked from everywhere
+(the keystone discipline):
+
+- a city may not be founded on a tile owned by another player;
+- a tile owned by another player may not be WORKED by your city;
+- units MAY cross foreign territory (there is no war-declaration system at alpha; say so at
+  the rule site rather than pretending the omission is a design choice);
+- a captured city's tiles transfer to the captor, and the previous owner's ownership of tiles it
+  no longer claims is cleared — a tile owned by a player with no city in range is a state no
+  command can produce and must be impossible.
+
+Ownership is recomputed from culture every turn (a pure function of cities + culture), NOT
+accumulated incrementally — a derived value that is also stored is a value that can drift.
+
+## Governments
+
+A new catalog section `governments`: `GovernmentSpec` with `id`, `name`, `rateCaps`
+(`{ tax, science, luxury }` maximum per rate), `freeUnitsPerCity`, `unitSupportCost`,
+`provenance`. Placeholder rows: at least `despotism`, `monarchy`, `republic`.
+
+`PlayerState.government: GovernmentId` (required). A new command
+`{ type: 'SetGovernment'; government: GovernmentId }` — **planner-and-player legal**, validated
+against the catalog, refused with a typed error for an unknown id or (if you add a prerequisite)
+an unmet tech. Government changes take effect immediately; the anarchy transition is DEFERRED
+and noted at the rule site.
+
+Effects, all read from the spec and applied in one place: rate caps clamp `SetRates` legality,
+`freeUnitsPerCity` and `unitSupportCost` change the money loop's unit upkeep.
+
+## Happiness
+
+Each city's citizens are happy, content or unhappy. `happiness.ts` computes it as a PURE
+function of the city and its owner's state (never stored as a count that can drift):
+
+- unhappy citizens come from city size (the `UNHAPPY_PER_CITIZEN` placeholder thresholds),
+  reduced by `BuildingSpec.happiness` (temple, colosseum) and by luxury RESOURCES the player
+  has connected, plus the government's own modifier;
+- happy citizens come from luxuries and buildings that make people happy.
+
+**Disorder is real**: if unhappy > happy, the city is in CIVIL DISORDER — it produces no
+shields, no beakers and no gold that turn, growth food is not accumulated, and the state says
+so. That is the cross-system integration A2 asks for, so it must touch growth, production AND
+the money loop, each asking the ONE verdict rather than re-deriving it.
+
+The UI must be able to show it, and `sim` must be able to detect a player stuck permanently
+in disorder (a policy that never fixes happiness is a policy bug, and it should be visible).
+
+## Victory and score
+
+`score.ts`: an integer-only score per player from population, cities, techs, culture and
+wonders, with the weights in the catalog (placeholder). One function computes it; the UI and
+the engine both read that function — the M8 review already noted the scoreboard deliberately
+has no score column because no scoring rule existed, so this is where it appears.
+
+Victory conditions, catalog-driven, evaluated at ONE point in the turn loop (after the money
+loop, before the turn increments) so there is one statement of the rule:
+
+- **conquest** — you own every other civilization's original capital... or simpler and more
+  honest: you are the last civilization holding a city (if you own cities and every other
+  civilization owns none, you win);
+- **domination** — you own at least `DOMINATION_LAND_PCT` of the land tiles that any city
+  claims, or at least `DOMINATION_POP_PCT` of the world population (placeholders);
+- **cultural** — your total culture reaches `CULTURAL_VICTORY_CULTURE` (placeholder);
+- **score** — at the turn limit, the highest score wins.
+
+Space race is DEFERRED (it needs a whole parts-and-launch subsystem) and must be named as
+deferred in the catalog and the docs rather than silently absent.
+
+`GameOutcome = { readonly kind: 'victory' | 'defeat' | 'draw'; readonly condition: VictoryConditionId;
+readonly winner: PlayerId | null; readonly turn: number } | null` — a DERIVED value on the
+result/state read, never a stored flag that can disagree with the board. A finished game
+REFUSES further commands with a typed error, which is the difference between a victory screen
+and a game that keeps playing behind it.
+
+`civPlayers()` decides "civilization" — barbarians never win, never score, and never count
+toward another player's conquest.
+
+## The UI (A1's victory/defeat screen, and the rest of A2's surface)
+
+- a victory/defeat screen naming the condition and the winner, reachable from the game end;
+- borders rendered on the map (a per-player tint), asserted through the draw trace, with the
+  pixel test proving the tint actually reaches the canvas;
+- culture and happiness in the city screen, from the ENGINE's own readouts;
+- a government selector dispatching `SetGovernment` through the engine, with the engine's own
+  refusal shown;
+- a score column in the scoreboard, read from the one scoring function;
+- all of it through the frozen M8 test seam and accessibility contract — extend that table with
+  the new controls' roles and names and update it in INTERFACES.md's M8 section is NOT allowed
+  (it is frozen); instead state the new names beside the new panels and keep them unique.
+
+## Acceptance evidence
+
+- Per-system scenarios with EXACT numbers: culture accumulation over a fixed script; a border
+  expansion at its exact threshold; a tie broken by the lower city id; a foreign-owned tile
+  refusing to be worked; disorder zeroing shields, beakers and gold; a government's rate cap
+  refusing a rate; upkeep changing with government.
+- Each new rule has a fire case and a clean case, and each new invariant is registered in `sim`
+  with a fire case.
+- Every victory condition demonstrated ENDING A REAL GAME, with the exact turn and winner —
+  A3 requires at least one, and a condition that has never fired is a condition that does not
+  work.
+- The 20-seed tournament re-run: zero invariant violations, and the outcome distribution
+  reported (how many games ended in which condition) — a tournament where nothing ever ends is
+  evidence the conditions are unreachable.
+- Balance evidence from the harness for at least one new knob (culture rate or victory
+  threshold), honest about whether it shows an effect.
+- A played golden that INCLUDES a victory, so the end of a game is covered at hash level.

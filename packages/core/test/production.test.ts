@@ -44,6 +44,7 @@ import {
 } from '../src/cities.js';
 import { applyEconomy } from '../src/economy.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asCityId,
   asPlayerId,
@@ -55,6 +56,7 @@ import {
   type BuildingId,
   type TechId,
 } from '../src/ids.js';
+
 import type { GameMap, RulesetView, TerrainDef } from '../src/map.js';
 import { applyProduction, itemCostOf } from '../src/production.js';
 import { productionGate } from '../src/resources.js';
@@ -150,6 +152,10 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(0),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   treasury: 0,
   rates: DEFAULT_RATES,
   beakers: 0,
@@ -173,6 +179,10 @@ const city = (id: number, owner: number, tile: number, overrides: Partial<City> 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
@@ -193,6 +203,11 @@ const board = (cities: readonly City[], overrides: Partial<GameState> = {}): Gam
   units: [],
   explored: [Array.from({ length: 16 }, () => false), Array.from({ length: 16 }, () => false)],
   nextCityId: 100,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities,
   improvements: [],
   ...overrides,

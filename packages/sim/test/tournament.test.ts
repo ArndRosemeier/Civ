@@ -33,6 +33,10 @@
  * asked for explicitly.
  */
 
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { DEFAULT_SETTINGS, civPlayers, type GameState, type Settings } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
 import { FULL_TIER } from '@civts/testing';
@@ -885,4 +889,82 @@ describe('a smoke self-play tournament of the real AI', () => {
     // verdict instead of being cut off by the runner before it can say anything.
     300_000,
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * The outcome distribution — did anything actually END?
+ * ------------------------------------------------------------------ */
+
+/**
+ * The evidence script, started the way a person starts it.
+ *
+ * `scripts/tournament-evidence.ts` runs its tournament at module scope (its argv *is* the
+ * experiment), so it cannot be imported into this process without running one — a test that
+ * imported it would play a game as a side effect of collection and, worse, would set
+ * `process.exitCode` from this file's own argv. One process, exactly as the sweep tests in
+ * `sim-cli.test.ts` start theirs.
+ */
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
+const TSX_CLI = join(REPO_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+const EVIDENCE_SCRIPT = join(REPO_ROOT, 'scripts', 'tournament-evidence.ts');
+
+interface ScriptRun {
+  readonly status: number | null;
+  readonly stdout: string;
+}
+
+const runEvidenceScript = (args: readonly string[]): ScriptRun => {
+  const result = spawnSync(process.execPath, [TSX_CLI, EVIDENCE_SCRIPT, ...args], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: 300_000,
+  });
+  if (result.error !== undefined) throw result.error;
+  return { status: result.status, stdout: result.stdout };
+};
+
+/**
+ * **A tournament's averages cannot tell you whether the game can end at all.**
+ *
+ * Every A3 run up to this wave reported "zero violations, within budget" while *every* one of
+ * its twenty games stopped at the horizon, and nothing in the output said so — the timings and
+ * the verdict are both silent about endings. A victory condition that has never fired is a
+ * condition that does not work, and the count of endings is the only figure that shows it, so
+ * the script counts them, prints them, and says the finding out loud when every game reached its
+ * limit.
+ *
+ * The test drives the real script (one seed, one turn — 0.5 s measured) rather than a copy of
+ * its logic, so what is pinned is the printed evidence a reader gets. Both spellings are
+ * checked, because the text block is what a person reads and the JSON is what a pipeline reads,
+ * and the two must count the same games: the JSON's `turnLimitGames` is asserted equal to the
+ * number of `max-turns` rows in the report it was computed from, which is the derived-value
+ * agreement this whole wave is about.
+ */
+describe('the outcome distribution counts endings, not averages', () => {
+  it('prints why each game stopped, and calls a run in which nothing ended a finding', () => {
+    const run = runEvidenceScript(['--seeds', '1', '--turns', '1']);
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain('OUTCOME DISTRIBUTION');
+    // The count, as printed: one game, and it hit the turn limit.
+    expect(run.stdout).toMatch(/max-turns\s+1 of 1 games/);
+    // And the interpretation, which is only emitted when every game reached the horizon.
+    expect(run.stdout).toContain('it is a finding, not a table of outcomes');
+  });
+
+  it('carries the same count in the structured value the text is rendered from', () => {
+    const run = runEvidenceScript(['--seeds', '1', '--turns', '1', '--json']);
+    expect(run.status).toBe(0);
+    // No JSON parsing here on purpose: the value is canonical (sorted keys), so the fields are
+    // asserted as bytes a pipeline would see. `evidenceVersion` is 2 because the outcome block
+    // is part of the value's shape, not something the text renderer computes.
+    expect(run.stdout).toContain('"evidenceVersion":2');
+    expect(run.stdout).toContain(
+      '"outcomes":{"counts":[{"count":1,"stoppedBecause":"max-turns"}],"earlyGames":0,"games":1,' +
+        '"turnLimitGames":1}',
+    );
+    // The distribution's own denominator is the report's game list, so the two cannot disagree:
+    // the block is a reading of `report.games`, and this is the reading checked against it.
+    expect(run.stdout).toContain('"games":[{"finalHash"');
+    expect(run.stdout).toContain('"stoppedBecause":"max-turns"');
+  });
 });

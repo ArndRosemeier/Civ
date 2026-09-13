@@ -47,7 +47,14 @@ import {
   type CombatContext,
   type CombatDef,
 } from '../src/combat.js';
-import { asPlayerId, asTerrainId, asTileIndex, asUnitId, asUnitTypeId } from '../src/ids.js';
+import {
+  asGovernmentId,
+  asPlayerId,
+  asTerrainId,
+  asTileIndex,
+  asUnitId,
+  asUnitTypeId,
+} from '../src/ids.js';
 import type { RulesetView } from '../src/map.js';
 import { asImprovementId } from '../src/improvements.js';
 import { nextBelow, seedRng, type RngState } from '../src/rng.js';
@@ -198,6 +205,10 @@ const stateWith = (units: readonly Unit[]): GameState => ({
       color: '#d12f2f',
       startingTile: asTileIndex(0),
       kind: 'civ',
+      // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+      // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+      // this literal is a hand-built state, so it states the id rather than deriving it.
+      government: asGovernmentId('despotism'),
       treasury: 0,
       rates: { tax: 5, science: 5, luxury: 0 },
       beakers: 0,
@@ -209,6 +220,11 @@ const stateWith = (units: readonly Unit[]): GameState => ({
   units,
   explored: [Array.from({ length: 4 }, () => false)],
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
 });

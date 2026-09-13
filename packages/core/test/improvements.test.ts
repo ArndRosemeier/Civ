@@ -31,6 +31,7 @@ import { hashValue } from '@civts/testing';
 import { cityYields, type City } from '../src/cities.js';
 import {
   asCityId,
+  asGovernmentId,
   asPlayerId,
   asTechId,
   asTerrainId,
@@ -72,6 +73,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import type { UnitDef } from '../src/units.js';
 
 /* ------------------------------------------------------------------ *
@@ -267,6 +269,7 @@ const player = (
   // parameter exists because the improvement kind is gated by tech too (M5's
   // "Gating"), and the one section that says so needs a player who knows one.
   techs: [...techs],
+  government: asGovernmentId('despotism'),
 });
 
 const PLAYERS: readonly PlayerState[] = [
@@ -286,6 +289,10 @@ const city = (overrides: Partial<City> = {}): City => ({
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
@@ -321,6 +328,8 @@ const state = (
   units: [],
   explored: PLAYERS.map(() => new Array<boolean>(WIDTH * HEIGHT).fill(false)),
   nextCityId: cities.length,
+
+  tileOwner: [],
   cities,
   improvements,
 });
@@ -344,7 +353,7 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
  * ------------------------------------------------------------------ */
 
 describe('GameState.improvements at setup', () => {
-  it('starts empty, as an array, at schema version 8', () => {
+  it('starts empty, as an array, at schema version 9', () => {
     // A fifth additive shape change (M1 -> M2 -> M3 -> M4a -> M4b -> M4c -> M5): the
     // field is empty here, and the version moved with it, so a save from the previous
     // shape is recognisable rather than silently misread. M4b moved it because
@@ -365,7 +374,7 @@ describe('GameState.improvements at setup', () => {
     expect(game.value.improvements).toEqual([]);
     expect(Array.isArray(game.value.improvements)).toBe(true);
     expect(game.value.schemaVersion).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBe(9);
 
     // M4c's map key, read the same way and for the same reason: a fresh game's map
     // always *carries* `resources`, and this stand-in catalog ships no resource row,

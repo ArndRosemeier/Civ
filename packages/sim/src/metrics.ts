@@ -304,7 +304,7 @@ const buildRow = (
     incomeLuxuries: income.luxuries,
     maintenance: upkeep.maintenance,
     unitSupport: upkeep.unitSupport,
-    unitsSupported: unitSupport(state, playerId).supported,
+    unitsSupported: unitSupport(state, ruleset, playerId).supported,
     food,
     shields,
     commerce,

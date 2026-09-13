@@ -46,7 +46,10 @@ import {
 import { type BuildingDef, type City, cityById, cityYields } from '../src/cities.js';
 import type { GameEvent } from '../src/commands.js';
 import { FOOD_BOX_BASE, FOOD_BOX_PER_CITIZEN, applyGrowth, foodBoxSize } from '../src/growth.js';
+import { asUnitId, asUnitTypeId } from '../src/ids.js';
+import type { Unit } from '../src/units.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asCityId,
   asPlayerId,
@@ -63,6 +66,46 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
+/**
+ * **M9+M10's four catalog sections, as this file's hand-built views state them.**
+ *
+ * `RulesetView` makes all four optional and the engine is total over a view that declares none
+ * — but each absence is a *deliberately degenerate* rule rather than a neutral default, and
+ * three of the four absences would change what this file measures:
+ *
+ * - no `culture` section means every city claims radius 1 for ever (`NO_BORDER_RULES`) and
+ *   nobody is ever unhappy (`NO_HAPPINESS_RULES`), so a fixture written for M3's two-ring
+ *   working radius would have half its tiles refused;
+ * - no `victory` section still lets **conquest** fire (that condition has no threshold), so a
+ *   board where one civilization happens to hold every city would end the game mid-test;
+ * - no `score` section makes every score 0, which is honest but makes the score column
+ *   unreadable.
+ *
+ * So this file states them, once, here — the numbers are visible in one place instead of being
+ * implied by an absence. The unhappy ladder is **empty** (nobody riots, so the M4b numbers this
+ * file pins are still the M4b numbers) and the victory thresholds are **unreachable**, because
+ * this file is not about who wins: M10's own acceptance evidence plays real games through the
+ * shipped catalog, where every threshold is a real one. The score weights are the shipped
+ * five, so a score this file reads is a score a game would show.
+ */
+const HAND_BUILT_SECTIONS = {
+  culture: {
+    borderRadius2Culture: 10,
+    borderRadius3Culture: 100,
+    unhappyThresholds: [],
+    luxuriesPerHappyCitizen: 2,
+    happyPerLuxuryResource: 1,
+  },
+  score: { perPopulation: 2, perCity: 3, perTech: 4, perCulture: 1, perWonder: 8 },
+  victory: {
+    dominationLandPct: 101,
+    dominationPopPct: 101,
+    culturalVictoryCulture: Number.MAX_SAFE_INTEGER,
+    scoreVictoryTurn: Number.MAX_SAFE_INTEGER,
+  },
+} as const;
+
 import { advanceTurn } from '../src/turn.js';
 
 /* ------------------------------------------------------------------ *
@@ -154,6 +197,7 @@ const RULESET: RulesetView = {
   units: [],
   buildings: [GRANARY, PYRAMIDS, TEMPLE, MARKET, EXACTLY_THE_BOX, PAST_THE_BOX],
   improvements: [],
+  ...HAND_BUILT_SECTIONS,
   fidelity: 'tuned',
 };
 
@@ -165,6 +209,10 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(0),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   treasury: STARTING_TREASURY,
   rates: DEFAULT_RATES,
   beakers: 0,
@@ -186,10 +234,37 @@ const city = (id: number, tile: number, overrides: Partial<City> = {}): City => 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
-const board = (overrides: Partial<GameState> = {}): GameState => ({
+/**
+ * **Player 1's resident: what keeps a one-city board a game rather than a won one.**
+ *
+ * M10's conquest condition has no threshold in it — "you are the last civilization on the
+ * board" — so a board where player 1 owns neither a city nor a unit is a *finished* game, and
+ * `advanceTurn` refuses to move a finished game. Every trace in this file is a run of turns
+ * over a board with one city, so without a resident nothing would advance and every trace
+ * would read `[1, 1, 0, 0]` for ever.
+ *
+ * A warrior on tile 15 — the corner farthest from the city tiles this file uses — is invisible
+ * to every number here: it works no tile, it is nobody's neighbour, and `economy.ts` allows
+ * `FREE_UNITS_BASE` units before it charges support, so it adds no gold to any ledger. This is
+ * a fixture, not a claim about M10; the conquest rule's own behaviour is pinned on boards
+ * built for it.
+ */
+const RESIDENT: Unit = {
+  id: asUnitId(99),
+  type: asUnitTypeId('warrior'),
+  owner: asPlayerId(1),
+  tile: asTileIndex(15),
+  movementLeft: 1,
+};
+
+const baseBoard = (overrides: Partial<GameState> = {}): GameState => ({
   schemaVersion: SCHEMA_VERSION,
   revision: 0,
   turn: 1,
@@ -202,10 +277,26 @@ const board = (overrides: Partial<GameState> = {}): GameState => ({
   units: [],
   explored: [Array.from({ length: 16 }, () => false), Array.from({ length: 16 }, () => false)],
   nextCityId: 2,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
   ...overrides,
 });
+
+const board = (overrides: Partial<GameState> = {}): GameState => {
+  const state = baseBoard(overrides);
+  const absent = state.players.some(
+    (each) =>
+      each.kind === 'civ' &&
+      !state.cities.some((city) => city.owner === each.id) &&
+      !state.units.some((unit) => unit.owner === each.id),
+  );
+  return absent ? { ...state, units: [...state.units, RESIDENT] } : state;
+};
 
 const CITY_A = asCityId(0);
 const CITY_B = asCityId(1);

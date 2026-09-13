@@ -243,7 +243,7 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     expect(hashOf(CATALOG, 'the shipped catalog again')).toBe(SHIPPED_HASH);
   });
 
-  it('is 7cf57f33400a00f6, and c2d3d7665e3a17ce with resources and units reversed', () => {
+  it('is 732414efe2080f75, and the arrangement hash with resources and units reversed', () => {
     // These two numbers are the requirement's own measured fact, and pinning them is
     // what ties the property below to the real catalog. **If this assertion fails, the
     // catalog's content or order moved**: that is either an intentional content change
@@ -293,14 +293,39 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     // because it says the same thing. A state golden moving here would mean the
     // relocation had become a retune. No row was reordered — the arrangement sweep below
     // still passes — and the rebuild's non-vacuity assertions now cover `capture` as well.
-    expect(SHIPPED_HASH).toBe('7cf57f33400a00f6');
+    // **M9+M10 re-measured them a fifth time, and it is a rehash as well as an identity
+    // movement — the first wave where both happened.**
+    //
+    // Identity moved because the catalog gained four required sections (`governments`, a
+    // three-row list; `culture`, `score` and `victory`, each a table with a provenance
+    // note) and because every building row gained `culturePerTurn` and `happiness`, so
+    // `hashValue` sees keys and fields it never saw before. The pins were
+    // `7cf57f33400a00f6` and `c2d3d7665e3a17ce`; both moved together, as they always
+    // have, because the second is the same catalog with two sections reversed.
+    //
+    // What makes this one different from M6b and M7 — where identity moved and the state
+    // goldens did not, so a state golden moving would have been evidence of an
+    // unintentional retune — is that **the state goldens moved too, and they were
+    // supposed to**: M9/M10 change what a game *does*, one `SCHEMA_VERSION` bump (8 -> 9)
+    // and one deliberate regeneration through `CIVTS_WRITE_GOLDENS=1`. The two movements
+    // are the wave's two halves, and `golden.test.ts` under `WRITE_MODE` is the record of
+    // the second. No row was reordered; the three-arrangement sweep below still passes,
+    // and the non-vacuity assertions over the rebuild now cover all four new sections.
+    //
+    // One magnitude in the new `culture` section moved *after* it was first pinned and
+    // *after* the first golden regeneration of this wave: the unhappy ladder went from
+    // `3/6/10` to `7/12/18`, because a city of three citizens was measured to be
+    // permanently unable to produce the temple that would have contented it (the
+    // measurement is in `@civts/rules`' `culture` doc comment). That is a retune, not a
+    // relocation, and it is why the played goldens moved twice in this wave.
+    expect(SHIPPED_HASH).toBe('732414efe2080f75');
     const reversedUnits = arranged(CATALOG, 'units', reverseOrder(CATALOG.units.length));
     const reversedBoth = arranged(
       reversedUnits,
       'resources',
       reverseOrder(CATALOG.resources.length),
     );
-    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('c2d3d7665e3a17ce');
+    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('a5bb89fdba634f85');
   });
 });
 
@@ -406,6 +431,14 @@ describe('a catalog rebuilt row for row has the shipped identity', () => {
       improvements: CATALOG.improvements.map((row) => ({ ...row })),
       resources: CATALOG.resources.map((row) => ({ ...row })),
       techs: CATALOG.techs.map((row) => ({ ...row })),
+      // M9+M10's four sections, rebuilt the same way and for the same reason. The three
+      // singletons are cloned as objects (they are rows, not lists) and `governments` as a
+      // list of cloned rows, so a hash that moved here would be the same defect the M6b and
+      // M7 sections were put in this rebuild to catch.
+      governments: CATALOG.governments.map((row) => ({ ...row })),
+      culture: { ...CATALOG.culture },
+      score: { ...CATALOG.score },
+      victory: { ...CATALOG.victory },
       // M6b's `combat` section is a singleton rather than a list of rows, so it is cloned
       // as an object. It is in this rebuild for the same reason every section is: the
       // identity a replay compares is the *whole* validated ruleset, and a rebuild that

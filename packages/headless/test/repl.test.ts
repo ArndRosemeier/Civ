@@ -56,6 +56,7 @@ import {
   SCHEMA_VERSION,
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
   asResourceId,
@@ -66,12 +67,15 @@ import {
   cityById,
   cityRadius,
   foodBoxSize,
+  happinessRulesOf,
   hitPointsLabel,
   indexToX,
   indexToY,
   newGame,
+  planSetRates,
   playerIncome,
   playerUpkeep,
+  rateCapsOf,
   seedRng,
   tileIndex,
   unitDef,
@@ -160,6 +164,10 @@ const syntheticState = (): GameState => ({
       color: '#d12f2f',
       startingTile: tileIndex(WIDTH, 0, 0),
       kind: 'civ',
+      // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+      // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+      // this literal is a hand-built state, so it states the id rather than deriving it.
+      government: asGovernmentId('despotism'),
       // M5: every `PlayerState` carries `techs`, and an empty *list* is what "knows
       // nothing" is. `researching` is deliberately absent rather than present-and-
       // `undefined`: absence is what "researching nothing" means, and a key holding
@@ -181,6 +189,10 @@ const syntheticState = (): GameState => ({
       color: '#2f6fd1',
       startingTile: tileIndex(WIDTH, 0, 1),
       kind: 'civ',
+      // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+      // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+      // this literal is a hand-built state, so it states the id rather than deriving it.
+      government: asGovernmentId('despotism'),
       techs: [],
       treasury: 10,
       rates: { tax: 6, science: 4, luxury: 0 },
@@ -210,6 +222,11 @@ const syntheticState = (): GameState => ({
     new Array<boolean>(WIDTH * HEIGHT).fill(true),
   ],
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   // M4a: nothing is built yet, and the key is an *empty array* rather than absent —
   // `improvements` is part of every state hash, and `canonicalize` refuses
@@ -430,7 +447,7 @@ const moneyLines = (label: string, units: number, free: number, gold = 0): reado
   `ok: ${label} collected ${String(gold)} gold, 0 beakers and 0 luxuries from its cities at ` +
     'its rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
     'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-    'tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+    'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   `ok: ${label} paid 0 gold of upkeep (0 building maintenance + 0 unit support for ` +
     `${String(units)} unit(s), ${String(free)} of them free)`,
 ];
@@ -470,6 +487,7 @@ const hutState = (rngSeed: number): GameState => {
         // player" rule the money fields follow. `applyResearch` skips anything that
         // is not a civilization, so this list can never grow.
         techs: [],
+        government: asGovernmentId('despotism'),
         // M4b: one shape for every player, barbarians included — `PlayerId` is an
         // index into `players` and `state.ts` gives them the same money fields a
         // civilization has, inert. `applyEconomy` skips anything that is not a
@@ -576,6 +594,11 @@ const bankruptState = (): GameState => {
         : player,
     ),
     nextCityId: 1,
+    // M9: the materialised ownership layer. `[]` is the honest value for a
+    // state nobody has run a turn on: `withOwnership` fills it from the cities the
+    // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+    // layer cannot make a border wrong — it only means none has been claimed yet.
+    tileOwner: [],
     cities: [
       {
         id: asCityId(0),
@@ -588,6 +611,7 @@ const bankruptState = (): GameState => {
         queue: [],
         buildings: [asBuildingId('toll-house')],
         workedTiles: [tileIndex(WIDTH, 0, 1), tileIndex(WIDTH, 1, 1)],
+        culture: 0,
       },
     ],
     // The settler and settler-plus-army: eight units for player 0, one for player 1.
@@ -640,10 +664,10 @@ const EXPECTED_TRANSCRIPT = [
   'you are Player 1 (p0); every view below is drawn from your fog of war',
   'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 cities',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
-  '  luxuries DO NOTHING yet: nothing reads them until M9 (happiness).',
+  '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -657,7 +681,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
@@ -677,7 +701,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 1 1',
@@ -695,7 +719,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 2 2',
@@ -713,7 +737,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 9 9',
@@ -731,12 +755,12 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> wibble',
   'error: unknown command "wibble" - no such command.',
-  '  commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
+  '  commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | help | quit',
   '  type "help" for what each one does.',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -750,13 +774,13 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
@@ -772,7 +796,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> quit',
@@ -809,10 +833,10 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'you are Player 1 (p0); every view below is drawn from your fog of war',
   'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 cities',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
-  '  luxuries DO NOTHING yet: nothing reads them until M9 (happiness).',
+  '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
-  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | end | units | state | save <path> | help | quit',
+  'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | help | quit',
   '',
   'CivTS state: seed=7 turn=1 revision=0 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
@@ -826,7 +850,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
@@ -847,7 +871,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> work 2 mine',
@@ -866,14 +890,14 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> state',
-  'state: seed=7 turn=1 revision=1 schema=8 map=tiny(4x4) civs=2',
+  'state: seed=7 turn=1 revision=1 schema=9 map=tiny(4x4) civs=2',
   'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, 0 luxuries',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
-  '  luxuries DO NOTHING yet: nothing reads them until M9 (happiness): they only pile up, and this build neither spends nor reads them.',
+  '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  gold pays upkeep, and a treasury that cannot pay is paid for by disbanding units',
   '  (highest id first) rather than by going negative.',
   'economy: at these rates this state collects 0 gold, 0 beakers and 0 luxuries a turn',
@@ -886,7 +910,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'jobs: 2 Worker@2,2 mining, 3 turns left',
   'civs: Player 1 (p0) <- you, Player 2 (p1)',
   'rng: a=-456573687 b=-84222363 c=801465066 d=1648156487',
-  'hash: 07fda6ec366add66',
+  'hash: 4eb7c0dae97ea7fa',
   'CivTS state: seed=7 turn=1 revision=1 map=tiny(4x4) civs=2 viewer=0 gold=10 research=idle banked=0',
   'view: x 0..3, y 0..3 (4x4 of 4x4)',
   '  |0',
@@ -900,13 +924,13 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
@@ -923,7 +947,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp mining, 2 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp) mining, 2 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> cancel 2',
@@ -941,7 +965,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> work 2 road',
@@ -960,13 +984,13 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp building a road, 2 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) building a road, 2 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 3 begins; every unit refilled its movement',
   '  revision 5',
@@ -983,14 +1007,14 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp building a road, 1 turn left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp) building a road, 1 turn left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
   'ok: unit 2 finished improvement "Road" (2 turns) on (2,2); the tile is improved',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 4 begins; every unit refilled its movement',
   '  revision 6',
@@ -1006,7 +1030,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
@@ -1027,7 +1051,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> quit',
@@ -1086,7 +1110,14 @@ describe('the REPL transcript', () => {
     // `packages/testing` goldens were regenerated once for M4c; nothing here
     // regenerates or re-derives them.)
 
-    expect(hashValue(syntheticState())).toBe('68f146af88de5f28');
+    // Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9): `PlayerState` gained the required
+    // `government` key and `GameState` gained the `tileOwner` ownership layer, and both
+    // are hashed. 68f146af88de5f28 -> 4e79624888b55ca8 is the schema-version bump and
+    // those two keys, and nothing else: this board's government is `despotism` (the row
+    // `defaultGovernmentOf` picks, the shipped catalog's first) and its ownership layer is
+    // the one `withOwnership` derives from its single city, so neither is a number this
+    // fixture chose. The transcript below moved with it.
+    expect(hashValue(syntheticState())).toBe('4e79624888b55ca8');
 
     const capture = open();
     runScript(capture.session, SCRIPT.join('\n'), capture.write);
@@ -1134,7 +1165,14 @@ describe('the REPL transcript', () => {
     //
     // Rehashed for M6 (SCHEMA_VERSION 7 -> 8): M6's unit shape, the same bump the pin
     // above records. 1ca22df3412b4ceb -> 854c8039fe812a82.
-    expect(hashValue(capture.session.state)).toBe('854c8039fe812a82');
+    //
+    // Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9), the same bump: `PlayerState.government`
+    // and `GameState.tileOwner`. 854c8039fe812a82 -> 2a2db6d2ef998dcc. **The transcript did
+    // not move for this one alone** — the two lines that did move are the `commands:` summary
+    // and the luxury sentence, and both moved because M9 added verbs and made luxuries
+    // readable, not because of the hash. The state pin and the text pin are separate
+    // assertions so that a future wave can tell which of the two a change moved.
+    expect(hashValue(capture.session.state)).toBe('2a2db6d2ef998dcc');
     // The `end` in this script banked a turn of a *cityless* economy: no city, so no
     // commerce and no income — the treasury is exactly the starting 10. A money loop
     // that invented income for a player with nothing built would move this.
@@ -1337,7 +1375,7 @@ describe('commands', () => {
     // research step that edited its input in place would move this line.
     // Rehashed for M6 (SCHEMA_VERSION 7 -> 8) with every other pin in this file; the
     // M6 annotation on the synthetic-state pin above states why.
-    expect(hashValue(state)).toBe('68f146af88de5f28');
+    expect(hashValue(state)).toBe('4e79624888b55ca8');
 
     // Same input, same result: the session holds no hidden state of its own.
     const fresh = open();
@@ -1646,18 +1684,65 @@ describe('the city verbs', () => {
     first.session.run('found 0');
     const withCity = first.session.state;
 
-    // Player 1's settler at (0,1) is one tile from the city at (0,0).
-    const second = open({ state: withCity, playerIndex: 1 });
+    // **M9+M10: this fixture had to change, and the reason is a real precedence.**
+    //
+    // It used to be Player 2's own settler at (0,1) — one tile from Player 1's city at
+    // (0,0) — trying to found, and the engine answered `city-too-close`. Since M9, (0,1)
+    // is inside the city's radius-1 borders and owned by Player 1, so the *ownership*
+    // refusal answers first and this test would have been asserting the wrong thing if it
+    // were simply re-pinned. Two facts make the old fixture unable to reach the distance
+    // rule at all:
+    //
+    //   - founding on another player's land is refused whether or not it is close
+    //     (`planFoundCity` checks `foreignOwnerAt` **before** `nearestCityWithin`, so a
+    //     settler at a rival's border hears "that is their land", never "too close");
+    //   - `nearestCityWithin` skips a city at distance >= `MIN_CITY_DISTANCE` (2), and a
+    //     city owns every tile at distance < 1, so *every* tile the distance rule refuses
+    //     is a tile some city already owns. Against a rival's city the distance rule is
+    //     therefore unreachable; against **your own** city it is reachable, because your
+    //     own land is legal to found on.
+    //
+    // So the board is now two of Player 1's own settlers: the founder at (0,0) and unit 5
+    // one tile away. That is the only board on which "at least 2 apart" is the engine's
+    // answer, and the other side of the precedence is asserted below it rather than
+    // worked around.
+    const adjacentSettler: Unit = {
+      id: asUnitId(5),
+      type: asUnitTypeId('settler'),
+      owner: asPlayerId(0),
+      tile: tileIndex(WIDTH, 0, 1),
+      movementLeft: 1,
+      hitPointsLeft: 1,
+    };
+    const crowded: GameState = {
+      ...withCity,
+      nextUnitId: 6,
+      units: [...withCity.units, adjacentSettler],
+    };
+
+    const second = open({ state: crowded });
     const before = hashValue(second.session.state);
     second.clear();
 
-    const error = refusal(second.session.run('found 1'));
+    const error = refusal(second.session.run('found 5'));
     expect(error.kind).toBe('city-too-close');
     expect(second.text()).toContain('error: city-too-close');
     expect(second.text()).toContain('at least 2 apart');
     expect(second.text()).toContain('legal:');
     expect(second.session.state.revision).toBe(withCity.revision);
     expect(hashValue(second.session.state)).toBe(before);
+
+    // The other side of the precedence the comment above describes, asserted rather than
+    // assumed: the very tile the old fixture used, asked of the *rival* whose borders now
+    // cover it, is refused as **their land** and not as "too close". Both are true of that
+    // tile; the engine picks the one the player can act on, and this is the pin that says
+    // so — a reordering of the two checks would flip this line and the one above it.
+    const rival = open({ state: withCity, playerIndex: 1 });
+    rival.clear();
+    const rivalError = refusal(rival.session.run('found 1'));
+    expect(rivalError.kind).toBe('tile-owned-by-another-player');
+    expect(rival.text()).toContain('error: tile-owned-by-another-player');
+    expect(rival.text()).not.toContain('city-too-close');
   });
 
   it('shows a city only where the player can see it', () => {
@@ -1728,6 +1813,11 @@ const resourceState = (roadTiles: readonly TileIndex[]): GameState => {
   return {
     ...base,
     nextCityId: 1,
+    // M9: the materialised ownership layer. `[]` is the honest value for a
+    // state nobody has run a turn on: `withOwnership` fills it from the cities the
+    // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+    // layer cannot make a border wrong — it only means none has been claimed yet.
+    tileOwner: [],
     map: {
       ...base.map,
       resources: [{ tile: IRON_TILE, resource: asResourceId('iron') }],
@@ -1744,6 +1834,10 @@ const resourceState = (roadTiles: readonly TileIndex[]): GameState => {
         queue: [],
         buildings: [],
         workedTiles: [],
+        // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+        // from this and `computeTileOwner` reads it, so a hand-built city states a number
+        // rather than leaving the engine to guess one.
+        culture: 0,
       },
     ],
     improvements: roadTiles.map((tile) => ({ tile, kind: asImprovementId('road') })),
@@ -1847,6 +1941,11 @@ describe('the resource gate', () => {
     const contested: GameState = {
       ...base,
       nextCityId: 2,
+      // M9: the materialised ownership layer. `[]` is the honest value for a
+      // state nobody has run a turn on: `withOwnership` fills it from the cities the
+      // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+      // layer cannot make a border wrong — it only means none has been claimed yet.
+      tileOwner: [],
       cities: [
         ...base.cities,
         {
@@ -1860,6 +1959,10 @@ describe('the resource gate', () => {
           queue: [],
           buildings: [],
           workedTiles: [],
+          // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+          // from this and `computeTileOwner` reads it, so a hand-built city states a number
+          // rather than leaving the engine to guess one.
+          culture: 0,
         },
       ],
     };
@@ -2077,10 +2180,19 @@ describe('buildings and wonders, as the reader meets them', () => {
       queue: [],
       buildings,
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     });
     const state: GameState = {
       ...base,
       nextCityId: 2,
+      // M9: the materialised ownership layer. `[]` is the honest value for a
+      // state nobody has run a turn on: `withOwnership` fills it from the cities the
+      // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+      // layer cannot make a border wrong — it only means none has been claimed yet.
+      tileOwner: [],
       cities: [
         // City 1 finished the Pyramids (the shipped catalog's one wonder).
         city(0, 'City 1', 0, 0, [asBuildingId('pyramids')]),
@@ -2124,6 +2236,11 @@ describe('buildings and wonders, as the reader meets them', () => {
     const state: GameState = {
       ...base,
       nextCityId: 1,
+      // M9: the materialised ownership layer. `[]` is the honest value for a
+      // state nobody has run a turn on: `withOwnership` fills it from the cities the
+      // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+      // layer cannot make a border wrong — it only means none has been claimed yet.
+      tileOwner: [],
       cities: [
         {
           id: asCityId(0),
@@ -2138,6 +2255,7 @@ describe('buildings and wonders, as the reader meets them', () => {
           // catalog's own numbers, read through `maintenanceOf` rather than restated.
           buildings: [asBuildingId('granary'), asBuildingId('barracks'), asBuildingId('pyramids')],
           workedTiles: [tileIndex(WIDTH, 0, 1)],
+          culture: 0,
         },
       ],
     };
@@ -2177,6 +2295,11 @@ describe('buildings and wonders, as the reader meets them', () => {
     const withCity = (buildings: readonly BuildingId[]): GameState => ({
       ...base,
       nextCityId: 1,
+      // M9: the materialised ownership layer. `[]` is the honest value for a
+      // state nobody has run a turn on: `withOwnership` fills it from the cities the
+      // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+      // layer cannot make a border wrong — it only means none has been claimed yet.
+      tileOwner: [],
       cities: [
         {
           id: asCityId(0),
@@ -2190,6 +2313,7 @@ describe('buildings and wonders, as the reader meets them', () => {
           buildings,
           // One worked grassland tile: 4 food against 2 eaten, a surplus of +2.
           workedTiles: [tileIndex(WIDTH, 0, 1)],
+          culture: 0,
         },
       ],
     });
@@ -2239,6 +2363,11 @@ describe('buildings and wonders, as the reader meets them', () => {
     const state: GameState = {
       ...base,
       nextCityId: 1,
+      // M9: the materialised ownership layer. `[]` is the honest value for a
+      // state nobody has run a turn on: `withOwnership` fills it from the cities the
+      // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+      // layer cannot make a border wrong — it only means none has been claimed yet.
+      tileOwner: [],
       cities: [
         {
           id: asCityId(0),
@@ -2251,6 +2380,10 @@ describe('buildings and wonders, as the reader meets them', () => {
           queue: [],
           buildings: [asBuildingId('ghost-house')],
           workedTiles: [],
+          // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+          // from this and `computeTileOwner` reads it, so a hand-built city states a number
+          // rather than leaving the engine to guess one.
+          culture: 0,
         },
       ],
     };
@@ -2304,7 +2437,7 @@ describe('event rendering', () => {
       'ok: Player 1 (p0) collected 2 gold, 0 beakers and 0 luxuries from its cities at its ' +
         'rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
         'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-        'tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+        'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(block[2]).toBe(
       'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for ' +
@@ -2314,7 +2447,7 @@ describe('event rendering', () => {
       'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its ' +
         'rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
         'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-        'tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+        'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(block[4]).toBe(
       'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for ' +
@@ -2335,6 +2468,11 @@ describe('event rendering', () => {
     const starving: GameState = {
       ...syntheticState(),
       nextCityId: 1,
+      // M9: the materialised ownership layer. `[]` is the honest value for a
+      // state nobody has run a turn on: `withOwnership` fills it from the cities the
+      // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+      // layer cannot make a border wrong — it only means none has been claimed yet.
+      tileOwner: [],
       cities: [
         {
           id: asCityId(0),
@@ -2347,6 +2485,10 @@ describe('event rendering', () => {
           queue: [],
           buildings: [],
           workedTiles: [],
+          // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+          // from this and `computeTileOwner` reads it, so a hand-built city states a number
+          // rather than leaving the engine to guess one.
+          culture: 0,
         },
       ],
     };
@@ -2374,7 +2516,7 @@ describe('event rendering', () => {
       'ok: Player 1 (p0) collected 1 gold, 0 beakers and 0 luxuries from its cities at its ' +
         'rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
         'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-        'tree); luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+        'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(capture.session.state.players[0]?.treasury).toBe(11);
   });
@@ -2523,8 +2665,10 @@ describe('event rendering', () => {
         `${String(income.luxuries)} ${income.luxuries === 1 ? 'luxury' : 'luxuries'} from its ` +
         'cities at its rates - beakers now buy tech: they are banked toward the tech you ' +
         'selected and spent on the turn the pool covers its cost ("research <techId>" chooses ' +
-        'one, "tech" shows the tree); luxuries DO NOTHING yet: nothing reads them until M9 ' +
-        '(happiness)',
+        'one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content ' +
+        'one, and each luxury resource you have connected contents 1 more; a city whose ' +
+        'unhappy citizens outnumber its happy ones is in disorder and produces no shields, ' +
+        'beakers or gold',
     );
     expect(block[1]).toBe(
       `ok: Player 1 (p0) paid ${String(upkeep.gold)} gold of upkeep ` +
@@ -3000,7 +3144,11 @@ describe('the worker verbs', () => {
     // synthetic-state pin records. d25659e4bfc2a50b -> 9787f054e1c300ea. The transcript
     // moved with it in every line that names a unit — hit points, as above — and in the
     // `state` view's `schema=8`.
-    expect(hashValue(first.session.state)).toBe('9787f054e1c300ea');
+    // Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9): `PlayerState.government` and
+    // `GameState.tileOwner`, the same bump the pins above record. 9787f054e1c300ea ->
+    // b8a0218a7031e90c. The transcript moved with it in every line that names a unit —
+    // hit points, as above — and in the `state` view's `schema=9`.
+    expect(hashValue(first.session.state)).toBe('b8a0218a7031e90c');
   });
 
   it('documents the worker verbs in help and in the command summary', () => {
@@ -3071,10 +3219,32 @@ describe('the rates verb', () => {
     // The lesson: the rule, and legal triples — each of which the *engine* accepted
     // before it was printed (the hint is built with `planSetRates`, not asserted).
     expect(capture.text()).toContain(`must sum to exactly ${String(RATE_TOTAL)}`);
-    expect(capture.text()).toContain(`"rates ${String(RATE_TOTAL)} 0 0"`);
-    expect(capture.text()).toContain(`"rates 0 ${String(RATE_TOTAL)} 0"`);
-    expect(capture.text()).toContain(`"rates 0 0 ${String(RATE_TOTAL)}"`);
-    expect(capture.text()).toContain('"rates 6 4 0"');
+
+    // **The offered triples are checked against the engine, not against a literal set.**
+    // The four pins that used to stand here were `"rates 10 0 0"`, `"rates 0 10 0"`,
+    // `"rates 0 0 10"` and `"rates 6 4 0"` — the corners of the *uncapped* space. M9's
+    // `rateCaps` make all three `10` triples illegal, so those pins stopped describing
+    // anything the hint can honestly print. What the hint *is* for is "here are triples
+    // you may actually use", so that is what is asserted: every triple in the hint sums
+    // to `RATE_TOTAL` **and** is accepted by `planSetRates`, and the caps' own corners are
+    // among them — derived from the acting player's government rather than spelled out.
+    const offered = [...capture.text().matchAll(/"rates (\d+) (\d+) (\d+)"/g)].flatMap((match) => {
+      const [, tax, science, luxury] = match;
+      if (tax === undefined || science === undefined || luxury === undefined) return [];
+      return [{ tax: Number(tax), science: Number(science), luxury: Number(luxury) }];
+    });
+    expect(offered.length).toBeGreaterThanOrEqual(4);
+    const acting = capture.session.state.players.find((player) => player.id === asPlayerId(0));
+    if (acting === undefined) throw new Error('the fixture has no player 0');
+    const caps = rateCapsOf(RULESET, acting);
+    for (const rates of offered) {
+      expect(rates.tax + rates.science + rates.luxury).toBe(RATE_TOTAL);
+      expect(planSetRates(capture.session.state, RULESET, asPlayerId(0), rates).ok).toBe(true);
+    }
+    expect(offered.some((rates) => rates.tax === caps.tax)).toBe(true);
+    expect(offered.some((rates) => rates.science === caps.science)).toBe(true);
+    expect(offered.some((rates) => rates.luxury === caps.luxury)).toBe(true);
+    expect(offered).toContainEqual({ tax: 6, science: 4, luxury: 0 });
 
     // A refusal is inert: the rates are still what they were.
     expect(ratesOf(capture)).toEqual({ tax: 6, science: 4, luxury: 0 });
@@ -3443,8 +3613,12 @@ describe('the research verbs', () => {
     // The help text says what beakers do now, and does *not* repeat the sentence M4b
     // wrote about them being inert — the stale claim this milestone had to remove.
     expect(capture.text()).toContain('Beakers buy tech (see "research")');
-    expect(capture.text()).toContain('LUXURIES DO');
+    // M9: the luxury half of M4b's "they do nothing" claim is gone too, and the help says
+    // what luxuries actually do now — the same statement the per-event line makes, from the
+    // same function.
+    expect(capture.text()).toContain('luxuries content');
     expect(capture.text()).not.toContain('beakers and luxuries DO NOTHING');
+    expect(capture.text()).not.toContain('DO NOTHING yet');
     expect(COMMAND_SUMMARY).toContain('research <techId>');
     expect(COMMAND_SUMMARY).toContain('tech');
   });
@@ -3486,7 +3660,9 @@ describe('the economy the reader is shown', () => {
       'beakers now buy tech: they are banked toward the tech you selected and spent on the ' +
         'turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
     );
-    expect(banner).toContain('luxuries DO NOTHING yet: nothing reads them until M9 (happiness).');
+    expect(banner).toContain(
+      'luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
+    );
     expect(banner).toContain('"rates <tax> <science> <luxury>" moves the sliders');
 
     // M5: and the position *in the tree*, in the same banner, for the same reason —
@@ -3511,7 +3687,7 @@ describe('the economy the reader is shown', () => {
     expect(economyLines).toHaveLength(1);
     expect(economyLines[0]).toBe(
       'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, ' +
-        '0 luxuries - luxuries DO NOTHING yet: nothing reads them until M9 (happiness)',
+        '0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(capture.text()).toContain(
       '1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -3528,19 +3704,26 @@ describe('the economy the reader is shown', () => {
     const text = capture.text();
     const player = capture.session.state.players[0];
     if (player === undefined) throw new Error('no player 0');
+    const luxuryRules = happinessRulesOf(RULESET);
     const income = playerIncome(capture.session.state, RULESET, asPlayerId(0));
     const upkeep = playerUpkeep(capture.session.state, RULESET, asPlayerId(0));
-    const support = unitSupport(capture.session.state, asPlayerId(0));
+    const support = unitSupport(capture.session.state, RULESET, asPlayerId(0));
 
     expect(text).toContain(
       'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, ' +
         '0 luxuries',
     );
-    // M5: the state view's luxuries line keeps the M4b sentence's tail and loses its
-    // beaker half, which moved to the `research:` line printed just above it.
+    // The luxuries line now says what luxuries **do** — M9 reads the pool, so M4b's
+    // "they only pile up, and this build neither spends nor reads them" is the stale
+    // half of the sentence and is gone. The two figures in the replacement come from
+    // `happinessRulesOf`, so this assertion is the catalog's numbers, not a copy of
+    // them: a balance sweep that re-runged `luxuriesPerHappyCitizen` would move both
+    // the line and this expectation together.
     expect(text).toContain(
-      'luxuries DO NOTHING yet: nothing reads them until M9 (happiness): they only pile up, ' +
-        'and this build neither spends nor reads them.',
+      `luxuries CONTENT CITIZENS: every ${String(luxuryRules.luxuriesPerHappyCitizen)} banked ` +
+        'content one, and each luxury resource you have connected contents ' +
+        `${String(luxuryRules.happyPerLuxuryResource)} more; a city whose unhappy citizens ` +
+        'outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
     );
     // M5: the state view states the research position as well, in the engine's own
     // figures (`researchStep`, the step the pipeline runs), and counts the tree the
@@ -3571,21 +3754,45 @@ describe('the economy the reader is shown', () => {
     capture.session.run('state');
     const before = capture.text();
 
+    // The most-tax triple the acting government allows, **asked of its caps** rather than
+    // written down. This used to be `rates 10 0 0` — "all gold" — and that corner no
+    // longer exists: `despotism` caps tax at 8, so 2 of the 10 tenths must go somewhere
+    // else and the split can no longer send everything to one channel. The luxury channel
+    // is still exactly zero at this triple, which is the half of the old claim that
+    // survives.
+    const acting = capture.session.state.players[0];
+    if (acting === undefined) throw new Error('the fixture has a player 0');
+    const caps = rateCapsOf(BILLING_RULESET, acting);
+    const maxTax: Rates = { tax: caps.tax, science: RATE_TOTAL - caps.tax, luxury: 0 };
+    expect(planSetRates(capture.session.state, BILLING_RULESET, asPlayerId(0), maxTax).ok).toBe(
+      true,
+    );
+
     capture.clear();
-    expect(capture.session.run('rates 10 0 0').kind).toBe('applied');
+    expect(
+      capture.session.run(
+        `rates ${String(maxTax.tax)} ${String(maxTax.science)} ${String(maxTax.luxury)}`,
+      ).kind,
+    ).toBe('applied');
     expect(capture.text()).toContain(
-      'ok: rates set to tax 10 / science 0 / luxury 0 (sum 10 of 10)',
+      `ok: rates set to tax ${String(maxTax.tax)} / science ${String(maxTax.science)} / luxury ${String(maxTax.luxury)} (sum ${String(RATE_TOTAL)} of ${String(RATE_TOTAL)})`,
     );
 
     capture.clear();
     capture.session.run('state');
     const after = capture.text();
 
-    // All gold: the beaker and luxury channels of the projection go to zero, because
-    // the same city commerce is being split differently.
+    // The projection really followed the rates, stated in the engine's own figures: the
+    // luxury channel is zero, gold is the channel that grew, and the ledger line under
+    // `state` prints exactly what `playerIncome` says.
     const income = playerIncome(capture.session.state, BILLING_RULESET, asPlayerId(0));
-    expect(income.beakers).toBe(0);
     expect(income.luxuries).toBe(0);
+    expect(income.gold).toBeGreaterThan(0);
+    expect(after).toContain(
+      `collects ${String(income.gold)} gold, ${String(income.beakers)} ` +
+        `${income.beakers === 1 ? 'beaker' : 'beakers'} and ${String(income.luxuries)} ` +
+        `${income.luxuries === 1 ? 'luxury' : 'luxuries'} a turn`,
+    );
     expect(after).toContain('0 beakers, 0 luxuries');
     expect(after).not.toBe(before);
     // …and the *pools* are untouched by a rate change: only the next split moves.
@@ -3984,7 +4191,18 @@ describe('the play command', () => {
         // `(2/2 movement, 1/1 hp)`, which the assertion above derives from the engine's
         // own `hitPointsLabel` rather than restating. The city view's own numbers are
         // unchanged.
-        expect(first.stdout).toContain('hash: 97b02fcaa6e3716b');
+        // Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9): the wave writes three new keys into
+        // every state — each player's `government` (the opening `despotism`, whose id is
+        // stored rather than derived), each city's `culture`, and the map-wide `tileOwner`
+        // ownership layer — so `newGame` alone moves the hash of this script's world, and the
+        // turns it plays move it again. 97b02fcaa6e3716b -> 287162749a278c82. The transcript
+        // moved with it in two visible ways: `schema=9`, and the two M9 lines the new views
+        // print (the header's `government=` field and the city view's culture/happiness
+        // summary), which the assertions above derive from the engine rather than restate.
+        // This is the same one-bump reason every golden in this wave moved, and it is the
+        // wave's *only* rehash node for the headless transcript: the numbers the script's own
+        // views print are unchanged.
+        expect(first.stdout).toContain('hash: 287162749a278c82');
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -4211,7 +4429,13 @@ describe('the provenance command', () => {
     // other number here. Its id is the section's own name (`COMBAT_ROW_ID`), because a
     // section of nine numbers has no id of its own. M7 adds the eighth, `capture` — the
     // one magnitude M6 left behind in `core/cities.ts` and the last of them to become
-    // content, with the section's own name as its id for the same reason.
+    // content, with the section's own name as its id for the same reason. **M9+M10 adds
+    // the last four**: `governments` (a catalog of three rows, each with its own caps,
+    // free units, support cost and happiness modifier), `culture` (the border radii, the
+    // unhappy ladder, the per-luxury rates — one singleton row named `CULTURE_ROW_ID`),
+    // `score` (the five weights) and `victory` (the four thresholds). Every magnitude
+    // M9+M10 introduced is in here, which is the point: a borders rule or a victory
+    // threshold that lived as a literal would have no row for this report to print.
     const rows = printedRows(printed);
     expect(rows.map((row) => row.id)).toEqual([
       ...CATALOG.terrains.map((t) => t.id),
@@ -4222,6 +4446,10 @@ describe('the provenance command', () => {
       ...CATALOG.techs.map((t) => t.id),
       'combat',
       'capture',
+      ...CATALOG.governments.map((g) => g.id),
+      'culture',
+      'score',
+      'victory',
     ]);
 
     // …which is what makes the table and the totals agree.
@@ -4241,7 +4469,12 @@ describe('the provenance command', () => {
     // provenance report that skipped it would leave the nine numbers this project was
     // most recently caught hiding exactly where they used to be — unaccounted for.
     // M7 adds `capture` as the eighth heading, in the catalog's own position, so the
-    // divisor the capture rule reads is a row this report accounts for.
+    // divisor the capture rule reads is a row this report accounts for. M9+M10 adds the
+    // ninth through twelfth — `governments`, `culture`, `score`, `victory` — in the order
+    // `provenanceSections` emits them, which is the order the four new `Ruleset` sections
+    // are declared in. Six of the twelve sections are singletons the catalogs do not
+    // carry; they are sections because a report that skipped them would be a report whose
+    // totals silently excluded the newest numbers in the project.
     expect(printed.sections.map((section) => section.name)).toEqual([
       'terrains',
       'units',
@@ -4251,6 +4484,10 @@ describe('the provenance command', () => {
       'techs',
       'combat',
       'capture',
+      'governments',
+      'culture',
+      'score',
+      'victory',
     ]);
 
     for (const section of printed.sections) {
@@ -4431,6 +4668,11 @@ const combatState = (options?: {
     ...base,
     nextUnitId: 8,
     nextCityId: 1,
+    // M9: the materialised ownership layer. `[]` is the honest value for a
+    // state nobody has run a turn on: `withOwnership` fills it from the cities the
+    // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+    // layer cannot make a border wrong — it only means none has been claimed yet.
+    tileOwner: [],
     units: [
       ...base.units,
       attacker,
@@ -4459,6 +4701,10 @@ const combatState = (options?: {
           ...(options?.walls === false ? [] : [asBuildingId('walls')]),
         ],
         workedTiles: [],
+        // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+        // from this and `computeTileOwner` reads it, so a hand-built city states a number
+        // rather than leaving the engine to guess one.
+        culture: 0,
       },
     ],
   };

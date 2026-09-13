@@ -65,7 +65,8 @@ import {
   type TileIndex,
   type UnitId,
 } from '@civts/core';
-import { assertNever, productionItemName } from '../events.js';
+import { assertNever, governmentLabel, productionItemName } from '../events.js';
+import { commandsClosed } from './closed.js';
 import type { PanelContext } from './index.js';
 
 /** One row of the unit list: the engine's readouts for a unit, already formatted. */
@@ -193,6 +194,11 @@ export const actionLabel = (command: Command, state: GameState, ruleset: Ruleset
       return `Attack ${tileLabel(state, command.target)}`;
     case 'FortifyUnit':
       return 'Fortify';
+    // M9: the government command is not a unit command and never reaches this panel's
+    // action list — but the switch is exhaustive over `Command`, so the member is handled
+    // explicitly rather than falling through to `assertNever` as an unreachable branch.
+    case 'SetGovernment':
+      return `Change government to ${governmentLabel(ruleset, command.government)}`;
   }
   return assertNever(command);
 };
@@ -325,8 +331,15 @@ export const mountUnitPanel = (parent: HTMLElement, ctx: PanelContext): UnitPane
     );
 
     actions.setAttribute('aria-label', `Actions for unit ${String(row.id)}`);
+    // M10: a finished game refuses every command (`game-over`), so the group's controls are
+    // rendered disabled rather than removed — the orders are still what this unit *could* do, and
+    // the one honest thing to say about them is that the engine will not take them any more. A
+    // disabled control is not one the page offers (docs/INTERFACES.md, M8 keystone).
+    const closed = commandsClosed(ctx.api);
     for (const command of unitPanelCommands(state, ruleset, playerId, row.id)) {
-      actions.append(actionButton(ctx, actionLabel(command, state, ruleset), command));
+      const control = actionButton(ctx, actionLabel(command, state, ruleset), command);
+      control.disabled = closed;
+      actions.append(control);
     }
   };
 

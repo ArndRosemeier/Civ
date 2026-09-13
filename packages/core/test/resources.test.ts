@@ -42,6 +42,7 @@ import { cityProductionOptions } from '../src/actions.js';
 import { cityById, type BuildingDef, type City, type ProductionItem } from '../src/cities.js';
 import { applyCommand, planSetProduction } from '../src/commands.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asCityId,
   asPlayerId,
@@ -94,6 +95,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import type { TechDef } from '../src/tech.js';
 import type { UnitDef, UnitRole } from '../src/units.js';
 
@@ -321,6 +323,10 @@ const civPlayer = (index: number, techs: readonly TechId[] = []): PlayerState =>
   color: '#d12f2f',
   startingTile: asTileIndex(17),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   treasury: STARTING_TREASURY,
   rates: DEFAULT_RATES,
   beakers: 0,
@@ -348,6 +354,10 @@ const city = (id: number, owner: number, tile: number, population = 1): City => 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
 });
 
 interface BoardOptions {
@@ -393,6 +403,8 @@ const board = (options: BoardOptions): GameState => {
       Array.from({ length: options.map.width * options.map.height }, () => false),
     ),
     nextCityId: options.cities?.length ?? 0,
+
+    tileOwner: [],
     cities: options.cities ?? [],
     improvements,
   };
@@ -922,21 +934,33 @@ describe('bonus resources add their yields to the tile', () => {
       shields: 0,
       commerce: 0,
     });
-    // Every player field is exactly the shape M4b left it in: M4c added no
-    // contentment, so there is nothing on a player for a luxury to change.
+    // **The shape a player is stored in, read one field at a time.** M4b's seven, M5's tech
+    // list, and M9+M10's `government` — and **nothing about contentment**, which is this
+    // assertion's subject and the reason it survived the wave that finally gave luxuries an
+    // effect.
+    //
+    // M9's happiness rule *does* read a connected luxury (`happiness.ts` counts them and
+    // turns them into happy citizens), and M10's culture rule reads a city's culture — but
+    // `happinessOf` and `playerCulture` are **pure functions of the state**, never stored
+    // fields, so a luxury still changes nothing about how a player is written down. That is
+    // the standing requirement's "no derived value recomputed in two places" holding a
+    // *shape* still while a rule underneath it changed. `government` is the one new field,
+    // and it is an *input* to the happiness function (its `happinessModifier`) rather than a
+    // result of it, which is why it belongs on the player and contentment does not.
     expect(Object.keys(state.players[0] ?? {})).toEqual([
       'id',
       'name',
       'color',
       'startingTile',
       'kind',
+      'government',
       'treasury',
       'rates',
       'beakers',
       'luxuries',
       // M5 added the tech list; it is required on every player and is the one field
-      // after M4b's five. Nothing here reads it for contentment, which is the point
-      // of this assertion: a luxury's only effect is still that it is counted.
+      // after M4b's five. `government` above is M9's, and it is the last: no field for
+      // contentment, no field for culture, no field for a score.
       'techs',
     ]);
   });

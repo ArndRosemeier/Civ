@@ -42,6 +42,7 @@ import {
   type GameState,
   type SetupError,
 } from '../src/state.js';
+
 import { unitById, unitDef, unitsOnTile, type UnitDef, type UnitRole } from '../src/units.js';
 // M6: the hasher is the judge of "no key holds `undefined`", because that is the
 // condition that makes a state unhashable rather than merely untidy.
@@ -614,11 +615,11 @@ describe('starting units — M6 puts hit points on the board', () => {
     expect(JSON.stringify(state)).not.toContain('undefined');
   });
 
-  it('is schema version 8 and says so on every unit, at a seed that reproduces', () => {
+  it('is schema version 9 and says so on every unit, at a seed that reproduces', () => {
     const first = mustGame(11, SETTINGS, WITH_HIT_POINTS);
     const second = mustGame(11, SETTINGS, WITH_HIT_POINTS);
 
-    expect(first.schemaVersion).toBe(8);
+    expect(first.schemaVersion).toBe(9);
     expect(second).toEqual(first);
     // The hit points are inside the hashed JSON, so two games that differed only there
     // would be two different states.
@@ -908,14 +909,14 @@ describe('starting fog', () => {
  * (INTERFACES.md M6, "Units in play").
  */
 describe('the persisted state shape', () => {
-  it('is schema version 8 — M6 put hit points on the unit and combat on the board', () => {
+  it('is schema version 9 — M9+M10 put governments, borders, culture and victory on the board', () => {
     // Pinned by *value*, not by `toBe(SCHEMA_VERSION)`. A test that agrees with
     // whatever the constant says cannot notice a shape change that was never
     // recorded, and recording it is the whole point of the number: the comment
     // above `SCHEMA_VERSION` is where the history is written down, this is where it
     // is enforced. When the shape moves again, this line moves with it — in the
     // same commit as the golden regeneration, which is what a rehash is.
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBe(9);
   });
 
   it('gives every player a tech list, and gives nobody a research choice', () => {

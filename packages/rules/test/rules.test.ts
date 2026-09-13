@@ -70,6 +70,27 @@ const COMBAT = CATALOG.combat;
  */
 const CAPTURE_ROWS = 1;
 const CAPTURE = CATALOG.capture;
+/**
+ * M9's government rows — the ninth provenance section, and the first *row* section since the
+ * techs. Three rows, each with its own tuning claim, each counted and listed separately: a
+ * sweep asking "which of these governments has a sourced support cost?" has to be able to see
+ * the rows rather than a subtotal over them. Aliased for the same reason every other section
+ * is: the report's total and its sections must agree, and a row count written in six places is
+ * free to disagree with itself.
+ */
+const GOVERNMENTS = CATALOG.governments;
+/**
+ * M9+M10's three singleton sections — culture/contentment, score and victory. Each is **one**
+ * provenance claim carrying several magnitudes (five culture and contentment numbers, five
+ * score weights, four victory thresholds), so like `combat` and `capture` each counts as one
+ * row: the claim is what is counted, and a claim is what a reader audits.
+ */
+const CULTURE_ROWS = 1;
+const CULTURE = CATALOG.culture;
+const SCORE_ROWS = 1;
+const SCORE = CATALOG.score;
+const VICTORY_ROWS = 1;
+const VICTORY = CATALOG.victory;
 
 /**
  * The catalog with one unit row replaced. Written as a function rather than a
@@ -336,6 +357,14 @@ describe('ruleset validation', () => {
         techs: [],
         combat: CATALOG.combat,
         capture: CATALOG.capture,
+        // M9+M10's four sections, spelled out for the same reason: `Catalog` requires
+        // them, so "ships none" is written as `[]` and rejected like any other empty
+        // catalog. `culture`, `score` and `victory` are singletons, so they are the
+        // shipped rows copied — what is on trial here is the *row lists*.
+        governments: [],
+        culture: { ...CATALOG.culture },
+        score: { ...CATALOG.score },
+        victory: { ...CATALOG.victory },
       },
       'tuned',
     );
@@ -1012,7 +1041,31 @@ describe('building catalog', () => {
     const r = validateRuleset(CATALOG, 'tuned');
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.value.buildings).toEqual([...BUILDINGS]);
+      // **The validated rows are the catalog rows, with M9's one projection applied.** Every
+      // field of every row survives validation unchanged; the single difference is that a
+      // row's `happiness` is *projected onto its effects* as a `city-happiness` effect, which
+      // is where `buildings.ts` reads it (`effectTotals`) and therefore the only shape the
+      // engine ever sees. The projection is replace-not-append, so a row that declared the
+      // effect directly would still produce exactly one.
+      //
+      // Asserted as a *transformation* rather than as an equality with the raw rows, because
+      // the difference is the wave's decision: the magnitude is stated once, on the row, and
+      // the effect is derived from it, so no row can hold a `happiness` that disagrees with
+      // the effect the engine adds up.
+      const projected = r.value.buildings.map((b) => ({
+        ...b,
+        effects: b.effects.filter((e) => e.kind !== 'city-happiness'),
+      }));
+      expect(projected).toEqual([...BUILDINGS]);
+      for (const b of r.value.buildings) {
+        const source = BUILDINGS.find((row) => row.id === b.id);
+        const projectedHappiness = b.effects.filter((e) => e.kind === 'city-happiness');
+        expect(projectedHappiness).toEqual(
+          (source?.happiness ?? 0) > 0
+            ? [{ kind: 'city-happiness', amount: source?.happiness }]
+            : [],
+        );
+      }
       // A validated ruleset's `buildingSpec`s are structurally the engine's
       // `BuildingDef`s: the cost `itemCost` reads is present and is an integer.
       for (const b of r.value.buildings) expect(Number.isInteger(b.cost)).toBe(true);
@@ -1053,10 +1106,34 @@ describe('building catalog', () => {
     // (walls, barracks, temple) the row's provenance note says so out loud.
     for (const b of BUILDINGS) expect(b.effects.length).toBeGreaterThan(0);
 
+    // The kinds are read from the **validated** ruleset, not from the raw rows: M9 declares a
+    // building's contentment as `happiness` on the row and *projects* it onto a
+    // `city-happiness` effect, so the shipped content that exercises that kind is a row whose
+    // `happiness` is non-zero. Reading only the raw rows would report the kind as unexercised
+    // while a real game adds it up every turn.
+    const validated = validateRuleset(CATALOG, 'tuned');
+    expect(validated.ok).toBe(true);
     const kinds = new Set<BuildingEffectKind>(
+      (validated.ok ? validated.value.buildings : BUILDINGS).flatMap((b) =>
+        b.effects.map((e) => e.kind),
+      ),
+    );
+    for (const kind of BUILDING_EFFECT_KINDS) {
+      expect({ kind, exercised: kinds.has(kind) }).toEqual({ kind, exercised: true });
+    }
+    // …and the projection is not the only source of any of them: every kind except
+    // `city-happiness` is declared directly by a shipped row, which is what keeps the raw
+    // catalog readable on its own.
+    const rawKinds = new Set<BuildingEffectKind>(
       BUILDINGS.flatMap((b) => b.effects.map((e) => e.kind)),
     );
-    expect([...BUILDING_EFFECT_KINDS].every((kind) => kinds.has(kind))).toBe(true);
+    for (const kind of BUILDING_EFFECT_KINDS) {
+      if (kind === 'city-happiness') {
+        expect(rawKinds.has(kind)).toBe(false);
+        continue;
+      }
+      expect(rawKinds.has(kind)).toBe(true);
+    }
   });
 
   it('marks exactly one shipped row as a wonder, and leaves the key off every other row', () => {
@@ -1223,7 +1300,10 @@ describe('building catalog', () => {
     // could make: `pct` and `amount` are both numbers.
     for (const b of BUILDINGS) {
       for (const e of b.effects) {
-        const value = e.kind === 'growth-food' ? e.amount : e.pct;
+        // M9 added a third numeric kind, `city-happiness`, whose field is `amount` like
+        // `growth-food`'s. The three are spelled out rather than defaulted so a fourth
+        // kind added without a decision here fails to compile.
+        const value = e.kind === 'growth-food' || e.kind === 'city-happiness' ? e.amount : e.pct;
         expect(Number.isInteger(value)).toBe(true);
         expect(value).toBeGreaterThanOrEqual(0);
       }
@@ -2127,7 +2207,11 @@ describe('provenance summary', () => {
         RESOURCES.length +
         TECHS.length +
         COMBAT_ROWS +
-        CAPTURE_ROWS,
+        CAPTURE_ROWS +
+        GOVERNMENTS.length +
+        CULTURE_ROWS +
+        SCORE_ROWS +
+        VICTORY_ROWS,
     );
     expect(s.cited + s.placeholder).toBe(s.total);
     // The improvement rows are counted, not merely present: the report's sections
@@ -2148,7 +2232,11 @@ describe('provenance summary', () => {
         RESOURCES.length +
         TECHS.length +
         COMBAT_ROWS +
-        CAPTURE_ROWS,
+        CAPTURE_ROWS +
+        GOVERNMENTS.length +
+        CULTURE_ROWS +
+        SCORE_ROWS +
+        VICTORY_ROWS,
     );
   });
 
@@ -2181,6 +2269,14 @@ describe('provenance summary', () => {
         // M7's capture rule: one row, filed under the section's own name, listed last for
         // the same reason — the order is the catalog's.
         'capture',
+        // M9's government rows: three rows, listed by their own ids in the catalog's order,
+        // because unlike combat and capture this section is a *list*.
+        ...GOVERNMENTS.map((g) => g.id),
+        // M9+M10's three singletons, filed under their sections' own names and listed last,
+        // for the same reason combat and capture are: the order is the catalog's.
+        'culture',
+        'score',
+        'victory',
       ]);
     });
 
@@ -2200,6 +2296,10 @@ describe('provenance summary', () => {
         'techs',
         'combat',
         'capture',
+        'governments',
+        'culture',
+        'score',
+        'victory',
       ]);
       expect(total).toBe(summary.total);
       expect(placeholder).toBe(summary.placeholder);
@@ -2243,6 +2343,33 @@ describe('provenance summary', () => {
       expect(sectionOf(CATALOG, 'capture')?.summary.total).toBe(CAPTURE_ROWS);
       expect(sectionOf(CATALOG, 'capture')?.summary.placeholder).toBe(CAPTURE_ROWS);
       expect(sectionOf(CATALOG, 'capture')?.rows.map((r) => r.id)).toEqual(['capture']);
+      // M9's governments: a row section, so the count is the row count and the ids are the
+      // catalog's own — the assertion that would catch a government row added to the catalog
+      // without a provenance claim.
+      expect(sectionOf(CATALOG, 'governments')?.summary.total).toBe(GOVERNMENTS.length);
+      expect(sectionOf(CATALOG, 'governments')?.summary.placeholder).toBe(GOVERNMENTS.length);
+      expect(sectionOf(CATALOG, 'governments')?.rows.map((r) => r.id)).toEqual(
+        GOVERNMENTS.map((g) => g.id),
+      );
+      // M9+M10's three singletons. `culture` carries the border thresholds and the unhappy
+      // ladder, `score` the five weights, `victory` the four thresholds — eleven magnitudes
+      // that lived nowhere auditable before this wave. Each is one claim, so each counts as
+      // one row and is listed under its own section name.
+      expect(sectionOf(CATALOG, 'culture')?.summary.total).toBe(CULTURE_ROWS);
+      expect(sectionOf(CATALOG, 'culture')?.summary.placeholder).toBe(CULTURE_ROWS);
+      expect(sectionOf(CATALOG, 'culture')?.rows.map((r) => r.id)).toEqual(['culture']);
+      expect(sectionOf(CATALOG, 'score')?.summary.total).toBe(SCORE_ROWS);
+      expect(sectionOf(CATALOG, 'score')?.summary.placeholder).toBe(SCORE_ROWS);
+      expect(sectionOf(CATALOG, 'score')?.rows.map((r) => r.id)).toEqual(['score']);
+      expect(sectionOf(CATALOG, 'victory')?.summary.total).toBe(VICTORY_ROWS);
+      expect(sectionOf(CATALOG, 'victory')?.summary.placeholder).toBe(VICTORY_ROWS);
+      expect(sectionOf(CATALOG, 'victory')?.rows.map((r) => r.id)).toEqual(['victory']);
+      // The three singletons are the sections whose magnitudes have no other home: read them
+      // through the report, so a magnitude added to one of them without a `provenance` field
+      // is a compile error rather than a silent omission.
+      expect(CULTURE.provenance.kind).toBe('placeholder');
+      expect(SCORE.provenance.kind).toBe('placeholder');
+      expect(VICTORY.provenance.kind).toBe('placeholder');
     });
 
     it('counts a cited unit row as cited, not as a missing row', () => {
@@ -2263,7 +2390,11 @@ describe('provenance summary', () => {
           RESOURCES.length +
           TECHS.length +
           COMBAT_ROWS +
-          CAPTURE_ROWS,
+          CAPTURE_ROWS +
+          GOVERNMENTS.length +
+          CULTURE_ROWS +
+          SCORE_ROWS +
+          VICTORY_ROWS,
       );
       expect(summary.cited).toBe(1);
       expect(summary.placeholder).toBe(summary.total - 1);

@@ -606,8 +606,18 @@ describe('every catalog section is either patchable or reported', () => {
     'buildings',
     'improvements',
     'resources',
+    // M9+M10: `governments` is a row section like the five above it; `culture`, `score`
+    // and `victory` are singletons like `combat` and `capture`. All four are reachable
+    // through `RulesetPatch`, which is what the standing requirement demands of every
+    // magnitude this wave adds — and it is asserted here rather than assumed, because a
+    // section that `Catalog` gained without a decision about patching would be a
+    // magnitude no balance sweep could move.
+    'governments',
     'combat',
     'capture',
+    'culture',
+    'score',
+    'victory',
   ];
   const UNPATCHABLE: readonly string[] = ['techs'];
 
@@ -654,10 +664,14 @@ describe('every catalog section is either patchable or reported', () => {
       'buildings',
       'capture',
       'combat',
+      'culture',
+      'governments',
       'improvements',
       'resources',
+      'score',
       'terrains',
       'units',
+      'victory',
     ]);
   });
 

@@ -38,10 +38,13 @@ import {
   cityRadius,
   cityYields,
   foodBoxSize,
+  happinessOf,
   indexToX,
   indexToY,
   itemCost,
   planSetWorkedTiles,
+  playerCulture,
+  wholeCulture,
   type CityId,
   type GameState,
   type PlayerId,
@@ -50,6 +53,7 @@ import {
   type TileIndex,
 } from '@civts/core';
 import { productionItemName } from '../events.js';
+import { commandsClosed } from './closed.js';
 import type { PanelContext } from './index.js';
 
 /** One entry of the `Cities` list. */
@@ -97,6 +101,16 @@ export interface CityFact {
  * The city's readouts, straight from the engine. `undefined` when the state holds no such
  * city — the honest answer for a query about a city that is not there, and the same reading
  * `cityYields` takes.
+ *
+ * **M9 added culture and happiness, and neither is recomputed here.** `happinessOf` is
+ * `happiness.ts`' one verdict on a city's citizens — the same call `cityYields` makes to decide
+ * whether the city is in disorder, so the number on this screen and the number the production,
+ * growth and money loops acted on are one number. Its `disordered` field IS what the engine's
+ * `isDisordered(state, ruleset, cityId)` returns (that function is this same read by id), so the
+ * panel asks once rather than twice. Culture is `city.culture` read through `wholeCulture` — the
+ * total reading `culture.ts` takes of a value a save may have carried anything in — beside
+ * `playerCulture`, the derived sum the cultural victory threshold is measured against. There is
+ * deliberately no stored player total for this panel to disagree with; the contract says why.
  */
 export const cityFacts = (
   state: GameState,
@@ -108,6 +122,9 @@ export const cityFacts = (
 
   const yields = cityYields(state, ruleset, cityId);
   const target = cityGrowthTarget(buildingCatalog(ruleset), city, foodBoxSize(city.population));
+  const mood = happinessOf(state, ruleset, city);
+  const cityCulture = wholeCulture(city.culture);
+  const allCities = playerCulture(state, city.owner);
 
   return [
     { label: 'Population', value: String(city.population) },
@@ -120,6 +137,20 @@ export const cityFacts = (
     { label: 'Food box', value: `${String(city.foodBox)} / ${String(target)}` },
     { label: 'Stored shields', value: String(city.shields) },
     { label: 'Buildings', value: String(city.buildings.length) },
+    {
+      label: 'Culture',
+      value: `${String(cityCulture)} here, ${String(allCities)} in all your cities`,
+    },
+    {
+      label: 'Happiness',
+      value: `${String(mood.happy)} happy, ${String(mood.content)} content, ${String(mood.unhappy)} unhappy`,
+    },
+    {
+      label: 'Disorder',
+      value: mood.disordered
+        ? 'civil disorder — no shields, no beakers, no gold and no growth this turn'
+        : 'in good order',
+    },
   ];
 };
 
@@ -161,6 +192,10 @@ export const workedTileOptions = (
       tile,
       text: `${String(indexToX(state.map, tile))},${String(indexToY(state.map, tile))}`,
       worked: isWorked,
+      // M9: the planner now also refuses a tile **another player owns**, so a checkbox the
+      // panel disables is one the applier would refuse — the UI keystone, with one more
+      // rule behind the same call. (M9's claim radius does not narrow the ring; it decides
+      // who the ring's tiles belong to.)
       legal: planSetWorkedTiles(state, playerId, cityId, next).ok,
       next,
     };
@@ -330,6 +365,11 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
     const city = cityId === undefined ? undefined : cityById(state, cityId);
     if (cityId === undefined || city === undefined) return;
 
+    // M10: once the engine has ended the game it refuses every command, so the tile checkboxes and
+    // the production buttons below are rendered disabled — closed, not hidden, because "what this
+    // city could have built" is still a true statement about the final position.
+    const closed = commandsClosed(ctx.api);
+
     dialog.setAttribute('aria-label', `City ${city.name}`);
     title.textContent = city.name;
 
@@ -350,7 +390,7 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
       input.setAttribute('aria-label', `Work tile ${option.text}`);
       // The engine's verdict, rendered as a disabled control rather than as a hidden one:
       // the tile is real, the assignment is not legal, and a player can see both facts.
-      input.disabled = !option.legal;
+      input.disabled = !option.legal || closed;
       input.dataset['tile'] = String(option.tile);
       input.addEventListener('change', () => {
         ctx.dispatch({ type: 'SetWorkedTiles', cityId, tiles: option.next });
@@ -363,6 +403,7 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
     for (const choice of productionChoices(state, ruleset, cityId)) {
       const button = el(doc, 'button', `Build ${choice.label} (${String(choice.cost)} shields)`);
       button.type = 'button';
+      button.disabled = closed;
       button.addEventListener('click', () => {
         ctx.dispatch({ type: 'SetProduction', cityId, item: choice.item });
       });

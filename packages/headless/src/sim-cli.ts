@@ -427,6 +427,21 @@ const COMBAT_ROW_ID = 'combat';
 const CAPTURE_ROW_ID = 'capture';
 
 /**
+ * **M9+M10's singleton sections**, named for the same reason `COMBAT_ROW_ID` and
+ * `CAPTURE_ROW_ID` are: each is a table of related magnitudes with no row id of its own, so
+ * the override record and the knob syntax need a name to file it under, and the catalog's
+ * own field name is the honest one.
+ *
+ * The three join `readNumeric`/`readProvenance` so a balance sweep can move them — which is
+ * the *whole point* of M9 and M10 putting their magnitudes in the catalog in the first
+ * place: a border threshold, a score weight or a victory condition that no sweep can turn
+ * is a knob nobody will ever tune.
+ */
+const CULTURE_ROW_ID = 'culture';
+const SCORE_ROW_ID = 'score';
+const VICTORY_ROW_ID = 'victory';
+
+/**
  * The sections that are **one row rather than a list of rows**, by their own names.
  *
  * A list rather than a chain of `if (section === 'combat')` branches, because "which
@@ -3480,6 +3495,84 @@ const readNumeric = (
           return notNumeric();
       }
     }
+    // M9: the government rows are a *row* section, so the field is a plain name and the
+    // value comes out of the row — including the three caps, which are spelled
+    // `rateCaps.<slider>` because that is how the row nests them.
+    case 'governments': {
+      const row = catalog.governments.find((candidate) => String(candidate.id) === id);
+      if (row === undefined) {
+        return unknown(catalog.governments.map((candidate) => String(candidate.id)));
+      }
+      switch (field) {
+        case 'rateCaps.tax':
+          return ok(row.rateCaps.tax);
+        case 'rateCaps.science':
+          return ok(row.rateCaps.science);
+        case 'rateCaps.luxury':
+          return ok(row.rateCaps.luxury);
+        case 'freeUnitsPerCity':
+          return ok(row.freeUnitsPerCity);
+        case 'unitSupportCost':
+          return ok(row.unitSupportCost);
+        case 'happinessModifier':
+          return ok(row.happinessModifier);
+        default:
+          return notNumeric();
+      }
+    }
+    // M9's culture section. The unhappy ladder is **not** sweepable as a single number —
+    // it is a list, and `parseOverride` addresses one field — so a sweep that wants it
+    // moved uses a JSON patch. Saying so here rather than reporting a bare "not a number"
+    // is the difference between a limitation and a mystery.
+    case 'culture': {
+      if (id !== CULTURE_ROW_ID) return unknown([CULTURE_ROW_ID]);
+      switch (field) {
+        case 'borderRadius2Culture':
+          return ok(catalog.culture.borderRadius2Culture);
+        case 'borderRadius3Culture':
+          return ok(catalog.culture.borderRadius3Culture);
+        case 'luxuriesPerHappyCitizen':
+          return ok(catalog.culture.luxuriesPerHappyCitizen);
+        case 'happyPerLuxuryResource':
+          return ok(catalog.culture.happyPerLuxuryResource);
+        default:
+          return notNumeric();
+      }
+    }
+    // M10's five weights.
+    case 'score': {
+      if (id !== SCORE_ROW_ID) return unknown([SCORE_ROW_ID]);
+      switch (field) {
+        case 'perPopulation':
+          return ok(catalog.score.perPopulation);
+        case 'perCity':
+          return ok(catalog.score.perCity);
+        case 'perTech':
+          return ok(catalog.score.perTech);
+        case 'perCulture':
+          return ok(catalog.score.perCulture);
+        case 'perWonder':
+          return ok(catalog.score.perWonder);
+        default:
+          return notNumeric();
+      }
+    }
+    // M10's four thresholds.
+    case 'victory': {
+      if (id !== VICTORY_ROW_ID) return unknown([VICTORY_ROW_ID]);
+      switch (field) {
+        case 'dominationLandPct':
+          return ok(catalog.victory.dominationLandPct);
+        case 'dominationPopPct':
+          return ok(catalog.victory.dominationPopPct);
+        case 'culturalVictoryCulture':
+          return ok(catalog.victory.culturalVictoryCulture);
+        case 'scoreVictoryTurn':
+          return ok(catalog.victory.scoreVictoryTurn);
+        default:
+          return notNumeric();
+      }
+    }
   }
 };
 
@@ -3531,6 +3624,34 @@ const readProvenance = (
         : err(
             `capture.${id} is not a catalog row (the section is one row, named ` +
               `"${CAPTURE_ROW_ID}")`,
+          );
+    }
+    case 'governments': {
+      const row = catalog.governments.find((candidate) => String(candidate.id) === id);
+      return row === undefined ? err(`governments.${id} is not a catalog row`) : ok(row.provenance);
+    }
+    case 'culture': {
+      return id === CULTURE_ROW_ID
+        ? ok(catalog.culture.provenance)
+        : err(
+            `culture.${id} is not a catalog row (the section is one row, named ` +
+              `"${CULTURE_ROW_ID}")`,
+          );
+    }
+    case 'score': {
+      return id === SCORE_ROW_ID
+        ? ok(catalog.score.provenance)
+        : err(
+            `score.${id} is not a catalog row (the section is one row, named ` +
+              `"${SCORE_ROW_ID}")`,
+          );
+    }
+    case 'victory': {
+      return id === VICTORY_ROW_ID
+        ? ok(catalog.victory.provenance)
+        : err(
+            `victory.${id} is not a catalog row (the section is one row, named ` +
+              `"${VICTORY_ROW_ID}")`,
           );
     }
   }

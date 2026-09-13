@@ -339,6 +339,12 @@ const cmdKey = (cmd: Command): string => {
       return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
     case 'FortifyUnit':
       return `FortifyUnit ${String(cmd.unitId)}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 
@@ -523,18 +529,33 @@ const itemUniverse = (ruleset: RulesetView): readonly ProductionItem[] => {
  */
 const RESEARCH_RATES: readonly Rates[] = [
   { tax: 2, science: 8, luxury: 0 },
-  { tax: 0, science: 10, luxury: 0 },
+  // M9+M10: was `0/10/0`, which `despotism`'s science cap of 8 now refuses. The
+  // replacement keeps the science share as high as the cap allows and spends the rest of
+  // the budget on luxuries, so it is still the most scientific triple available.
+  { tax: 0, science: 8, luxury: 2 },
   { tax: 4, science: 6, luxury: 0 },
   { tax: 3, science: 7, luxury: 0 },
 ];
 
+/**
+ * A small exhaustive rate space — small, so it is swept rather than sampled.
+ *
+ * **Every entry is legal under the opening government** (M9+M10). Before M9 the only rule
+ * was "three integers >= 0 summing to `RATE_TOTAL`", so this list held the three extremes
+ * `10/0/0`, `0/10/0` and `0/0/10`. `despotism` caps tax at 8, science at 8 and luxury at
+ * 2, so all three are now refused — and because the sweep below treats a refusal as a
+ * *problem* (its precondition is "the planner accepts the in-range triple"), the whole
+ * keystone went red with 90 reports about triples that are correctly refused. The corners
+ * of the capped space are what the sweep is for now: the tax ceiling, the science ceiling,
+ * the luxury ceiling, and three interior points.
+ */
 const RATE_UNIVERSE: readonly Rates[] = [
   { tax: 6, science: 4, luxury: 0 },
-  { tax: 0, science: 10, luxury: 0 },
-  { tax: 10, science: 0, luxury: 0 },
-  { tax: 4, science: 4, luxury: 2 },
-  { tax: 0, science: 0, luxury: 10 },
+  { tax: 2, science: 8, luxury: 0 },
   { tax: 8, science: 2, luxury: 0 },
+  { tax: 4, science: 4, luxury: 2 },
+  { tax: 0, science: 8, luxury: 2 },
+  { tax: 8, science: 0, luxury: 2 },
 ];
 
 const rateUniverse = (): readonly Rates[] => RATE_UNIVERSE;
@@ -811,7 +832,7 @@ const keystoneSweep = (
         // (e) `SetRates` (M4b), swept over the small rate space.
         asked('planSetRates');
         for (const rates of rateUniverse()) {
-          const planned = planSetRates(state, player.id, rates);
+          const planned = planSetRates(state, ruleset, player.id, rates);
           bump('planSetRates');
           if (!planned.ok) {
             rec.check(
@@ -1497,7 +1518,7 @@ const conservationRun = (
       if (turn % 5 === 0) {
         const rates = RESEARCH_RATES[(turn / 5 + Number(player)) % RESEARCH_RATES.length];
         if (rates !== undefined) {
-          const planned = planSetRates(state, player, rates);
+          const planned = planSetRates(state, ruleset, player, rates);
           if (planned.ok) {
             const applied = applyCommand(state, player, { type: 'SetRates', rates }, ruleset);
             if (applied.ok) {
@@ -2408,7 +2429,12 @@ describe('8. what the goldens actually gate, measured', () => {
     // Five from M6: the three fresh worlds, the played world, and the played world with a
     // battle applied (`played-civs2-seed42-combat`) — the entry M6's acceptance list asks
     // for, named rather than counted so a replacement cannot pass.
-    expect(file.entries.length).toBe(5);
+    //
+    // **M10 makes it six**, adding `played-civs2-seed42-victory`: the played game continued
+    // to the turn limit, where the score condition ends it — "a played golden that INCLUDES
+    // a victory", which is this wave's acceptance item. The count moved with the list below,
+    // and the list is the assertion that matters.
+    expect(file.entries.length).toBe(6);
     // The Node major is pinned, so a hash moving because the *runtime* moved is reported
     // as such rather than as a game change.
     expect(file.nodeMajor).toBe(24);
@@ -2426,6 +2452,7 @@ describe('8. what the goldens actually gate, measured', () => {
     expect(names).toEqual([
       'played-civs2-seed42',
       'played-civs2-seed42-combat',
+      'played-civs2-seed42-victory',
       'tiny-civs2-seed1',
       'tiny-civs2-seed1337',
       'tiny-civs2-seed42',

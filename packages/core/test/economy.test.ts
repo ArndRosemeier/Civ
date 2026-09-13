@@ -42,8 +42,6 @@ import type { GameEvent } from '../src/commands.js';
 // a rename fails here rather than in another package.
 import {
   FREE_UNITS_BASE,
-  FREE_UNITS_PER_CITY,
-  UNIT_SUPPORT_COST,
   applyEconomy,
   buildingMaintenance,
   freeUnitAllowance,
@@ -53,7 +51,13 @@ import {
   splitCommerce,
   unitSupport,
 } from '../src/economy.js';
+// M9: the free-per-city allowance and the per-unit support cost are **catalog rows of the
+// government**, not module constants, so this file reads them from the ruleset it hands the
+// engine — the same read `economy.ts` makes. A test that hard-coded "2 free per city, 1 gold
+// each" would go on passing after a balance sweep moved either number.
+import { freeUnitsPerCity, governmentDef, type GovernmentDef } from '../src/governments.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asCityId,
   asPlayerId,
@@ -77,6 +81,7 @@ import {
   type PlayerState,
   type Rates,
 } from '../src/state.js';
+
 import type { Unit, UnitDef } from '../src/units.js';
 
 /* ------------------------------------------------------------------ *
@@ -193,11 +198,28 @@ const FRACTIONAL_UPKEEP: BuildingDef = {
   effects: [],
 };
 
+/**
+ * M9's government rows for this file's hand-built world: one row (`despotism`) whose
+ * numbers are **this file's own placeholders**, deliberately different from the shipped
+ * catalog's so a test that read the shipped number by accident would fail. The
+ * per-city allowance is 2 and the per-unit cost 1, which is what the M4b contract's
+ * numbers were before M9 moved them into the catalog.
+ */
+const DESPOTISM: GovernmentDef = {
+  id: asGovernmentId('despotism'),
+  name: 'Despotism',
+  rateCaps: { tax: 8, science: 8, luxury: 2 },
+  freeUnitsPerCity: 2,
+  unitSupportCost: 1,
+  happinessModifier: 0,
+};
+
 const RULESET: RulesetView = {
   terrains: [TERRAIN],
   units: [WARRIOR, WORKER],
   buildings: [GRANARY],
   improvements: [],
+  governments: [DESPOTISM],
   fidelity: 'tuned',
 };
 
@@ -210,6 +232,34 @@ const LIBRARY_RULESET: RulesetView = { ...RULESET, buildings: [GRANARY, LIBRARY]
 const NONSENSE_RULESET: RulesetView = {
   ...RULESET,
   buildings: [ZERO_UPKEEP, NEGATIVE_UPKEEP, FRACTIONAL_UPKEEP],
+};
+
+/**
+ * The two numbers this file's fixture states, **read back out of the row it just
+ * declared** rather than written a second time in the assertions below. That is the M9
+ * discipline applied to a test: a body that spelled `2` and `1` for itself would be a second
+ * statement of the fixture, and a sweep that moved the row would leave the body asserting a
+ * game nobody plays.
+ */
+const HAND_ALLOWANCE_PER_CITY = DESPOTISM.freeUnitsPerCity;
+const HAND_UNIT_COST = DESPOTISM.unitSupportCost;
+
+/**
+ * The sanity check that the two readers below agree with the row: `freeUnitAllowance` and
+ * `unitSupport` reach their magnitudes through `governments.ts`' accessors, so the numbers
+ * this file asserts against are the numbers the engine would charge. Asserted here, before
+ * any test runs, because a disagreement is a broken *fixture* and every assertion below
+ * would then be measuring the wrong game — and asserted rather than assumed because a
+ * silent mismatch is exactly the dual-source bug M9's catalog exists to prevent.
+ */
+const checkFixture = (): void => {
+  const ruleset = freeUnitsPerCity(RULESET, player(0));
+  if (ruleset !== HAND_ALLOWANCE_PER_CITY) {
+    throw new Error('economy.test.ts: the fixture row and the engine disagree about free units');
+  }
+  if (governmentDef(RULESET, asGovernmentId('despotism'))?.unitSupportCost !== HAND_UNIT_COST) {
+    throw new Error('economy.test.ts: the fixture row and the engine disagree about unit cost');
+  }
 };
 
 /**
@@ -295,6 +345,10 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(0),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   treasury: 0,
   rates: DEFAULT_RATES,
   beakers: 0,
@@ -341,6 +395,10 @@ const city = (id: number, owner: number, tile: number, overrides: Partial<City> 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
@@ -362,6 +420,11 @@ const board = (overrides: Partial<GameState> = {}): GameState => ({
     Array.from({ length: 16 }, () => false),
   ],
   nextCityId: 100,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
   ...overrides,
@@ -758,19 +821,27 @@ describe('bonus resources — a tile’s worth reaches the city, and then the mo
 });
 
 describe('unit support — the free allowance and the cost beyond it', () => {
-  it('is FREE_UNITS_BASE with no cities, and FREE_UNITS_PER_CITY more per city', () => {
+  it('reads the allowance and the cost this file declared on its one government row', () => {
+    checkFixture();
+  });
+
+  it('is FREE_UNITS_BASE with no cities, and HAND_ALLOWANCE_PER_CITY more per city', () => {
     const bare = board({ units: [] });
-    expect(freeUnitAllowance(bare, P0)).toBe(FREE_UNITS_BASE);
+    expect(freeUnitAllowance(bare, RULESET, P0)).toBe(FREE_UNITS_BASE);
 
     const cityful = board({ cities: [city(0, 0, 5), city(1, 0, 10), city(2, 1, 12)] });
     // Only the player's own cities count: two of the three, plus the base.
-    expect(freeUnitAllowance(cityful, P0)).toBe(FREE_UNITS_PER_CITY * 2 + FREE_UNITS_BASE);
-    expect(freeUnitAllowance(cityful, P1)).toBe(FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE);
+    expect(freeUnitAllowance(cityful, RULESET, P0)).toBe(
+      HAND_ALLOWANCE_PER_CITY * 2 + FREE_UNITS_BASE,
+    );
+    expect(freeUnitAllowance(cityful, RULESET, P1)).toBe(
+      HAND_ALLOWANCE_PER_CITY * 1 + FREE_UNITS_BASE,
+    );
   });
 
   it('charges nothing at exactly the free threshold and one unit’s cost one over', () => {
     const at = board({ units: unitStack(FREE_UNITS_BASE, 0) });
-    expect(unitSupport(at, P0)).toEqual({
+    expect(unitSupport(at, RULESET, P0)).toEqual({
       units: FREE_UNITS_BASE,
       free: FREE_UNITS_BASE,
       supported: 0,
@@ -778,11 +849,11 @@ describe('unit support — the free allowance and the cost beyond it', () => {
     });
 
     const over = board({ units: unitStack(FREE_UNITS_BASE + 1, 0) });
-    expect(unitSupport(over, P0)).toEqual({
+    expect(unitSupport(over, RULESET, P0)).toEqual({
       units: FREE_UNITS_BASE + 1,
       free: FREE_UNITS_BASE,
       supported: 1,
-      gold: UNIT_SUPPORT_COST,
+      gold: HAND_UNIT_COST,
     });
   });
 
@@ -790,27 +861,27 @@ describe('unit support — the free allowance and the cost beyond it', () => {
     // Three cities: the allowance is 10, so ten units are free and the eleventh
     // costs one. The formula is the contract's, and it is pinned at its edge.
     const cities = [city(0, 0, 5), city(1, 0, 10), city(2, 0, 12)];
-    const allowance = FREE_UNITS_PER_CITY * cities.length + FREE_UNITS_BASE;
+    const allowance = HAND_ALLOWANCE_PER_CITY * cities.length + FREE_UNITS_BASE;
     const at = board({ cities, units: unitStack(allowance, 0) });
     const over = board({ cities, units: unitStack(allowance + 1, 0) });
 
     expect(allowance).toBe(10);
-    expect(unitSupport(at, P0).gold).toBe(0);
-    expect(unitSupport(over, P0).gold).toBe(UNIT_SUPPORT_COST);
+    expect(unitSupport(at, RULESET, P0).gold).toBe(0);
+    expect(unitSupport(over, RULESET, P0).gold).toBe(HAND_UNIT_COST);
   });
 
   it('counts only the player’s own units — a barbarian band is on nobody’s bill', () => {
     const state = board({
       units: [...unitStack(FREE_UNITS_BASE + 2, 0), unit(90, WARRIOR, 1), unit(91, WARRIOR, 2)],
     });
-    expect(unitSupport(state, P0).gold).toBe(2 * UNIT_SUPPORT_COST);
-    expect(unitSupport(state, P1)).toEqual({
+    expect(unitSupport(state, RULESET, P0).gold).toBe(2 * HAND_UNIT_COST);
+    expect(unitSupport(state, RULESET, P1)).toEqual({
       units: 1,
       free: FREE_UNITS_BASE,
       supported: 0,
       gold: 0,
     });
-    expect(unitSupport(state, BARBARIAN).units).toBe(1);
+    expect(unitSupport(state, RULESET, BARBARIAN).units).toBe(1);
   });
 });
 
@@ -853,15 +924,15 @@ describe('playerUpkeep — the two halves, and their sum', () => {
   it('adds maintenance to unit support', () => {
     const state = board({
       cities: [city(0, 0, 5, { buildings: [asBuildingId('temple')] })],
-      // One city lifts the allowance to FREE_UNITS_PER_CITY + FREE_UNITS_BASE, so
+      // One city lifts the allowance to HAND_ALLOWANCE_PER_CITY + FREE_UNITS_BASE, so
       // nine units leave three billable.
-      units: unitStack(FREE_UNITS_PER_CITY + FREE_UNITS_BASE + 3, 0),
+      units: unitStack(HAND_ALLOWANCE_PER_CITY + FREE_UNITS_BASE + 3, 0),
     });
 
     expect(playerUpkeep(state, UPKEEP_RULESET, P0)).toEqual({
       maintenance: TEMPLE.maintenance,
-      unitSupport: 3 * UNIT_SUPPORT_COST,
-      gold: TEMPLE.maintenance + 3 * UNIT_SUPPORT_COST,
+      unitSupport: 3 * HAND_UNIT_COST,
+      gold: TEMPLE.maintenance + 3 * HAND_UNIT_COST,
     });
   });
 });
@@ -982,8 +1053,8 @@ describe('applyEconomy — income, upkeep and bankruptcy', () => {
         maintenance: 0,
         unitSupport: 0,
         units: 0,
-        // The city lifts the allowance: FREE_UNITS_PER_CITY per city plus the base.
-        freeUnits: FREE_UNITS_PER_CITY + FREE_UNITS_BASE,
+        // The city lifts the allowance: HAND_ALLOWANCE_PER_CITY per city plus the base.
+        freeUnits: HAND_ALLOWANCE_PER_CITY + FREE_UNITS_BASE,
       },
     ]);
     expect(outcome.state.players[0]?.treasury).toBe(STARTING_TREASURY + 1);
@@ -1030,7 +1101,7 @@ describe('applyEconomy — income, upkeep and bankruptcy', () => {
         unitId: asUnitId(5),
         unitType: WARRIOR.id,
         tile: asTileIndex(0),
-        saved: UNIT_SUPPORT_COST,
+        saved: HAND_UNIT_COST,
       },
       {
         type: 'UnitDisbanded',
@@ -1038,7 +1109,7 @@ describe('applyEconomy — income, upkeep and bankruptcy', () => {
         unitId: asUnitId(4),
         unitType: WARRIOR.id,
         tile: asTileIndex(0),
-        saved: UNIT_SUPPORT_COST,
+        saved: HAND_UNIT_COST,
       },
     ]);
     expect(outcome.state.units.map((kept) => Number(kept.id))).toEqual([0, 1, 2, 3]);
@@ -1066,7 +1137,7 @@ describe('applyEconomy — income, upkeep and bankruptcy', () => {
         maintenance: TEMPLE.maintenance,
         unitSupport: 0,
         units: 0,
-        freeUnits: FREE_UNITS_PER_CITY + FREE_UNITS_BASE,
+        freeUnits: HAND_ALLOWANCE_PER_CITY + FREE_UNITS_BASE,
       },
       // One gold of income against two of maintenance leaves one unpaid, and a
       // disband would not have helped: there is no unit to remove.
@@ -1270,8 +1341,8 @@ describe('the money loop reads the state, not a cache', () => {
     const without = board({ players: [player(0)], units: unitStack(FREE_UNITS_BASE, 0) });
     const oneMore = board({ players: [player(0)], units: unitStack(FREE_UNITS_BASE + 1, 0) });
 
-    expect(unitSupport(without, P0).gold).toBe(0);
-    expect(unitSupport(oneMore, P0).gold).toBe(UNIT_SUPPORT_COST);
+    expect(unitSupport(without, RULESET, P0).gold).toBe(0);
+    expect(unitSupport(oneMore, RULESET, P0).gold).toBe(HAND_UNIT_COST);
   });
 
   it('reads the rates from the state it is handed, and never rewrites a banked turn', () => {

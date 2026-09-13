@@ -108,6 +108,7 @@ import {
   hasImprovement,
   improvementDef,
   improvementsAt,
+  isDisordered,
   legalActions,
   newGame,
   planStartWork,
@@ -331,6 +332,12 @@ const cmdKey = (cmd: Command): string => {
       return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
     case 'FortifyUnit':
       return `FortifyUnit ${String(cmd.unitId)}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 
@@ -1157,6 +1164,11 @@ describe('2. improvement honesty', () => {
 
     let citiesChecked = 0;
     let pepsChecked = 0;
+    // The two branches the disorder rule above can take over these cities, counted so
+    // "the clean case is checked" and "the disordered case existed at all" are both
+    // measurements rather than hopes.
+    let cleanBranch = 0;
+    let disorderBranch = 0;
     for (const state of finals) {
       for (const city of state.cities) {
         const built = cityYields(state, RULESET, city.id);
@@ -1167,11 +1179,28 @@ describe('2. improvement honesty', () => {
         // A tile's observed delta is its raw delta because neither terrain yields
         // nor improvement deltas are ever negative in this catalog (asserted in the
         // fixture test above), so the clamp at zero cannot be doing any work here.
+        //
+        // **M9's disorder is the one case where that is not true, and it is checked
+        // rather than skipped.** `cityYields` zeroes a disordered city's `shields` and
+        // `commerce` (growth food is not accumulated either, but `food` itself is left
+        // as produced — `cities.ts` states that rule once). So in a disordered city the
+        // improvement's shield and commerce yields are *unobservable*: an improvement
+        // that is really there pays nobody, which is a fact about the city rather than
+        // about the pair list. The delta is therefore expected to be either the raw
+        // improvement delta or exactly zero on those two channels, and which one is
+        // decided by **the engine's own verdict** — `isDisordered`, the same function
+        // `cityYields` asks — never by the numbers this test is checking.
+        //
+        // Both branches are counted below and asserted non-vacuous, so the day disorder
+        // stops happening this file says so instead of silently checking one case.
+        const disordered = isDisordered(state, RULESET, city.id);
+        if (disordered) disorderBranch += 1;
+        else cleanBranch += 1;
         expect({
           food: built.food - bare.food,
           shields: built.shields - bare.shields,
           commerce: built.commerce - bare.commerce,
-        }).toEqual(expected);
+        }).toEqual(disordered ? { food: expected.food, shields: 0, commerce: 0 } : expected);
 
         citiesChecked += 1;
         pepsChecked += state.improvements.length;
@@ -1180,6 +1209,17 @@ describe('2. improvement honesty', () => {
 
     expect(citiesChecked).toBeGreaterThan(0);
     expect(pepsChecked).toBeGreaterThan(0);
+    // **Both branches of the disorder rule above were really taken.** The clean branch is
+    // the one this test has always been about; the disordered branch is M9's, and it is
+    // asserted to have happened rather than left as a branch nobody enters — the day the
+    // long play stops producing disordered cities, this says so instead of quietly
+    // checking half the rule.
+    expect(cleanBranch, 'at least one city was out of disorder').toBeGreaterThan(0);
+    expect(disorderBranch, 'at least one city was in disorder').toBeGreaterThan(0);
+    console.log(
+      'm4a improvement-honesty disorder branches:',
+      JSON.stringify({ cleanBranch, disorderBranch, citiesChecked }),
+    );
   });
 });
 
@@ -2111,6 +2151,7 @@ describe('6. goldens: what they cover, and what they do not', () => {
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
       'played-civs2-seed42-combat',
+      'played-civs2-seed42-victory',
     ]);
 
     const state = goldenState(42);

@@ -401,6 +401,12 @@ const cmdKey = (cmd: Command): string => {
       return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
     case 'FortifyUnit':
       return `FortifyUnit ${String(cmd.unitId)}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 

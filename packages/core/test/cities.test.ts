@@ -42,6 +42,7 @@ import { isExplored } from '../src/fog.js';
 import {
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asPlayerId,
   asTerrainId,
   asTileIndex,
@@ -225,6 +226,7 @@ const player = (index: number, tile: number, kind: 'civ' | 'barbarian' = 'civ'):
   // array, never an absent key — so a hand-built player literal states it, barbarians
   // included: they can never research, and the empty list is what says so.
   techs: [],
+  government: asGovernmentId('despotism'),
 });
 
 const at = (x: number, y: number): number => tileIndex(WIDTH, x, y);
@@ -245,6 +247,10 @@ const city = (id: number, owner: number, tile: number, overrides: Partial<City> 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
@@ -315,6 +321,8 @@ const state = (
   units: [],
   explored: PLAYERS.map(() => new Array<boolean>(WIDTH * HEIGHT).fill(false)),
   nextCityId: cities.length,
+
+  tileOwner: [],
   cities,
   improvements,
 });

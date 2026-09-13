@@ -65,7 +65,7 @@
 import { cityAt } from './cities.js';
 import type { GameEvent } from './commands.js';
 import { type TileIndex, type UnitId } from './ids.js';
-import { neighbors8, terrainAtIndex, type RulesetView, type TerrainRole } from './map.js';
+import { isWaterRole, neighbors8, terrainAtIndex, type RulesetView } from './map.js';
 import { placeholder, type Provenance } from './provenance.js';
 import { nextBelow } from './rng.js';
 import type { GameState, PlayerState } from './state.js';
@@ -131,7 +131,9 @@ export const HUT_REWARD_PROVENANCE: Provenance = placeholder(
  * band is never spawned onto one. The two words live here and in `commands.ts`
  * (which reads "on land" for `FoundCity`); the vocabulary is the engine's own.
  */
-const WATER_ROLES: readonly TerrainRole[] = ['ocean', 'coast'];
+// M10 moved the two-element list to `map.ts` (`WATER_ROLES`/`isWaterRole`) because a third
+// reader appeared: the domination land share also asks what ground is land. One list, three
+// readers.
 
 /**
  * Is there a hut on `tile`? A pure read of the map, and total: a tile that is not
@@ -219,7 +221,7 @@ const standable = (state: GameState, ruleset: RulesetView, tile: TileIndex): boo
   if (id === undefined) return false;
   const def = ruleset.terrains.find((terrain) => terrain.id === id);
   if (def === undefined || def.impassable) return false;
-  return !WATER_ROLES.includes(def.role);
+  return !isWaterRole(def.role);
 };
 
 /**

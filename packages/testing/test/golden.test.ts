@@ -88,9 +88,12 @@ import {
   DEFAULT_SETTINGS,
   applyCommand,
   civPlayers,
+  gameOutcomeOf,
+  outcomeFor,
   hitPointsLeftOf,
   newGame,
   planSetResearch,
+  scoreHorizon,
   spawnUnit,
   unitById,
   unitDef,
@@ -102,6 +105,7 @@ import {
   type Settings,
   type SetupError,
   type UnitId,
+  type VictoryResult,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset, type RulesetError } from '@civts/rules';
 import { canonicalize, hashValue } from '../src/index.js';
@@ -151,6 +155,14 @@ const PLAYED_ENTRY_NAME = `played-civs${String(GOLDEN_CIV_COUNT)}-seed${String(P
 const COMBAT_ENTRY_NAME = `${PLAYED_ENTRY_NAME}-combat`;
 
 /**
+ * M10's entry — the played game continued until a victory condition ends it.
+ *
+ * Named for what it is, like the other two: the map, the civilization count and the seed
+ * it starts from, plus the fact that it is the *ended* game rather than the played one.
+ */
+const VICTORY_ENTRY_NAME = `${PLAYED_ENTRY_NAME}-victory`;
+
+/**
  * How many turns the played script ends. Fixed rather than "until something
  * happens": a golden is a replay, and a loop that stopped early would make the
  * stored hash depend on the stopping rule as well as on the engine.
@@ -170,7 +182,9 @@ const GOLDEN_NOTE =
   '(seeds 1, 42, 1337; map size tiny; 2 civilizations; plus one played 30-turn game ' +
   'on seed 42, which founds a city, builds an improvement, produces a unit and a ' +
   'building, grows, researches a tech and runs the money loop; plus one battle applied ' +
-  'to that played game with AttackUnit, stored as played-civs2-seed42-combat). ' +
+  'to that played game with AttackUnit, stored as played-civs2-seed42-combat; plus that ' +
+  'played game continued to the turn limit, where the score condition ends it and seat 0 ' +
+  'wins, stored as played-civs2-seed42-victory). ' +
   'Hashes are only guaranteed for a pinned (engine revision, Node major): ' +
   'changing one requires an intentional regeneration and a "rehash: <reason>" note in the commit message.';
 
@@ -275,6 +289,16 @@ const mustState = (seed: number): GameState => {
 /** What a played game produced: the state at the end, and everything that happened. */
 interface PlayedGame {
   readonly state: GameState;
+  readonly events: readonly GameEvent[];
+}
+
+/** The played game continued to its ending: the board, the verdict, and how long it took. */
+interface VictoryGame {
+  readonly state: GameState;
+  /** Who the engine says won and by what — `gameOutcomeOf`'s own `VictoryResult`. */
+  readonly verdict: VictoryResult;
+  /** Turns played past the played entry's own 30. */
+  readonly turns: number;
   readonly events: readonly GameEvent[];
 }
 
@@ -533,6 +557,63 @@ const combatGame = (): CombatGame => {
   };
 };
 
+/**
+ * M10's victory entry: **the played game, continued until a real victory condition ends
+ * it.**
+ *
+ * M9+M10's acceptance list asks for "a played golden that INCLUDES a victory, so the end
+ * of a game is covered at hash level". This is that entry. It is deliberately the
+ * strongest version of the item available:
+ *
+ * - **It starts from the played game**, so the stored state is the end of a game a player
+ *   really played — a founded city, a finished improvement, a produced unit, a researched
+ *   tech, a completed building — and not a board arranged into a terminal shape.
+ * - **Every turn goes through the applier** (`step`, i.e. `applyCommand ... EndTurn`), so
+ *   the victory is reached by the turn loop rather than asserted about a state.
+ * - **The condition is the score condition at the horizon**, which is the one the engine
+ *   reaches unaided: `scoreVictoryTurn` is a catalog magnitude and `turn.ts` evaluates the
+ *   conditions after the money loop, so the game ends on the turn `scoreHorizon` names and
+ *   the highest-scoring civilization wins. Measured cost: 199 further turns, ~70 ms, which
+ *   is cheap enough for the fast tier and is why this is a *played* entry rather than a
+ *   second hand-built board.
+ *
+ * The `outcome` is returned alongside so the test can pin the condition, the turn and the
+ * winner — an entry whose hash moved is a regression, but an entry that stopped *ending*
+ * would be a hole this file could otherwise store silently.
+ */
+const victoryGame = (): VictoryGame => {
+  const events: GameEvent[] = [];
+  let state = playedGame().state;
+  // The loop asks the engine's total predicate (`gameOutcomeOf`), which answers "is this
+  // game over, and how" without a viewer; the *reading* a seat gets — with the `kind` and
+  // the turnaround — is taken from `outcomeFor` by the test below, so neither function is
+  // asked a question it does not answer.
+  let verdict = endingOf(state);
+  let turns = 0;
+
+  // The bound is a guard on THIS loop, not a game rule: the horizon is a catalog
+  // magnitude and a run that somehow never reached it must fail loudly rather than spin.
+  const limit = scoreHorizon(RULESET) + 1;
+  while (verdict === null && turns < limit) {
+    state = step(state, { type: 'EndTurn' }, events);
+    verdict = endingOf(state);
+    turns += 1;
+  }
+
+  if (verdict === null) {
+    throw new Error(
+      `the victory golden played ${String(turns)} turns past the ${String(
+        scoreHorizon(RULESET),
+      )}-turn horizon and no condition ever held — a victory entry that contains no victory ` +
+        'is worse than no entry at all',
+    );
+  }
+  return { state, verdict, turns, events };
+};
+
+/** Is this game over, and by what — the engine's own total predicate. */
+const endingOf = (state: GameState): VictoryResult | null => gameOutcomeOf(state, RULESET);
+
 /** The hashes this build of the engine produces, in scenario order. */
 const actualEntries = (): readonly GoldenEntry[] => [
   ...GOLDEN_SEEDS.map((seed) => ({ name: entryName(seed), hash: hashValue(mustState(seed)) })),
@@ -544,6 +625,10 @@ const actualEntries = (): readonly GoldenEntry[] => [
   // about the golden *file* covering combat, and an unstored hash gates nothing across
   // engine revisions. `combatGame` applies a real `AttackUnit` to the played world.
   { name: COMBAT_ENTRY_NAME, hash: hashValue(combatGame().state) },
+  // M10's ending, for the same reason one milestone later: an engine revision that broke
+  // the victory rule would change this hash, and the entry is what makes that a diff
+  // rather than something only a live game could notice.
+  { name: VICTORY_ENTRY_NAME, hash: hashValue(victoryGame().state) },
 ];
 
 /** One entry's stored hash, or a failure that names the entry even when the file is absent. */
@@ -631,13 +716,17 @@ describe('golden scenarios', () => {
   });
 
   it('is not vacuous: distinct scenarios produce distinct hashes', () => {
-    // Every entry — the three fresh worlds *and* the played one — must hash
+    // Every entry — the three fresh worlds *and* the three played ones — must hash
     // differently from every other. A collision between two entries would mean one of
     // them detects nothing the other does not, and between a fresh world and the
-    // played state on the same seed it would mean the play changed nothing.
-    const hashes = actualEntries().map((entry) => entry.hash);
-    expect(new Set(hashes).size).toBe(actualEntries().length);
-    expect(hashes.length).toBe(GOLDEN_SEEDS.length + 2);
+    // played state on the same seed it would mean the play changed nothing. The M10
+    // victory entry is the sharpest case of that: it starts from the played entry and
+    // adds ~199 turns, so if the two ever hashed alike the turn loop would be doing
+    // nothing that reaches the hash at all.
+    const entries = actualEntries();
+    const hashes = entries.map((entry) => entry.hash);
+    expect(new Set(hashes).size).toBe(entries.length);
+    expect(hashes.length).toBe(GOLDEN_SEEDS.length + 3);
     for (const hash of hashes) expect(hash).toMatch(/^[0-9a-f]{16}$/);
   });
 
@@ -761,6 +850,10 @@ describe('golden scenarios', () => {
       // stored state is exactly where a unit at 0 hit points would survive unnoticed, so
       // this scenario is checked by the same rule as the others rather than trusted.
       [COMBAT_ENTRY_NAME, combatGame().state],
+      // M10's ending, which is a state where the turn loop has stopped: it is checked by
+      // the same unit-health rules as every other entry, and a finished game's board is
+      // exactly where a unit left at 0 hit points would survive unnoticed.
+      [VICTORY_ENTRY_NAME, victoryGame().state],
     ];
     for (const [name, state] of scenarios) {
       expect(state.units.length, `${name} has no units to check`).toBeGreaterThan(0);
@@ -1004,7 +1097,7 @@ describe('golden scenarios', () => {
   });
 
   it('stores the played entry beside the fresh ones, under its own name', () => {
-    // The list itself: five entries, all distinct, the two played ones last and named for
+    // The list itself: six entries, all distinct, the three played ones last and named for
     // what they are. `actualEntries` is the single source both the comparison and the
     // regeneration read, so a drift between "what is checked" and "what is written"
     // is impossible by construction.
@@ -1018,14 +1111,55 @@ describe('golden scenarios', () => {
     // battle is its own scenario whose board is the played world plus an applied
     // `AttackUnit` — engine-placed combatants, engine legality, engine dice. The entry list
     // is pinned by name here *and* in the adversarial suites, which were updated with it.
+    // **M10 makes it six.** The victory entry (`VICTORY_ENTRY_NAME`) is this wave's
+    // acceptance item — "a played golden that INCLUDES a victory, so the end of a game is
+    // covered at hash level" — and it is the played game continued to the horizon rather
+    // than a board arranged into a terminal shape, so the hash covers the end of a *real*
+    // game. The entry list is pinned by name here *and* in the adversarial suites, which
+    // were updated with it.
     const entries = actualEntries();
-    expect(entries).toHaveLength(GOLDEN_SEEDS.length + 2);
+    expect(entries).toHaveLength(GOLDEN_SEEDS.length + 3);
     expect(entries.map((entry) => entry.name)).toEqual([
       ...GOLDEN_SEEDS.map(entryName),
       PLAYED_ENTRY_NAME,
       COMBAT_ENTRY_NAME,
+      VICTORY_ENTRY_NAME,
     ]);
     expect(new Set(entries.map((entry) => entry.hash)).size).toBe(entries.length);
+  });
+
+  it('stores a played game that a victory condition really ended', () => {
+    // M9+M10's acceptance item — "a played golden that INCLUDES a victory, so the end of a
+    // game is covered at hash level" — proved rather than implied. The hash alone cannot
+    // tell a game that ended from a game that ran out of script, so the ending itself is
+    // pinned: the condition, the turn and the winner, read from the stored state's own
+    // board through `outcomeFor`.
+    //
+    // The turn is asserted against `scoreHorizon(RULESET)` rather than against a written
+    // 200, so a catalog retune of the horizon moves this test with the rule instead of
+    // making it fail; the winner is asserted to be a real seat rather than "somebody".
+    const game = victoryGame();
+    const seat = PLAYER_ZERO(game.state);
+    // The seat's own reading of its ending — the function a screen and a CLI both use —
+    // so "the golden contains a victory" is asserted in the vocabulary the product speaks.
+    const reading = outcomeFor(game.state, RULESET, seat);
+    expect(reading?.kind).toBe('victory');
+    expect(reading?.condition).toBe('score');
+    expect(reading?.turn).toBe(scoreHorizon(RULESET));
+    expect(reading?.winner).toBe(seat);
+    expect(game.state.turn).toBe(scoreHorizon(RULESET));
+    expect(game.verdict.condition).toBe('score');
+    // The turn count is a *report*, not a rule — the rule is the horizon pinned above.
+    // What matters is that the loop really played turns, so the ending was reached by
+    // play rather than read off a state that was already terminal.
+    expect(game.turns).toBeGreaterThan(0);
+
+    // Non-vacuity, in the two directions that matter: the game was *still in play* at the
+    // played entry's own end (so the condition is reached by the turns this entry adds,
+    // not inherited), and the turn loop stopped because the game was over rather than
+    // because the guard ran out.
+    expect(endingOf(playedGame().state)).toBeNull();
+    expect(game.turns).toBeLessThan(scoreHorizon(RULESET) + 1);
   });
 
   it('names the reason when a ruleset cannot populate the world', () => {

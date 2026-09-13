@@ -35,6 +35,27 @@
  * reading the pixels cannot reveal terrain the player has not explored. That is a presentation
  * decision and it is stated here rather than implied.
  *
+ * ## Borders (M9)
+ *
+ * The ownership layer (`state.tileOwner`) is drawn as a **per-player tint along the edges where
+ * ownership changes**. Three things about that are decisions rather than details:
+ *
+ * - **Ownership is read, never derived.** `ownerAt` is `borders.ts`' own read of the layer, so the
+ *   tile the map paints as mine is the tile `planSetWorkedTiles` refuses to a rival — one
+ *   statement of who owns what, asked from the presentation layer rather than written again here.
+ * - **The colour is the app's, not this module's.** `FrameInput.ownerColour` is the *same*
+ *   `colourOfPlayer` lookup the unit and city markers already use, so a player is one colour
+ *   everywhere on the canvas instead of one colour per layer.
+ * - **A border is drawn only on an explored tile.** Fog is the engine's memory (`state.explored`),
+ *   and painting a rival's territory the player has never seen would reveal through the border
+ *   exactly what the flat fog colour refuses to reveal through the terrain. So an unexplored tile
+ *   never carries a tint even when the layer says it is owned; the draw trace still reports the
+ *   ownership the layer holds, and `border` says whether a band was painted.
+ *
+ * The band is `fillRect` rather than a stroke: an integer-aligned fill of a known thickness lands
+ * on whole pixels, so the e2e suite can sample inside a border and read the owner's own colour
+ * rather than whatever a stroked path anti-aliased into.
+ *
  * ## Determinism
  *
  * Integer arithmetic, comparisons and `Math.floor`/`Math.round`/`Math.min`/`Math.max` only. No
@@ -44,9 +65,11 @@
  */
 
 import {
+  UNOWNED,
   asTileIndex,
   indexToX,
   indexToY,
+  ownerAt,
   type GameState,
   type TileIndex,
   type UnitId,
@@ -112,6 +135,18 @@ export interface DrawEntry {
   readonly x: number;
   readonly y: number;
   readonly terrain: string;
+  /**
+   * The owner the engine's `tileOwner` layer holds for this tile, or `null` when the layer says
+   * `UNOWNED`. Copied verbatim: the trace is a claim about the frame, and the frame read the
+   * layer, so a test can compare this against `state.tileOwner` tile for tile.
+   */
+  readonly owner: number | null;
+  /**
+   * Was a border band painted on this tile? True only where the tile is owned, the player has
+   * explored it, and at least one of its four neighbours is owned by somebody else (or by
+   * nobody, or is off the map) — see the module note on fog and on the edges of the world.
+   */
+  readonly border: boolean;
 }
 
 /**
@@ -173,6 +208,16 @@ export interface CityMarker {
   readonly colour: string;
 }
 
+/**
+ * The colour a player's things are painted in — the app's own palette, asked by the renderer.
+ *
+ * A function rather than a copy of the palette, and deliberately: the unit markers, the city
+ * markers and the territory tint all ask this one lookup (`main.ts`' `colourOfPlayer`), so "which
+ * colour is player 2?" has one answer in this app rather than one per drawing layer. The renderer
+ * is still a pure function of its input — the palette is an input, and it never changes mid-frame.
+ */
+export type OwnerColour = (owner: number) => string;
+
 /** Everything a frame needs, all of it copied from the state or from presentation state. */
 export interface FrameInput {
   readonly state: GameState;
@@ -182,6 +227,8 @@ export interface FrameInput {
   readonly viewport: ViewportPx;
   readonly units: readonly UnitMarker[];
   readonly cities: readonly CityMarker[];
+  /** The colour per player, for the territory tint (M9) — see `OwnerColour`. */
+  readonly ownerColour: OwnerColour;
   readonly cursor: { readonly x: number; readonly y: number } | null;
 }
 
@@ -209,24 +256,69 @@ export const darken = (colour: string, t: number): string => {
   return `rgb(${String(mix(r))}, ${String(mix(g))}, ${String(mix(b))})`;
 };
 
+/** The ownership layer's value on a tile, or `UNOWNED` for a tile that is off the map. */
+const ownerOn = (state: GameState, x: number, y: number): number => {
+  if (x < 0 || y < 0 || x >= state.map.width || y >= state.map.height) return UNOWNED;
+  return ownerAt(state, asTileIndex(y * state.map.width + x)) ?? UNOWNED;
+};
+
+/**
+ * Which of a tile's four outer edges a border band belongs on: the ones where the neighbour's
+ * owner differs from this tile's. Off the map counts as unowned, so the edge of the world is the
+ * edge of a territory rather than a border that stops one column early.
+ */
+interface BorderEdges {
+  readonly left: boolean;
+  readonly right: boolean;
+  readonly up: boolean;
+  readonly down: boolean;
+}
+
+const borderEdges = (state: GameState, x: number, y: number, owner: number): BorderEdges => ({
+  left: ownerOn(state, x - 1, y) !== owner,
+  right: ownerOn(state, x + 1, y) !== owner,
+  up: ownerOn(state, x, y - 1) !== owner,
+  down: ownerOn(state, x, y + 1) !== owner,
+});
+
+/** One owned tile's pending tint: where it is, in whose colour, and on which of its edges. */
+interface Territory {
+  readonly x: number;
+  readonly y: number;
+  readonly colour: string;
+  readonly edges: BorderEdges;
+}
+
 /**
  * Draw one frame of the map and report what it drew.
  *
  * The walk is the projection's own `visibleTileBounds`, clipped to the map, and the fill is
  * `view.ts`'s `tileRect` — the *same* rectangle the hit-test inverts. A tile's terrain id comes
  * from `state.map.terrain` (an engine read), its explored flag from `state.explored[viewer]`
- * (also an engine read), and nothing else on the tile is inspected.
+ * (also an engine read), and its owner from `borders.ts`' `ownerAt` over `state.tileOwner` — the
+ * M9 ownership layer, read rather than recomputed. Nothing else on the tile is inspected.
+ *
+ * Draw order is terrain, then territory, then cities, then units: a border band is drawn along the
+ * tiles' outer edges and both kinds of marker are corner-anchored, so a marker drawn last is never
+ * swallowed by a band — which is what keeps "the colour at a tile's centre" a claim about terrain
+ * rather than about who owns the tile.
  */
 export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   const { state, camera, viewport } = input;
   const extent = { width: state.map.width, height: state.map.height };
   const bounds = visibleTileBounds(camera, extent, viewport);
   const exploredRow = state.explored[input.viewer];
+  const size = tileRect(camera, 0, 0).size;
+  // The band's thickness in CSS pixels, from the tile's own size: at the default zoom a tile is
+  // 32 px and the band is 4, so it is visible at a glance and still leaves the tile's centre —
+  // where the pixel tests sample terrain — untouched.
+  const band = Math.max(2, Math.round(size / 8));
 
   ctx.fillStyle = rgbCss(FOG_COLOUR);
   ctx.fillRect(0, 0, viewport.width, viewport.height);
 
   const tiles: DrawEntry[] = [];
+  const territories: Territory[] = [];
   for (let y = bounds.y0; y <= bounds.y1; y += 1) {
     for (let x = bounds.x0; x <= bounds.x1; x += 1) {
       if (tiles.length >= DRAW_TRACE_LIMIT) break;
@@ -239,6 +331,7 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
       if (terrainId === undefined) continue;
       const rect = tileRect(camera, x, y);
       const explored = exploredRow?.[tile] === true;
+      const owner = ownerOn(state, x, y);
       ctx.fillStyle = rgbCss(explored ? terrainColour(terrainId) : FOG_COLOUR);
       ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
       // A one-pixel grid line, drawn inside the tile so neighbouring fills never land on a
@@ -249,17 +342,45 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
         ctx.lineWidth = 1;
         ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
       }
+      // Territory is collected here and painted after the walk (see the module note on draw
+      // order), because the band must not be covered by the next tile's terrain fill.
+      const banded = explored && owner !== UNOWNED;
+      const edges = banded ? borderEdges(state, x, y, owner) : undefined;
+      if (edges !== undefined) {
+        territories.push({
+          x: rect.x,
+          y: rect.y,
+          colour: input.ownerColour(owner),
+          edges,
+        });
+      }
       // The index is a real one: the walk is inside the map's own bounds, and the terrain lookup
       // above is what proved it. `asTileIndex` is the engine's own constructor for the branded id
       // — a widening, not an escape hatch.
-      tiles.push({ tile: asTileIndex(tile), x, y, terrain: terrainId });
+      tiles.push({
+        tile: asTileIndex(tile),
+        x,
+        y,
+        terrain: terrainId,
+        owner: owner === UNOWNED ? null : owner,
+        border: edges !== undefined && (edges.left || edges.right || edges.up || edges.down),
+      });
     }
+  }
+
+  // The ownership tint: one band per edge where ownership changes, in the owner's own colour.
+  for (const territory of territories) {
+    const { x, y, edges } = territory;
+    ctx.fillStyle = rgbCss(territory.colour);
+    if (edges.left) ctx.fillRect(x, y, band, size);
+    if (edges.right) ctx.fillRect(x + size - band, y, band, size);
+    if (edges.up) ctx.fillRect(x, y, size, band);
+    if (edges.down) ctx.fillRect(x, y + size - band, size, band);
   }
 
   // Markers, deliberately small and corner-anchored: the pixel tests sample a tile's CENTRE, and
   // a marker that covered the centre would make "the colour of grassland" depend on what was
   // standing there. A marker therefore never reaches the middle of a tile.
-  const size = tileRect(camera, 0, 0).size;
   for (const city of input.cities) {
     const rect = tileRect(camera, indexToX(state.map, city.tile), indexToY(state.map, city.tile));
     if (!onScreen(rect.x, rect.y, viewport)) continue;

@@ -15,6 +15,7 @@ import {
   TERRAIN_ROLES,
   UNIT_ROLES,
   asBuildingId,
+  asGovernmentId,
   asImprovementId,
   asResourceId,
   asTechId,
@@ -23,12 +24,14 @@ import {
   err,
   isPlaceholder,
   ok,
+  RATE_TOTAL,
   placeholder,
   cited,
   type BuildingDef,
   type BuildingEffect,
   type BuildingEffectKind,
   type Fidelity,
+  type GovernmentId,
   type ImprovementDef,
   type ImprovementKind,
   type Provenance,
@@ -191,6 +194,34 @@ export interface Catalog {
    * applied to the one M6 magnitude that was still buried in logic.
    */
   readonly capture: CaptureSpec;
+  /**
+   * **The culture and contentment model — M9's section.** Required, like `combat` and
+   * `capture`, and required *in fact*: `borders.ts`' `cultureRulesOf` and `happiness.ts`'
+   * `happinessRulesOf` read every magnitude from the ruleset they are handed and keep no
+   * copy, so a catalog without this section is a game whose borders and whose disorder
+   * have no rules at all. `validateRuleset` refuses such a catalog.
+   */
+  readonly culture: CultureSpec;
+  /**
+   * **The government rows — M9's catalog.** Required, and required *in fact*: every
+   * player in a `GameState` carries a `government` id (`newGame` stamps the default row
+   * on civilizations and barbarians alike), `economy.ts` reads two magnitudes from the
+   * row on every money-loop iteration, and validation requires the section to be
+   * non-empty with exactly one row flagged as the default.
+   */
+  readonly governments: readonly GovernmentSpec[];
+  /**
+   * **The score weights — M10's section.** Required, like `combat`: `core/score.ts`
+   * keeps no copy of any weight, so a catalog without it is a game whose scoreboard has
+   * no basis.
+   */
+  readonly score: ScoreSpec;
+  /**
+   * **The victory thresholds — M10's section.** Required, like `combat`: `core/victory.ts`
+   * reads all four from the ruleset it is handed, so a catalog without it is a game that
+   * cannot end.
+   */
+  readonly victory: VictorySpec;
 }
 
 /**
@@ -287,6 +318,78 @@ export interface BuildingSpec extends BuildingDef {
   readonly maintenance: number;
   /** What it does for its own city; `[]` is "nothing yet", not "unknown". */
   readonly effects: readonly BuildingEffect[];
+  /**
+   * Culture this building gives **its own city every turn** while it stands
+   * (INTERFACES.md M9: "`BuildingSpec` gains required `culturePerTurn`, an integer
+   * `>= 0`").
+   *
+   * **Required, and required in fact rather than by convention.** Every shipped row
+   * below states a number, including the rows that state `0`, because the contract makes
+   * it required and because "how much culture is this building worth?" is a question a
+   * content author has to answer rather than inherit: a row that said nothing would be a
+   * building whose culture is whatever a reader assumed. It cannot be a required
+   * *property* for the mechanical reason `UnitSpec.hitPoints` is not one — the engine's
+   * structural `BuildingDef` (in `core/cities.ts`, which this package does not own)
+   * declares it optional, and `@civts/sim`'s override applier rebuilds a `BuildingSpec`
+   * field by field — so, exactly as with `hitPoints`, `validateRuleset` is where the
+   * requirement is enforced: a building row that declares no `culturePerTurn` at all is
+   * refused alongside one that declares a fraction or a negative.
+   *
+   * **It is read on the `cityCultureGrew` path, not projected onto an effect.** The
+   * engine's `BuildingEffect` union has no culture member and M9 does not add one: the
+   * contract spells the field on the *spec* and `core/culture.ts`' `culturePerTurnOf`
+   * reads it there, so a building's per-turn culture has one home (the row) and one
+   * reader (the culture pass). `happiness` below takes the *other* route on purpose —
+   * see its own note for why the two differ.
+   */
+  readonly culturePerTurn?: number;
+  /**
+   * Culture granted **once**, to the completing city, at the moment this building is
+   * finished (INTERFACES.md M9: "`cultureBonus` (wonders only, one-off)").
+   *
+   * **Wonders only, enforced.** `validateRuleset` refuses a non-wonder row that declares
+   * a non-zero bonus, and refuses a wonder that declares a non-positive one. Both halves
+   * are rules rather than tidiness: the contract says "wonders only", so a temple with a
+   * one-off would be content contradicting the frozen interface; and a wonder with no
+   * bonus would be a wonder that does nothing special on completion, which is the one
+   * moment a wonder *is* special in this engine (it has no other global effect).
+   *
+   * Absent means "no bonus", never `undefined` — `0` is refused rather than accepted as a
+   * synonym, so a row that means "no bonus" says nothing and a row that declares this
+   * field is making a claim the validator checks.
+   */
+  readonly cultureBonus?: number;
+  /**
+   * Content citizens this building makes — the number the contract spells
+   * `BuildingSpec.happiness` (INTERFACES.md M9, "Happiness": "*happy from buildings*").
+   *
+   * **Required in fact, optional in type**, for exactly the reason `culturePerTurn` is:
+   * the engine's structural `BuildingDef` does not declare it, so `validateRuleset`
+   * enforces the contract's "required" and every shipped row states one (including the
+   * zeros).
+   *
+   * ## Why this one *is* projected onto an effect and `culturePerTurn` is not
+   *
+   * A city's contentment is a *sum of the things that affect it*, and that sum is
+   * computed by `core/buildings.ts`' `effectTotals`, which folds `BuildingEffect`s. So
+   * `@civts/rules` projects this field onto a `{ kind: 'city-happiness', amount }` effect
+   * **once, at validation time** — the single place a spec row becomes an effect — and
+   * `BuildingDef` (the engine's view) deliberately carries no `happiness` field, so there
+   * is exactly one path from content into a city's contentment and no second reader
+   * (`cities.ts`' `cityYields` asks `happiness.ts`, which asks the effect total).
+   *
+   * `culturePerTurn` is not projected because nothing *sums* it: the culture pass walks
+   * each city's own building ids and reads each row's number, so an effect row would be a
+   * second copy of a number with no summer to keep it honest. **The rule is the same in
+   * both cases — one home per magnitude — and the two fields differ only in whether an
+   * existing summer wants them.** Saying so here, rather than leaving a reader to notice
+   * the asymmetry, is the point.
+   *
+   * Signed, so a `-1` row is legal: an unhappy-making building is a rule this union can
+   * express (`city-happiness` is signed) and a content author may want one. The shipped
+   * catalog has none.
+   */
+  readonly happiness?: number;
   /** Present (and `true`) only for a wonder. Absent means "ordinary building". */
   readonly wonder?: true;
   /**
@@ -540,6 +643,311 @@ export interface CaptureSpec {
   readonly provenance: Provenance;
 }
 
+/**
+ * **The culture section of the catalog** (M9) — the two culture thresholds that decide
+ * how far a city's borders reach, the contentment ladder that decides when a city is in
+ * disorder, and the two luxury magnitudes that decide how many of its citizens are
+ * content.
+ *
+ * ## Why these are one section rather than three
+ *
+ * They are one *model*: what a city's accumulated culture and its buildings' contentment
+ * do to the city. `borders.ts`' `cultureRulesOf` and `happiness.ts`' `happinessRulesOf`
+ * both read this section, and the split between them is a split of *readers*, not of
+ * tables — a section per reader would be three names for one set of magnitudes, which is
+ * exactly the "one rule, two places" shape this project refuses. Keeping them together
+ * also makes the sweep's job honest: a balance sweep over `RulesetPatch.culture` moves
+ * the whole contentment-and-borders model, and a sweep that moved the border thresholds
+ * without the happiness ladder could not answer "is the game winnable culturally *because*
+ * it is also governable".
+ *
+ * ## The thresholds are `>=` and the ladder is ascending
+ *
+ * `borderRadius2Culture <= culture` (not `<`) is the rule the engine implements
+ * (`borders.ts`' `claimedRadius`), so the numbers here are the *first* culture value at
+ * which the radius applies: a city whose culture reaches exactly
+ * `borderRadius2Culture` claims radius 2, and one point below it claims radius 1. Both
+ * thresholds are checked as **one ascending pair** rather than as two independent
+ * bounds, because a `borderRadius3Culture` below `borderRadius2Culture` is not a
+ * stricter ruleset, it is a rule that can never fire: `claimedRadius` tests radius 3
+ * first, so the radius-2 threshold would be dead data.
+ *
+ * `unhappyThresholds` is a ladder for the same reason and is checked the same way:
+ * ascending, strictly, with the first rung at `minPopulation <= 1`, so that a city of
+ * size 1 has a defined unhappy count. The ladder is **explicit about its rungs** rather
+ * than implied by array index — a row states the population it starts at — because a
+ * content author adding a rung in the middle must not have to renumber the ones after
+ * it, and because an implied index is a magnitude that is not written down anywhere a
+ * reader can see it.
+ *
+ * ## Provenance: placeholder, every number
+ *
+ * Every magnitude below is an **unsourced value of ours, chosen to be playable**. Civ 3
+ * has a culture model (accumulated culture, city-radius expansion at 10/100/1000 for the
+ * second ring and beyond, and a happiness model with luxuries, entertainers and
+ * government-specific content/unhappy citizens) and this engine is **Civ-3-SHAPED, not
+ * Civ 3**: the *shape* — cumulative culture expanding a city's reach, luxuries making
+ * citizens content, size making them unhappy — is deliberate; the numbers are not Civ
+ * 3's, are not measured from it, and are not claimed to match it. Every one of them is
+ * `placeholder`, so `fidelity: 'cited-only'` refuses this section like every other.
+ */
+export interface CultureSpec {
+  /**
+   * The culture at which a city's borders reach radius 2. Integer `>= 0`, and
+   * `<= borderRadius3Culture`.
+   *
+   * The radius-1 ring is **not** in this section: every city claims its eight
+   * neighbours and its own tile from the moment it is founded, which is a rule (a city
+   * with no culture still occupies the ground it stands on) rather than a threshold.
+   * Written down here so a reader does not go looking for a third number.
+   */
+  readonly borderRadius2Culture: number;
+  /** The culture at which a city's borders reach radius 3. Integer `>= borderRadius2Culture`. */
+  readonly borderRadius3Culture: number;
+  /**
+   * The ladder from city size to unhappy citizens, **ascending by `minPopulation`**.
+   *
+   * Read by `happiness.ts`' `unhappyFromSize` as "the highest rung whose
+   * `minPopulation <= population`", so a city of size 5 under the shipped ladder
+   * (`1→0`, `3→1`, `6→2`, `10→4`) has 1 unhappy citizen.
+   */
+  readonly unhappyThresholds: readonly UnhappyThresholdSpec[];
+  /**
+   * How many connected luxury resources make one citizen content. Integer `>= 1`.
+   *
+   * `1` is legal and means "every connected luxury contented one citizen", which is the
+   * most generous setting this field can express; `0` is refused because
+   * `floor(luxuries / 0)` is `Infinity`, a value no state can hold.
+   */
+  readonly luxuriesPerHappyCitizen: number;
+  /**
+   * How much a **single** connected luxury resource is worth, as happiness, on top of
+   * the `luxuriesPerHappyCitizen` count above. Integer `>= 0`.
+   *
+   * This is deliberately a second, additive term rather than a replacement for the
+   * first. The two answer different questions a player asks separately — "do I have
+   * enough luxuries?" (`luxuriesPerHappyCitizen`) and "does *this* luxury help me?"
+   * (this field) — and the contract's happiness rule names both ("happy from buildings +
+   * luxury resources + luxury spending"), which is why the engine computes both and adds
+   * them. A catalog that wants only the count sets this to 0, which is a legal, stated
+   * position rather than a degenerate one.
+   */
+  readonly happyPerLuxuryResource: number;
+  readonly provenance: Provenance;
+}
+
+/**
+ * One rung of `CultureSpec.unhappyThresholds`: the city size at which a count of
+ * unhappy citizens begins to apply.
+ *
+ * A row rather than a plain number because the ladder's *steps* are the rule: a bare
+ * `[0, 1, 2, 4]` array is a magnitude (the step size) that lives in logic — "three
+ * citizens per extra unhappy citizen" would be an unwritten rule of the array's
+ * indices — while `{ minPopulation: 6, unhappy: 2 }` states both numbers a reader or a
+ * sweep needs.
+ */
+export interface UnhappyThresholdSpec {
+  /** The lowest city size at which this rung applies. Integer `>= 1`. */
+  readonly minPopulation: number;
+  /** How many of the city's citizens are unhappy from size alone. Integer `>= 0`. */
+  readonly unhappy: number;
+}
+
+/**
+ * **The government section of the catalog** (M9) — one row per government, carrying the
+ * four magnitudes that make a government mean something in this engine.
+ *
+ * ## What a government *is*, here
+ *
+ * Four numbers and a name. This engine has no palace, no revolution, no senate and no
+ * diplomatic consequences; what it has is M4b's economy and M9's contentment, and a
+ * government is exactly the set of dials those two systems let a ruler turn:
+ *
+ * - `rateCaps` — how far the tax/science/luxury sliders may go (M4b's `RATE_TOTAL` rule
+ *   says the three *sum* to 10; these caps say how the ten may be *distributed*, which
+ *   is why a despotism cannot run 0/0/10 and a republic can);
+ * - `freeUnitsPerCity` and `unitSupportCost` — what an army costs (M4b's two module
+ *   constants, relocated here);
+ * - `happinessModifier` — what being ruled this way does to contentment (M9's new
+ *   magnitude).
+ *
+ * ## M4b's two constants are RELOCATED, not rebalanced
+ *
+ * `FREE_UNITS_PER_CITY = 2` and `UNIT_SUPPORT_COST = 1` lived in `core/economy.ts`.
+ * They move here as the `despotism` row's two numbers — **exactly**, so a game played
+ * under despotism bills its army at the same price as before this wave, and the M4b
+ * goldens survive the relocation. If a golden moves after this section appears, the
+ * despotism row changed a number it was not supposed to.
+ *
+ * ## Provenance: placeholder, all of it
+ *
+ * Civ 3 has governments (despotism, monarchy, republic, democracy, communism, fascism)
+ * and each has its own support and happiness rules. This engine ships three and the
+ * *shape* is deliberately Civ-3-like — a repressive default with a low free-unit
+ * allowance, a monarchy that supports a bigger army, a republic that pays for its army
+ * but keeps its people happier — while every number below is **ours, unsourced and
+ * chosen to be playable**. No row is a Civ 3 figure, the anarchy/revolution transition
+ * is not modelled at all (see `core/governments.ts`), and `fidelity: 'cited-only'`
+ * refuses this section like every other.
+ */
+export interface GovernmentSpec {
+  readonly id: GovernmentId;
+  readonly name: string;
+  /** The highest each slider may reach. Integers `>= 0` and `<= RATE_TOTAL`. */
+  readonly rateCaps: GovernmentRateCaps;
+  /** Units supported for free per city owned. Integer `>= 0`. */
+  readonly freeUnitsPerCity: number;
+  /** Gold per turn per unit beyond the free allowance. Integer `>= 0`. */
+  readonly unitSupportCost: number;
+  /** Added to a city's unhappy count. Signed integer. */
+  readonly happinessModifier: number;
+  /**
+   * The tech a player must know to adopt this government. Absent for one available from
+   * the start. `validateRuleset` rejects an unknown tech, in the same block that checks
+   * every other row's `requiresTech`.
+   */
+  readonly requiresTech?: TechId;
+  readonly provenance: Provenance;
+}
+
+/** The per-slider ceilings a government imposes. Every field `>= 0` and `<= RATE_TOTAL`. */
+export interface GovernmentRateCaps {
+  readonly tax: number;
+  readonly science: number;
+  readonly luxury: number;
+}
+
+/**
+ * **The score section of the catalog** (M10) — the five weights a player's score is the
+ * sum of.
+ *
+ * ## One function, five numbers
+ *
+ * `core/score.ts` is the only scorer in the engine, and these are the only magnitudes in
+ * it: `score = perPopulation * (citizens) + perCity * (cities) + perTech * (techs) +
+ * perCulture * (culture) + perWonder * (wonders)`. Everything else about the score — that
+ * it is a *derived* read, that it counts civilizations only, that ties break toward the
+ * lower player id — is a rule and lives in that module.
+ *
+ * ## Why a weight of 0 is legal and meaningful
+ *
+ * A catalog may say "culture does not count toward this game's score" by setting
+ * `perCulture: 0`. That is a tuning position rather than a degenerate section — the
+ * other four weights still order the players — and refusing it would make the sweep
+ * unable to ask the question "what does the game look like if only territory matters?".
+ * The *section* being absent is different and is refused, because a catalog with no
+ * score section is one whose score nobody chose.
+ *
+ * ## Provenance: placeholder, all five
+ *
+ * Civ 3's score is a per-turn accumulation over territory, population, content citizens,
+ * techs, wonders and future tech, rescaled against the game's difficulty and the
+ * turn-limit scale. **This engine's score is a different thing wearing similar
+ * vocabulary**: a single end-of-turn integer whose weights are ours, unsourced, and
+ * chosen only so that a scoreboard orders players sensibly. None of the five is a Civ 3
+ * figure and `fidelity: 'cited-only'` refuses the section.
+ */
+export interface ScoreSpec {
+  /** Score per citizen in the player's cities. Integer `>= 0`. */
+  readonly perPopulation: number;
+  /** Score per city owned. Integer `>= 0`. */
+  readonly perCity: number;
+  /** Score per technology known. Integer `>= 0`. */
+  readonly perTech: number;
+  /** Score per point of accumulated culture (the derived player total). Integer `>= 0`. */
+  readonly perCulture: number;
+  /** Score per wonder held. Integer `>= 0`. */
+  readonly perWonder: number;
+  readonly provenance: Provenance;
+}
+
+/**
+ * **The victory section of the catalog** (M10) — the four thresholds a game can end at.
+ *
+ * ## Four conditions, four numbers, and one of them is a turn
+ *
+ * | condition | threshold | field |
+ * |---|---|---|
+ * | conquest | last civilization standing | *(none — it is a structural rule)* |
+ * | domination | land **or** population share | `dominationLandPct`, `dominationPopPct` |
+ * | cultural | accumulated player culture | `culturalVictoryCulture` |
+ * | score | the turn limit | `scoreVictoryTurn` |
+ *
+ * Conquest has no number because it has no threshold: "every other civilization has no
+ * cities" is `core/victory.ts`' `conquestWinner`, a shape of the board rather than a
+ * magnitude. Nothing here can be turned to make conquest easier or harder, which is
+ * worth stating so a sweep does not go looking for the knob.
+ *
+ * ## The two percentages are compared with INTEGER arithmetic
+ *
+ * `victory.ts`' `dominationWinner` tests `owned * 100 >= pct * total` rather than
+ * `owned / total >= pct / 100`, because the second form is floating-point division in a
+ * determinism-critical module (`packages/core` may not use transcendentals, and a
+ * float comparison is a rounding decision at exactly the boundary a threshold test
+ * lives on). That is why `pct` is an integer percentage rather than a fraction, and why
+ * the boundary is `>=`: **a player holding exactly the stated percentage wins**, which
+ * the adversarial boundary tests pin at the value and one step below.
+ *
+ * ## A `scoreVictoryTurn` behind the runner's `maxTurns` is a game nobody can win
+ *
+ * `scoreVictoryTurn` is the **turn at which the score victory is decided** — the
+ * contract's "at turn limit" — and it is deliberately a *catalog* horizon rather than
+ * the experiment budget `SimulationOptions.maxTurns`. A simulation that stops at
+ * `maxTurns: 100` while the catalog's horizon is 200 stops because the *experiment*
+ * ended, with no winner: `stoppedBecause: 'max-turns'`. That distinction is stated here
+ * because conflating the two would make every short simulation claim a score victory.
+ * A value of `Number.MAX_SAFE_INTEGER` is legal and means "this ruleset has no score
+ * victory", which the shipped catalog does **not** use.
+ *
+ * `culturalVictoryCulture` is compared with `>=` ("a player whose culture reaches the
+ * threshold wins", never "exceeds"), so the boundary is the value itself.
+ *
+ * ## Provenance: placeholder, all four
+ *
+ * Civ 3's victory conditions are conquest, domination (two thirds of the land and
+ * population), cultural (100,000 culture, or 20,000 per city), diplomatic, spaceship and
+ * Histographic. **This engine ships four of those names and none of those numbers**:
+ * the two percentages, the culture threshold and the turn horizon are ours, unsourced,
+ * chosen so that a game of a few hundred turns can plausibly end under each of them,
+ * and are not presented as Civ 3's. There is no diplomatic, spaceship or wonder victory
+ * here, and `fidelity: 'cited-only'` refuses the section.
+ */
+export interface VictorySpec {
+  /**
+   * The share of the world's **claimed** land a player must hold to win by domination.
+   * Integer percentage, and the comparison is `>=`. `1..100`.
+   *
+   * "Claimed" rather than "all": the denominator is the number of tiles any
+   * civilization's culture has claimed, because the map's size is an experiment's
+   * choice. A world where nothing is claimed cannot fire this condition, which is
+   * `victory.ts`' rule rather than a special case here.
+   */
+  readonly dominationLandPct: number;
+  /**
+   * The share of the world's **civilian** population a player must hold to win by
+   * domination. Integer percentage, compared with `>=`. `1..100`.
+   *
+   * Barbarians have no population and no cities (`civPlayers()` decides what a
+   * civilization is), so they are not in the denominator and cannot win by this route.
+   */
+  readonly dominationPopPct: number;
+  /**
+   * The accumulated culture a player needs to win culturally. Integer `>= 1`,
+   * compared with `>=`.
+   *
+   * Measured on the **derived** player total (`core/culture.ts`' `playerCulture` — the
+   * sum of that player's cities' accumulated culture), because no player-level culture is
+   * stored.
+   */
+  readonly culturalVictoryCulture: number;
+  /**
+   * The turn at which the score victory is decided: the player with the highest score
+   * wins, and a tie is a `draw` with `winner: null`. Integer `>= 1`.
+   */
+  readonly scoreVictoryTurn: number;
+  readonly provenance: Provenance;
+}
+
 export type RulesetError =
   | { readonly kind: 'empty-catalog'; readonly catalog: string }
   | { readonly kind: 'duplicate-id'; readonly catalog: string; readonly id: string }
@@ -628,6 +1036,29 @@ export interface Ruleset {
    * carries it.)
    */
   readonly capture: CaptureSpec;
+  /**
+   * **M9's culture and contentment model**, carried through validation unchanged.
+   *
+   * `RulesetView` does not declare the field (it is the engine's structural view, and
+   * `borders.ts`/`happiness.ts` read their sections structurally, total over a missing
+   * one), so this is the *typed* home of the same data — which is what makes the shipped
+   * catalog's numbers reachable as numbers by a test or a sweep rather than only as
+   * untyped reads. Every real game is played on a validated `Ruleset`, which always
+   * carries it.
+   */
+  readonly culture: CultureSpec;
+  /**
+   * **M9's government rows**, carried through validation unchanged — the same argument
+   * as `culture`, and one more: `core/governments.ts`' `governmentDef` reads this list
+   * for every rate check, every free-unit allowance and every happiness modifier, and a
+   * validated ruleset that dropped it would leave every player's government nameable but
+   * meaningless.
+   */
+  readonly governments: readonly GovernmentSpec[];
+  /** **M10's score weights**, carried through unchanged. See `Ruleset.culture`. */
+  readonly score: ScoreSpec;
+  /** **M10's victory thresholds**, carried through unchanged. See `Ruleset.culture`. */
+  readonly victory: VictorySpec;
   readonly fidelity: Fidelity;
 }
 
@@ -998,6 +1429,10 @@ export const CATALOG: Catalog = {
       // a technology in front of it would move the *earliest* building in the game
       // behind a research step, which is a playability decision M6 does not make — the
       // gated building below is a later, larger investment instead.
+      // M9: no culture and no contentment — a granary is about food, and this row says
+      // so with the two zeros rather than by omitting the fields.
+      culturePerTurn: 0,
+      happiness: 0,
       provenance: placeholder(
         'unsourced: cost, zero maintenance and the growth-food amount are ours, chosen to be playable; ' +
           'the one building here that is free to keep, so an early city is never bankrupted by its first build',
@@ -1012,6 +1447,9 @@ export const CATALOG: Catalog = {
       // units, and combat is M6. A shield multiplier is the nearest placeholder
       // the M4c effect union offers, and it is NOT a claim about Civ 3.
       effects: [{ kind: 'shield-multiplier', pct: 25 }],
+      // M9: no culture, no contentment.
+      culturePerTurn: 0,
+      happiness: 0,
       provenance: placeholder(
         'unsourced: this cost, the 1 gold maintenance and the 25% shield placeholders are ours; ' +
           'the veteran-unit effect a barracks is really for arrives with combat in M6, so this multiplier is a stand-in',
@@ -1025,6 +1463,9 @@ export const CATALOG: Catalog = {
       // Same stand-in discipline as the barracks: defense is M6, so the row
       // declares a placeholder shield multiplier and says it is one.
       effects: [{ kind: 'shield-multiplier', pct: 25 }],
+      // M9: no culture, no contentment.
+      culturePerTurn: 0,
+      happiness: 0,
       provenance: placeholder(
         'unsourced: this cost, the 1 gold maintenance and the 25% shield placeholders are ours; ' +
           'no defensive effect is modelled until combat arrives in M6, so this multiplier is a stand-in, not a claim',
@@ -1035,8 +1476,11 @@ export const CATALOG: Catalog = {
       name: 'Temple',
       cost: 15,
       maintenance: 1,
-      // A temple is about contentment, which is M9; the commerce multiplier is
-      // the placeholder the union offers and the note says exactly that.
+      // M9 keeps the commerce multiplier (it is M4c's tuning, untouched) and adds the
+      // two fields a temple is actually *for*: `culturePerTurn` and `happiness`, below.
+      // The note is retuned to say so, because its M4c wording ("no happiness effect is
+      // modelled until M9") became false the moment M9 landed — a stale provenance note
+      // is a false claim about this row.
       effects: [{ kind: 'commerce-multiplier', pct: 25 }],
       // M6: the gated building. **This is the row that makes "M6 content actually uses the
       // gates M5 built" true for buildings**, so a later retune that removes it silently
@@ -1048,10 +1492,20 @@ export const CATALOG: Catalog = {
       // the gate rather than about one opening strategy. The row is otherwise untouched:
       // its cost and effects are M4c's placeholders, not M6's.
       requiresTech: asTechId('ceremonial-burial'),
+      // M9: **a temple is the first culture-producing building**, and its 25% commerce
+      // multiplier above stops being a stand-in for happiness the moment this field
+      // exists. One culture per turn and one content citizen: enough that a single
+      // temple reaches radius 2 in a plausible number of turns (see the `culture`
+      // section below for the threshold) and enough to hold a size-4 city out of
+      // disorder on its own.
+      culturePerTurn: 1,
+      happiness: 1,
       provenance: placeholder(
-        'unsourced: this cost, the 1 gold maintenance and the 25% commerce placeholders are ours; ' +
-          'no happiness effect is modelled until M9, so this multiplier is a stand-in, not a claim; ' +
-          "the Ceremonial Burial requirement is M6 closing M5's unused-gate gap, not a Civ 3 figure",
+        'unsourced: this cost, the 1 gold maintenance, the 25% commerce multiplier, the 1 culture per turn ' +
+          'and the 1 content citizen are ours, chosen to be playable, and none is traced to Civ 3; M4c ' +
+          'shipped this row with a commerce multiplier standing in for happiness because contentment was ' +
+          'not modelled yet, and M9 adds the real fields beside it rather than replacing it; the Ceremonial ' +
+          "Burial requirement is M6 closing M5's unused-gate gap, not a Civ 3 figure",
       ),
     },
     {
@@ -1064,9 +1518,15 @@ export const CATALOG: Catalog = {
       // building-effects scenario builds a library on a hand-built, tech-free board to
       // measure its 50% beaker multiplier, so a technology in front of it would turn that
       // scenario into a test of the tech gate instead of a test of the multiplier.
+      // M9: a library is a *culture* building here as well as a science one — that is a
+      // shape choice (knowledge makes a city's influence grow) and a placeholder, not a
+      // Civ 3 claim; Civ 3's library gives no culture.
+      culturePerTurn: 1,
+      happiness: 0,
       provenance: placeholder(
-        'unsourced: this cost, the 1 gold maintenance and the 50% beaker placeholders are ours, chosen to be playable; ' +
-          'beakers themselves accumulate and do nothing until research arrives in M5',
+        'unsourced: this cost, the 1 gold maintenance, the 50% beaker multiplier and the 1 culture per turn are ' +
+          "ours, chosen to be playable; M5 gave the beakers something to do, and M9 adds the culture — Civ 3's " +
+          "library produces no culture, so that pairing is this engine's shape and not a claim",
       ),
     },
     {
@@ -1075,6 +1535,10 @@ export const CATALOG: Catalog = {
       cost: 12,
       maintenance: 1,
       effects: [{ kind: 'commerce-multiplier', pct: 50 }],
+      // M9: no culture. The luxury half of the contentment model is about *resources*
+      // and slider spending, not about the building that multiplies commerce.
+      culturePerTurn: 0,
+      happiness: 0,
       provenance: placeholder(
         'unsourced: this cost, the 1 gold maintenance and the 50% commerce placeholders are ours, chosen to be playable; ' +
           'M4c models commerce multipliers and nothing else about trade',
@@ -1086,6 +1550,12 @@ export const CATALOG: Catalog = {
       cost: 25,
       maintenance: 3,
       effects: [{ kind: 'shield-multiplier', pct: 50 }],
+      // M9: no culture, no contentment. A factory is the one building here that a
+      // player might expect to make people *unhappy*; that is a tuning position this
+      // union can express (`happiness` is signed) and the shipped catalog does not take
+      // it, so the field states the zero.
+      culturePerTurn: 0,
+      happiness: 0,
       provenance: placeholder(
         'unsourced: this cost, the 3 gold maintenance and the 50% shield placeholders are ours, chosen to be playable; ' +
           'no pollution, power or population cost is modelled',
@@ -1101,9 +1571,18 @@ export const CATALOG: Catalog = {
       // one thing that can destroy a building here — bankruptcy (which disbands
       // it, after which it is buildable again).
       wonder: true,
+      // M9: the wonder's culture. Two per turn for as long as it stands, and a
+      // one-off 10 the turn it completes — the only `cultureBonus` in the catalog, and
+      // the row `validateRuleset`'s "wonders only, and a wonder must declare one"
+      // check is written for.
+      culturePerTurn: 2,
+      cultureBonus: 10,
+      happiness: 1,
       provenance: placeholder(
-        'unsourced: this cost, the 2 gold maintenance and the growth-food amount are ours, chosen to be playable; ' +
-          'the only shipped wonder, marking the wonders-v1 rules rather than reproducing Civ 3 numbers',
+        'unsourced: this cost, the 2 gold maintenance, the growth-food amount, the 2 culture per turn, the ' +
+          '10-culture one-off and the 1 content citizen are ours, chosen to be playable; the only shipped ' +
+          "wonder, marking the wonders-v1 rules and M9/M10's wonder-culture rule rather than reproducing " +
+          "Civ 3 numbers — Civ 3's Pyramids give no culture at all",
       ),
     },
   ],
@@ -1544,6 +2023,266 @@ export const CATALOG: Catalog = {
         'sweep can move it through `RulesetPatch.capture` instead of reporting that it cannot be moved',
     ),
   },
+  /**
+   * **M9's culture and contentment model** — see `CultureSpec` for the full argument.
+   *
+   * The four magnitudes, and why each is where it is:
+   *
+   * | field | value | what it decides |
+   * |---|---|---|
+   * | `borderRadius2Culture` | 10 | a city claims radius 2 once it has 10 culture |
+   * | `borderRadius3Culture` | 100 | …and radius 3 at 100 |
+   * | `unhappyThresholds` | `1→0, 7→1, 12→2, 18→4` | size makes citizens unhappy |
+   * | `luxuriesPerHappyCitizen` | 2 | two connected luxuries content one citizen |
+   * | `happyPerLuxuryResource` | 1 | …and each luxury contents one more |
+   *
+   * **The threshold shape is Civ-3-like and the numbers are not Civ 3's.** Civ 3 expands
+   * a city's reach at 10, 100 and 1,000 culture for its successive rings; the first two
+   * of those are the two numbers here, arrived at independently as "a temple reaches the
+   * second ring in ten turns and the third in a hundred" and *not* copied from a source.
+   * Shipping 10 and 100 while saying "these are Civ 3's" would be exactly the false
+   * fidelity claim PLAN.md §6.2 forbids, so the claim is the reverse: they look similar
+   * because they are round numbers a player can reason about, and no measurement stands
+   * behind them.
+   *
+   * **Why the ladder has four rungs, and why the rungs moved out from `3/6/10`.**
+   *
+   * A city must be able to grow to the point where a player has to *do* something —
+   * that is what makes disorder a mechanic rather than a rounding error — and the
+   * fourth rung is where the shipped buildings stop being sufficient on their own (a
+   * temple and a wonder content two citizens; beyond that a player reaches for
+   * luxuries, which is the loop the two luxury fields exist to close).
+   *
+   * The first three rungs were `3/6/10` when this section was written, and they were
+   * **measured to be unplayable** and moved to `7/12/18`. The measurement, exactly:
+   *
+   * 1. A city of **three** citizens has one unhappy citizen and no happiness source of
+   *    its own, so it is in disorder — and disorder stops it producing shields. The
+   *    temple that would content that citizen is itself bought with shields, and it is
+   *    gated on Ceremonial Burial, so a city that reaches size 3 before the tech does
+   *    can never build the thing that would cure it. The state is unrecoverable, not
+   *    merely unhappy.
+   * 2. In a real 100-turn game (`SIMPLE_POLICY`, tiny map, two civilizations) that
+   *    produced **9 disordered cities out of 11**, including six size-3 cities whose
+   *    shield pools never left single digits: `c1/p3:u1h0D[granary]sh0`,
+   *    `c3/p3:u1h0D[granary]sh4`, and so on. One civilization's whole territory was
+   *    frozen for the rest of the run.
+   * 3. The engine's own growth demonstration — a city growing from size 1 with no
+   *    buildings, the canonical statement that the growth loop works — stops producing
+   *    at three citizens (`shields at turn 14: 32 banked by then plus 4 at three
+   *    citizens = 36 (got 32)`).
+   *
+   * None of those three is a fact about the disorder *rule*, which is the contract's
+   * and is unchanged. They are facts about the numbers, and the numbers are
+   * `placeholder` — unsourced and chosen to be playable. `7/12/18` keeps every
+   * property the shape was chosen for (a city can still grow into disorder, a temple
+   * and a wonder still content two citizens, a metropolis still needs luxuries) while
+   * putting the first rung past the point where a city could plausibly have built
+   * one: a city that reaches size 7 has been producing for many turns.
+   *
+   * Civ 3's own answer to this is *content citizens granted by government*, which this
+   * engine does not model — `GovernmentSpec.happinessModifier` is a signed modifier on
+   * the unhappy count, not a free allowance — so the rungs carry that job here.
+   */
+  culture: {
+    borderRadius2Culture: 10,
+    borderRadius3Culture: 100,
+    unhappyThresholds: [
+      { minPopulation: 1, unhappy: 0 },
+      { minPopulation: 7, unhappy: 1 },
+      { minPopulation: 12, unhappy: 2 },
+      { minPopulation: 18, unhappy: 4 },
+    ],
+    luxuriesPerHappyCitizen: 2,
+    happyPerLuxuryResource: 1,
+    provenance: placeholder(
+      'unsourced: the 10/100 border thresholds, the four-rung unhappy ladder (deliberately re-runged from ' +
+        '3/6/10 to 7/12/18 after it was measured to make a city of three citizens permanently unable to ' +
+        'build the temple that would cure it), the two-luxuries-per-content-' +
+        'citizen divisor and the one-per-luxury term are all ours, chosen to be playable, and none is ' +
+        'traced to Civ 3 or measured from it; Civ 3 expands city reach at 10/100/1000 culture and has its ' +
+        'own happiness model with entertainers, luxuries, war weariness and per-government content ' +
+        'citizens, none of which this engine reproduces — the 10 and the 100 are round numbers a player ' +
+        'can reason about and are NOT presented as Civ 3 figures',
+    ),
+  },
+  /**
+   * **M9's government rows** — three, one of them the default.
+   *
+   * | row | caps (tax/science/luxury) | free/city | support | happiness | tech |
+   * |---|---|---|---|---|---|
+   * | `despotism` | 8/8/2 | 2 | 1 | 0 | *(none — the default)* |
+   * | `monarchy` | 8/6/4 | 4 | 1 | 0 | Monarchy |
+   * | `republic` | 6/8/6 | 1 | 2 | 1 | The Republic |
+   *
+   * **`despotism`'s two economy numbers are M4b's, exactly.** `freeUnitsPerCity: 2` is
+   * the old `FREE_UNITS_PER_CITY` and `unitSupportCost: 1` is the old
+   * `UNIT_SUPPORT_COST`, so a game played under despotism — which is every game, until a
+   * player changes government — bills its army identically to the pre-M9 engine, and the
+   * M4b goldens survive the relocation. `freeUnitsPerCity: 2` with three cities is six
+   * free units plus M4b's `FREE_UNITS_BASE` of four, which is the ten the old formula
+   * gave.
+   *
+   * **The caps are how the ten rate points may be dealt.** `RATE_TOTAL` is 10 and the
+   * three rates must sum to it, so a cap below 10 is a statement about *distribution*: a
+   * despotism cannot run a total-luxury economy (its luxury cap is 2) and a republic
+   * cannot run a total-tax one (its tax cap is 6). Every cap is `<= 10`, so no cap can be
+   * unreachable, and every cap is `>= 1`, so no slider is dead.
+   *
+   * **`monarchy` requires Monarchy and `republic` requires The Republic**, which is why
+   * those two rows of the tree are load-bearing: without them the government feature
+   * would be a menu a player is handed at turn zero rather than something it earns.
+   * `despotism` deliberately requires nothing, so there is always a government to fall
+   * back to and the feature is reachable from the first turn of every game.
+   *
+   * **The happiness modifiers are 0 / 0 / +1** — and the zeros are a *choice*, not an
+   * omission: making despotism unhappy-making (as Civ 3 does, in effect) would change
+   * every pre-M9 golden by putting early cities into disorder, which is a rebalance this
+   * wave does not make. The republic's +1 is where the contentment difference lives.
+   */
+  governments: [
+    {
+      id: asGovernmentId('despotism'),
+      name: 'Despotism',
+      rateCaps: { tax: 8, science: 8, luxury: 2 },
+      freeUnitsPerCity: 2,
+      unitSupportCost: 1,
+      happinessModifier: 0,
+      provenance: placeholder(
+        'unsourced: the 8/8/2 caps and the zero happiness modifier are ours, chosen to be playable, and ' +
+          "none is traced to Civ 3's despotism (whose real penalty is a tile-yield cap and a support model " +
+          "this engine does not have); the free-units-per-city of 2 and the per-unit cost of 1 are M4b's " +
+          '`FREE_UNITS_PER_CITY` and `UNIT_SUPPORT_COST` RELOCATED here unchanged, not a rebalance — a ' +
+          'game played under despotism bills its army exactly as it did before M9',
+      ),
+    },
+    {
+      id: asGovernmentId('monarchy'),
+      name: 'Monarchy',
+      rateCaps: { tax: 8, science: 6, luxury: 4 },
+      freeUnitsPerCity: 4,
+      unitSupportCost: 1,
+      happinessModifier: 0,
+      // The prerequisite is a tech this catalog **actually ships**. It was `monarchy`, a row
+      // that never existed: `checkTechRefsOfRows` caught it as the validation failure it is,
+      // which is the check earning its keep — a government gated on a tech nobody can
+      // research is unreachable content that looks reachable.
+      //
+      // `ceremonial-burial` is the nearest shipped row in spirit (an early ancient-era tech
+      // whose whole content is ordering) and the least disruptive: it is already an opening
+      // choice among three roots, so gating monarchy on it adds a fourth reason to take it
+      // rather than moving a row in the tree.
+      requiresTech: asTechId('ceremonial-burial'),
+      provenance: placeholder(
+        'unsourced: the 8/6/4 caps, the four free units per city, the per-unit cost and the zero happiness ' +
+          'modifier are ours, chosen to be playable; the shape (a monarchy supports a larger army than a ' +
+          "despotism) is deliberate and Civ-3-like, the numbers are not Civ 3's, and the anarchy transition " +
+          'a real revolution would impose is not modelled at all',
+      ),
+    },
+    {
+      id: asGovernmentId('republic'),
+      name: 'Republic',
+      rateCaps: { tax: 6, science: 8, luxury: 6 },
+      freeUnitsPerCity: 1,
+      unitSupportCost: 2,
+      happinessModifier: 1,
+      // The prerequisite is a tech this catalog **actually ships** — see the monarchy row's
+      // note: `the-republic` was never a row, and only the tech-reference check stood between
+      // that typo and unreachable content.
+      //
+      // `literature` is the nearest shipped row in spirit (a mid-ancient tech with two
+      // prerequisites, so a republic is a *late* ancient-era decision rather than an opening
+      // one, which is the ordering this row's provenance claims).
+      requiresTech: asTechId('literature'),
+      provenance: placeholder(
+        'unsourced: the 6/8/6 caps, the single free unit per city, the doubled per-unit cost and the one ' +
+          'content citizen are ours, chosen to be playable; the trade the row describes — a republic pays ' +
+          'more for its army and keeps its people happier — is a Civ-3-shaped choice, not a Civ 3 figure, ' +
+          'and this engine models no war weariness, no senate and no diplomatic consequence of the choice',
+      ),
+    },
+  ],
+  /**
+   * **M10's score weights** — five integers, one linear function, nothing else.
+   *
+   * | term | weight | what it counts |
+   * |---|---|---|
+   * | `perPopulation` | 2 | citizens across the player's cities |
+   * | `perCity` | 3 | cities owned |
+   * | `perTech` | 4 | technologies known |
+   * | `perCulture` | 1 | accumulated culture (the derived total) |
+   * | `perWonder` | 8 | wonders held |
+   *
+   * **The ordering is the claim, not the numbers.** A wonder is worth more than a tech,
+   * a tech more than a city, a city more than a citizen, and a point of culture least of
+   * all — which is a *ranking* a player can play toward. The absolute sizes are
+   * arbitrary: doubling all five would leave every game's winner and every relative
+   * standing identical, which is why they are stated as a table a sweep can move rather
+   * than derived from anything.
+   *
+   * **`perCulture` is 1 rather than 0** even though culture already has its own victory
+   * condition, because a cultural player should not be *penalised* on the scoreboard for
+   * choosing that route — and 1 rather than 3 so that a culture-heavy empire does not
+   * automatically dominate a score game it did not play for.
+   */
+  score: {
+    perPopulation: 2,
+    perCity: 3,
+    perTech: 4,
+    perCulture: 1,
+    perWonder: 8,
+    provenance: placeholder(
+      'unsourced: these five weights are ours, chosen to be playable and to give a sensible ordering ' +
+        '(wonder > tech > city > citizen > culture point), and none is traced to Civ 3 — whose score is a ' +
+        'per-turn accumulation over territory, population, content citizens, techs, wonders and future ' +
+        'tech, rescaled by difficulty and by the turn-limit scale, and is a different thing from this ' +
+        'single end-of-turn integer wearing similar vocabulary',
+    ),
+  },
+  /**
+   * **M10's victory thresholds** — the four numbers a game can end at.
+   *
+   * | condition | threshold |
+   * |---|---|
+   * | conquest | *(none — last civilization with a city)* |
+   * | domination | 60% of claimed land **or** 40% of civilian population |
+   * | cultural | 1,500 accumulated culture |
+   * | score | turn 200 |
+   *
+   * **The two shares are integers and are compared with `>=`**, which is what makes the
+   * boundary the value itself: a player holding exactly 60% of the claimed land wins.
+   * The land share is the stricter of the two because land is harder to take than
+   * population is to grow, and the population share is the one a tall, peaceful empire
+   * reaches — the pair exists so domination is not one strategy's condition.
+   *
+   * **1,500 culture is reachable and not automatic.** A city with a temple produces 1 per
+   * turn; the shipped catalog's wonders and libraries add more; a four-city empire with
+   * temples and libraries banks roughly 8 per turn once it is built out, which is about
+   * 190 turns of play, and a wonder-heavy one gets there well inside the 200-turn score
+   * horizon. A player who never builds a culture building never reaches it, which is what
+   * makes it a victory condition rather than a participation award.
+   *
+   * **`scoreVictoryTurn: 200` is the catalog's horizon, deliberately apart from any
+   * experiment's `maxTurns`** — see `VictorySpec` for why conflating the two would make
+   * every short simulation claim a score win. The shipped value is well above the
+   * evidence runs' budgets, so a 100-turn simulation reports no victory and
+   * `stoppedBecause: 'max-turns'`, which is the honest answer.
+   */
+  victory: {
+    dominationLandPct: 60,
+    dominationPopPct: 40,
+    culturalVictoryCulture: 1500,
+    scoreVictoryTurn: 200,
+    provenance: placeholder(
+      'unsourced: the 60%/40% domination shares, the 1,500-culture threshold and the 200-turn score ' +
+        'horizon are ours, chosen so that a game of a few hundred turns can plausibly end under each ' +
+        'condition, and none is traced to Civ 3; Civ 3 wins by holding two thirds of the land AND ' +
+        'population for domination, by 100,000 culture (or 20,000 per city) for cultural, and by ' +
+        'diplomacy, spaceship and Histographic score — none of which this engine implements, and no ' +
+        'number here is a Civ 3 figure',
+    ),
+  },
 };
 
 /**
@@ -1901,6 +2640,89 @@ const checkBuilding = (b: BuildingSpec): readonly RulesetError[] => {
     );
   }
 
+  // M9's three new fields. All three are read through `unknown`, because the thing
+  // being validated may be JSON, a `Partial` patch or a hand-built literal — and because
+  // two of them are *required in fact*: the contract spells `culturePerTurn` and
+  // `happiness` as required on `BuildingSpec`, while the engine's structural
+  // `BuildingDef` declares both optional, so this function is where "required" is
+  // enforced. That is the same arrangement `UnitSpec.hitPoints` uses, and the note on
+  // `BuildingSpec.culturePerTurn` argues it in full.
+  const culturePerTurn: unknown = b['culturePerTurn'];
+  if (culturePerTurn === undefined) {
+    errors.push(
+      bad(
+        'culturePerTurn',
+        'must be declared: the contract makes it required, so a row that says nothing would be a ' +
+          'building whose culture is whatever a reader assumed (state 0 to mean none)',
+      ),
+    );
+  } else if (typeof culturePerTurn !== 'number' || !Number.isInteger(culturePerTurn)) {
+    errors.push(bad('culturePerTurn', 'must be an integer'));
+  } else if (culturePerTurn < 0) {
+    errors.push(
+      bad(
+        'culturePerTurn',
+        'must not be negative: culture accumulates and never decreases, and a building that took ' +
+          'culture away each turn would break that promise from inside the culture pass',
+      ),
+    );
+  }
+
+  const happiness: unknown = b['happiness'];
+  if (happiness === undefined) {
+    errors.push(
+      bad(
+        'happiness',
+        'must be declared: the contract makes it required, so a row that says nothing would be a ' +
+          'building whose contentment is whatever a reader assumed (state 0 to mean none)',
+      ),
+    );
+  } else if (typeof happiness !== 'number' || !Number.isInteger(happiness)) {
+    // Signed on purpose: an unhappy-making building is a rule the `city-happiness`
+    // effect can express, so only integrality is required here.
+    errors.push(bad('happiness', 'must be an integer (it may be negative)'));
+  }
+
+  // `cultureBonus` is the one of the three that is *optional*, and the two halves of its
+  // rule are the contract's own words: "wonders only, one-off". A non-wonder row that
+  // declares a bonus contradicts the interface; a wonder that declares none is a wonder
+  // with nothing special about the turn it completes, which is the only moment this
+  // engine makes a wonder special. Both are refused by name rather than silently ignored,
+  // because the alternative is content that looks like it does something and does not.
+  const cultureBonus: unknown = b['cultureBonus'];
+  if (cultureBonus !== undefined) {
+    if (typeof cultureBonus !== 'number' || !Number.isInteger(cultureBonus)) {
+      errors.push(bad('cultureBonus', 'must be an integer'));
+    } else if (cultureBonus <= 0) {
+      errors.push(
+        bad(
+          'cultureBonus',
+          `must be > 0 when declared (got ${String(cultureBonus)}): a row that means "no bonus" says ` +
+            'nothing, so a stated zero is a row whose author expected something to happen',
+        ),
+      );
+    } else if (wonder !== true) {
+      errors.push(
+        bad(
+          'cultureBonus',
+          'is wonders only (the contract says so): an ordinary building that grants a one-off culture ' +
+            'bonus on completion would be content contradicting the frozen interface',
+        ),
+      );
+    }
+  }
+  // **A wonder is not required to declare a completion bonus.** The obvious-sounding rule —
+  // "a wonder that grants nothing on completion is not a wonder" — is *our* invention rather
+  // than the contract's, and it was written here and then removed for two reasons. The
+  // contract makes `cultureBonus` an optional field of a wonder row, so a catalog that omits
+  // it is inside the interface; and making it mandatory would make `wonder: true` unacceptable
+  // on a row without one, which is a statement about content the engine has no business
+  // making (`rules.test.ts` pins that `wonder: true` is accepted on any row, because
+  // `wonder` is what the global-uniqueness rule reads and nothing else). The shipped
+  // `pyramids` row does declare one, and the M4c rule that spends it is pinned by its own
+  // tests; a second wonder that grants nothing on completion would be a tuning choice, not a
+  // validation error.
+
   return errors;
 };
 
@@ -2054,6 +2876,12 @@ const checkTechRefsOfRows = (catalog: Catalog): readonly RulesetError[] => {
     ['buildings', catalog.buildings],
     ['improvements', catalog.improvements],
     ['resources', catalog.resources],
+    // M9: governments are the fifth kind of row to declare `requiresTech`, and they are
+    // added *here* rather than checked in `checkGovernment` for exactly the reason this
+    // function exists: a `requiresTech` is a reference into the tech tree, and one
+    // function that resolves every one of them is what stops the fifth kind from being
+    // forgotten the way the field was before M6.
+    [GOVERNMENTS_SECTION, catalog.governments],
   ];
 
   return sections.flatMap(([section, rows]) =>
@@ -2532,6 +3360,412 @@ const checkCapture = (section: unknown): readonly RulesetError[] => {
   return [];
 };
 
+/* ------------------------------------------------------------------ *
+ * M9+M10 — the culture, government, score and victory sections
+ * ------------------------------------------------------------------ */
+
+const CULTURE_ROW_ID = 'culture';
+const SCORE_ROW_ID = 'score';
+const VICTORY_ROW_ID = 'victory';
+const GOVERNMENTS_SECTION = 'governments';
+
+/**
+ * A record, or `undefined` — the one read every `unknown`-facing checker here starts
+ * with.
+ *
+ * Written once, rather than as the local `isRecord` const each of `checkCombat` and
+ * `checkCapture` declares for itself, because the M9/M10 checkers below are four
+ * functions that would otherwise repeat it four times. (The two older checkers keep
+ * their own copies: rewriting them is not this wave's business, and a helper three
+ * functions use is not worth a fourth function's worth of churn.)
+ */
+const asRecord = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
+  typeof value === 'object' && value !== null
+    ? (value as Readonly<Record<string, unknown>>)
+    : undefined;
+
+/** The integer `field` of `record`, or `undefined` when it is absent or not an integer. */
+const integerField = (
+  record: Readonly<Record<string, unknown>>,
+  field: string,
+): number | undefined => {
+  const value = record[field];
+  return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
+};
+
+/**
+ * **The culture section, checked as one model.**
+ *
+ * Five rules, and each is a rule rather than a taste:
+ *
+ * - **Every magnitude is an integer**, for the reason every simulation number in this
+ *   file is: culture is added into `City.culture`, compared against a border threshold
+ *   and compared against a victory threshold, and a fraction in any of them would reach
+ *   a value `canonicalize` cannot round-trip and no golden hash could pin (PLAN.md §5.3).
+ * - **`borderRadius2Culture >= 0` and `borderRadius3Culture >= borderRadius2Culture`**,
+ *   checked as **one ascending pair**. `borders.ts`' `claimedRadius` tests radius 3
+ *   first and then radius 2, so a `borderRadius3Culture` below `borderRadius2Culture` is
+ *   not a stricter ruleset — it is one in which the radius-2 threshold can never fire,
+ *   because any culture that reaches the 3 threshold already passed the 2 one. That is
+ *   dead data, and refusing it at load time is cheaper than a reader discovering it.
+ * - **`luxuriesPerHappyCitizen >= 1`** — `happiness.ts` computes
+ *   `floor(luxuries / luxuriesPerHappyCitizen)`, so `0` is a division by zero and
+ *   `Infinity` is not a count of content citizens.
+ * - **`happyPerLuxuryResource >= 0`** — it is *added* to the happiness count, so a
+ *   negative value is a luxury that makes its owner's citizens unhappy, which is not
+ *   what the field means. `0` is legal and states "only the count matters".
+ * - **`unhappyThresholds` is a non-empty, strictly ascending ladder beginning at
+ *   `minPopulation <= 1`.** Ascending because `unhappyFromSize` folds the ladder and
+ *   takes the highest applicable rung: a ladder out of order would make the rung order
+ *   — not the population — decide the answer. Beginning at `<= 1` because a city of size
+ *   1 must have a defined unhappy count; without a rung at or below 1, `unhappyFromSize`
+ *   returns the degenerate answer for a city that exists in every game. Strictly
+ *   ascending (not merely non-decreasing) because two rungs at the same population is
+ *   one rung written twice, and the second is dead data — the same argument as the
+ *   border pair, one level down.
+ *
+ * **Total over `unknown`, like `checkCombat`**: the section may be JSON or a patch, and a
+ * *missing* section has to be reported rather than crashing the validator — a catalog
+ * that says nothing about culture is not a catalog with default cultures, it is one whose
+ * borders and whose disorder have no rules (`borders.ts` and `happiness.ts` both read the
+ * magnitudes from the ruleset they are handed).
+ */
+const checkCulture = (section: unknown): readonly RulesetError[] => {
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'culture',
+    id: CULTURE_ROW_ID,
+    field,
+    detail,
+  });
+
+  const record = asRecord(section);
+  if (record === undefined) {
+    return [bad('culture', 'must be an object carrying the culture and contentment magnitudes')];
+  }
+
+  const errors: RulesetError[] = [];
+
+  const radius2 = integerField(record, 'borderRadius2Culture');
+  const radius3 = integerField(record, 'borderRadius3Culture');
+  if (radius2 === undefined) errors.push(bad('borderRadius2Culture', 'must be an integer'));
+  else if (radius2 < 0) errors.push(bad('borderRadius2Culture', 'must not be negative'));
+  if (radius3 === undefined) errors.push(bad('borderRadius3Culture', 'must be an integer'));
+  else if (radius3 < 0) errors.push(bad('borderRadius3Culture', 'must not be negative'));
+
+  if (radius2 !== undefined && radius3 !== undefined && radius3 < radius2) {
+    errors.push(
+      bad(
+        'borderRadius3Culture',
+        `must be >= borderRadius2Culture (got ${String(radius3)} < ${String(radius2)}): ` +
+          'the engine tests radius 3 before radius 2, so the lower threshold could never fire ' +
+          'and the radius-2 entry would be dead data',
+      ),
+    );
+  }
+
+  const perHappy = integerField(record, 'luxuriesPerHappyCitizen');
+  if (perHappy === undefined) errors.push(bad('luxuriesPerHappyCitizen', 'must be an integer'));
+  else if (perHappy < 1) {
+    errors.push(
+      bad(
+        'luxuriesPerHappyCitizen',
+        'must be >= 1: it divides the luxury count, and 0 is a division by zero ' +
+          '(Infinity is not a count of content citizens)',
+      ),
+    );
+  }
+
+  const perLuxury = integerField(record, 'happyPerLuxuryResource');
+  if (perLuxury === undefined) errors.push(bad('happyPerLuxuryResource', 'must be an integer'));
+  else if (perLuxury < 0) {
+    errors.push(
+      bad(
+        'happyPerLuxuryResource',
+        "must not be negative: it is added to a city's happiness, and a negative value is a " +
+          'luxury that makes its owner unhappy',
+      ),
+    );
+  }
+
+  const ladder = record['unhappyThresholds'];
+  if (!Array.isArray(ladder) || ladder.length === 0) {
+    errors.push(
+      bad(
+        'unhappyThresholds',
+        'must be a non-empty array of { minPopulation, unhappy } rungs: a city of size 1 has to ' +
+          'have a defined unhappy count',
+      ),
+    );
+  } else {
+    let previous: number | undefined;
+    for (const [index, entry] of ladder.entries()) {
+      const rung = asRecord(entry);
+      if (rung === undefined) {
+        errors.push(bad(`unhappyThresholds[${String(index)}]`, 'must be an object'));
+        previous = undefined;
+        continue;
+      }
+      const min = integerField(rung, 'minPopulation');
+      const unhappy = integerField(rung, 'unhappy');
+      if (min === undefined || min < 1) {
+        errors.push(
+          bad(`unhappyThresholds[${String(index)}].minPopulation`, 'must be an integer >= 1'),
+        );
+      }
+      if (unhappy === undefined || unhappy < 0) {
+        errors.push(bad(`unhappyThresholds[${String(index)}].unhappy`, 'must be an integer >= 0'));
+      }
+      if (min === undefined) {
+        previous = undefined;
+        continue;
+      }
+      if (index === 0 && min > 1) {
+        errors.push(
+          bad(
+            'unhappyThresholds',
+            `must begin at minPopulation <= 1 (got ${String(min)}): a size-1 city exists in every ` +
+              'game and has to have a defined unhappy count',
+          ),
+        );
+      }
+      if (previous !== undefined && min <= previous) {
+        errors.push(
+          bad(
+            `unhappyThresholds[${String(index)}].minPopulation`,
+            `must be strictly greater than the previous rung's ${String(previous)}: the ladder is ` +
+              'read as "the highest rung that applies", so a repeated population is one rung ' +
+              'written twice and the second is dead data',
+          ),
+        );
+      }
+      previous = min;
+    }
+  }
+
+  return errors;
+};
+
+/**
+ * **The government rows, checked as one table.**
+ *
+ * Per row: the id and name are non-empty (`checkRows` already refuses an empty catalog
+ * and a duplicate id, so this function does not repeat either), the caps are three
+ * integers in `[0, RATE_TOTAL]`, the two economy numbers are integers `>= 0`, the
+ * happiness modifier is an integer of either sign, and `requiresTech` is a string when
+ * present — the *reference* check for that field is `checkTechRefsOfRows`, which is the
+ * one place every `requiresTech` in the catalog is resolved against the tree.
+ *
+ * **Why the cap bound is `RATE_TOTAL` rather than `100`.** The three rates must sum to
+ * exactly `RATE_TOTAL` (`state.ts`' rule, enforced by `ratesProblem`), so a cap above
+ * `RATE_TOTAL` is unreachable — no legal triple can exceed it — and a cap of `0` makes a
+ * slider dead: a government that forbids all science is a government whose player cannot
+ * research at all, which is a different game rather than a tuning position. Refusing both
+ * at load time is what keeps "the caps describe a distribution of the ten points" true.
+ *
+ * ## The section is refused when empty, and refused when it has no usable default
+ *
+ * `newGame` stamps *the default row* on every player, and `core/governments.ts`'
+ * `defaultGovernmentOf` picks it as **the first row of the section**. So an empty section
+ * is a game with no government to give anybody (the engine would fall back to its
+ * `NO_GOVERNMENT` degenerate row, which is deliberately unlike every shipped row), and a
+ * section whose first row is unusable would stamp an unusable government on every player
+ * at turn zero. `checkRows` covers the empty case with the `empty-catalog` error every
+ * other catalog gets; the "first row" rule is stated here rather than as a flag, so a
+ * content author reordering the section knows what it costs.
+ *
+ * ## Total over `unknown`, like `checkCulture`
+ *
+ * And note that the row list is *not* read through `unknown`: a `Catalog` with no
+ * `governments` field at all is a TypeScript error, and a JSON catalog that omits it is
+ * reported by `checkRows` as an empty catalog rather than crashing here. This function
+ * reads the rows it is given and is total over each row's fields.
+ */
+const checkGovernment = (g: GovernmentSpec): readonly RulesetError[] => {
+  const errors: RulesetError[] = [];
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: GOVERNMENTS_SECTION,
+    id: g.id,
+    field,
+    detail,
+  });
+
+  // Read through a record view of the row rather than field by field off the typed
+  // object, for the reason `checkCombat` reads its section that way: the thing being
+  // validated may be JSON or a hand-built literal, and a field that is present but not a
+  // number has to be *reported* rather than compared as `NaN`. The typed parameter is
+  // what tells the compiler the shape content is supposed to have; this view is what
+  // checks that it does.
+  const row = g as unknown as Readonly<Record<string, unknown>>;
+
+  if (g.name === '') errors.push(bad('name', 'must not be empty'));
+
+  const caps: unknown = g['rateCaps'];
+  const capRecord = asRecord(caps);
+  if (capRecord === undefined) {
+    errors.push(bad('rateCaps', 'must be an object carrying tax, science and luxury'));
+  } else {
+    for (const slider of ['tax', 'science', 'luxury'] as const) {
+      const cap = integerField(capRecord, slider);
+      if (cap === undefined) {
+        errors.push(bad(`rateCaps.${slider}`, 'must be an integer'));
+        continue;
+      }
+      if (cap < 0) errors.push(bad(`rateCaps.${slider}`, 'must not be negative'));
+      else if (cap > RATE_TOTAL) {
+        errors.push(
+          bad(
+            `rateCaps.${slider}`,
+            `must be <= RATE_TOTAL (${String(RATE_TOTAL)}): the three rates sum to exactly ` +
+              `${String(RATE_TOTAL)}, so a higher cap can never be reached`,
+          ),
+        );
+      } else if (cap === 0) {
+        errors.push(
+          bad(
+            `rateCaps.${slider}`,
+            'must be >= 1: a cap of zero makes the slider dead, which is a government that ' +
+              'forbids a whole channel rather than one that constrains it',
+          ),
+        );
+      }
+    }
+  }
+
+  const free = integerField(row, 'freeUnitsPerCity');
+  if (free === undefined) errors.push(bad('freeUnitsPerCity', 'must be an integer'));
+  else if (free < 0) errors.push(bad('freeUnitsPerCity', 'must not be negative'));
+
+  const support = integerField(row, 'unitSupportCost');
+  if (support === undefined) errors.push(bad('unitSupportCost', 'must be an integer'));
+  else if (support < 0) errors.push(bad('unitSupportCost', 'must not be negative'));
+
+  const modifier = integerField(row, 'happinessModifier');
+  if (modifier === undefined) {
+    // Signed on purpose: a government may make its people less content (which is what
+    // Civ 3's despotism effectively does), so only integrality is required.
+    errors.push(bad('happinessModifier', 'must be an integer (it may be negative)'));
+  }
+
+  return errors;
+};
+
+/**
+ * **The score section, checked on its own terms** — five integers, each `>= 0`.
+ *
+ * Negative is refused because a term that *subtracts* would make a player's score depend
+ * on the order the terms are summed in a way no reader could predict, and because "more
+ * citizens is worse" is not what any of these weights means. Zero is legal and is a
+ * tuning position rather than a degenerate one: `perCulture: 0` states "culture does not
+ * count toward this game's score", and the other four weights still order the players —
+ * the argument `ScoreSpec` makes in full.
+ *
+ * **Total over `unknown`, like `checkCulture`** — and a missing section is *reported*
+ * rather than defaulted, because `core/score.ts` keeps no copy of any weight.
+ */
+const checkScore = (section: unknown): readonly RulesetError[] => {
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'score',
+    id: SCORE_ROW_ID,
+    field,
+    detail,
+  });
+
+  const record = asRecord(section);
+  if (record === undefined) {
+    return [bad('score', 'must be an object carrying the five score weights')];
+  }
+
+  const errors: RulesetError[] = [];
+  for (const field of ['perPopulation', 'perCity', 'perTech', 'perCulture', 'perWonder']) {
+    const value = integerField(record, field);
+    if (value === undefined) errors.push(bad(field, 'must be an integer'));
+    else if (value < 0) errors.push(bad(field, 'must not be negative'));
+  }
+
+  return errors;
+};
+
+/**
+ * **The victory section, checked as one set of thresholds.**
+ *
+ * - **The two shares are integers in `[1, 100]`.** `100` is legal and means "hold
+ *   everything", which `victory.ts`' integer comparison expresses exactly
+ *   (`owned * 100 >= 100 * total`), and `0` is refused because a share of nothing is a
+ *   condition that holds at turn zero — a game that ends before it starts is not a
+ *   tuning position. The *comparison* is `>=` and that is the engine's rule, stated in
+ *   `victory.ts`, not something this section can change.
+ * - **`culturalVictoryCulture >= 1`.** `0` would make every player a cultural victor at
+ *   turn zero, and the condition is checked with `>=`, so `1` is the lowest threshold
+ *   that means anything.
+ * - **`scoreVictoryTurn >= 1`.** The turn at which the score is read; `0` would be a
+ *   score victory decided before the first turn, and the runner's own turn counter starts
+ *   at 1.
+ * - **`scoreVictoryTurn` is deliberately NOT required to be below any experiment's
+ *   `maxTurns`** — see `VictorySpec` for why the two horizons are different things and
+ *   why conflating them would make every short simulation claim a score win. There is no
+ *   check here that could express that anyway: validation sees a catalog, never a
+ *   simulation's options.
+ *
+ * **Total over `unknown`, like `checkCulture`.** A missing section is reported rather
+ * than defaulted: `core/victory.ts` reads all four thresholds from the ruleset it is
+ * handed, so a catalog without this section is a game that cannot end.
+ */
+const checkVictory = (section: unknown): readonly RulesetError[] => {
+  const bad = (field: string, detail: string): RulesetError => ({
+    kind: 'invalid-value',
+    catalog: 'victory',
+    id: 'victory',
+    field,
+    detail,
+  });
+
+  const record = asRecord(section);
+  if (record === undefined) {
+    return [bad('victory', 'must be an object carrying the four victory thresholds')];
+  }
+
+  const errors: RulesetError[] = [];
+
+  for (const field of ['dominationLandPct', 'dominationPopPct']) {
+    const value = integerField(record, field);
+    if (value === undefined) errors.push(bad(field, 'must be an integer'));
+    else if (value < 1 || value > 100) {
+      errors.push(
+        bad(
+          field,
+          'must be in 1..100: a share of 0 holds at turn zero (a game that ends before it starts), ' +
+            'and a share above 100 can never be reached',
+        ),
+      );
+    }
+  }
+
+  const culture = integerField(record, 'culturalVictoryCulture');
+  if (culture === undefined) errors.push(bad('culturalVictoryCulture', 'must be an integer'));
+  else if (culture < 1) {
+    errors.push(
+      bad(
+        'culturalVictoryCulture',
+        'must be >= 1: the condition is checked with >=, so 0 would make every player a cultural ' +
+          'victor at turn zero',
+      ),
+    );
+  }
+
+  const turn = integerField(record, 'scoreVictoryTurn');
+  if (turn === undefined) errors.push(bad('scoreVictoryTurn', 'must be an integer'));
+  else if (turn < 1) {
+    errors.push(
+      bad('scoreVictoryTurn', 'must be >= 1: the turn counter starts at 1, so 0 is not a turn'),
+    );
+  }
+
+  return errors;
+};
+
 export const validateRuleset = (
   catalog: Catalog,
   fidelity: Fidelity,
@@ -2572,6 +3806,21 @@ export const validateRuleset = (
     // buildings a sack destroys are themselves well-formed. Read as `unknown`, so a
     // catalog that omits it is *reported* rather than crashing the validator.
     ...checkCapture(catalog.capture),
+    // M9: the government rows are a *row catalog* like units and buildings — they get the
+    // empty-catalog and duplicate-id treatment `checkRows` gives every row list, plus
+    // their own per-row checks. They sit after the five row catalogs and before the
+    // M9/M10 sections so that a complaint about a government's caps is read next to the
+    // other row complaints.
+    ...checkRows(GOVERNMENTS_SECTION, catalog.governments),
+    ...catalog.governments.flatMap(checkGovernment),
+    // M9+M10's three singleton sections, each read as `unknown` so a catalog that omits
+    // one is *reported* rather than crashing the validator (the `checkCombat` argument).
+    // They run last, after every row catalog, because a complaint about a border
+    // threshold is only meaningful once the buildings that produce the culture are
+    // themselves well-formed.
+    ...checkCulture(catalog.culture),
+    ...checkScore(catalog.score),
+    ...checkVictory(catalog.victory),
   ];
 
   if (fidelity === 'cited-only') {
@@ -2657,12 +3906,71 @@ export const validateRuleset = (
         note: catalog.capture.provenance.note,
       });
     }
+    // M9: the government rows are *rows*, so they are audited row by row like units and
+    // buildings — and they must be, because each is a separate tuning claim about a
+    // separate government. A single section-level note could not say "the monarchy's
+    // support numbers are ours" without also claiming it for the republic's.
+    for (const g of catalog.governments) {
+      if (isPlaceholder(g.provenance)) {
+        errors.push({
+          kind: 'placeholder-in-cited-only',
+          catalog: GOVERNMENTS_SECTION,
+          id: g.id,
+          note: g.provenance.note,
+        });
+      }
+    }
+    // M9+M10: the three singleton sections, each refused by name exactly as `combat` and
+    // `capture` are. The culture section carries the two border thresholds, the four-rung
+    // unhappy ladder and the two luxury magnitudes; `score` carries five weights and
+    // `victory` four thresholds. Leaving any of them out of this audit would mean content
+    // could ship eleven uncited rules numbers past a `cited-only` check that claims to
+    // have audited the catalog.
+    for (const [name, id, provenance] of [
+      ['culture', CULTURE_ROW_ID, catalog.culture.provenance],
+      ['score', SCORE_ROW_ID, catalog.score.provenance],
+      ['victory', VICTORY_ROW_ID, catalog.victory.provenance],
+    ] as const) {
+      if (isPlaceholder(provenance)) {
+        errors.push({
+          kind: 'placeholder-in-cited-only',
+          catalog: name,
+          id,
+          note: provenance.note,
+        });
+      }
+    }
   }
 
   // The annotations state the contract each `extends` encodes, and keep the
   // return type honest: what leaves validation is the engine's view.
   const units: readonly UnitSpec[] = catalog.units;
-  const buildings: readonly BuildingSpec[] = catalog.buildings;
+  // **M9: the happiness projection — the one place a spec row becomes an effect.**
+  //
+  // The contract spells a building's contentment as `BuildingSpec.happiness`, and the
+  // engine's contentment arithmetic is a fold over `BuildingEffect`s
+  // (`core/buildings.ts`' `effectTotals`). Rather than teach the engine's effect union a
+  // second field name, the spec field is projected onto `{ kind: 'city-happiness' }`
+  // **here, once, at validation time**, and `BuildingDef` carries no `happiness` field at
+  // all — so there is exactly one path from content into a city's contentment and no
+  // second reader that could disagree with the first.
+  //
+  // It is written as **replace, not append**, and that is the load-bearing part: content
+  // that declared a `city-happiness` effect by hand (which nothing shipped does) has that
+  // entry dropped and the one derived from `happiness` put in its place. Appending would
+  // make the two add up, so a row stating `happiness: 1` and
+  // `effects: [{ kind: 'city-happiness', amount: 1 }]` would content two citizens — one
+  // number, two homes, the defect class this project has found six times. A zero
+  // projects to no effect at all, so a building that changes nothing adds nothing to the
+  // fold.
+  const buildings: readonly BuildingSpec[] = catalog.buildings.map((row) => {
+    const happiness = typeof row.happiness === 'number' ? row.happiness : 0;
+    const rest = row.effects.filter((effect) => effect.kind !== 'city-happiness');
+    return {
+      ...row,
+      effects: happiness === 0 ? rest : [...rest, { kind: 'city-happiness', amount: happiness }],
+    };
+  });
   const improvements: readonly ImprovementSpec[] = catalog.improvements;
   const resources: readonly ResourceSpec[] = catalog.resources;
   const techs: readonly TechSpec[] = catalog.techs;
@@ -2672,6 +3980,14 @@ export const validateRuleset = (
   // M7: the capture rule travels with the validated ruleset for the same reason, and
   // `cities.ts`' `captureRulesOf` is the one reader. See `Ruleset.capture`.
   const capture: CaptureSpec = catalog.capture;
+  // M9+M10: the four new sections travel with the validated ruleset for the reason
+  // `combat` and `capture` do — the engine's readers (`borders.ts`, `happiness.ts`,
+  // `governments.ts`, `score.ts`, `victory.ts`) read every magnitude from the ruleset
+  // they are handed and keep no copy. See `Ruleset.culture`.
+  const culture: CultureSpec = catalog.culture;
+  const governments: readonly GovernmentSpec[] = catalog.governments;
+  const score: ScoreSpec = catalog.score;
+  const victory: VictorySpec = catalog.victory;
 
   return errors.length > 0
     ? err(errors)
@@ -2684,6 +4000,10 @@ export const validateRuleset = (
         techs,
         combat,
         capture,
+        culture,
+        governments,
+        score,
+        victory,
         fidelity,
       });
 };
@@ -2789,6 +4109,21 @@ export const provenanceSections = (catalog: Catalog): readonly ProvenanceSection
   // so its "row" is the one its provenance is filed under (`CAPTURE_ROW_ID`), and the
   // count comes from the rows the section actually carries.
   sectionOf('capture', [{ id: CAPTURE_ROW_ID, provenance: catalog.capture.provenance }]),
+  // M9: the government rows are the ninth section, and they are a *row* section rather
+  // than a singleton — three rows, each with its own tuning claim, each counted and
+  // listed. The argument above applies unchanged, and it is sharpest here: a sweep or a
+  // reader asking "which of these governments has a sourced support cost?" has to be able
+  // to see the rows, not a subtotal over them.
+  sectionOf(GOVERNMENTS_SECTION, catalog.governments),
+  // M9+M10's three singleton sections are the tenth, eleventh and twelfth. They carry
+  // eleven rules numbers between them (five culture/contentment magnitudes, five score
+  // weights, four victory thresholds — with `conquest` having none), and every one is a
+  // `placeholder` of ours. A provenance report that listed the catalog's rows without
+  // these would understate exactly the numbers this wave introduced, which is the
+  // half-truth this function exists to prevent.
+  sectionOf('culture', [{ id: CULTURE_ROW_ID, provenance: catalog.culture.provenance }]),
+  sectionOf('score', [{ id: SCORE_ROW_ID, provenance: catalog.score.provenance }]),
+  sectionOf('victory', [{ id: VICTORY_ROW_ID, provenance: catalog.victory.provenance }]),
 ];
 
 /**

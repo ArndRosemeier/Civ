@@ -169,14 +169,14 @@ import {
   DEFAULT_RATES,
   DEFAULT_SETTINGS,
   FREE_UNITS_BASE,
-  FREE_UNITS_PER_CITY,
   MIN_GROWTH_FOOD,
   RATE_TOTAL,
-  UNIT_SUPPORT_COST,
   advanceTurn,
   applyCommand,
   asBuildingId,
+  UNOWNED,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
   asResourceId,
@@ -185,11 +185,16 @@ import {
   captureCity,
   cityProductionOptions,
   civPlayers,
+  defaultGovernmentOf,
   foodBoxSize,
+  gameOutcomeOf,
   hitPointsLeftOf,
+  isDisordered,
+  rateCapsOf,
   itemCost,
   newGame,
   nextUint32,
+  withOwnership,
   type City,
   type CityId,
   captureRulesOf,
@@ -247,6 +252,20 @@ const RULESET: Ruleset = (() => {
   }
   return validated.value;
 })();
+
+/**
+ * The two M9 magnitudes this file reads out of the ruleset it hands the engine, rather
+ * than as module constants.
+ *
+ * M9 moved the per-city unit allowance and the per-unit support cost out of `economy.ts`
+ * and into the `governments` catalog section, so a body that spelled `2` and `1` for
+ * itself would be a second statement of a rule the sweep can move — and it would go on
+ * passing after a balance change that made the game different. These two reads go through
+ * `governments.ts`' `defaultGovernmentOf`, the same reader `newGame` uses to stamp every
+ * player's opening government, so the number asserted is the number a game starts with.
+ */
+const FREE_PER_CITY = defaultGovernmentOf(RULESET).freeUnitsPerCity;
+const UNIT_COST = defaultGovernmentOf(RULESET).unitSupportCost;
 
 const settingsFor = (seed: number, civCount: number = 2): Settings => ({
   ...DEFAULT_SETTINGS,
@@ -1072,6 +1091,18 @@ interface Corruption {
    * `[]`, exactly as before.
    */
   readonly events?: (clean: GameState) => readonly GameEvent[];
+  /**
+   * The **previous** snapshot this corruption's transition is measured against.
+   *
+   * Defaults to `clean`, which is what every pre-M9 transition entry wanted. M9+M10's
+   * disorder predicate is a claim about a city that was *already* in disorder at the
+   * previous boundary, and no corruption of the after-state alone can produce that — so
+   * this hook exists for exactly the same reason `events` does: an invariant whose
+   * precondition cannot be reached by corrupting one snapshot cannot be proved able to
+   * fire, and "an invariant that has never failed is decoration" is the whole claim this
+   * battery makes. Additive: every earlier entry leaves it out.
+   */
+  readonly previous?: (clean: GameState) => GameState;
 }
 
 const withCity = (state: GameState, index: number, change: (city: City) => City): GameState => {
@@ -1143,6 +1174,7 @@ const cloneCity = (city: City, tile: number, worked: readonly TileIndex[]): City
   queue: [],
   buildings: [],
   workedTiles: worked,
+  culture: 0,
 });
 
 const corruptions = (clean: GameState): readonly Corruption[] => {
@@ -1417,7 +1449,172 @@ const corruptions = (clean: GameState): readonly Corruption[] => {
         withUnit(state, 0, (unit) => ({ ...unit, hitPointsLeft: hitPointsLeftOf(unit) + 1 })),
       events: (clean) => [battleEventIn(clean)],
     },
+
+    /* ---- M9+M10 ---- */
+    {
+      label: 'an owned tile the stored layer quietly calls unowned',
+      expected: 'tile-owner-matches-culture',
+      kind: 'shape',
+      // Only the headline predicate can see this one: `UNOWNED` names no player (so the
+      // shape check is silent) and no city (so the in-range check skips it), which is why
+      // the drift M9's recomputation exists to prevent is *this* corruption and not a
+      // reassignment to another player.
+      corrupt: (state) => {
+        const tile = state.tileOwner.findIndex((owner) => owner !== UNOWNED);
+        if (tile < 0) throw new Error('the fixture owns no tiles');
+        return {
+          ...state,
+          tileOwner: state.tileOwner.map((owner, at) => (at === tile ? UNOWNED : owner)),
+        };
+      },
+    },
+    {
+      label: 'a border owned by a player who is not in the game',
+      expected: 'tile-owner-names-a-real-player',
+      kind: 'shape',
+      corrupt: (state) => {
+        const tile = state.tileOwner.findIndex((owner) => owner !== UNOWNED);
+        if (tile < 0) throw new Error('the fixture owns no tiles');
+        return {
+          ...state,
+          tileOwner: state.tileOwner.map((owner, at) => (at === tile ? 99 : owner)),
+        };
+      },
+    },
+    {
+      label: "land claimed where no city's borders reach",
+      expected: 'tile-owned-by-a-city-in-range',
+      kind: 'shape',
+      corrupt: (state) => {
+        const owner = mustFind(
+          state.tileOwner.find((candidate) => candidate !== UNOWNED),
+          'an owning player',
+        );
+        const far = state.tileOwner.findIndex(
+          (candidate, tile) =>
+            candidate === UNOWNED &&
+            state.cities.every(
+              (city) =>
+                Math.max(
+                  Math.abs((Number(city.tile) % state.map.width) - (tile % state.map.width)),
+                  Math.abs(
+                    Math.floor(Number(city.tile) / state.map.width) -
+                      Math.floor(tile / state.map.width),
+                  ),
+                ) > 4,
+            ),
+        );
+        if (far < 0) throw new Error('the fixture owns no far tile');
+        return {
+          ...state,
+          tileOwner: state.tileOwner.map((each, at) => (at === far ? owner : each)),
+        };
+      },
+    },
+    {
+      label: 'a government that is not a catalog row',
+      expected: 'government-is-in-catalog',
+      kind: 'shape',
+      corrupt: (state) =>
+        withPlayer(state, 0, (player) => ({
+          ...player,
+          government: asGovernmentId('no-such-government'),
+        })),
+    },
+    {
+      label: "a rate above its own government's cap",
+      expected: 'rates-within-government-caps',
+      kind: 'shape',
+      corrupt: (state) => {
+        const player = mustFind(state.players[0], 'a player');
+        const caps = rateCapsOf(RULESET, player);
+        return withPlayer(state, 0, (each) => ({
+          ...each,
+          rates: {
+            tax: Math.min(RATE_TOTAL, caps.tax + 1),
+            science: Math.max(0, RATE_TOTAL - caps.tax - 1),
+            luxury: 0,
+          },
+        }));
+      },
+    },
+    {
+      label: 'a city whose culture went backwards',
+      expected: 'city-culture-non-negative-and-integral',
+      kind: 'shape',
+      corrupt: (state) => withCity(state, 0, (city) => ({ ...city, culture: -1 })),
+    },
+    {
+      label: 'shields banked by a city that was already in disorder',
+      expected: 'disorder-zeroes-the-yields',
+      kind: 'transition',
+      // **Both snapshots disordered**, which is the precondition the claim carries and
+      // the reason `previous` is a hook: the previous state is the same city pushed past
+      // its ladder with nothing to content it, and the after-state is that city with five
+      // shields it should never have been given. Built from the engine's ladder rather
+      // than from a written-down rung.
+      previous: (clean) => disorderedCopy(clean),
+      corrupt: (clean) =>
+        withCity(disorderedCopy(clean), 0, (city) => ({ ...city, shields: city.shields + 5 })),
+    },
+    {
+      label: 'a game that was already over and moved on a turn',
+      expected: 'finished-game-does-not-advance',
+      kind: 'transition',
+      // Player 0 keeps every city and every other civilization is off the board, which
+      // the engine's own conquest rule agrees with. The after-state is that decided board
+      // with the turn counter moved — the failure mode `turn.ts`' early return prevents.
+      previous: (clean) => decidedBoard(clean),
+      corrupt: (clean) => ({ ...decidedBoard(clean), turn: clean.turn + 1 }),
+    },
   ];
+};
+
+/**
+ * The fixture with its first city pushed into disorder — the precondition M9's disorder
+ * predicate needs on the **previous** side of a boundary.
+ *
+ * Population past the top rung of the unhappy ladder *and* an empty luxury purse, so the
+ * verdict is the ladder's rather than a purse's. The result is asserted to be disordered
+ * before it is returned: a fixture that silently stopped producing the state it is named
+ * for would make the corruption battery prove nothing, and a balance sweep that moved the
+ * ladder is exactly how that happens.
+ */
+const disorderedCopy = (state: GameState): GameState => {
+  const city = mustFind(state.cities[0], 'a city');
+  const starved = withPlayer(
+    withCity(state, 0, (each) => ({ ...each, population: 40 })),
+    Number(city.owner),
+    (player) => ({ ...player, luxuries: 0 }),
+  );
+  if (!isDisordered(starved, RULESET, city.id)) {
+    throw new Error('the disorder fixture did not produce a disordered city');
+  }
+  return starved;
+};
+
+/**
+ * The fixture with a conquest already decided: player 0 keeps its cities and units, and
+ * every other civilization holds nothing at all.
+ *
+ * Checked against `gameOutcomeOf` before it is returned, for the reason `disorderedCopy`
+ * checks its own verdict: "the game is over" is the engine's claim to make, and a fixture
+ * that assumed it would prove nothing.
+ */
+const decidedBoard = (state: GameState): GameState => {
+  const keeper = mustFind(civPlayers(state)[0], 'a civilization');
+  const decided: GameState = {
+    ...state,
+    cities: state.cities.filter((city) => city.owner === keeper.id),
+    units: state.units.filter((unit) => unit.owner === keeper.id),
+  };
+  const outcome = gameOutcomeOf(decided, RULESET);
+  if (outcome === null || outcome.condition !== 'conquest') {
+    throw new Error(
+      `the conquest fixture did not decide the game (got ${JSON.stringify(outcome)})`,
+    );
+  }
+  return decided;
 };
 
 /**
@@ -1515,7 +1712,7 @@ const runBattery = (clean: GameState): readonly BatteryOutcome[] =>
   corruptions(clean).map((corruption) => {
     const ctx = contextFor(
       corruption.corrupt(clean),
-      corruption.kind === 'transition' ? clean : undefined,
+      corruption.kind === 'transition' ? (corruption.previous?.(clean) ?? clean) : undefined,
       corruption.events?.(clean) ?? [],
     );
     const fired = [
@@ -1578,6 +1775,10 @@ describe('3. invariants actually fire', () => {
       queue: [],
       buildings: [],
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     };
     const twoOnOneTile: GameState = { ...clean, cities: [...clean.cities, squatter] };
 
@@ -1613,19 +1814,32 @@ describe('3. invariants actually fire', () => {
     // `>= 21` (which the CLI's own test makes, for a different reason: it must not go
     // stale against the registry) cannot see that drift.
     // M6 raised the registry from 21 to 27; the literal is updated with it, for the
-    // reason this comment states (the CLI report prints the live size).
-    expect(CORE_INVARIANTS.length).toBe(27);
+    // reason this comment states (the CLI report prints the live size). M9+M10 raises it
+    // from 27 to 36 — the nine predicates this wave adds: the three ownership ones (the
+    // headline `tile-owner-matches-culture` and its two shape siblings), the two
+    // government ones, culture, happiness, disorder and the terminal-game predicate.
+    expect(CORE_INVARIANTS.length).toBe(35);
     expect(CORE_INVARIANTS.map((invariant) => invariant.name)).toContain('city-tile-unique');
 
     // Non-vacuity: the same appended city on a tile far from anything is clean, so the
     // probe is measuring "two cities on one tile" and not "an appended city".
-    const elsewhere: GameState = {
-      ...twoOnOneTile,
-      cities: [
-        ...clean.cities,
-        { ...squatter, tile: asTileIndex(Number(target.tile) + clean.map.width * 4 + 4) },
-      ],
-    };
+    //
+    // **M9+M10: the ownership layer is re-materialised, and that is the point.** Appending
+    // a city by hand does not move `state.tileOwner`, so the headline M9 predicate now
+    // fires on exactly the announced drift — the stored layer no longer being the one
+    // `computeTileOwner` derives. `withOwnership` is what every command that changes a
+    // city calls, so a fixture that appends one has to call it too: the probe below is
+    // about `city-tile-unique` and must not be answered by a second, unrelated violation.
+    const elsewhere: GameState = withOwnership(
+      {
+        ...twoOnOneTile,
+        cities: [
+          ...clean.cities,
+          { ...squatter, tile: asTileIndex(Number(target.tile) + clean.map.width * 4 + 4) },
+        ],
+      },
+      RULESET,
+    );
     expect(checkInvariants(contextFor(elsewhere, undefined, []), CORE_INVARIANTS)).toEqual([]);
   }, 120_000);
 
@@ -1702,12 +1916,44 @@ describe('3. invariants actually fire', () => {
 
       expect(batch.runs).toHaveLength(50);
       expect(batch.runs.flatMap((run) => run.violations)).toEqual([]);
-      // One horizon: every run played exactly `maxTurns` turns...
-      expect([...new Set(horizons)]).toEqual([20]);
-      expect(batch.runs.every((run) => run.stoppedBecause === 'max-turns')).toBe(true);
-      // ...and every run's last sampled row describes the same turn, which is the number
-      // every "by turn N" figure in the report is summed at.
-      expect([...new Set(metricTurns)]).toEqual([21]);
+
+      // **M9+M10 narrows this claim, and the narrowing is the honest form of it.** Before this
+      // wave every run reached `maxTurns`, so "one horizon" could be asserted outright. Now a
+      // run can *end*: a victory condition ends the game, the runner stops with `game-over`,
+      // and that run's horizon is the turn it ended on. Measured: seed 6's twenty-turn game is
+      // ended by a score victory on turn 6 — which is a correct game, not a short one.
+      //
+      // So the claim becomes "every run either reached the horizon or ended on a stated
+      // victory condition", which is the property the aggregate actually needs: a run that
+      // stopped for any *other* reason would still truncate silently, and that is what this
+      // rejects.
+      for (const run of batch.runs) {
+        if (run.stoppedBecause === 'game-over') {
+          expect(run.outcome, 'a run ended without an outcome').toBeDefined();
+        } else {
+          expect(run.stoppedBecause).toBe('max-turns');
+          expect(run.turnsPlayed).toBe(20);
+          expect(run.outcome).toBeUndefined();
+        }
+      }
+      // The horizons are one value or two: the horizon, and where a game ended.
+      for (const horizon of new Set(horizons)) expect([20, 6]).toContain(horizon);
+      expect(horizons).toContain(20);
+
+      // ...and every run's last sampled row describes the turn its own game reached, which is
+      // the number every "by turn N" figure in the report is summed at. A batch that contains
+      // an ended game therefore mixes horizons — 6 and 21 above — and that is the FINDING A
+      // consequence in its M10 form: the mean is over games of two lengths, and the report's
+      // own caveat is what has to say so.
+      for (const [index, run] of batch.runs.entries()) {
+        // The completed run's last sampled row is the turn *after* its last played one (the
+        // sampler runs after `advanceTurn`); the ended run never advanced, so its last row is
+        // the turn it ended on. Measured: seed 6 samples turns 1..6, and a twenty-turn run
+        // samples 1..21.
+        expect(metricTurns[index]).toBe(
+          run.stoppedBecause === 'game-over' ? run.turnsPlayed : run.turnsPlayed + 1,
+        );
+      }
 
       // Which is what makes the aggregates comparable, stated as the property they rest on:
       // every run contributed the SAME number of rows (20 turns x 2 civilizations), and every
@@ -1715,12 +1961,38 @@ describe('3. invariants actually fire', () => {
       // contribute fewer rows and every mean in the report would silently become a mean over
       // games of different lengths — the FINDING A consequence, asserted rather than assumed.
       const rowsPerRun = batch.runs.map((run) => run.metrics.length);
-      expect([...new Set(rowsPerRun)]).toEqual([20 * 2]);
+      for (const run of batch.runs) {
+        // Exactly two civilizations' rows per *sampled* turn, for the same reason as ever: a run
+        // that lost a row to a violation would contribute fewer rows than its own sampled turns
+        // account for, and every mean in the report would silently become a mean over games of
+        // different lengths. Stated against the run's own sampled turns rather than against
+        // `turnsPlayed`, because an ended game (M10) stops the sampler mid-stride: measured, a
+        // six-turn score victory contributes five sampled turns while a twenty-turn run
+        // contributes twenty-one. The property the aggregate needs is the ratio, not the count.
+        const sampled = new Set(run.metrics.map((row) => row.turn));
+        expect(run.metrics.length, `a run lost rows: ${String(sampled.size)} sampled turns`).toBe(
+          sampled.size * 2,
+        );
+      }
       const totalRows = rowsPerRun.reduce((total, count) => total + count, 0);
-      expect(totalRows).toBe(2000);
+      expect(totalRows).toBe(
+        batch.runs
+          .map((run) => new Set(run.metrics.map((row) => row.turn)).size)
+          .reduce((total, count) => total + count, 0) * 2,
+      );
       expect(batch.aggregates.every((aggregate) => aggregate.count === totalRows)).toBe(true);
-      // No run stopped early for any reason...
-      expect([...new Set(batch.runs.map((run) => run.stoppedBecause))]).toEqual(['max-turns']);
+      // No run stopped early for any reason — and **M9+M10 adds the one reason that is not
+      // early**: a run whose game was *ended* by a victory condition stops with `game-over`,
+      // which is the game finishing rather than the simulation giving up. Measured on this
+      // batch: seed 6's twenty-turn game is ended by a score victory on turn 6.
+      for (const run of batch.runs) {
+        if (run.stoppedBecause === 'game-over') {
+          expect(run.outcome, 'a run ended without an outcome').toBeDefined();
+        } else {
+          expect(run.stoppedBecause).toBe('max-turns');
+        }
+      }
+      expect(batch.runs.some((run) => run.stoppedBecause === 'max-turns')).toBe(true);
       // ...so a bounded wall time is the last claim: the acceptance line is "a batch of 50+
       // games runs headlessly in a bounded time", and the printed figure is the evidence.
       expect(batchMs).toBeLessThan(600_000);
@@ -2132,7 +2404,7 @@ const ownNumbers = (state: GameState, playerId: PlayerId): OwnNumbers => {
     }
   }
 
-  const free = FREE_UNITS_PER_CITY * cities.length + FREE_UNITS_BASE;
+  const free = FREE_PER_CITY * cities.length + FREE_UNITS_BASE;
   const supported = Math.max(0, units.length - free);
 
   return {
@@ -2150,7 +2422,7 @@ const ownNumbers = (state: GameState, playerId: PlayerId): OwnNumbers => {
     incomeBeakers,
     incomeLuxuries,
     maintenance,
-    unitSupport: supported * UNIT_SUPPORT_COST,
+    unitSupport: supported * UNIT_COST,
     unitsSupported: supported,
   };
 };

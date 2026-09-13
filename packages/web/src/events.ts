@@ -43,6 +43,7 @@
 import {
   buildingDef,
   cityById,
+  governmentDef,
   improvementDef,
   indexToX,
   indexToY,
@@ -54,6 +55,7 @@ import {
   type GameEvent,
   type GameMap,
   type GameState,
+  type GovernmentId,
   type HutRewardKind,
   type ImprovementId,
   type PlayerId,
@@ -93,8 +95,13 @@ export interface EventContext {
 export const tileLabel = (map: GameMap, tile: TileIndex): string =>
   `${String(indexToX(map, tile))},${String(indexToY(map, tile))}`;
 
-/** A player's name, or `player <id>` when the state does not define that id. */
-const playerLabel = (state: GameState, id: PlayerId): string =>
+/**
+ * A player's name, or `player <id>` when the state does not define that id.
+ *
+ * Exported for M10's victory screen, which has to name the winner: the screen and the log spell a
+ * player the same way, so "who won?" and "who changed government?" cannot read as two vocabularies.
+ */
+export const playerLabel = (state: GameState, id: PlayerId): string =>
   state.players.find((player) => player.id === id)?.name ?? `player ${String(id)}`;
 
 /** A city's name, or `city <id>`. */
@@ -127,6 +134,15 @@ const buildingLabel = (ruleset: RulesetView, id: BuildingId): string =>
 
 /** A tech's name, or the raw id. */
 const techLabel = (ruleset: RulesetView, id: TechId): string => techDef(ruleset, id)?.name ?? id;
+
+/**
+ * A government's name, or the raw id — M9's label.
+ *
+ * Exported because the government selector and the scoreboard panel both need it, and one
+ * spelling of "Monarchy" is the whole reason this lives beside the other four.
+ */
+export const governmentLabel = (ruleset: RulesetView, id: GovernmentId): string =>
+  governmentDef(ruleset, id)?.name ?? id;
 
 /** A resource's name, or the raw id. */
 const resourceLabel = (ruleset: RulesetView, id: ResourceId): string =>
@@ -264,6 +280,19 @@ const renderEvent = (event: GameEvent, ctx: EventContext): string => {
           : `, sacked: ${event.destroyed.map((id) => buildingLabel(ruleset, id)).join(', ')}`;
       return `${playerLabel(state, event.to)} captured ${event.name} (city ${String(event.cityId)}) from ${playerLabel(state, event.from)} at ${tileLabel(map, event.tile)} — population ${String(event.population)}${sacked}`;
     }
+    // M9: the two culture events say different things and are rendered differently on
+    // purpose — the per-turn gain is a flow a reader sums, the wonder's one-off is a jump
+    // with a cause. A log that rendered them with one sentence would make "why did this
+    // city's culture jump?" unanswerable from the log, which is the one thing the log is
+    // for.
+    case 'CityCultureGrew':
+      return `${cityLabel(state, event.cityId)} of ${playerLabel(state, event.owner)} gained ${String(event.gain)} culture from its own buildings`;
+    case 'CityCultureGained':
+      return `${cityLabel(state, event.cityId)} of ${playerLabel(state, event.owner)} gained ${String(event.bonus)} culture at once — ${buildingLabel(ruleset, event.building)} was completed`;
+    case 'GovernmentChanged':
+      return event.from === event.to
+        ? `${playerLabel(state, event.playerId)} re-affirmed ${governmentLabel(ruleset, event.to)}; nothing changed but the revision`
+        : `${playerLabel(state, event.playerId)} changed government from ${governmentLabel(ruleset, event.from)} to ${governmentLabel(ruleset, event.to)}`;
   }
 
   // Unreachable while the switch above handles every member: the type of `event` is

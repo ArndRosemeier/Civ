@@ -469,7 +469,7 @@ const plannerVerdict = (
         planSetProduction(state, RULESET, playerId, command.cityId, command.item),
       );
     case 'SetRates':
-      return normalizePlan(planSetRates(state, playerId, command.rates));
+      return normalizePlan(planSetRates(state, RULESET, playerId, command.rates));
     case 'SetResearch':
       return normalizePlan(planSetResearch(state, RULESET, playerId, command.tech));
     default:

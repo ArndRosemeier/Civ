@@ -23,6 +23,37 @@ export * from './cities.js';
 // `BuildingDef`/`City` from `cities.ts` type-only), so the order here is a reading
 // order, not an evaluation requirement.
 export * from './buildings.js';
+/**
+ * **M9+M10's systems**, in reading order: the ownership layer, then the two counts that
+ * feed it and the score, then the two rules a game ends and is graded by.
+ *
+ * - `borders.ts` — the tile-ownership layer and the one statement of "this tile belongs
+ *   to somebody else". It sits after `cities.js` because a border is a function of the
+ *   cities' culture, and `withOwnership` is the layer's only writer.
+ * - `governments.ts` — the government rows and the one read of a rate cap, a per-city
+ *   free allowance, a per-unit support cost and a happiness modifier. After `state.js`
+ *   (it reads a `PlayerState`) and before `economy.js`, which asks it for two of those
+ *   four numbers in place of the module constants M4b declared.
+ * - `culture.ts` — accumulated city culture and the **derived** player total. There is
+ *   deliberately no `PlayerState.culture`; see the module note for why the derived half
+ *   is the contract's own insistence rather than an optimisation.
+ * - `happiness.ts` — the contentment counts and the one disorder verdict. It asks
+ *   `cities.js` and `buildings.js` for what a city *is* and `governments.ts` for what
+ *   its ruler does to it; `cities.ts`' `cityYields` asks it back, which is the one
+ *   deliberate runtime cycle in this package and is argued where it is declared.
+ * - `score.ts` — the five weighted terms, the only scorer in the engine.
+ * - `victory-rules.ts` — the four thresholds, read out of the catalog, and the
+ *   condition order.
+ * - `victory.ts` — the conditions, the caller-relative outcome, and the one function a
+ *   finished game is recognised by.
+ */
+export * from './borders.js';
+export * from './governments.js';
+export * from './culture.js';
+export * from './happiness.js';
+export * from './score.js';
+export * from './victory-rules.js';
+export * from './victory.js';
 export * from './growth.js';
 export * from './economy.js';
 // M5's technology rules. Before `production.js`/`turn.js` in reading order because

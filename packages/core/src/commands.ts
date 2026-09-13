@@ -294,12 +294,29 @@ import {
 // copy would be free to disagree with the pass that completes the item, which is
 // exactly how a wonder comes to exist twice.
 import { buildingHolder, mayStartBuilding } from './buildings.js';
+// M9: the border *rule* — the ownership layer's own reads. `foreignOwnerAt` is the one
+// statement of "this tile belongs to somebody else" (two laws are built on it, below), and
+// `withOwnership` is the **only writer** of `GameState.tileOwner` — which this module calls
+// after the two commands that can move a border (founding a city, capturing one). The
+// claim *radius* is deliberately not read here: M9 does not narrow M3's working ring, only
+// the question of who owns the ring's tiles (see the note in `planSetWorkedTiles`).
+import { foreignOwnerAt, withOwnership } from './borders.js';
 // Runtime import of the rate *rule*, not of the money loop: `SetRates` must refuse
 // a triple the split cannot use with the same reason a slider UI would show, and
 // `economy.ts` is where that rule is written down once. `economy.ts` imports this
 // module's `GameEvent` **type-only**, so the edge is one-way at runtime.
-import { ratesProblem } from './economy.js';
+import { rateCapProblem, ratesProblem } from './economy.js';
 import { visibleTiles, withExplored } from './fog.js';
+// M9: the government *rule*. `governmentCatalog`/`governmentDef` answer "does this
+// ruleset describe that row?" (so the refusal can list the menu), and
+// `governmentTechRequirement` is the row's `requiresTech` read through the one parse of
+// it. `governments.ts` imports nothing from this module, so the edge is one-way.
+import {
+  governmentCatalog,
+  governmentDef,
+  governmentTechRequirement,
+  type GovernmentDef,
+} from './governments.js';
 import { resolveHutEntry, type HutRewardKind } from './hut.js';
 // Runtime imports, not type-only: `StartWork` asks the catalog what a job *is*
 // (its `turns` and its `allowedRoles`) and whether the tile already carries the
@@ -315,6 +332,7 @@ import {
   asUnitId,
   type BuildingId,
   type CityId,
+  type GovernmentId,
   type PlayerId,
   type ResourceId,
   type TechId,
@@ -327,6 +345,7 @@ import {
   inBounds,
   indexToX,
   indexToY,
+  isWaterRole,
   terrainAtIndex,
   type RulesetView,
   type TerrainDef,
@@ -354,8 +373,14 @@ import type { GameState, PlayerState, Rates } from './state.js';
 // on, and `tech.ts` is where cost, prerequisites, "already known" and the two writers
 // of the `researching` key are written down once. `tech.ts` imports this module's
 // `GameEvent` **type-only**, so the edge is one-way at runtime.
-import { researchProblem, withResearching } from './tech.js';
+import { researchProblem, unmetTechRequirement, withResearching } from './tech.js';
 import { advanceTurn } from './turn.js';
+// M9: the victory *rule*, asked once per command by the gate at the top of
+// `applyCommand`. Value imports, not types: the gate has to run the rule, and the
+// contract is explicit that it is "a DERIVED value on the result/state read" rather than
+// a flag this module maintains. `victory.ts` imports nothing from this module, so the
+// edge is one-way.
+import { gameOutcomeOf, type VictoryConditionId } from './victory.js';
 import {
   clearFortified,
   experienceOf,
@@ -462,7 +487,34 @@ export type Command =
    * spend (`planFortifyUnit`); it emits no event, and `legalActions` therefore does
    * not advertise it — see the module note.
    */
-  | { readonly type: 'FortifyUnit'; readonly unitId: UnitId };
+  | { readonly type: 'FortifyUnit'; readonly unitId: UnitId }
+  /**
+   * Change the acting player's government (M9). No `playerId`, for the reason
+   * `SetRates` and `SetResearch` have none: a player changes its own government and
+   * nothing else, which removes the only way a caller could stage a coup.
+   *
+   * Legal exactly when the actor leads a civilization, the id names a row of the
+   * ruleset's `governments` catalog, and (where a row declares one) its `requiresTech`
+   * is known — all three stated once in `planSetGovernment` below, which
+   * `applyCommand` refuses with and `actions.ts` deliberately does **not** advertise
+   * (a government is a *setting*, like `SetRates` and `SetWorkedTiles`, not an action
+   * of a unit or a city: "every row of the catalog" is a content list, and a generator
+   * that yielded it would be advertising a choice board as if it were the player's
+   * whole move set).
+   *
+   * **The change takes effect immediately** — the contract says so — and the anarchy
+   * transition is DEFERRED. That is not an oversight and it is not hidden: a real
+   * revolution costs some turns of production or income, and this engine's pipeline has
+   * nowhere to carry "this player is in anarchy until turn N" without a new per-player
+   * field and a new pipeline step. `governments.ts`' `GovernmentDef` doc is the rule
+   * site where that is written down, and this is the second place a player-facing
+   * reader would look.
+   *
+   * It writes **only** `government`, and it emits a `GovernmentChanged` event because
+   * this is the one command in M9 whose whole effect is a single field with no
+   * payload of its own to read — unlike `SetRates`, whose payload is the triple.
+   */
+  | { readonly type: 'SetGovernment'; readonly government: GovernmentId };
 
 /**
  * Every way a command can be refused, as a *reason* rather than a message
@@ -742,6 +794,99 @@ export type GameError =
       readonly unitId: UnitId;
       readonly target: TileIndex;
       readonly defenders: number;
+    }
+  /**
+   * M9: `FoundCity` was asked for a tile **another player owns** (the ownership layer
+   * is `PlayerId` there, and this is that id). The contract's first border law: "a city
+   * may not be founded on a tile owned by another player".
+   *
+   * `owner` travels with the refusal because the fix depends on it — a player can see
+   * whose land it is standing on, and "found somewhere else" is a different action from
+   * "take that city first".
+   */
+  | {
+      readonly kind: 'tile-owned-by-another-player';
+      readonly unitId: UnitId;
+      readonly tile: TileIndex;
+      readonly owner: PlayerId;
+    }
+  /**
+   * M9: `SetWorkedTiles` named a tile another player owns. The contract's second border
+   * law: "a tile owned by another player may not be WORKED by your city".
+   *
+   * Distinct from `tile-worked-by-another-city` (which is about a *city*'s claim and
+   * names that city) and from `tile-not-workable` (which is about geometry), because the
+   * three have three different fixes and a caller routing on `kind` must be able to tell
+   * them apart.
+   */
+  | {
+      readonly kind: 'tile-owned-by-another-player-city';
+      readonly cityId: CityId;
+      readonly tile: TileIndex;
+      readonly owner: PlayerId;
+    }
+  /**
+   * M9: `SetWorkedTiles` on a tile no city of yours claims at all. The contract's
+   * "a city may only work tiles within its culture radius", stated as a refusal a
+   * player can act on.
+   *
+   * **Why this is a new member rather than a reuse of `tile-not-workable`.** That one
+   * already means "outside the working radius, off the map, or the centre", and a tile
+   * inside the working radius but outside the *claimed* radius is none of those — it is
+   * a tile the city could work if its culture grew. The two have different fixes
+   * ("pick a tile in the ring" versus "grow the city's culture, or found closer"), and
+   * collapsing them would make the refusal lie about which ring it meant. The
+   * `radius` field names the claimed radius the answer was computed from, so a UI can
+   * say "this city claims 1 tile of reach" from the refusal alone.
+   */
+  /**
+   * M9: `SetGovernment` named an id no `governments` row defines. Its own member for
+   * the reason `unknown-tech` and `unknown-improvement` have theirs: the fix is "pick a
+   * government this ruleset describes", and `known` lists them in catalog order so a UI
+   * can render the menu from the refusal.
+   */
+  | {
+      readonly kind: 'unknown-government';
+      readonly government: GovernmentId;
+      readonly known: readonly GovernmentId[];
+    }
+  /**
+   * M9: the government row declares `requiresTech` and this player does not know it.
+   *
+   * The contract allows a prerequisite ("or (if you add a prerequisite) an unmet tech")
+   * and the shipped catalog uses it — monarchy and republic both sit behind a tech, so
+   * the three shipped governments are reachable in an order rather than all at once.
+   * Distinct from `unknown-government` (the row exists) and it names the tech, so the
+   * refusal is renderable as "research Monarchy first".
+   */
+  | {
+      readonly kind: 'government-tech-required';
+      readonly government: GovernmentId;
+      readonly tech: TechId;
+    }
+  /**
+   * M9: **the game is over.** A finished game refuses further commands, and this is
+   * the typed refusal that does it.
+   *
+   * It is raised for every command except `EndTurn`, which is deliberately still
+   * accepted: the turn pipeline is what *reports* the ending, a runner that could not
+   * end its turn would hang on the turn the game finished, and "advance a finished
+   * game" is a no-op rather than a decision — the victory rule is a pure read of the
+   * board, so an `EndTurn` on a finished game changes nothing and discovers nothing
+   * new.
+   *
+   * `outcome` carries the whole `VictoryResult` the refusal was computed from
+   * (`victory.ts`' type), so a caller does not have to re-ask to find out who won —
+   * and because the two are the *same* value, the refusal and the screen cannot
+   * disagree. `command` names what was refused, which is the one fact a bare
+   * `game-over` would lose.
+   */
+  | {
+      readonly kind: 'game-over';
+      readonly condition: VictoryConditionId;
+      readonly winner: PlayerId | null;
+      readonly turn: number;
+      readonly command: Command['type'];
     }
   | { readonly kind: 'invalid-argument'; readonly detail: string };
 
@@ -1115,6 +1260,61 @@ export type GameEvent =
       readonly population: number;
       /** Buildings destroyed, in destruction order; wonders are never among them. */
       readonly destroyed: readonly BuildingId[];
+    }
+  /**
+   * M9: `cityId` accumulated `gain` culture this turn from its own buildings.
+   *
+   * Emitted **only for a city whose gain is positive**, on the M4a precedent the event
+   * union's own note states for `WorkProgressed`: a line that says nothing new is a line
+   * the log is worse for. A city with no culture-producing building gains nothing and
+   * emits nothing, and its culture is still in the state for anyone who asks.
+   *
+   * `owner` travels with it because a consumer rendering the event log needs to colour
+   * or filter by player, and reading it back off the city would be reading the state the
+   * event is supposed to spare it from diffing.
+   */
+  | {
+      readonly type: 'CityCultureGrew';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      /** Culture added this turn; strictly positive. */
+      readonly gain: number;
+    }
+  /**
+   * M9: a **wonder's one-off** culture landed — `CityCultureGained`, so named because it
+   * is a different fact from the per-turn `CityCultureGrew` above and a consumer
+   * summing the stream must be able to tell them apart.
+   *
+   * Emitted at the moment of completion by `production.ts`, carrying the building that
+   * granted it, so the log reads "the Pyramids were completed and 10 culture landed"
+   * rather than two unrelated lines a reader has to correlate. Only ever emitted for a
+   * positive bonus; a wonder that declares none is an ordinary `CityProduced`.
+   */
+  | {
+      readonly type: 'CityCultureGained';
+      readonly cityId: CityId;
+      readonly owner: PlayerId;
+      /** Culture added, once; strictly positive. */
+      readonly bonus: number;
+      /** The building whose completion granted it. */
+      readonly building: BuildingId;
+    }
+  /**
+   * M9: the acting player changed government. `from` and `to` are both named, for the
+   * reason `CityCaptured` names both owners: "you are now a republic" without saying
+   * what you were is not enough to reconcile a log against a state.
+   *
+   * The only M9 command that emits an event at all. `SetRates`, `SetResearch`,
+   * `SetWorkedTiles` and `SetProduction` all emit nothing on the M3 setters' precedent —
+   * their payload *is* the record of the change — and a government has no payload beyond
+   * the id, so the event is what makes the change visible to a log-only consumer without
+   * that consumer diffing a field it would have to know about.
+   */
+  | {
+      readonly type: 'GovernmentChanged';
+      readonly playerId: PlayerId;
+      readonly from: GovernmentId;
+      readonly to: GovernmentId;
     };
 
 /**
@@ -1340,10 +1540,11 @@ const planMoveFor = (
  * this: a terrain's `impassable` flag cannot answer it, because mountains are
  * impassable *and* land.
  */
-const WATER_ROLES: readonly TerrainRole[] = ['ocean', 'coast'];
+// M10 moved the two-element list to `map.ts` (see `isWaterRole` there): the domination land
+// share became the third reader of "is this ground land?", and three copies of a rule about
+// the world is the drift this project's discipline exists to prevent.
 
 /** Is this terrain role water (ocean or coast)? */
-const isWaterRole = (role: TerrainRole): boolean => WATER_ROLES.includes(role);
 
 /**
  * The id the next founded city will take.
@@ -1483,6 +1684,25 @@ export const planFoundCity = (
   }
   if (isWaterRole(terrain.role)) return err({ kind: 'not-on-land', unitId, tile });
 
+  // M9's first border law: **a city may not be founded on a tile owned by another
+  // player**. Asked through `borders.ts`' `foreignOwnerAt`, which is the one statement
+  // of "this tile belongs to somebody else" — the same read `planSetWorkedTiles` and
+  // `autoAssignWorkedTiles` make, so the three cannot disagree about what foreign means.
+  //
+  // It is checked **after** the distance rule, deliberately, so the more specific and
+  // more common refusal wins: two cities may not be adjacent whatever the borders say,
+  // and a player that walks up to a neighbour's land hears "too close" or "that is their
+  // land" — never both, and never the less actionable one when the other applies.
+  //
+  // Founding on your **own** land is legal, which is worth stating because it is the
+  // case a reader wonders about: it is the normal case, since your own cities' borders
+  // cover the ground your settlers walk over, and refusing it would make expansion
+  // impossible past the first city.
+  const foreign = foreignOwnerAt(state, tile, playerId);
+  if (foreign !== undefined) {
+    return err({ kind: 'tile-owned-by-another-player', unitId, tile, owner: foreign });
+  }
+
   const clash = nearestCityWithin(state, tile, MIN_CITY_DISTANCE);
   if (clash !== undefined) {
     return err({
@@ -1504,6 +1724,13 @@ export const planFoundCity = (
     population: 1,
     foodBox: 0,
     shields: 0,
+    // M9: a new city has **no culture**, and that is a rule rather than an initialisation:
+    // its claim is radius 1 (its own tile and its eight neighbours), it works that ring,
+    // and it earns the wider ring by accumulating culture — see `borders.ts`'
+    // `claimedRadius` and the catalog's `borderRadius2Culture`. Starting at 0 rather than
+    // at the first threshold is what makes a border *grow* during a game instead of being
+    // handed to the founder.
+    culture: 0,
     // Nothing is being built yet: production is the player's next decision. The
     // key is *omitted* rather than written as `undefined` — `City.production` is
     // optional, and a present-but-`undefined` key cannot be represented in
@@ -1592,9 +1819,38 @@ export const planSetWorkedTiles = (
         detail: `SetWorkedTiles takes integer tile indices (got ${String(tile)})`,
       });
     }
+    // The duplicate check sits **with the other checks about the payload itself**, before
+    // every rule about the board: `[4, 4]` names one tile twice, and the reason to refuse it
+    // is the list rather than anything about tile 4 — so a list that is wrong in two ways at
+    // once is reported for the way the *caller* can fix by editing the command. It is asked
+    // after the integer check for the same reason (a non-integer entry is not a tile at all)
+    // and before the geometry, the culture radius and the ownership rules, each of which is a
+    // statement about the world.
+    if (listed.has(index)) return err({ kind: 'duplicate-worked-tile', cityId, tile });
+    listed.add(index);
+
     if (index === centre || !inside.has(index))
       return err({ kind: 'tile-not-workable', cityId, tile });
 
+    // **M9 does NOT narrow the working ring.** The contract's rule is "a tile owned by
+    // another player may not be WORKED by your city" — it says nothing about the tile having
+    // to be inside the city's own claim. It is worth writing down why, because the narrower
+    // rule is the obvious-sounding one and it was implemented here first and then removed:
+    //
+    // - M3's working radius and M9's claim radius are **different numbers with different
+    //   jobs**. A city works the 21 tiles of its radius-2 ring from the moment it is founded;
+    //   what M9 adds is that the *world* can now be somebody else's, so a ring tile that a
+    //   rival civilization has claimed is refused (`tile-owned-by-another-player-city`) while
+    //   an unclaimed one is worked exactly as M3 said.
+    // - At culture 0 the claim is radius 1, so the narrower rule would silently cut every
+    //   city's workable tiles from 20 to 8 — a size-1 city could not feed its second citizen
+    //   without a border war, and every M3 number would move. Measured: M3's own acceptance
+    //   suite went red in 1,540 places with the check in, and the readings it was protecting
+    //   (food and shields conserved, assignments built from the radius accepted) were all
+    //   correct.
+    //
+    // So the ring rule is M3's, unchanged, and the ownership rule below is M9's addition. Two
+    // rules, each stated once, neither standing in for the other.
     const other = state.cities.find(
       (candidate) =>
         candidate.id !== city.id &&
@@ -1604,8 +1860,36 @@ export const planSetWorkedTiles = (
       return err({ kind: 'tile-worked-by-another-city', cityId, tile, byCityId: other.id });
     }
 
-    if (listed.has(index)) return err({ kind: 'duplicate-worked-tile', cityId, tile });
-    listed.add(index);
+    // M9's second border law: **a tile owned by another player may not be WORKED**.
+    // Asked through the same `foreignOwnerAt` the founder and `autoAssignWorkedTiles` use,
+    // so "their land" means one thing in all three places — `borders.ts`' module note says
+    // as much ("Asked by `planFoundCity`, `planSetWorkedTiles` and `autoAssignWorkedTiles`"),
+    // and this is the call that makes that sentence true.
+    //
+    // It is asked **last, and that is a decision**: a tile can satisfy two refusals at once —
+    // another player's land *and* already worked by one of your own cities — and this
+    // codebase's rule is that a caller hears the reason it can act on. "Your other city
+    // works this tile" is about your own assignment, which you can change; "this is their
+    // land" is about the world, which you cannot.
+    const foreign = foreignOwnerAt(state, tile, playerId);
+    if (foreign !== undefined) {
+      return err({ kind: 'tile-owned-by-another-player-city', cityId, tile, owner: foreign });
+    }
+
+    // M9's second border law: **a tile owned by another player may not be WORKED**. Asked
+    // through the same `foreignOwnerAt` the founder uses, so "their land" means one thing in
+    // both places.
+    //
+    // **It is asked last, and the order is a decision rather than a leftover.** A tile can
+    // satisfy both refusals at once — it is another player's land *and* one of your own
+    // cities is already working it — and this codebase's rule is that a caller is told the
+    // reason it can act on. "Your other city works this tile" is a statement about your own
+    // assignment, which you can change; "this is their land" is a statement about the world,
+    // which you cannot. Reporting the first is also what keeps each refusal's *reason* the
+    // narrowest true one, and it is what M3's own contested-radius fixture pins (a board
+    // built so that three tiles are simultaneously in two cities' rings). Both branches are
+    // reachable: a tile owned by your own player but worked by another of your cities is
+    // refused here, and a foreign tile nobody works is refused below.
   }
 
   return ok({ city, tiles: [...tiles] });
@@ -1965,14 +2249,31 @@ export interface SetRatesPlan {
  * `SetRates`' legality is stated, called by `applyCommand` to refuse and by a UI
  * that wants to disable the confirm button before submitting.
  *
- * Two checks, and they are the whole rule:
+ * Three checks, and they are the whole rule:
  *
  * 1. the actor exists (`unknown-player`) — the same opening every command has, and
  *    the reason a mistyped id is a typed refusal rather than a silent no-op;
  * 2. the triple is three integers `>= 0` summing to exactly `RATE_TOTAL`
  *    (`invalid-argument`, with the actual sum in the message) — the rule itself
  *    lives in `economy.ts`' `ratesProblem`, so the command layer cannot develop a
- *    second opinion about what a rate is.
+ *    second opinion about what a rate is;
+ * 3. **M9: the triple respects this player's government's rate caps**
+ *    (`invalid-argument`, naming the slider and the cap) — the rule itself lives in
+ *    `economy.ts`' `rateCapProblem`, which reads the caps from `governments.ts` and
+ *    from nowhere else.
+ *
+ * **The cap is a conjunct of M4b's rule, not a replacement for it**, and the order of
+ * the two checks is deliberate: the sum rule runs first because it is about arithmetic
+ * and has one answer for every player, and the cap rule runs second because it is about
+ * *this* player's government. A triple that breaks both is reported as the arithmetic
+ * error, which is the one a UI's slider cannot produce and therefore the one that means
+ * the caller is not a UI.
+ *
+ * **A barbarian actor is legal and inert**, the same shape `SetResearch` takes: the
+ * contract's rate rule has no `kind` check in it, and barbarians have no commerce for a
+ * rate to divide (the money loop skips them), so nothing about the game changes. The
+ * cap check still runs, against the barbarian row's government — which is the default
+ * one `newGame` gave it.
  *
  * `playerId`'s own rates are the only ones in reach: the command has no player
  * field, so "only for its own rates" is not a check but the shape of the command —
@@ -1995,6 +2296,7 @@ export interface SetRatesPlan {
  */
 export const planSetRates = (
   state: GameState,
+  ruleset: RulesetView,
   playerId: PlayerId,
   rates: Rates,
 ): Result<SetRatesPlan, GameError> => {
@@ -2003,6 +2305,9 @@ export const planSetRates = (
 
   const problem = ratesProblem(rates);
   if (problem !== undefined) return err({ kind: 'invalid-argument', detail: problem });
+
+  const capped = rateCapProblem(rates, player, ruleset);
+  if (capped !== undefined) return err({ kind: 'invalid-argument', detail: capped });
 
   return ok({
     player,
@@ -2103,6 +2408,77 @@ const workCancelledEvent = (unit: Unit, reason: WorkCancelledReason): readonly G
       reason,
     },
   ];
+};
+
+/* ------------------------------------------------------------------ *
+ * M9 — government
+ * ------------------------------------------------------------------ */
+
+/** What `planSetGovernment` decided: the player whose government moves, and the row. */
+export interface SetGovernmentPlan {
+  readonly player: PlayerState;
+  readonly government: GovernmentDef;
+}
+
+/**
+ * Decide whether `playerId` may adopt `government` — the one place `SetGovernment`'s
+ * legality is stated, called by `applyCommand` to refuse and by a UI that wants to grey
+ * out a row in the government menu before the player clicks it.
+ *
+ * Three checks, in the fixed most-specific-first order every command's opening uses:
+ *
+ * 1. the actor exists (`unknown-player`), and is a **civilization**
+ *    (`not-a-civilization`) — a government is what a *people* are ruled by, and
+ *    barbarians have no economy, no research and no policy in this engine, so letting
+ *    them hold a rate cap would be a rule about nobody;
+ * 2. `governments.ts`' `governmentDef` must find the row (`unknown-government`, with
+ *    the known ids so a UI can render the menu from the refusal);
+ * 3. the row's `requiresTech`, where it declares one, must be known by this player
+ *    (`government-tech-required`).
+ *
+ * **Adopting the government you already have is legal and changes nothing observable**,
+ * exactly as `SetRates`' and `SetResearch`'s idempotence is legal: the value the player
+ * already has is a value the player may ask for, and refusing it would make a UI's
+ * "confirm" button wrong. It still costs a revision, because it is still a command, and
+ * it still emits a `GovernmentChanged` event with `from === to` — the honest record of
+ * "this player asked for this government", which is a different fact from "the
+ * government changed" and is the one the event's own name is about.
+ *
+ * **A prerequisite is read through `tech.ts`' `unmetTechRequirement`**, the same read
+ * `SetProduction` and `StartWork` use for their gates, rather than through a second
+ * `player.techs.includes(...)` written here. Government rows are the third kind of row
+ * to declare `requiresTech` (after units/buildings/resources/improvements and techs
+ * themselves), and the reason it is read through one function is the reason all of them
+ * are: a catalog row's tech gate has *one* meaning in this engine.
+ */
+export const planSetGovernment = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  government: GovernmentId,
+): Result<SetGovernmentPlan, GameError> => {
+  const player = playerById(state, playerId);
+  if (player === undefined) return err({ kind: 'unknown-player', playerId });
+  if (player.kind !== 'civ') {
+    return err({
+      kind: 'invalid-argument',
+      detail: `only a civilization is governed (player ${String(playerId)} is ${player.kind})`,
+    });
+  }
+
+  const known = governmentCatalog(ruleset).map((row) => row.id);
+  const row = governmentDef(ruleset, government);
+  if (row === undefined) return err({ kind: 'unknown-government', government, known });
+
+  // `unmetTechRequirement` answers the *unmet* tech or `undefined` when it is known —
+  // `tech.ts`' one implementation of "is this tech requirement satisfied?", which is why
+  // this planner does not test `player.techs` itself.
+  const unmet = unmetTechRequirement(player, governmentTechRequirement(ruleset, government));
+  if (unmet !== undefined) {
+    return err({ kind: 'government-tech-required', government, tech: unmet });
+  }
+
+  return ok({ player, government: row });
 };
 
 /* ------------------------------------------------------------------ *
@@ -2671,8 +3047,20 @@ const applyCapture = (
     movementLeft: 0,
   }));
 
+  // M9: **a captured city's tiles transfer to the captor**, and the previous owner's
+  // ownership of tiles it no longer claims is cleared — which is the whole of the
+  // contract's rule, and it is *nothing but* this call. There is no transfer code here
+  // because the ownership layer is a pure function of the cities: moving the city's
+  // `owner` field is the transfer, and recomputing the layer is what makes the old
+  // owner's stale claims disappear. That is also what makes "a tile owned by a player
+  // with no city in range is a state no command can produce" true *by construction*
+  // rather than by a cleanup pass.
+  //
+  // Note that `captureCity` keeps the city's accumulated culture (`cities.ts` says why),
+  // so the captured city's claim radius is unchanged by the sack: what moves is who the
+  // claim belongs to.
   return ok({
-    state: spent,
+    state: withOwnership(spent, ruleset),
     events: [
       {
         type: 'CityCaptured',
@@ -2708,6 +3096,30 @@ export const applyCommand = (
   cmd: Command,
   ruleset: RulesetView,
 ): Result<CommandOutcome, GameError> => {
+  // M9: **a finished game refuses further commands**, and this is the one gate.
+  //
+  // It is asked before the `switch`, so it covers every command at once and cannot be
+  // forgotten when a future command is added — a per-case check would be the "one rule,
+  // N places" shape this codebase refuses. `EndTurn` is deliberately exempt: the turn
+  // pipeline is what *reports* an ending, a runner that could not end its turn would
+  // hang on the turn the game finished, and an `EndTurn` on a finished game is a no-op
+  // rather than a decision — the victory rule is a pure read of the board, so advancing
+  // a finished game changes nothing and discovers nothing new.
+  //
+  // The refusal carries the *outcome itself* (`victory.ts`' `gameOutcomeOf`), not a
+  // re-derived copy of it, so the refusal a caller sees and the victory screen a player
+  // sees are the same value read twice rather than two values that must agree.
+  const ending = cmd.type === 'EndTurn' ? null : gameOutcomeOf(state, ruleset);
+  if (ending !== null) {
+    return err({
+      kind: 'game-over',
+      condition: ending.condition,
+      winner: ending.winner,
+      turn: state.turn,
+      command: cmd.type,
+    });
+  }
+
   switch (cmd.type) {
     case 'MoveUnit': {
       const plan = planMove(state, ruleset, playerId, cmd.unitId, cmd.to);
@@ -2800,7 +3212,14 @@ export const applyCommand = (
           tile: founded.tile,
         },
       ];
-      return ok({ state: next, events });
+
+      // M9: a new city claims its ring, so the ownership layer moves **with the command
+      // that moved it** rather than waiting for the next turn. `withOwnership` is the one
+      // writer and recomputes from the cities, so this is a cache refresh and not an
+      // incremental claim: the new city's radius comes from its own culture (0, so radius
+      // 1) and any tile it takes from a neighbour is taken by the culture-and-id rule,
+      // not by "whoever founded last".
+      return ok({ state: withOwnership(next, ruleset), events });
     }
 
     case 'SetWorkedTiles': {
@@ -2883,7 +3302,7 @@ export const applyCommand = (
     }
 
     case 'SetRates': {
-      const plan = planSetRates(state, playerId, cmd.rates);
+      const plan = planSetRates(state, ruleset, playerId, cmd.rates);
       if (!plan.ok) return err(plan.error);
 
       // M4b. Only `rates` moves. The player's `treasury`, `beakers` and `luxuries`
@@ -2955,6 +3374,43 @@ export const applyCommand = (
       const fortified = withFortified(plan.value.unit);
       const dug: Unit = { ...fortified, movementLeft: 0 };
       return ok({ state: { ...withUnit(state, dug), revision: state.revision + 1 }, events: [] });
+    }
+
+    // M9: the acting player's government. Only `government` moves on that player's row;
+    // every other field — the treasury, the two pools, the techs, the rates — is shared
+    // with the input, which is never modified.
+    //
+    // The change takes effect **immediately**, which is the contract's rule and is
+    // observable the very next time anything asks: the rate caps a `SetRates` is
+    // checked against, the free-unit allowance the *next* money loop bills against, and
+    // the unhappy count the *next* turn's yields are computed from all read the new row
+    // from that moment. The anarchy transition is DEFERRED — see the `SetGovernment`
+    // command's own note and `governments.ts`' `GovernmentDef` for why.
+    //
+    // Emits `GovernmentChanged` with both ids, so a log-only consumer sees the change
+    // without diffing a field, and so `from === to` (the idempotent re-affirmation,
+    // which is legal) is distinguishable from a real change by the reader.
+    case 'SetGovernment': {
+      const plan = planSetGovernment(state, ruleset, playerId, cmd.government);
+      if (!plan.ok) return err(plan.error);
+
+      const players = state.players.map((player) =>
+        player.id === plan.value.player.id
+          ? { ...player, government: plan.value.government.id }
+          : player,
+      );
+
+      return ok({
+        state: { ...state, revision: state.revision + 1, players },
+        events: [
+          {
+            type: 'GovernmentChanged',
+            playerId: plan.value.player.id,
+            from: plan.value.player.government,
+            to: plan.value.government.id,
+          },
+        ],
+      });
     }
   }
 };

@@ -15,10 +15,13 @@
  *   share, plus building/improvement gold effects), then upkeep (building
  *   maintenance plus unit support), then `treasury += income - upkeep`, then
  *   **bankruptcy**.
- * - Unit support (placeholder): the first
- *   `FREE_UNITS_PER_CITY * cityCount + FREE_UNITS_BASE` units are free; each unit
- *   beyond that costs `UNIT_SUPPORT_COST` gold. Only civilizations' units count —
- *   barbarians have no economy.
+ * - Unit support (**M9: read from the government**): the first
+ *   `government.freeUnitsPerCity * cityCount + FREE_UNITS_BASE` units are free; each
+ *   unit beyond that costs `government.unitSupportCost` gold. Only civilizations' units
+ *   count — barbarians have no economy. M4b wrote the two per-government numbers as
+ *   module constants here and said in their own comments that Civ 3's support is
+ *   government-dependent and that this engine did not model it; M9 is the milestone
+ *   that does, so those constants are gone (see the note where they were).
  * - Bankruptcy: a treasury that would go below zero floors at **0** and the
  *   shortfall is paid by **disbanding units**, deterministically: repeatedly
  *   remove the highest-id unit of that player until the shortfall is covered or
@@ -61,7 +64,7 @@
  *   zero lines noisy can filter on `gold === 0`; a consumer trying to reconstruct
  *   a *suppressed* line can only guess.
  * - **A disband never saves more than is still owed.** Each removal of a
- *   supported unit saves that unit's `UNIT_SUPPORT_COST` of this turn's upkeep,
+ *   supported unit saves that unit's `government.unitSupportCost` of this turn's upkeep,
  *   and the last one is capped at what remains of the shortfall. Without the cap a
  *   disband worth 1 gold could "cover" a 1-gold shortfall twice over, and the
  *   treasury would have to either discard gold (a lie) or go positive on a turn
@@ -95,10 +98,11 @@
  *   chosen to be playable; none of them is presented as Civ 3's. Each constant
  *   says so where it is declared, and `RATE_TOTAL` (in `state.ts`, where the
  *   `Rates` shape lives) does too. Civ 3's real support model is
- *   government-dependent (despotism supports a number of units *per city* free,
- *   and free support changes with the government), which this engine does not
- *   model at all: `FREE_UNITS_PER_CITY`/`FREE_UNITS_BASE` are our own flat
- *   approximation, NOT that rule.
+ *   government-dependent (despotism supports a number of units *per city* free, and
+ *   free support changes with the government) and **M9 models the shape of it** — the
+ *   per-city allowance and the per-unit cost are `GovernmentSpec` rows — while the
+ *   specific numbers remain ours: `FREE_UNITS_BASE` and every shipped row are
+ *   placeholders, NOT Civ 3's table.
  */
 
 import { buildingCatalog, cityYields } from './cities.js';
@@ -116,6 +120,17 @@ import {
 // so the edge is erased and `commands.ts` (which imports `ratesProblem` from here
 // as a *value*) cannot form a runtime cycle.
 import type { GameEvent } from './commands.js';
+// M9: a government's rate caps and its support numbers, read from the spec and from
+// nowhere else. `rateCapProblem` composes `rateCapsOf` with M4b's own rule rather than
+// restating a cap, and `freeUnitAllowance`/`unitSupport` below take their two magnitudes
+// from `freeUnitsPerCity`/`unitSupportCost` — the M4b module constants that used to sit
+// in this file are gone, and the comment where they were says why.
+import {
+  freeUnitsPerCity as governmentFreeUnitsPerCity,
+  governmentOf,
+  rateCapsOf,
+  unitSupportCost as governmentUnitSupportCost,
+} from './governments.js';
 import type { PlayerId } from './ids.js';
 import type { RulesetView } from './map.js';
 import {
@@ -128,35 +143,49 @@ import {
 import type { Unit } from './units.js';
 
 /* ------------------------------------------------------------------ *
- * Tuning constants — every one a placeholder of ours
+ * Tuning constants — and M9's move of two of them into the catalog
  * ------------------------------------------------------------------ */
 
 /**
- * Units a city supports for free. 2 is a **placeholder**: it is unsourced and
- * chosen to be playable — one unit to defend the city and one to work its land is
- * the smallest garrison that does not make a city a gold sink on the turn it is
- * founded — and it is **not** a Civ 3 figure, whose free support is a
- * per-government number this engine does not model.
+ * **M4b's per-city free support is gone from this module (M9).** It is
+ * `GovernmentSpec.freeUnitsPerCity` now, read through `governments.ts`'
+ * `freeUnitsPerCity(ruleset, player)`.
+ *
+ * The M4b comment that used to sit here said the quiet part out loud — "it is **not**
+ * a Civ 3 figure, whose free support is a per-government number this engine does not
+ * model" — and M9 is the milestone that makes the engine model it. Keeping a copy here
+ * as well would be exactly the defect M6b had to retrofit for combat: a magnitude in
+ * the catalog *and* a magnitude in logic, free to disagree, and a sweep that moved one
+ * of them would measure nothing.
  */
-export const FREE_UNITS_PER_CITY = 2;
 
 /**
- * Units a civilization supports for free before it owns any city. 4 is a
- * **placeholder**: it is unsourced and chosen to be playable — a new game hands
- * every civilization a settler and a worker (M4b, "Starting units"), and 4 leaves
- * room for a scout and a defender too, so a player is never forced into
- * bankruptcy, and never has its starting units disbanded, before it has founded
- * its first city and can earn anything. It is not a sourced Civ 3 number.
+ * Units a civilization supports for free **before it owns any city** — the base term
+ * of M4b's allowance formula, and the one part of it that is genuinely not a
+ * government's business.
+ *
+ * It is deliberately **not** a catalog field, and that is a reading rather than an
+ * omission. The contract's government row names two magnitudes — `freeUnitsPerCity` and
+ * `unitSupportCost` — and this is neither: it is the floor that keeps a civilization
+ * with no cities from paying for the units it starts with. A per-government base would
+ * be a fourth number no contract names, and the sweep of a government's support rule is
+ * already available through the per-city term (set it to 0 and the base is all that
+ * remains).
+ *
+ * 4 is a **placeholder**: unsourced, chosen to be playable. A new game hands every
+ * civilization a settler and a worker (M4b, "Starting units"), and 4 leaves room for a
+ * scout and a defender too, so a player is never forced into bankruptcy — and never has
+ * its starting units disbanded — before it has founded its first city and can earn
+ * anything. It is not a sourced Civ 3 number.
  */
 export const FREE_UNITS_BASE = 4;
 
 /**
- * Gold per turn for each unit beyond the free allowance. 1 is a **placeholder**:
- * it is unsourced and chosen to be playable — one gold per unit per turn is
- * enough that a large army visibly drains a treasury while a small one does not —
- * and it is not a sourced Civ 3 figure.
+ * **M4b's per-unit support cost is gone from this module (M9)**, for the same reason
+ * and with the same words as `FREE_UNITS_PER_CITY` above: it is
+ * `GovernmentSpec.unitSupportCost` now, read through `governments.ts`'
+ * `unitSupportCost(ruleset, player)`.
  */
-export const UNIT_SUPPORT_COST = 1;
 
 /* ------------------------------------------------------------------ *
  * The commerce split
@@ -279,6 +308,52 @@ export const ratesProblem = (rates: Rates): string | undefined => {
 };
 
 /**
+ * The **government's** half of the rate rule, as a refusal: which slider is over this
+ * player's cap, and by how much.
+ *
+ * A second function rather than a clause inside `ratesProblem`, because the two answer
+ * different questions and a caller often wants only one of them. `ratesProblem` is "is
+ * this a well-formed triple at all?" — a question about arithmetic that has one answer
+ * for every player in the game and is asked by the command layer, the CLI and the UI.
+ * This is "may *this player* set it?" — a question about a government, asked only where
+ * a player's own sliders move. Folding the cap into `ratesProblem` would make the answer
+ * to the first question depend on whose turn it is, which is exactly the kind of
+ * coupling that makes two callers disagree.
+ *
+ * **Both are still one rule at the command site**: `planSetRates` below asks
+ * `ratesProblem` and then this, and a refusal names the cap. The `SetRates` doc in
+ * `commands.ts` states that the caps are a *conjunct* of M4b's rule rather than a
+ * replacement for it, and this is the conjunct.
+ *
+ * A player this ruleset cannot resolve a government for is governed by
+ * `governments.ts`' degenerate rule, whose caps are `RATE_TOTAL` — so an unresolvable
+ * player is capped only by the total rule, which is what M4b did for everybody.
+ */
+export const rateCapProblem = (
+  rates: Rates,
+  player: PlayerState,
+  ruleset: RulesetView,
+): string | undefined => {
+  const caps = rateCapsOf(ruleset, player);
+  const parts: readonly (readonly [string, number, number])[] = [
+    ['tax', rateField(rates, 'tax') ?? 0, caps.tax],
+    ['science', rateField(rates, 'science') ?? 0, caps.science],
+    ['luxury', rateField(rates, 'luxury') ?? 0, caps.luxury],
+  ];
+
+  for (const [name, value, cap] of parts) {
+    if (value > cap) {
+      return (
+        `${name} is capped at ${String(cap)} by the ${governmentOf(ruleset, player).name} ` +
+        `government (asked for ${String(value)})`
+      );
+    }
+  }
+
+  return undefined;
+};
+
+/**
  * Can a value be indexed by a key at all? A type predicate rather than a cast, so
  * `rateField` below can widen to `unknown`, narrow with a real runtime check, and
  * still read a field without asserting a shape nothing verified.
@@ -344,17 +419,31 @@ const ownedUnits = (state: GameState, playerId: PlayerId): readonly Unit[] =>
   state.units.filter((unit) => unit.owner === playerId);
 
 /**
- * The units `playerId` may keep without paying: `FREE_UNITS_PER_CITY` per city it
- * owns, plus `FREE_UNITS_BASE` — the contract's placeholder formula, in the one
- * place it is written down.
+ * The units `playerId` may keep without paying: the **government's**
+ * `freeUnitsPerCity` per city it owns, plus `FREE_UNITS_BASE` — M4b's formula, in the
+ * one place it is written down, with M9's per-government term read from the spec.
  *
- * A city count read from `state.cities` by owner, so a player with no cities still
- * has its `FREE_UNITS_BASE`. The count is a whole number by construction (it is a
- * length), so nothing here can produce a fraction.
+ * A city count read from `state.cities` by owner, so a player with no cities still has
+ * its `FREE_UNITS_BASE`. The count is a whole number by construction (it is a length)
+ * and the per-city term is a whole number by validation, so nothing here can produce a
+ * fraction.
+ *
+ * This is the function `unitSupport` bills against **and** the one a UI asks to show
+ * "you are supporting 3 of 6 units" — one formula, two askers, rather than a
+ * presentation of the rule beside the rule.
  */
-export const freeUnitAllowance = (state: GameState, playerId: PlayerId): number => {
+export const freeUnitAllowance = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): number => {
   const cities = state.cities.filter((city) => city.owner === playerId).length;
-  return FREE_UNITS_PER_CITY * cities + FREE_UNITS_BASE;
+  const player = state.players.find((candidate) => candidate.id === playerId);
+  // A player the state does not contain still has an allowance: the degenerate
+  // government's per-city term, so the read is total for a caller that asked about a
+  // stale id. `unit-owner-exists` in `@civts/sim` is what reports such a state.
+  const perCity = player === undefined ? 2 : governmentFreeUnitsPerCity(ruleset, player);
+  return perCity * cities + FREE_UNITS_BASE;
 };
 
 /** What a player's army costs this turn, and the counts behind the number. */
@@ -365,25 +454,31 @@ export interface UnitSupport {
   readonly free: number;
   /** How many are over the allowance and therefore billable. */
   readonly supported: number;
-  /** `supported * UNIT_SUPPORT_COST`. */
+  /** `supported * the player's government's `unitSupportCost``. */
   readonly gold: number;
 }
 
 /**
  * What `playerId`'s units cost in this state — the contract's rule: the first
  * `freeUnitAllowance` units are free, every unit beyond that costs
- * `UNIT_SUPPORT_COST` gold.
+ * the player's government's `unitSupportCost` gold.
  *
  * Which units are "the free ones" is not stored and does not need to be: the cost
  * is uniform, so the bill depends only on the *count*. That is also what makes the
  * disband rule below well defined — removing any one supported unit saves exactly
  * one unit's cost.
  */
-export const unitSupport = (state: GameState, playerId: PlayerId): UnitSupport => {
+export const unitSupport = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): UnitSupport => {
   const units = ownedUnits(state, playerId).length;
-  const free = freeUnitAllowance(state, playerId);
+  const free = freeUnitAllowance(state, ruleset, playerId);
   const supported = Math.max(0, units - free);
-  return { units, free, supported, gold: supported * UNIT_SUPPORT_COST };
+  const player = state.players.find((candidate) => candidate.id === playerId);
+  const cost = player === undefined ? 1 : governmentUnitSupportCost(ruleset, player);
+  return { units, free, supported, gold: supported * cost };
 };
 
 /**
@@ -431,7 +526,7 @@ export const playerUpkeep = (
   playerId: PlayerId,
 ): Upkeep => {
   const maintenance = buildingMaintenance(state, ruleset, playerId);
-  const support = unitSupport(state, playerId).gold;
+  const support = unitSupport(state, ruleset, playerId).gold;
   return { maintenance, unitSupport: support, gold: maintenance + support };
 };
 
@@ -564,7 +659,7 @@ const withoutUnit = (state: GameState, unitId: Unit['id']): GameState => ({
  *    straight through, along with the turn's beakers and luxuries.
  * 4. **bankruptcy** — a negative result floors at 0 and the shortfall is covered by
  *    disbanding the player's **highest-id** units one at a time (each saving
- *    `UNIT_SUPPORT_COST`, the last capped at what remains), emitting
+ *    the government's `unitSupportCost`, the last capped at what remains), emitting
  *    `UnitDisbanded` per removal and `TreasuryShortfall` for whatever could not be
  *    covered. The treasury is exactly 0 afterwards — never negative — and the
  *    ledger identity in the module note holds to the gold. Whatever is still unpaid
@@ -609,7 +704,7 @@ export const applyEconomy = (state: GameState, ruleset: RulesetView): EconomyOut
 
     const income = playerIncome(current, ruleset, player.id);
     const upkeep = playerUpkeep(current, ruleset, player.id);
-    const support = unitSupport(current, player.id);
+    const support = unitSupport(current, ruleset, player.id);
 
     events.push({
       type: 'IncomeCollected',
@@ -649,12 +744,18 @@ export const applyEconomy = (state: GameState, ruleset: RulesetView): EconomyOut
     // disbanding one would destroy a unit and buy nothing — which is the sort of
     // arbitrary punishment the contract's "until the shortfall is covered" does not
     // ask for.
+    // M9: one unit's cost is the *government's* — `unitSupportCost` — not M4b's
+    // constant. Read once, outside the loop, because a disband never changes a
+    // player's government: the number is the same on every iteration and a second
+    // read inside would be a second place the two could differ.
+    const perUnit = governmentUnitSupportCost(ruleset, player);
+
     while (covered < shortfall) {
-      if (unitSupport(current, player.id).supported <= 0) break;
+      if (unitSupport(current, ruleset, player.id).supported <= 0) break;
       const victim = highestIdUnit(current, player.id);
       if (victim === undefined) break;
 
-      const saved = Math.min(UNIT_SUPPORT_COST, shortfall - covered);
+      const saved = Math.min(perUnit, shortfall - covered);
       current = withoutUnit(current, victim.id);
       covered += saved;
       events.push({

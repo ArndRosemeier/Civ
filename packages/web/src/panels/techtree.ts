@@ -44,6 +44,7 @@ import {
   type TechId,
 } from '@civts/core';
 import { assertNever, techName } from '../events.js';
+import { commandsClosed } from './closed.js';
 import type { PanelContext } from './index.js';
 
 /** The three states a tree node can be in. */
@@ -215,6 +216,9 @@ export const mountTechPanel = (parent: HTMLElement, ctx: PanelContext): TechPane
         : `Researching: ${research.name} (${String(research.beakers)} beakers banked)`;
 
     list.replaceChildren();
+    // M10: a finished game refuses every command, so a research row is closed with the engine's own
+    // refusals rather than beside them — `SetResearch` is one of them (`game-over`).
+    const closed = commandsClosed(ctx.api);
     for (const row of techRows(state, ruleset, playerId)) {
       const item = el(doc, 'li');
       const button = el(
@@ -225,7 +229,7 @@ export const mountTechPanel = (parent: HTMLElement, ctx: PanelContext): TechPane
       button.type = 'button';
       button.dataset['state'] = row.state;
       button.dataset['tech'] = row.id;
-      button.disabled = !row.selectable;
+      button.disabled = !row.selectable || closed;
       if (row.researching) button.setAttribute('aria-current', 'true');
       button.addEventListener('click', () => {
         ctx.dispatch({ type: 'SetResearch', tech: row.id });

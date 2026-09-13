@@ -61,6 +61,14 @@ import {
   isWonder,
   maintenanceOf,
 } from './buildings.js';
+// M9's border rule, asked — never restated. `foreignOwnerAt` is the *one* statement of
+// "this tile belongs to somebody else", which is the rule a founder, a `SetWorkedTiles`
+// and (here) the auto-assigner all obey. An `owner !== city.owner` written here would be
+// a second answer to that question, and the tile a growing city takes is exactly where
+// the two answers would first disagree. This is a **cycle** — `borders.ts` imports
+// `cityRadius` from this module — and it is safe for the reason the `happiness.js` edge
+// below is: both directions read each other's bindings only *inside function bodies*.
+import { foreignOwnerAt } from './borders.js';
 import {
   inBounds,
   indexToX,
@@ -78,6 +86,15 @@ import {
 // well. Type-only in the other direction: `fog.ts` imports `GameState` from `state.ts`,
 // which does not import this module at runtime.
 import { visibleTiles, withExplored } from './fog.js';
+// M9's disorder rule. A value import, and it *is* a cycle (`happiness.ts` imports
+// `cityById`/`buildingCatalog` from this module at runtime, exactly as this module
+// imports its verdict) — safe for the reason `turn.ts`' barbarian edge is safe: both
+// directions only read each other's bindings *inside function bodies*, never while a
+// module is being evaluated, so the cycle resolves whichever module is entered first.
+// The alternative — a second copy of "unhappy > happy" here — is the defect class this
+// project has found six times, and a cycle nobody can see is cheaper than a rule
+// written twice.
+import { isDisordered } from './happiness.js';
 // The tile read a *worked* tile gets: terrain plus improvements plus bonus
 // resources. This module is the one that composes a city out of tiles, so it is
 // the place that asks for the whole of a tile's worth; `improvements.ts` owns the
@@ -108,6 +125,25 @@ import type { GameState } from './state.js';
  *   never a key holding `false`, which is the same trap as an explicit `undefined`
  *   one step removed (a falsy key survives neither a JSON round trip nor a
  *   reviewer's eye). The rules it turns on are stated once, in `buildings.ts`.
+ *
+ * **M9 adds two, and deliberately not a third.**
+ *
+ * - `culturePerTurn` (per-turn culture for the city that holds it) and
+ *   `cultureBonus` (a one-off, wonders only) are read by `culture.ts` alone and
+ *   written into `City.culture` by the culture pipeline step and by
+ *   `production.ts` at the moment of a wonder's completion.
+ * - The contract also names `BuildingSpec.happiness` (temple, colosseum). It is
+ *   **not a field here**, and that is the "state each rule once" rule rather than an
+ *   omission: `effects` is already the one place a building declares what it does to
+ *   its own city, `effectTotals` is the one thing that sums it, and the M9 member
+ *   `{ kind: 'city-happiness' }` is how happiness is said. `@civts/rules`' content
+ *   rows carry the contract's spelling — `happiness: 1` — and its row builder
+ *   projects it onto that effect **once, where the row is written**, so content
+ *   reads the way the contract names it and the engine still has exactly one path
+ *   into a city's contentment. A second `happiness` field on this type would be a
+ *   second number beside the effect, free to disagree with it — which is the defect
+ *   class this project has found six times, and the reason `cities.ts`' own module
+ *   note exists.
  */
 export interface BuildingDef {
   readonly id: BuildingId;
@@ -120,6 +156,33 @@ export interface BuildingDef {
   readonly effects: readonly BuildingEffect[];
   /** Present (and `true`) only for a wonder. Absent means "ordinary building". */
   readonly wonder?: true;
+  /**
+   * M9: culture this building earns **its own city** every turn, a whole number.
+   *
+   * Optional on the engine's view and required in fact on content:
+   * `@civts/rules`' `BuildingSpec` requires it, `validateRuleset` refuses a
+   * fractional or negative value, and the shipped catalog gives every row one (0 is
+   * how a row says "this building teaches nobody anything", which is a tuning choice
+   * rather than a missing value). It is optional *here* for the same mechanical
+   * reason `UnitSpec.hitPoints` is optional on `UnitDef`: `RulesetView` is the
+   * engine's structural view, the M2–M8 fixtures and `packages/core/test` build
+   * views that never run `validateRuleset`, and those must keep compiling.
+   *
+   * `culture.ts`' `culturePerTurnOf` is the one read of it, and the culture pipeline
+   * step is the one writer of the total it produces.
+   */
+  readonly culturePerTurn?: number;
+  /**
+   * M9: culture granted **once**, when this building completes — the wonder bonus.
+   *
+   * Optional, and `validateRuleset` refuses it on a row that is not a wonder: a
+   * one-off is what makes a wonder a cultural event rather than a slow temple, and a
+   * non-wonder row declaring one would be content meaning something the engine does
+   * not. Absent (never a key holding `0`) is how an ordinary building says "no
+   * bonus", which is also why `production.ts` asks `cultureBonusOf` rather than
+   * testing the field for truthiness.
+   */
+  readonly cultureBonus?: number;
 }
 
 /**
@@ -173,6 +236,28 @@ export interface City {
   readonly buildings: readonly BuildingId[];
   /** Excludes the centre; length <= `population`. */
   readonly workedTiles: readonly TileIndex[];
+  /**
+   * M9: culture accumulated by **this city**, a whole number that never decreases.
+   *
+   * It is a *city* field and never a player total, on the contract's own words:
+   * "The player's total is DERIVED by summing their cities — never stored
+   * separately, because two numbers that must agree are two numbers that will
+   * disagree". `culture.ts`' `playerCulture` is that sum, and there is no
+   * `PlayerState.culture` field for it to drift from.
+   *
+   * A city gains `BuildingSpec.culturePerTurn` per turn (a pipeline step, M9) and
+   * a one-off `BuildingSpec.cultureBonus` when a wonder completes. It is the
+   * input to two derived values and the owner of neither: the tile-ownership layer
+   * (`borders.ts`' `claimedTiles`) reads it through the catalog's border
+   * thresholds, and the score's culture term reads the player total. Neither is
+   * stored beside this number.
+   *
+   * Required, and `newGame`/`FoundCity`/`captureCity` all write a whole number —
+   * a missing or fractional culture would be a state `canonicalize` rejects, and
+   * `wholeCulture` in `culture.ts` is the one reader that makes a hand-built or
+   * older save total rather than fatal.
+   */
+  readonly culture: number;
 }
 
 /**
@@ -368,8 +453,23 @@ const terrainYields = (
  * - An unknown `cityId` yields all zeros rather than throwing: callers that want
  *   to know whether the city exists ask `cityById`, and a pure read of a city
  *   that is not there has no honest answer but "nothing".
+ *
+ * **M9 adds a sixth rule to that list, and it is why this function is split in two.**
+ * A city in CIVIL DISORDER (`happiness.ts`) produces no shields, no beakers and no
+ * gold, and does not accumulate growth food. `cityYields` is the one place that rule
+ * can be enforced without a second derivation existing: it is the function
+ * `production.ts` banks shields from, `economy.ts` splits commerce from and
+ * `growth.ts` reads a surplus from, so a city in revolt is empty at *all three* of
+ * those sites by construction rather than by three agreeing `if` statements.
+ * `cityYieldsIgnoringDisorder` below is the pre-M9 arithmetic, kept as the named
+ * half so the disorder rule is one return statement rather than a second copy of
+ * the tile walk.
  */
-export const cityYields = (state: GameState, ruleset: RulesetView, cityId: CityId): CityYields => {
+export const cityYieldsIgnoringDisorder = (
+  state: GameState,
+  ruleset: RulesetView,
+  cityId: CityId,
+): CityYields => {
   const city = cityById(state, cityId);
   if (city === undefined) return NO_YIELDS;
 
@@ -404,6 +504,43 @@ export const cityYields = (state: GameState, ruleset: RulesetView, cityId: CityI
   commerce = applyEffectPct(commerce, effects.commercePct);
 
   return { food, shields, commerce, foodSurplus: food - FOOD_PER_CITIZEN * city.population };
+};
+
+/**
+ * What a city produces this turn, **with M9's civil-disorder rule applied**.
+ *
+ * The rule: a city whose unhappy citizens outnumber its happy ones is in CIVIL
+ * DISORDER, and a disordered city produces **no shields, no beakers and no gold**,
+ * and **does not accumulate growth food**. That is stated once, here, in the one
+ * function the whole engine reads a city's output from — `production.ts` banks
+ * `shields`, `economy.ts` splits `commerce` (which the beaker and gold channels
+ * both come out of) and `growth.ts` reads `foodSurplus`. None of those three
+ * re-derives the verdict; they read this function, which asks `happiness.ts`'
+ * `isDisordered`, which asks `happinessOf`. One rule, four askers, by construction
+ * rather than by review — the M2/M4c "two writers of one layer" defect is exactly
+ * what a second derivation here would be.
+ *
+ * **What deliberately does *not* go to zero.** `food` itself stays as produced, and
+ * the surplus is `0` rather than `-food`: a disordered city is not starving, it is
+ * too busy rioting to grow. `foodSurplus: 0` is the honest encoding of the
+ * contract's "growth food is not accumulated" — `applyGrowth` reads a surplus of
+ * exactly zero as "nothing at all happens", which is precisely the rule, and it
+ * does it without a second branch in `growth.ts`.
+ *
+ * **Beakers and gold are zeroed through commerce, and that is not an approximation.**
+ * Both channels are shares of `cityYields(...).commerce` (`economy.ts`'
+ * `splitCommerce`), so a disordered city's commerce of 0 gives it 0 gold and 0
+ * beakers with no special case in the money loop. Luxuries are zeroed with them:
+ * they are the third share of the same split, and a city in revolt produces no
+ * contentment either.
+ *
+ * A city that does not exist yields all zeros, exactly as before M9.
+ */
+export const cityYields = (state: GameState, ruleset: RulesetView, cityId: CityId): CityYields => {
+  const raw = cityYieldsIgnoringDisorder(state, ruleset, cityId);
+  if (!isDisordered(state, ruleset, cityId)) return raw;
+
+  return { food: raw.food, shields: 0, commerce: 0, foodSurplus: 0 };
 };
 
 /**
@@ -445,7 +582,9 @@ export const autoAssignWorkedTiles = (
   }
   for (const tile of city.workedTiles) claimed.add(Number(tile));
 
-  const candidates = cityRadius(state, city.tile).filter((tile) => !claimed.has(Number(tile)));
+  const candidates = cityRadius(state, city.tile).filter(
+    (tile) => !claimed.has(Number(tile)) && foreignOwnerAt(state, tile, city.owner) === undefined,
+  );
 
   // What the tile is actually worth in this state: terrain, improvements **and
   // bonus resources**, so a citizen values a tile as it is — a mine already built
@@ -765,6 +904,17 @@ export const captureCity = (
     queue: [],
     buildings: city.buildings.filter((id) => !gone.has(id)),
     workedTiles: [],
+    // M9: the city's accumulated culture **stays with the city**. The contract lists
+    // what a capture changes — ownership, population, buildings, the queue, the worked
+    // tiles — and culture is not on that list, so inventing a sixth change ("the
+    // conqueror inherits the temples' legacy" / "the sack resets the city's story")
+    // would be inventing a rule rather than implementing one. What *does* move is the
+    // ownership layer, and it moves by itself: the layer is recomputed from the cities
+    // after this capture, so the captured city's claim now belongs to the captor and
+    // the previous owner's tiles it no longer claims are cleared — which is the
+    // contract's "a captured city's tiles transfer to the captor", with no transfer
+    // code to get wrong.
+    culture: city.culture,
   };
 
   const sacked: GameState = {

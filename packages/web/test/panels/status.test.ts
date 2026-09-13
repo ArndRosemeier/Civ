@@ -1,12 +1,15 @@
 /**
  * The status strip and the scoreboard: every displayed figure is a read of the state.
  *
- * There is no score in the engine (M10 owns scoring, and nothing in `@civts/core` ranks
- * players), so the assertions here are deliberately about *reads*: the treasury a player holds,
- * the population summed over its cities, the turn and the year the panel derives from it. If a
- * points formula ever appears in this panel, these tests do not need to change — but the
- * golden-hash and headless-equality tests would, which is the point: a scoring rule belongs in
- * the engine where it can be hashed, tested and agreed with.
+ * When M8 wrote this file there was no score in the engine, and the note here said so: the
+ * assertions were about *reads* — the treasury a player holds, the population summed over its
+ * cities, the turn and the year the panel derives from it — and a points formula in the panel
+ * would have been a game rule living in the presentation layer. **M10 landed the rule**, so the
+ * scoreboard grew the column M8 could not have, and it reads it the only way this package is
+ * allowed to: `scoreTable(state, ruleset)`, the engine's one scoring function, which the score
+ * victory condition also goes through. What is asserted below is therefore still a *read* — the
+ * number on screen is the engine's number — and the case that would notice a UI-side formula is
+ * the one that compares the row against `scoreTable` itself.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -17,6 +20,7 @@ import {
   asPlayerId,
   asUnitId,
   newGame,
+  scoreTable,
   type GameState,
   type RulesetView,
 } from '@civts/core';
@@ -100,13 +104,13 @@ describe('formatYear', () => {
 
 describe('scoreboardRows', () => {
   it('lists every player in player-id order, barbarians included', () => {
-    const rows = scoreboardRows(STATE);
+    const rows = scoreboardRows(STATE, RULESET);
     expect(rows.map((row) => row.player)).toEqual(['Player 1', 'Player 2', 'Barbarians']);
     expect(rows.map((row) => row.kind)).toEqual(['civ', 'civ', 'barbarian']);
   });
 
   it("counts the state's units and cities per player", () => {
-    const rows = scoreboardRows(STATE);
+    const rows = scoreboardRows(STATE, RULESET);
     expect(rows[0]?.units).toBe(2);
     expect(rows[1]?.units).toBe(2);
     expect(rows[2]?.units).toBe(0);
@@ -115,13 +119,13 @@ describe('scoreboardRows', () => {
   });
 
   it('shows the treasury the state holds, including the barbarian zero', () => {
-    expect(scoreboardRows(STATE).map((row) => row.treasury)).toEqual([10, 10, 0]);
+    expect(scoreboardRows(STATE, RULESET).map((row) => row.treasury)).toEqual([10, 10, 0]);
   });
 
   it("sums population over a player's cities once one exists", () => {
     const founded = applyCommand(STATE, P0, { type: 'FoundCity', unitId: asUnitId(0) }, RULESET);
     if (!founded.ok) throw new Error('founding the first city was refused');
-    const rows = scoreboardRows(founded.value.state);
+    const rows = scoreboardRows(founded.value.state, RULESET);
     expect(rows[0]?.cities).toBe(1);
     expect(rows[0]?.population).toBe(1);
     expect(rows[1]?.cities).toBe(0);
@@ -129,6 +133,38 @@ describe('scoreboardRows', () => {
   });
 
   it('marks the civilizations only when asked for the civilization rows', () => {
-    expect(civilizationRows(STATE).map((row) => row.player)).toEqual(['Player 1', 'Player 2']);
+    expect(civilizationRows(STATE, RULESET).map((row) => row.player)).toEqual([
+      'Player 1',
+      'Player 2',
+    ]);
+  });
+
+  it("carries the engine's own score, read from the one scoring function", () => {
+    // `scoreTable` (core `victory.ts`) is the engine's single scoring read — the same one the score
+    // victory condition goes through via `highestScore` — so the column and the condition cannot
+    // disagree. The panel computes nothing: this asserts that the number it shows IS that
+    // function's own, player by player, barbarians included.
+    const expected = new Map<number, number>(
+      scoreTable(STATE, RULESET).map((row) => [Number(row.playerId), row.score]),
+    );
+    for (const row of scoreboardRows(STATE, RULESET)) {
+      expect(row.score, `row for ${row.player}`).toBe(expected.get(Number(row.id)));
+    }
+
+    // Not vacuous: a fresh game scores nothing (no city, no culture, no wonder), and founding one
+    // moves the figure — the barbarians' row stays where the engine puts it.
+    const fresh = scoreboardRows(STATE, RULESET);
+    expect(fresh.every((row) => row.score === 0)).toBe(true);
+
+    const founded = applyCommand(STATE, P0, { type: 'FoundCity', unitId: asUnitId(0) }, RULESET);
+    if (!founded.ok) throw new Error('founding the first city was refused');
+    const grown = scoreboardRows(founded.value.state, RULESET);
+    const engineScore = scoreTable(founded.value.state, RULESET).find(
+      (row) => row.playerId === P0,
+    )?.score;
+    expect(engineScore, "the engine's score table has no row for the acting seat").toBeDefined();
+    expect(grown[0]?.score).toBe(engineScore);
+    expect(grown[0]?.score).toBeGreaterThan(0);
+    expect(grown[2]?.score).toBe(0);
   });
 });

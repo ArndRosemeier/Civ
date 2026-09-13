@@ -83,7 +83,33 @@ export type BuildingEffect =
   | { readonly kind: 'commerce-multiplier'; readonly pct: number } // marketplace
   | { readonly kind: 'beaker-multiplier'; readonly pct: number } // library
   | { readonly kind: 'shield-multiplier'; readonly pct: number } // factory
-  | { readonly kind: 'growth-food'; readonly amount: number }; // granary
+  | { readonly kind: 'growth-food'; readonly amount: number } // granary
+  /**
+   * M9: one citizen's worth of contentment, from a building in **its own city**.
+   *
+   * A **signed** integer, and that is the design of the member rather than a
+   * convenience: `happiness.ts` counts *unhappy* citizens down (a temple, a
+   * colosseum — the contract's own examples: "unhappy citizens … reduced by
+   * `BuildingSpec.happiness` (temple, colosseum)") while a *happy* citizen is a
+   * different count that the same union has to be able to raise. Two members
+   * (`unhappiness` and `happy-citizens`) would be two fields saying one thing and
+   * two halves of one subtraction; one signed amount *is* the subtraction, and
+   * `happiness.ts` reads the sign.
+   *
+   * **Why an effect rather than a fifth `BuildingSpec` field.** The contract's M9
+   * section names `BuildingSpec.happiness` directly, and the magnitude is the
+   * building row's either way — but the engine's one reader of "what does a
+   * building do to its own city" is `buildings.ts`' `cityBuildingEffects`, which
+   * walks `effects`. A separate field would be a second path into that one
+   * computation, which is the defect class this project has found repeatedly.
+   * `BuildingSpec.happiness` is therefore a readable *projection* onto this
+   * effect, applied in one place in `@civts/rules`, so nothing downstream can see
+   * two numbers for one fact.
+   *
+   * `amount` must be a whole number; `validateRuleset` rejects a fractional or
+   * non-finite one, because it ends up in a count of citizens.
+   */
+  | { readonly kind: 'city-happiness'; readonly amount: number }; // temple, colosseum
 
 /**
  * The effect kinds the engine understands, in canonical order (the order a
@@ -100,6 +126,7 @@ export const BUILDING_EFFECT_KINDS = [
   'beaker-multiplier',
   'shield-multiplier',
   'growth-food',
+  'city-happiness',
 ] as const;
 
 export type BuildingEffectKind = (typeof BUILDING_EFFECT_KINDS)[number];
@@ -201,6 +228,89 @@ export const compareTileResources = (a: TileResource, b: TileResource): number =
  * leaving a field optional and failing at runtime. A ruleset that genuinely has
  * no units says so with `units: []`, which is a catalog, not a missing field.
  */
+/**
+ * **One government row as this struct** (M9).
+ *
+ * Declared here rather than imported from `governments.ts` because `governments.ts`
+ * imports *this* module — the dependency runs one way, and a field type that ran the other
+ * way would be a cycle the runtime never needs. The shape is the engine's own
+ * `GovernmentDef` (a `governmentDef()` read returns exactly this), and it is the name-free
+ * subset of `@civts/rules`' `GovernmentSpec` that the engine reads; `provenance` and
+ * `requiresTech` are deliberately absent, because the engine resolves those through the
+ * gating module (`governments.ts`' `governmentTechRequirement`) rather than from the view.
+ */
+export interface GovernmentRow {
+  /** The id a command spells. */
+  readonly id: string;
+  readonly name: string;
+  /** The highest each slider may reach; `>= 0`, `<= RATE_TOTAL`. */
+  readonly rateCaps: { readonly tax: number; readonly science: number; readonly luxury: number };
+  /** Units supported for free per city owned (integer `>= 0`). */
+  readonly freeUnitsPerCity: number;
+  /** Gold per turn for each unit beyond the free allowance (integer `>= 0`). */
+  readonly unitSupportCost: number;
+  /** Added to a city's unhappy count (signed integer). */
+  readonly happinessModifier: number;
+}
+
+/**
+ * **M9's culture section as a view may state it**, read *structurally* and field by field.
+ *
+ * Every field is optional and **may hold anything**: `borders.ts`' `cultureRulesOf` and
+ * `happiness.ts`' `happinessRulesOf` reach the section through `unknown` and keep whatever
+ * they can read, so a view that states `borderRadius2Culture: "ten"` gets the degenerate
+ * border rule rather than a crash. The type is therefore a *convenience for a hand-built
+ * fixture*, not a constraint the engine relies on — which is why it is a loose shape here
+ * and a validated one in `@civts/rules`.
+ */
+export interface CultureSection {
+  readonly borderRadius2Culture?: unknown;
+  readonly borderRadius3Culture?: unknown;
+  readonly unhappyThresholds?: unknown;
+  readonly luxuriesPerHappyCitizen?: unknown;
+  readonly happyPerLuxuryResource?: unknown;
+}
+
+/**
+ * **M9's happiness ladder as a view may state it**: rows of `{ minPopulation, unhappy }`,
+ * read structurally by `happinessRulesOf` (a row whose `minPopulation` is not a whole number
+ * `>= 1` is dropped rather than defaulted, so one malformed entry cannot make every city in
+ * the world riot).
+ */
+export interface UnhappyThresholdRow {
+  readonly minPopulation: number;
+  readonly unhappy: number;
+}
+
+/**
+ * **M10's score weights as a view may state them** (see `score.ts`' `ScoreDef`).
+ *
+ * Declared here for the same one-way-dependency reason `GovernmentRow` is: `score.ts`
+ * imports this module, so the field's type cannot come from there. All optional and
+ * `unknown`, because `scoreRulesOf` reads a section structurally and treats an unreadable
+ * weight as 0 — the type is a fixture's convenience, not a constraint.
+ */
+export interface ScoreSection {
+  readonly perPopulation?: unknown;
+  readonly perCity?: unknown;
+  readonly perTech?: unknown;
+  readonly perCulture?: unknown;
+  readonly perWonder?: unknown;
+}
+
+/**
+ * **M10's victory thresholds as a view may state them** (see `victory-rules.ts`'
+ * `VictoryRules`). Same one-way-dependency reason as `GovernmentRow` and `ScoreSection`,
+ * and the same looseness: `victoryRulesOf` reads the section structurally, and an
+ * unreadable threshold becomes one no condition can reach rather than a crash.
+ */
+export interface VictorySection {
+  readonly dominationLandPct?: unknown;
+  readonly dominationPopPct?: unknown;
+  readonly culturalVictoryCulture?: unknown;
+  readonly scoreVictoryTurn?: unknown;
+}
+
 export interface RulesetView {
   readonly terrains: readonly TerrainDef[];
   /** The unit catalog, in data order. See `units.ts`' `UnitDef`. */
@@ -252,6 +362,35 @@ export interface RulesetView {
    * resources rather than an unanswerable question.
    */
   readonly resources?: readonly ResourceDef[];
+  /**
+   * M9's government rows. **Optional**, like `buildings` and `resources`, and for the
+   * same reason: a view written before governments existed (a structural stand-in, an
+   * M2-era fixture) is still a view the engine can run a game from — every player is
+   * simply under `governments.ts`' `NO_GOVERNMENT`, whose numbers reproduce M4b's flat
+   * allowance and cost exactly, so a pre-M9 fixture plays identically. A view that ships
+   * governments but none the current player's id names falls back the same way, which is
+   * what makes `governmentOf` total.
+   *
+   * `governmentCatalog` in `governments.ts` is the one place that decides what "no
+   * section" means, exactly as `buildingCatalog` does for buildings.
+   */
+  readonly governments?: readonly GovernmentRow[];
+  /**
+   * M9's culture section: the two border thresholds and the happiness table. **Optional**
+   * and read *structurally* by `borders.ts`' `cultureRulesOf` and `happiness.ts`'
+   * `happinessRulesOf`, so the field is declared here only to give a hand-built view a
+   * typed place to put it — the engine never assumes it exists, and both readers fall back
+   * to deliberately degenerate rules rather than to a second copy of the shipped numbers.
+   *
+   * One section for both halves rather than two, because `@civts/rules`' `CultureSpec` is
+   * one row: borders and contentment are two readings of the same idea ("what a city's
+   * culture buys it"), and splitting them here would let a view state one without the other.
+   */
+  readonly culture?: CultureSection;
+  /** M10's score weights. Optional; absent means every player scores 0 (`NO_SCORE_RULES`). */
+  readonly score?: ScoreSection;
+  /** M10's victory thresholds. Optional; absent means no condition can fire. */
+  readonly victory?: VictorySection;
   readonly fidelity: 'tuned' | 'cited-only';
 }
 
@@ -302,6 +441,43 @@ export const inBounds = (map: Pick<GameMap, 'width' | 'height'>, x: number, y: n
 
 export const terrainAtIndex = (map: GameMap, index: number): TerrainId | undefined =>
   map.terrain[index];
+
+/**
+ * **The terrain roles a land unit cannot enter**, and the one statement of it.
+ *
+ * Two modules had grown their own copy of this two-element list — `hut.ts` when it decided
+ * where a goody hut may sit, and `commands.ts` when it refused `FoundCity` on water — and
+ * M10 needed a third reader (the domination land share divides by the map's *land*). Three
+ * copies of a rule about the world is the drift this project's discipline exists to
+ * prevent, so the list and the predicate over it live here, where the terrain roles are
+ * declared, and the two older readers now call it.
+ *
+ * A role rather than a terrain id because the question is about *kinds* of ground, and a
+ * ruleset may declare any number of ocean and coast terrains: a per-id list would have to
+ * be maintained beside every terrain row a content pack adds.
+ */
+export const WATER_ROLES: readonly TerrainRole[] = ['ocean', 'coast'];
+
+/** Is this terrain role water — ground no land unit may enter? See `WATER_ROLES`. */
+export const isWaterRole = (role: TerrainRole): boolean => WATER_ROLES.includes(role);
+
+/**
+ * **How many tiles of this map are land** — the denominator M10's domination rule uses.
+ *
+ * Read through the ruleset's terrain rows rather than guessed from an id or a role name, so
+ * a terrain a content pack adds counts as land unless it says it is water. A tile whose
+ * terrain the ruleset does not describe counts as **not** land: the map and the ruleset
+ * disagree about that tile, and inflating the denominator with ground nobody can occupy
+ * would make domination strictly harder for a reason no catalog row states.
+ */
+export const landTileCount = (map: GameMap, ruleset: RulesetView): number => {
+  let total = 0;
+  for (const id of map.terrain) {
+    const def = ruleset.terrains.find((terrain) => terrain.id === id);
+    if (def !== undefined && !isWaterRole(def.role)) total += 1;
+  }
+  return total;
+};
 
 export const terrainAt = (map: GameMap, x: number, y: number): TerrainId | undefined =>
   inBounds(map, x, y) ? map.terrain[tileIndex(map.width, x, y)] : undefined;

@@ -21,7 +21,7 @@
  *    player's gold is *re-derived from the emitted events* each turn and compared to
  *    the state: the split is recomputed from the contract's own rule (floor each
  *    channel, remainder to gold) rather than by calling `splitCommerce`, upkeep is
- *    recomputed from `FREE_UNITS_PER_CITY`/`FREE_UNITS_BASE`/`UNIT_SUPPORT_COST` and
+ *    recomputed from `FREE_PER_CITY`/`FREE_UNITS_BASE`/`UNIT_COST` and
  *    the player's own cities and units, and the ledger identity
  *    `treasuryAfter - treasuryBefore === income - upkeep + covered + unpaid` is
  *    asserted to the gold every turn. The pipeline's *placement* is checked too: the
@@ -114,13 +114,11 @@ import {
   DEFAULT_RATES,
   DEFAULT_SETTINGS,
   FREE_UNITS_BASE,
-  FREE_UNITS_PER_CITY,
   MAP_DIMENSIONS,
   MAP_SIZES,
   RATE_TOTAL,
   SCHEMA_VERSION,
   STARTING_TREASURY,
-  UNIT_SUPPORT_COST,
   advanceTurn,
   applyCommand,
   applyEconomy,
@@ -130,10 +128,12 @@ import {
   asPlayerId,
   asTileIndex,
   cityYields,
+  defaultGovernmentOf,
   legalActions,
   neighbors8,
   newGame,
   planSetRates,
+  rateCapsOf,
   spawnUnit,
   terrainAtIndex,
   unitActions,
@@ -183,6 +183,42 @@ const RULESET: RulesetView = (() => {
   }
   return validated.value;
 })();
+
+/**
+ * The two M9 magnitudes this file reads out of the ruleset it hands the engine, rather
+ * than as module constants.
+ *
+ * M9 moved the per-city unit allowance and the per-unit support cost out of `economy.ts`
+ * and into the `governments` catalog section, so a body that spelled `2` and `1` for
+ * itself would be a second statement of a rule the sweep can move — and it would go on
+ * passing after a balance change that made the game different. These two reads go through
+ * `governments.ts`' `defaultGovernmentOf`, the same reader `newGame` uses to stamp every
+ * player's opening government, so the number asserted is the number a game starts with.
+ */
+const FREE_PER_CITY = defaultGovernmentOf(RULESET).freeUnitsPerCity;
+const UNIT_COST = defaultGovernmentOf(RULESET).unitSupportCost;
+
+/**
+ * **The most-luxury triple the opening government actually allows** (M9+M10).
+ *
+ * Before M9 the rate rule was only "three integers >= 0 summing to `RATE_TOTAL`", so
+ * `0/0/10` was legal and this file used it wherever it wanted "the whole budget on the
+ * luxury channel". A player now carries a government whose `rateCaps` clamp each share,
+ * and the shipped `despotism` caps luxury at 2 — so `0/0/10` is refused with
+ * `invalid-argument` and every assertion built on it fails for a reason that has nothing
+ * to do with the money loop being tested.
+ *
+ * The replacement is the same statement at the capped corner: as much luxury as the
+ * government allows, and the rest of the budget on the science channel (tax stays 0, so
+ * the "this twin earns no gold" assertions below still mean what they meant). Read from
+ * `defaultGovernmentOf` — the same reader `newGame` stamps players with — so a retune of
+ * `despotism` moves this triple with it.
+ */
+const MAX_LUXURY_RATES: Rates = {
+  tax: 0,
+  science: RATE_TOTAL - defaultGovernmentOf(RULESET).rateCaps.luxury,
+  luxury: defaultGovernmentOf(RULESET).rateCaps.luxury,
+};
 
 /** A catalog row by role, or a thrown fixture error naming the gap. */
 const unitOfRole = (role: UnitRole): UnitDef => {
@@ -294,6 +330,12 @@ const cmdKey = (cmd: Command): string => {
       return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
     case 'FortifyUnit':
       return `FortifyUnit ${String(cmd.unitId)}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 
@@ -388,7 +430,7 @@ const contractSplit = (commerce: number, rates: Rates): ContractSplit => {
 
 /** The support bill the contract's placeholder formula describes. */
 const contractSupport = (units: number, cities: number): number =>
-  Math.max(0, units - (FREE_UNITS_PER_CITY * cities + FREE_UNITS_BASE)) * UNIT_SUPPORT_COST;
+  Math.max(0, units - (FREE_PER_CITY * cities + FREE_UNITS_BASE)) * UNIT_COST;
 
 /**
  * What a building row declares as maintenance, read structurally — the same read
@@ -444,6 +486,10 @@ const disbandEventsOf = (events: readonly GameEvent[]): readonly DisbandEvent[] 
 
 const shortfallEventsOf = (events: readonly GameEvent[]): readonly ShortfallEvent[] =>
   events.flatMap((event) => (event.type === 'TreasuryShortfall' ? [event] : []));
+
+/** Every gold piece the money loop collected in these events, summed (see `ReplayResult.collected`). */
+const collectedGoldOf = (events: readonly GameEvent[]): number =>
+  incomeEventsOf(events).reduce((total, event) => total + event.gold, 0);
 
 const isMoneyEvent = (
   event: GameEvent,
@@ -692,19 +738,37 @@ const keystoneSweep = (seeds: readonly number[], steps: number): KeystoneRun => 
          * malformed payload must come back as `invalid-argument`, never as a crash.
          */
         for (const triple of legalRates) {
-          const plan = planSetRates(state, player.id, triple);
+          const plan = planSetRates(state, RULESET, player.id, triple);
           const applied = applyCommand(
             state,
             player.id,
             { type: 'SetRates', rates: triple },
             RULESET,
           );
+          // **M9 narrows "legal" from "sums to RATE_TOTAL" to "sums to RATE_TOTAL *and*
+          // respects the government's caps".** The generator enumerates the arithmetically
+          // legal space, so a triple such as `{tax: 0, science: 0, luxury: 10}` is now refused
+          // by the caps (despotism allows 2 luxury) — and refused is the *correct* answer.
+          //
+          // The keystone's claim is agreement, and it holds either way: what is checked is that
+          // the planner and the applier reached the same verdict, and that an accepted triple
+          // was written verbatim. Measured before this change: 6048 mismatches, every one of
+          // them a cap-refused triple that the old fixture called legal.
+          const caps = rateCapsOf(RULESET, player);
+          const withinCaps =
+            triple.tax <= caps.tax &&
+            triple.science <= caps.science &&
+            triple.luxury <= caps.luxury;
           rec.check(
-            plan.ok && applied.ok,
+            withinCaps ? plan.ok === applied.ok : plan.ok === applied.ok,
+            where(step, 'the planner and the applier disagreed about a rate triple'),
+          );
+          rec.check(
+            withinCaps ? plan.ok && applied.ok : !plan.ok && !applied.ok,
             where(
               step,
-              `a legal rate triple ${JSON.stringify(triple)} was refused ` +
-                `(plan ok=${String(plan.ok)}, applied ok=${String(applied.ok)})`,
+              `a rate triple ${JSON.stringify(triple)} within caps=${String(withinCaps)} was ` +
+                `answered wrongly (plan ok=${String(plan.ok)}, applied ok=${String(applied.ok)})`,
             ),
           );
           if (applied.ok) {
@@ -729,6 +793,7 @@ const keystoneSweep = (seeds: readonly number[], steps: number): KeystoneRun => 
         for (const [label, cmd] of malformed) {
           const plan = planSetRates(
             state,
+            RULESET,
             player.id,
             cmd.type === 'SetRates' ? cmd.rates : DEFAULT_RATES,
           );
@@ -908,7 +973,12 @@ describe('1. keystone — six generators agree with the applier, in both directi
       expect(totals.workCandidates).toBeGreaterThan(0);
       expect(totals.workYielded).toBe(totals.workAccepted);
       expect(totals.rateAccepted).toBeGreaterThan(0);
-      expect(totals.rateRefused).toBe(0); // every legal triple applies
+      // **Not zero any more.** The sweep walks the whole arithmetically legal rate space, and
+      // M9's `rateCaps` refuse a corner of it — so a zero here would mean the caps had been
+      // ignored. What is asserted instead is that a refusal is a *cap* refusal and not a
+      // disagreement: the pair agrees (checked above), and the accepted triples are non-zero, so
+      // the caps are refusing a corner rather than everything.
+      expect(totals.rateRefused).toBeGreaterThan(0);
       expect(totals.malformedRefused).toBeGreaterThan(0);
       // The policy decision `actions.ts` documents, asserted rather than assumed: the
       // enumerating generators yield no rate command at all.
@@ -1051,7 +1121,10 @@ const moneySweep = (seeds: readonly number[], turns: number, civCount: number): 
         }
 
         if (turn % 17 === 3) {
-          const rates = rateChoices[prng() % rateChoices.length];
+          // Cycled rather than drawn, for the same reason the recorder's own choices are
+          // (see `recordMoneyGame`): every entry must really be exercised, and which
+          // numbers a generator happens to produce is not what this sweep is measuring.
+          const rates = rateChoices[Math.floor(turn / 5) % rateChoices.length];
           if (rates !== undefined) {
             const outcome = applyCommand(state, playerId, { type: 'SetRates', rates }, RULESET);
             if (outcome.ok) {
@@ -1279,7 +1352,7 @@ const moneySweep = (seeds: readonly number[], turns: number, civCount: number): 
               where(turn, `player ${String(player.id)}: the disband event misdescribes its victim`),
             );
             rec.check(
-              event.saved === UNIT_SUPPORT_COST || covered === shortfall, // the last disband of a turn may be capped
+              event.saved === UNIT_COST || covered === shortfall, // the last disband of a turn may be capped
               where(turn, `player ${String(player.id)}: a disband saved ${String(event.saved)}`),
             );
           }
@@ -1348,7 +1421,16 @@ describe('2. money conservation — income minus upkeep equals the delta, every 
       expect(totals.citiesFounded).toBeGreaterThan(0);
       expect(totals.commerceSplit).toBeGreaterThan(0);
       expect(totals.incomeGold).toBeGreaterThan(0);
-      expect(totals.incomeLuxuries).toBeGreaterThan(0);
+      // **M9+M10 turns this from "greater than zero" into a measured zero, and the arithmetic
+      // is the reason rather than an accident.** `despotism` — the government every seat opens
+      // with — caps luxury at 2 of `RATE_TOTAL`, so the most-luxury sweep triple is `0/8/2`, and
+      // this fixture's cities average roughly three commerce a turn: `floor(3 * 2 / 10)` is
+      // zero. The channel is exercised on every turn of the sweep and floors away.
+      //
+      // The old assertion asked for a positive income, which only the uncapped `0/0/10` triple
+      // produced — the triple M9 refuses. Non-vacuity needs the channel *tried*, not the counter
+      // moved, and `rateChanges > 0` below is where that is asserted.
+      expect(totals.incomeLuxuries).toBe(0);
       expect(totals.rateChanges).toBeGreaterThan(0);
       expect(totals.disbands).toBeGreaterThan(0);
       expect(totals.bankruptPlayerTurns).toBeGreaterThan(0);
@@ -1412,7 +1494,7 @@ describe('2. money conservation — income minus upkeep equals the delta, every 
     expect(upkeep?.unitSupport).toBe(0);
     expect(upkeep?.gold).toBe(2);
     expect(upkeep?.units).toBe(1);
-    expect(upkeep?.freeUnits).toBe(FREE_UNITS_PER_CITY + FREE_UNITS_BASE);
+    expect(upkeep?.freeUnits).toBe(FREE_PER_CITY + FREE_UNITS_BASE);
     // Nothing to disband buys nothing, so the whole two gold is unpaid — and the
     // treasury floors at 0 rather than going negative.
     expect(disbandEventsOf(outcome.events)).toEqual([]);
@@ -1876,12 +1958,7 @@ describe('5. rates', () => {
     const P0 = asPlayerId(0);
     const before = hashValue(board);
 
-    const outcome = applyCommand(
-      board,
-      P0,
-      { type: 'SetRates', rates: { tax: 0, science: 0, luxury: RATE_TOTAL } },
-      RULESET,
-    );
+    const outcome = applyCommand(board, P0, { type: 'SetRates', rates: MAX_LUXURY_RATES }, RULESET);
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
 
@@ -1929,7 +2006,12 @@ describe('5. rates', () => {
     ];
 
     for (const [label, cmd] of illegal) {
-      const plan = planSetRates(board, P0, cmd.type === 'SetRates' ? cmd.rates : DEFAULT_RATES);
+      const plan = planSetRates(
+        board,
+        RULESET,
+        P0,
+        cmd.type === 'SetRates' ? cmd.rates : DEFAULT_RATES,
+      );
       const outcome = applyCommand(board, P0, cmd, RULESET);
 
       expect(outcome.ok, `${label} was accepted`).toBe(false);
@@ -1995,7 +2077,7 @@ describe('5. rates', () => {
     const changed = applyCommand(
       firstTurn.value.state,
       P0,
-      { type: 'SetRates', rates: { tax: 0, science: 0, luxury: RATE_TOTAL } },
+      { type: 'SetRates', rates: MAX_LUXURY_RATES },
       RULESET,
     );
     expect(changed.ok).toBe(true);
@@ -2019,12 +2101,23 @@ describe('5. rates', () => {
 
     // The changed twin earns no gold at all and banks the commerce as luxuries; the
     // control twin earns its share as gold. Both are exactly the contract's split.
-    const allLuxury = contractSplit(commerce, { tax: 0, science: 0, luxury: RATE_TOTAL });
+    const allLuxury = contractSplit(commerce, MAX_LUXURY_RATES);
     const control = contractSplit(commerce, DEFAULT_RATES);
     expect(incomeA.gold).toBe(allLuxury.gold);
     expect(incomeA.luxuries).toBe(allLuxury.luxuries);
     expect(incomeB.gold).toBe(control.gold);
-    expect(incomeA.gold).toBe(0);
+    // **"The luxury twin earns no gold" is no longer expressible, and this is what
+    // replaced it.** The claim used to be `incomeA.gold === 0`, which held because
+    // `0/0/10` put the whole budget on luxuries and `splitCommerce` had no remainder to
+    // hand to gold. `despotism` caps luxury at 2, so the most-luxury legal triple is
+    // `0/8/2` — tax is still 0, but the *division remainder* now lands in gold, which is
+    // the engine's own documented rule ("the remainder of the three integer divisions, to
+    // gold"). So the twin's gold is exactly that remainder — stated as the identity rather
+    // than as the number, so it is still checking the split and not a coincidence — and it
+    // is still smaller than the budget, which is what "no tax is being collected" means
+    // once a remainder exists.
+    expect(incomeA.gold).toBe(commerce - allLuxury.beakers - allLuxury.luxuries);
+    expect(incomeA.gold).toBeLessThan(RATE_TOTAL);
     expect(incomeB.gold).not.toBe(incomeA.gold);
 
     // The treasury difference is exactly the gold difference — the rate change moved the
@@ -2059,13 +2152,17 @@ describe('5. rates', () => {
         .addUnit(0, WORKER.id, [4, 4])
         .addUnit(1, WORKER.id, [30, 30]);
       // Seven Roman units, so the eighth (the one produced this turn) is over the
-      // allowance of FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE.
+      // allowance of FREE_PER_CITY * 1 + FREE_UNITS_BASE.
       for (let n = 0; n < 6; n += 1) builder = builder.addUnit(0, MILITARY.id, [4, 5 + n]);
       const built = builder
         .setTreasury(0, 200)
         .addCity(0, [8, 8], {
           population: 1,
           workedTiles: [],
+          // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+          // from this and `computeTileOwner` reads it, so a hand-built city states a number
+          // rather than leaving the engine to guess one.
+          culture: 0,
           shields,
           production: { kind: 'unit', id: item.id },
         })
@@ -2115,7 +2212,7 @@ describe('5. rates', () => {
     expect(upkeepB?.units).toBe(unitsBefore);
     expect(upkeepA?.unitSupport).toBe(contractSupport(unitsBefore + 1, 1));
     expect(upkeepB?.unitSupport).toBe(contractSupport(unitsBefore, 1));
-    expect((upkeepA?.gold ?? 0) - (upkeepB?.gold ?? 0)).toBe(UNIT_SUPPORT_COST);
+    expect((upkeepA?.gold ?? 0) - (upkeepB?.gold ?? 0)).toBe(UNIT_COST);
   });
 });
 
@@ -2291,10 +2388,19 @@ const recordMoneyGame = (seed: number, steps: number, civCount: number): Recordi
 
   const prng = makePrng(seed);
   const commands: RecordedCommand[] = [];
+  // **Three triples the opening government will accept** (M9+M10). This script is
+  // *recorded* and then replayed in a fresh process, and the recorder throws on a refused
+  // command by design — a script that skipped a refusal would be a recording of a
+  // different game. `despotism` caps tax at 8, science at 8 and luxury at 2, so the old
+  // choices `0/0/10` and `10/0/0` are both refused and the whole determinism test died in
+  // the recorder. These three are the corners of the *capped* space: all science, an even
+  // split, and all tax — the luxury channel's only legal corner is `0/8/2`, which the
+  // first entry is not, because "as much luxury as possible" cannot be the whole budget
+  // any more. The recording's hashes below moved with them, for the same reason.
   const rateChoices: readonly Rates[] = [
-    { tax: 0, science: 0, luxury: RATE_TOTAL },
-    { tax: 3, science: 3, luxury: 4 },
-    { tax: RATE_TOTAL, science: 0, luxury: 0 },
+    { tax: RATE_TOTAL - 2, science: 0, luxury: 2 },
+    { tax: 4, science: 4, luxury: 2 },
+    { tax: 2, science: RATE_TOTAL - 4, luxury: 2 },
   ];
 
   for (let step = 0; step < steps; step += 1) {
@@ -2326,7 +2432,13 @@ const recordMoneyGame = (seed: number, steps: number, civCount: number): Recordi
         break;
       }
       case 2: {
-        const rates = rateChoices[prng() % rateChoices.length];
+        // **Cycled rather than drawn**, so every one of the three is really used: this
+        // script is the evidence that the money loop moves gold, and a `prng()` draw that
+        // happened never to select the tax-heavy corner would make the "some player ended
+        // with gold" assertion below fail for a reason that is about luck rather than
+        // about the loop. The draw is still deterministic either way; cycling removes the
+        // dependence on which numbers the generator happened to produce.
+        const rates = rateChoices[Math.floor(step / 5) % rateChoices.length];
         if (rates !== undefined) chosen = { player: acting, cmd: { type: 'SetRates', rates } };
         break;
       }
@@ -2351,6 +2463,20 @@ interface ReplayResult {
   readonly disbands: number;
   readonly shortfalls: number;
   readonly units: number;
+  /**
+   * Total gold the money loop actually **collected**, summed over every `IncomeCollected`
+   * event in the run (M9+M10).
+   *
+   * This is the non-vacuity witness that replaced "some player ended the run with gold".
+   * That witness stopped being true when `despotism`'s `rateCaps` capped tax at 8 of the
+   * 10 rate points: this script spawns ten units per civilization, so every player runs a
+   * permanent deficit and ends on a treasury of exactly 0 — which is *correct* behaviour
+   * for a bankrupt player, and made the old witness fail for a reason that had nothing to
+   * do with the money loop. "Gold was collected" is both the closer statement of what the
+   * witness is for and one that survives a player being broke, and it moves with the loop
+   * rather than with the fiscal health of an artificial fixture.
+   */
+  readonly collected: number;
 }
 
 const replay = (recording: Recording): ReplayResult => {
@@ -2370,6 +2496,7 @@ const replay = (recording: Recording): ReplayResult => {
 
   let disbands = 0;
   let shortfalls = 0;
+  let collected = 0;
   for (const entry of recording.commands) {
     const outcome = applyCommand(state, entry.player, entry.cmd, RULESET);
     if (!outcome.ok) {
@@ -2377,6 +2504,7 @@ const replay = (recording: Recording): ReplayResult => {
     }
     disbands += disbandEventsOf(outcome.value.events).length;
     shortfalls += shortfallEventsOf(outcome.value.events).length;
+    collected += collectedGoldOf(outcome.value.events);
     state = outcome.value.state;
   }
 
@@ -2386,6 +2514,7 @@ const replay = (recording: Recording): ReplayResult => {
     disbands,
     shortfalls,
     units: state.units.length,
+    collected,
   };
 };
 
@@ -2397,6 +2526,7 @@ const replayLine = (result: ReplayResult): string =>
     String(result.disbands),
     String(result.shortfalls),
     String(result.units),
+    String(result.collected),
   ].join(' ');
 
 /** `tsx` is a devDependency; a missing install is a broken checkout, so say so. */
@@ -2441,6 +2571,7 @@ for (const spawn of recording.spawns) {
 
 let disbands = 0;
 let shortfalls = 0;
+let collected = 0;
 for (const entry of recording.commands) {
   const outcome = applyCommand(state, entry.player, entry.cmd, ruleset);
   if (!outcome.ok) {
@@ -2449,12 +2580,13 @@ for (const entry of recording.commands) {
   for (const event of outcome.value.events) {
     if (event.type === 'UnitDisbanded') disbands += 1;
     if (event.type === 'TreasuryShortfall') shortfalls += 1;
+    if (event.type === 'IncomeCollected') collected += event.gold;
   }
   state = outcome.value.state;
 }
 
 const gold = state.players.map((player) => player.treasury).join(',');
-console.log('RESULT ' + hashValue(state) + ' ' + gold + ' ' + String(disbands) + ' ' + String(shortfalls) + ' ' + String(state.units.length));
+console.log('RESULT ' + hashValue(state) + ' ' + gold + ' ' + String(disbands) + ' ' + String(shortfalls) + ' ' + String(state.units.length) + ' ' + String(collected));
 `;
 
 describe('7. determinism — in-process and in a fresh process', () => {
@@ -2506,7 +2638,9 @@ describe('7. determinism — in-process and in a fresh process', () => {
     // and the gold of every player is the part M4b added.
     expect(observed).toBe(replayLine(expected));
     expect(expected.disbands).toBeGreaterThan(0);
-    expect(expected.gold.some((value) => value > 0)).toBe(true);
+    // The money loop really moved gold (see `ReplayResult.collected` for why this is not
+    // "a player ended with gold").
+    expect(expected.collected).toBeGreaterThan(0);
   }, 180_000);
 });
 
@@ -2562,6 +2696,7 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
       'played-civs2-seed42-combat',
+      'played-civs2-seed42-victory',
     ]);
     expect(stored.nodeMajor).toBe(Number.parseInt(process.versions.node, 10));
 
@@ -2572,7 +2707,7 @@ describe('8. goldens: still a gate, and what they do and do not cover', () => {
     // game does **not** write). Named rather than written as `> 7` so a future schema bump
     // has to come here and say so — M6 is the fifth deliberate bump, and its rehash went
     // through the harness's opt-in path like the other four.
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBe(9);
 
     // The four new keys are inside the canonical JSON `hashValue` hashes, so a shape
     // change of any of them — added, renamed, removed — trips the gate. This is the check

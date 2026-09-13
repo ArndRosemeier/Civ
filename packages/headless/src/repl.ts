@@ -68,7 +68,7 @@
  *   them: research was M5 and happiness is M9. **Half of that sentence is now
  *   false.** Beakers buy tech, so every place they are printed says what they do
  *   and what they are banked toward; luxuries still do nothing, so
- *   `LUXURY_CAVEAT` is quoted, unchanged and from one constant, wherever they
+ *   `luxuryCaveat` is quoted, from one function, wherever they
  *   appear. Leaving the old wording in one of those places would be exactly the
  *   doc drift that made M4c's growth-food hole invisible: prose asserting a limit
  *   the engine no longer has.
@@ -106,12 +106,14 @@ import { dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 
 import {
+  DEFAULT_RATES,
   MAP_SIZES,
   MIN_CITY_DISTANCE,
   RATE_TOTAL,
   applyCommand,
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asTechId,
   asUnitId,
@@ -128,6 +130,21 @@ import {
   civPlayers,
   combatRulesOf,
   connected,
+  claimedRadius,
+  culturePerTurnOf,
+  cultureRulesOf,
+  disorderedCities,
+  gameOutcomeOf,
+  governmentCatalog,
+  governmentDef,
+  playerGovernment,
+  happinessOf,
+  happinessRulesOf,
+  ownedLandCount,
+  playerCulture,
+  playerScore,
+  scoreHorizon,
+  scoreTable,
   defenderBonusPct,
   describe,
   err,
@@ -148,11 +165,13 @@ import {
   ok,
   planAttackUnit,
   planFoundCity,
+  planSetGovernment,
   planSetProduction,
   planSetRates,
   planSetResearch,
   planSetWorkedTiles,
   planStartWork,
+  defaultGovernmentOf,
   playerIncome,
   playerUpkeep,
   prerequisitesOf,
@@ -185,6 +204,8 @@ import {
   type CityYields,
   type GameError,
   type GameMap,
+  type GovernmentDef,
+  type GovernmentId,
   type GameState,
   type ImprovementDef,
   type ImprovementId,
@@ -203,6 +224,7 @@ import {
   type TechId,
   type TerrainDef,
   type TileIndex,
+  type VictoryConditionId,
   type Unit,
   type UnitId,
   type UnitTypeId,
@@ -651,14 +673,19 @@ const legalAttackLines = (context: ErrorContext, unitId: UnitId): readonly strin
 
 /**
  * The tiles `cityId` may be assigned right now, asked one tile at a time of
- * `planSetWorkedTiles` — so a tile another city works, a tile outside the radius,
- * the centre itself and an off-map tile are all excluded by the engine's answer
- * rather than by a second opinion here.
+ * `planSetWorkedTiles` — so a tile another city works, a tile another player owns, the
+ * centre itself and an off-map tile are all excluded by the engine's answer rather than by
+ * a second opinion here.
  */
 const workableTiles = (state: GameState, playerId: PlayerId, city: City): readonly TileIndex[] =>
   cityRadius(state, city.tile).filter(
     (tile) =>
-      Number(tile) !== Number(city.tile) && planSetWorkedTiles(state, playerId, city.id, [tile]).ok,
+      Number(tile) !== Number(city.tile) &&
+      // M9: the planner now also refuses a tile **another player owns**, so this list is
+      // the tiles the engine would actually accept rather than the tiles geometry alone
+      // would allow. That is the whole point of asking the planner instead of re-deriving
+      // the rule here. (M9 does not narrow the ring itself — see `planSetWorkedTiles`.)
+      planSetWorkedTiles(state, playerId, city.id, [tile]).ok,
   );
 
 /**
@@ -956,6 +983,166 @@ const techLabel = (ruleset: RulesetView, id: TechId): string => {
  * `prerequisitesOf` is the engine's read of the edge, so a view cannot print a
  * prerequisite the research rule does not enforce.
  */
+/* ------------------------------------------------------------------ *
+ * M9+M10 - governments, culture, contentment, score and the outcome.
+ *
+ * Every number these views print is *read*, never derived: a city's culture comes from
+ * `city.culture`, its contentment from `happiness.ts`' `happinessOf` (the engine's own
+ * pure function), a player's culture from `culture.ts`' `playerCulture` (the derived
+ * total), a score from `score.ts`' `playerScore`, and the ending from `victory.ts`'
+ * `gameOutcomeOf`. "How much culture does this city have?" is not a question this file
+ * answers for itself — it asks the module that owns the rule, which is the same
+ * discipline the rest of the file follows for growth, prices and combat odds.
+ * ------------------------------------------------------------------ */
+
+/** `"Monarchy"`, or an honest fallback for an id this ruleset does not describe. */
+const governmentName = (ruleset: RulesetView, id: GovernmentId): string =>
+  governmentDef(ruleset, id)?.name ?? `"${id}"`;
+
+/** `"Monarchy" (monarchy)` — the row's name and the id a command spells. */
+const governmentLabel = (ruleset: RulesetView, id: GovernmentId): string => {
+  const def = governmentDef(ruleset, id);
+  return def === undefined ? `"${id}"` : `"${def.name}" (${id})`;
+};
+
+/**
+ * What each victory condition is, in a phrase a player reads once.
+ *
+ * A `Record` over the union rather than a `switch`, so adding a condition to
+ * `VictoryConditionId` without deciding what it is *called* is a compile error — the same
+ * shape as an exhaustive `switch`, with the labels in one place a reader can compare.
+ */
+const VICTORY_LABELS: Readonly<Record<VictoryConditionId, string>> = {
+  conquest: 'conquest (every other civilization is gone)',
+  domination: 'domination (enough of the world is yours)',
+  cultural: 'a cultural victory (enough accumulated culture)',
+  score: 'the score at the turn limit',
+};
+
+const victoryConditionLabel = (condition: VictoryConditionId): string => VICTORY_LABELS[condition];
+
+/** `tax 8 / science 8 / luxury 2` — a government's caps, as the sliders they cap. */
+const capsLabel = (def: GovernmentDef): string =>
+  `tax ${String(def.rateCaps.tax)} / science ${String(def.rateCaps.science)} / ` +
+  `luxury ${String(def.rateCaps.luxury)}`;
+
+/**
+ * The government view: **what you are governed by now**, every row this ruleset ships with
+ * its four magnitudes, and — for each row you cannot adopt — the engine's own reason.
+ *
+ * The refusal column is built by *asking* `planSetGovernment`, the evaluator `applyCommand`
+ * refuses with, so the menu can never offer a government the applier would refuse; and the
+ * magnitudes come from `governmentCatalog`, so a balance sweep that moved a cap is visible
+ * here rather than only in the ruleset.
+ */
+const governmentReport = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
+  // `playerGovernment` answers "what governs this player?" for a player this state may not
+  // have, and falls back to the catalog's default row — so this view is total over a
+  // hand-built state rather than one `undefined` away from a crash.
+  const current = playerGovernment(state, ruleset, playerId) ?? defaultGovernmentOf(ruleset);
+  const rows = governmentCatalog(ruleset).map((def) => {
+    const plan = planSetGovernment(state, ruleset, playerId, def.id);
+    const verdict = plan.ok
+      ? def.id === current.id
+        ? 'current'
+        : 'you may adopt this'
+      : plan.error.kind === 'government-tech-required'
+        ? `needs ${techLabel(ruleset, plan.error.tech)}`
+        : plan.error.kind === 'unknown-government'
+          ? 'unknown to this ruleset'
+          : plan.error.kind === 'unknown-player'
+            ? `no player ${String(playerId)}`
+            : `refused: ${plan.error.kind}`;
+    return (
+      `  ${def.id.padEnd(10)} ${def.name.padEnd(12)} caps ${capsLabel(def).padEnd(34)} ` +
+      `${String(def.freeUnitsPerCity)} free/city, ${String(def.unitSupportCost)} gold per unit ` +
+      `beyond, ${signed(def.happinessModifier)} unhappy - ${verdict}`
+    );
+  });
+
+  return [
+    `government: ${governmentLabel(ruleset, current.id)} - ${capsLabel(current)}, ` +
+      `${String(current.freeUnitsPerCity)} free unit(s) per city plus the flat allowance, ` +
+      `${String(current.unitSupportCost)} gold per unit beyond it, ` +
+      `${signed(current.happinessModifier)} to every city's unhappy count`,
+    `  rows this ruleset describes (changing takes effect immediately; anarchy is not modelled):`,
+    ...rows,
+  ].join('\n');
+};
+
+/**
+ * One city's culture and contentment, as the engine reads them: the accumulated culture
+ * and the radius it buys, the unhappy/happy/content counts, and the disorder verdict.
+ *
+ * The radius is `borders.ts`' `claimedRadius` — *asked*, not recomputed — so the number a
+ * player reads is the number the ownership layer uses.
+ */
+const cityCultureLine = (city: City, ruleset: RulesetView): string => {
+  const rules = cultureRulesOf(ruleset);
+  const radius = claimedRadius(rules, city.culture);
+  const next =
+    radius >= 3
+      ? 'its borders are at their widest'
+      : radius === 2
+        ? `radius 3 at ${String(rules.borderRadius3Culture)} culture`
+        : `radius 2 at ${String(rules.borderRadius2Culture)} culture`;
+  // The per-turn figure is the *sum over this city's own buildings*, read row by row from
+  // the catalog — the same read `culture.ts`' `applyCulture` makes, so the number a player
+  // reads is the number the next turn will add.
+  const perTurn = city.buildings.reduce((total, id) => total + culturePerTurnOf(ruleset, id), 0);
+  return (
+    `  culture ${String(city.culture)} - +${String(perTurn)} per turn from its own buildings, ` +
+    `claims radius ${String(radius)}, ${next}`
+  );
+};
+
+const happinessLine = (state: GameState, ruleset: RulesetView, city: City): string => {
+  const counts = happinessOf(state, ruleset, city);
+  return (
+    `  ${cityLabel(state, city.id)}: ${String(counts.unhappy)} unhappy, ` +
+    `${String(counts.happy)} happy, ${String(counts.content)} content of ` +
+    `${String(city.population)} citizen(s)` +
+    (counts.disordered
+      ? ' - IN DISORDER: no shields, no beakers, no gold, no growth'
+      : ' - content enough to work')
+  );
+};
+
+/**
+ * The outcome view: whether the game is over, who won and by which condition, and — if it
+ * is not over — which conditions are already met and by whom.
+ *
+ * The ending is `victory.ts`' `gameOutcomeOf`, asked fresh every time this is printed: it
+ * is a **derived** read of the board and not a flag, so a view cannot be stale and a save
+ * cannot carry a result that disagrees with its own cities.
+ */
+const outcomeReport = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
+  const ending = gameOutcomeOf(state, ruleset);
+  const horizon = scoreHorizon(ruleset);
+  const head =
+    ending === null
+      ? `outcome: the game is still running on turn ${String(state.turn)}; ` +
+        `the score victory is decided at turn ${String(horizon)}`
+      : ending.winner === null
+        ? `outcome: the game ENDED on turn ${String(state.turn)} by ` +
+          `${victoryConditionLabel(ending.condition)}, and it is a draw (no winner)`
+        : `outcome: the game ENDED on turn ${String(state.turn)} by ` +
+          `${victoryConditionLabel(ending.condition)}, won by ` +
+          playerLabel(state, ending.winner);
+
+  const scores = scoreTable(state, ruleset).map(
+    (row) =>
+      `  ${playerLabel(state, row.playerId).padEnd(24)} score ${String(row.score).padStart(6)}, ` +
+      `culture ${String(playerCulture(state, row.playerId))}`,
+  );
+
+  return [
+    head,
+    `  scores (your total: ${String(playerScore(state, ruleset, playerId))}):`,
+    ...scores,
+  ].join('\n');
+};
+
 const prerequisitesLabel = (ruleset: RulesetView, id: TechId): string => {
   const required = prerequisitesOf(ruleset, id);
   if (required.length === 0) return 'no prerequisites';
@@ -1323,8 +1510,8 @@ const techCatalogueHint = (ruleset: RulesetView): string => {
  * time, and as of M5 the two sentences are **different**, because the two channels
  * are no longer the same thing. Beakers buy tech (`tech.ts`), so they are printed
  * with what they are banked toward and how far the pool is from the cost; luxuries
- * still do nothing (happiness is M9), so `LUXURY_CAVEAT` is quoted in full wherever
- * they appear. Leaving the M4b sentence — "beakers and luxuries DO NOTHING yet" — on
+ * are read by M9's happiness (`luxuryCaveat` says exactly how), so that sentence is
+ * quoted in full wherever they appear. Leaving the M4b sentence — "beakers and luxuries DO NOTHING yet" — on
  * a beaker line would be a lie the engine's own turn pipeline contradicts, and a
  * stale claim in the output is how a real hole stays invisible.
  * ------------------------------------------------------------------ */
@@ -1346,18 +1533,33 @@ const playerStateOf = (state: GameState, id: PlayerId): PlayerState | undefined 
   state.players.find((player) => player.id === id);
 
 /**
- * The sentence that has to travel with the one inert channel, quoted in full
- * wherever luxuries are printed.
+ * The sentence that has to travel with the luxury channel, quoted in full wherever
+ * luxuries are printed — and, since M9, **the sentence changed**.
  *
  * M4b wrote one constant for *two* inert pools ("beakers and luxuries DO NOTHING
- * yet"). M5 made half of that sentence false — beakers now buy tech — so the
- * constant was split rather than edited: this half is still exactly true (happiness
- * is M9, and nothing reads `luxuries`), and the beaker half is now
- * `researchStanding`'s job, because what beakers do depends on what the player has
- * selected. One constant per claim, so the next milestone cannot leave a stale half
- * behind in one of the five places it is printed.
+ * yet"). M5 made half of that false — beakers buy tech — so the constant was split,
+ * and this half stayed exactly true for four milestones: nothing read `luxuries`.
+ * **M9 is the milestone that reads them**, so the old sentence is now a lie the
+ * engine's own `happinessOf` contradicts — exactly the "a stale claim in the output is
+ * how a real hole stays invisible" failure the module comment above warns about. It is
+ * replaced rather than deleted, and it is a **function of the ruleset** rather than a
+ * constant, because the two numbers in it are catalog magnitudes
+ * (`CultureSpec.luxuriesPerHappyCitizen` and `happyPerLuxuryResource`) that a balance
+ * sweep can move: a constant spelling "2" would go on being printed after the rule it
+ * describes had changed.
+ *
+ * Read through `happinessRulesOf`, the same reader `happinessOf` uses, so the prose
+ * cannot develop a second opinion about what luxuries do.
  */
-const LUXURY_CAVEAT = 'luxuries DO NOTHING yet: nothing reads them until M9 (happiness)';
+const luxuryCaveat = (ruleset: RulesetView): string => {
+  const rules = happinessRulesOf(ruleset);
+  return (
+    `luxuries CONTENT CITIZENS: every ${String(rules.luxuriesPerHappyCitizen)} banked ` +
+    `content one, and each luxury resource you have connected contents ` +
+    `${String(rules.happyPerLuxuryResource)} more; a city whose unhappy citizens outnumber ` +
+    'its happy ones is in disorder and produces no shields, beakers or gold'
+  );
+};
 
 /**
  * What the science share of commerce does, for a line that has just printed a
@@ -1404,12 +1606,12 @@ const poolsOf = (player: PlayerState): string =>
  * fabricated `0 gold` — the same reading `headerLine`'s gold field takes in
  * `textview`.
  */
-const economyLine = (state: GameState, playerId: PlayerId): string => {
+const economyLine = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
   const player = playerStateOf(state, playerId);
   if (player === undefined) {
     return `economy: unknown (this state has no player ${String(playerId)})\n`;
   }
-  const support = unitSupport(state, playerId);
+  const support = unitSupport(state, ruleset, playerId);
   return (
     `economy: ${String(wholeNumber(player.treasury))} gold, rates ${ratesTriple(player.rates)} ` +
     `(tax/science/luxury, sum ${String(
@@ -1417,7 +1619,7 @@ const economyLine = (state: GameState, playerId: PlayerId): string => {
         wholeNumber(player.rates.science) +
         wholeNumber(player.rates.luxury),
     )} of ${String(RATE_TOTAL)}), ${String(wholeNumber(player.beakers))} beakers, ` +
-    `${String(wholeNumber(player.luxuries))} luxuries - ${LUXURY_CAVEAT}\n` +
+    `${String(wholeNumber(player.luxuries))} luxuries - ${luxuryCaveat(ruleset)}\n` +
     `  ${String(support.units)} unit(s) against ${String(support.free)} supported free ` +
     `(${String(support.supported)} billable at ${String(support.gold)} gold); upkeep is what empties a treasury\n`
   );
@@ -1452,14 +1654,14 @@ const economyDetailLines = (
 
   const income = playerIncome(state, ruleset, playerId);
   const upkeep = playerUpkeep(state, ruleset, playerId);
-  const support = unitSupport(state, playerId);
+  const support = unitSupport(state, ruleset, playerId);
   const cities = citiesOf(state, playerId).length;
 
   return [
     `economy: ${String(wholeNumber(player.treasury))} gold, rates ${ratesLabel(player.rates)}, ` +
       `${String(wholeNumber(player.beakers))} beakers, ${String(wholeNumber(player.luxuries))} luxuries`,
     `  ${BEAKER_RULE}.`,
-    `  ${LUXURY_CAVEAT}: they only pile up, and this build neither spends nor reads them.`,
+    `  ${luxuryCaveat(ruleset)}.`,
     `  gold pays upkeep, and a treasury that cannot pay is paid for by disbanding units`,
     `  (highest id first) rather than by going negative.`,
     `economy: at these rates this state collects ${String(income.gold)} gold, ` +
@@ -1480,7 +1682,7 @@ const economyDetailLines = (
  * session whose player learns about upkeep by being bankrupted by it, so the
  * numbers are stated before the first command rather than only on demand.
  */
-const bannerEconomyLines = (state: GameState, playerId: PlayerId): string => {
+const bannerEconomyLines = (state: GameState, ruleset: RulesetView, playerId: PlayerId): string => {
   const player = playerStateOf(state, playerId);
   if (player === undefined) return '';
   const cities = citiesOf(state, playerId).length;
@@ -1488,7 +1690,7 @@ const bannerEconomyLines = (state: GameState, playerId: PlayerId): string => {
     `economy: ${poolsOf(player)}, rates ${ratesLabel(player.rates)}, ` +
     `${String(cities)} ${plural(cities, 'city', 'cities')}\n` +
     `  ${BEAKER_RULE}.\n` +
-    `  ${LUXURY_CAVEAT}.\n` +
+    `  ${luxuryCaveat(ruleset)}.\n` +
     `  "rates <tax> <science> <luxury>" moves the sliders (they must sum to ` +
     `${String(RATE_TOTAL)}); gold pays upkeep, and a treasury that cannot pay disbands units.\n`
   );
@@ -1504,14 +1706,48 @@ const bannerEconomyLines = (state: GameState, playerId: PlayerId): string => {
  * nothing else — an example the engine would refuse would be worse than no example.
  */
 const legalRatesExamples = (context: ErrorContext): readonly string[] => {
+  const government = playerGovernment(context.state, context.ruleset, context.playerId);
+  if (government === undefined) return [];
+
+  /**
+   * The corner of the capped space that puts as much of the budget as it can on one
+   * channel: fill that channel up to its cap, then the next, then the last.
+   *
+   * **Derived from `rateCaps`, never written down.** Before M9 the three corners were
+   * literally `10/0/0`, `0/10/0` and `0/0/10`, because the only rule was "three
+   * non-negative integers summing to `RATE_TOTAL`". A government caps each slider, so
+   * none of those three is reachable any more, and a hint that spelled them out would
+   * be advertising triples `planSetRates` refuses — the one thing this function's own
+   * doc comment says is worse than no example. Asking the government's caps is also what
+   * keeps the hint right when a later government has different ones.
+   */
+  const corner = (first: 'tax' | 'science' | 'luxury'): Rates => {
+    const order: readonly ('tax' | 'science' | 'luxury')[] =
+      first === 'tax'
+        ? ['tax', 'science', 'luxury']
+        : first === 'science'
+          ? ['science', 'tax', 'luxury']
+          : ['luxury', 'tax', 'science'];
+    const chosen = { tax: 0, science: 0, luxury: 0 };
+    let left = RATE_TOTAL;
+    for (const channel of order) {
+      const take = Math.min(government.rateCaps[channel], left);
+      if (channel === 'tax') chosen.tax = take;
+      else if (channel === 'science') chosen.science = take;
+      else chosen.luxury = take;
+      left -= take;
+    }
+    return chosen;
+  };
+
   const candidates: readonly Rates[] = [
-    { tax: RATE_TOTAL, science: 0, luxury: 0 },
-    { tax: 0, science: RATE_TOTAL, luxury: 0 },
-    { tax: 0, science: 0, luxury: RATE_TOTAL },
-    { tax: 6, science: 4, luxury: 0 },
+    corner('tax'),
+    corner('science'),
+    corner('luxury'),
+    DEFAULT_RATES,
   ];
   return candidates
-    .filter((rates) => planSetRates(context.state, context.playerId, rates).ok)
+    .filter((rates) => planSetRates(context.state, context.ruleset, context.playerId, rates).ok)
     .map(
       (rates) => `"rates ${String(rates.tax)} ${String(rates.science)} ${String(rates.luxury)}"`,
     );
@@ -1946,6 +2182,69 @@ export const formatGameError = (error: GameError, context: ErrorContext): string
         '  rather than aimed at a defender the command never named.',
         ...legalAttackLines(context, error.unitId),
       ].join('\n');
+
+    /* ---------------- M9: borders and government ---------------- */
+
+    // The two border refusals name the *owner*, because the fix depends on whose land it
+    // is — "found somewhere else" is a different action from "take that city first". The
+    // owner is printed through `playerLabel`, the same read every other line uses, so a
+    // refusal cannot disagree with the scoreboard about who owns what.
+    case 'tile-owned-by-another-player':
+      return [
+        `error: tile-owned-by-another-player - (${coordOf(context.state.map, error.tile)}) is ` +
+          `${playerLabel(context.state, error.owner)}'s land,`,
+        '  and a city may not be founded on a tile another player owns. Culture claims the',
+        "  ground a city works, so the tile you are standing on can be somebody else's even",
+        '  when nothing is built on it.',
+        ...legalMovesLines(context),
+      ].join('\n');
+
+    case 'tile-owned-by-another-player-city':
+      return [
+        `error: tile-owned-by-another-player-city - (${coordOf(context.state.map, error.tile)}) ` +
+          `is ${playerLabel(context.state, error.owner)}'s land,`,
+        `  and ${cityLabel(context.state, error.cityId)} may only work tiles it or its owner`,
+        "  claims. A tile inside your own borders but outside this city's reach is a different",
+        "  refusal: grow this city's culture or work the tile from the city nearer to it.",
+      ].join('\n');
+
+    // The lesson is the *two* rings and which one refused: M3's working radius is wider
+    // than M9's claimed radius for a young city, so this refusal is the one a player meets
+    // when a tile is in the ring the city could work and outside the ring it holds.
+    case 'unknown-government':
+      return [
+        `error: unknown-government - this ruleset has no government "${error.government}".`,
+        error.known.length === 0
+          ? '  it describes no governments at all, so nobody can be governed.'
+          : `  it describes: ${error.known.join(', ')}.`,
+      ].join('\n');
+
+    case 'government-tech-required':
+      return [
+        `error: government-tech-required - ${governmentLabel(context.ruleset, error.government)}`,
+        `  needs ${techLabel(context.ruleset, error.tech)}, which ` +
+          `${playerLabel(context.state, context.playerId)} does not know yet.`,
+        '  a government can always be changed back to one with no prerequisite, so the',
+        '  current one is never a trap.',
+        ...legalResearchLines(context),
+      ].join('\n');
+
+    // The one refusal that is about the *game* rather than about a command, so the lesson
+    // is the outcome itself: who won, how, and on which turn. `EndTurn` is deliberately
+    // still accepted on a finished game (see `applyCommand`), and the line says so, because
+    // a player who tries to keep playing deserves to know why nothing moves.
+    case 'game-over': {
+      const winner =
+        error.winner === null
+          ? 'nobody (the game is a draw)'
+          : playerLabel(context.state, error.winner);
+      return [
+        `error: game-over - the game ended on turn ${String(error.turn)} by ` +
+          `${victoryConditionLabel(error.condition)}, and ${winner} won.`,
+        `  "${error.command}" is refused: a finished game takes no further commands. "end" is`,
+        '  still accepted and does nothing, and "outcome" prints the result in full.',
+      ].join('\n');
+    }
   }
 };
 /** A `SetupError` as prose. Shared with the `map` command, so both say the same thing. */
@@ -2278,6 +2577,7 @@ export const COMMAND_SUMMARY =
   'work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | ' +
   'work <unitId> <improvementId> | cancel <unitId> | ' +
   'rates <tax> <science> <luxury> | research <techId> | tech | ' +
+  'government [<governmentId>] | culture | happiness | outcome | ' +
   'end | units | state | save <path> | help | quit';
 
 /**
@@ -2346,9 +2646,9 @@ const helpText = (rules: CombatDef): string => `commands:
                           of ours): that many tenths of every city's commerce go to gold,
                           beakers and luxuries, and the remainder of each division goes to
                           gold. It changes FUTURE collections only - nothing already banked
-                          is recomputed. Beakers buy tech (see "research"); LUXURIES DO
-                          NOTHING yet, because happiness is M9, so that one channel only
-                          piles up. Gold pays upkeep.
+                          is recomputed. Beakers buy tech (see "research"); luxuries content
+                          your citizens (see "happiness"), and gold pays upkeep. A rate above
+                          your government's cap for that slider is refused (see "government").
   research <techId>       choose what to research. <techId> is a tech id ("tech" lists
                           them). A tech may be chosen when this ruleset defines it, you do
                           not already know it, and you know all of its prerequisites; a
@@ -2360,12 +2660,31 @@ const helpText = (rules: CombatDef): string => `commands:
                           cost in beakers and its prerequisites, grouped into what you know,
                           what you may research now, and what is blocked - each blocked row
                           naming the prerequisite that is missing.
+  government [<id>]       with no argument, print your government and every row this
+                          ruleset describes - each with its rate caps, its free-unit
+                          allowance, its per-unit support cost and its happiness modifier -
+                          marking which one is current and why the others are refused. With
+                          an id, adopt it: the change takes effect immediately (the anarchy
+                          transition a real revolution would impose is not modelled), and a
+                          refusal is the engine's own (unknown id, or an unmet prerequisite).
+  culture                 your accumulated culture - the sum of your cities' own - and, per
+                          city, the culture it holds, what it gains each turn from its own
+                          buildings, and the border radius that culture buys.
+  happiness               every city's unhappy/happy/content counts and whether it is in
+                          disorder. A disordered city produces no shields, no beakers and
+                          no gold and does not grow; happiness is recomputed from the city
+                          and its owner every time it is asked, never stored.
+  outcome                 whether the game is over, who won and by which condition, and the
+                          scoreboard. A finished game refuses every command except "end".
   end                     end the turn: every unit's work advances, every city grows and
-                          produces, research advances, every player collects income and pays
-                          upkeep (a treasury that cannot pay disbands units), every unit
-                          refills its movement, turn advances. An improvement finished this
-                          turn counts towards this turn, and a unit produced this turn costs
-                          support from this turn.
+                          produces, culture accumulates, research advances, every player
+                          collects income and pays upkeep (a treasury that cannot pay disbands
+                          units), barbarians move, borders are recomputed, every unit refills
+                          its movement, turn advances. An improvement finished this turn
+                          counts towards this turn, a culture-producing building finished this
+                          turn banks its first culture this turn, and a unit produced this
+                          turn costs support from this turn. A game that is over does not
+                          advance.
   units                   list the units you can see, with position, movement left, hit
                           points (a damaged unit must be visible as damaged) and what each
                           one is doing.
@@ -2415,7 +2734,7 @@ const bannerText = (
   // M4b: the economy, before the first command rather than only on demand. A
   // session that never mentions the treasury is a session whose player finds out
   // what upkeep costs by being bankrupted by it.
-  bannerEconomyLines(state, playerId) +
+  bannerEconomyLines(state, ruleset, playerId) +
   // M5: what you are researching (nothing, at the start of a game) and how to
   // change it, stated once before the first command for the same reason.
   `${researchStanding(state, ruleset, playerId)}\n` +
@@ -2588,7 +2907,7 @@ const outcomeText = (
           `ok: ${playerLabel(outcome.state, event.playerId)} collected ${String(event.gold)} gold, ` +
           `${String(event.beakers)} ${plural(event.beakers, 'beaker')} and ` +
           `${String(event.luxuries)} ${plural(event.luxuries, 'luxury', 'luxuries')} from its ` +
-          `cities at its rates - ${BEAKER_RULE}; ${LUXURY_CAVEAT}`
+          `cities at its rates - ${BEAKER_RULE}; ${luxuryCaveat(ruleset)}`
         );
 
       // M5: the one event that spends the pool. It carries the price and the
@@ -2724,6 +3043,37 @@ const outcomeText = (
               `${event.destroyed.map((id) => buildingLabel(ruleset, id)).join(', ')})`) +
           ' - a wonder is never destroyed by capture, the city is not razed, and its tile ' +
           'improvements stay'
+        );
+
+      /* ---------------- M9: culture and government ---------------- */
+
+      // Two lines about one system, and they say different things on purpose: the per-turn
+      // accumulation names the *gain* (so a log can be summed), and the wonder's one-off
+      // names the *building* that granted it (so a reader can see why a city's culture
+      // jumped). A consumer that added the two together would be reading them as one fact,
+      // which is why they are two event members rather than one with an optional field.
+      case 'CityCultureGrew':
+        return (
+          `ok: ${cityLabel(outcome.state, event.cityId)} ` +
+          `(${playerLabel(outcome.state, event.owner)}) accumulated ` +
+          `${String(event.gain)} culture this turn from its own buildings`
+        );
+
+      case 'CityCultureGained':
+        return (
+          `ok: ${cityLabel(outcome.state, event.cityId)} ` +
+          `(${playerLabel(outcome.state, event.owner)}) gained ${String(event.bonus)} culture ` +
+          `at once, on completing ${buildingLabel(ruleset, event.building)} - a wonder's ` +
+          `one-off, granted the turn it is finished`
+        );
+
+      case 'GovernmentChanged':
+        return (
+          `ok: ${playerLabel(outcome.state, event.playerId)} changed government from ` +
+          `${governmentName(ruleset, event.from)} to ${governmentName(ruleset, event.to)}` +
+          (event.from === event.to
+            ? ' - the same government, re-affirmed; nothing but the revision moved'
+            : '; the change takes effect immediately, and anarchy is not modelled')
         );
     }
 
@@ -2869,6 +3219,13 @@ const appliedCommandText = (
             'the record of it')
       );
     }
+
+    // M9: `government <id>` DOES emit an event (`GovernmentChanged`), so the renderer
+    // above has already reported it — this case exists because the switch is exhaustive
+    // over `Command` and a new member must be considered here explicitly, which is exactly
+    // what the tail's `assertNever` is for.
+    case 'SetGovernment':
+      return undefined;
   }
 
   // Reached only when every member above was handled, which is what makes the tail
@@ -2993,7 +3350,7 @@ export const createSession = (options: SessionOptions): ReplSession => {
     // notice only after it has already gone bankrupt. It sits last, after the
     // things a command was probably about, and it is one line: the detail is a
     // `state` away.
-    write(economyLine(state, playerId));
+    write(economyLine(state, ruleset, playerId));
     // M5: research, beside the economy, for the same reason and with the same
     // arrival time. The pool is spent on the `end` that fills it, and a tech can
     // complete on a turn the player did not ask about it — so the running total, the
@@ -3497,6 +3854,92 @@ export const createSession = (options: SessionOptions): ReplSession => {
           );
         }
         write(`${techReport(state, ruleset, playerId)}\n`);
+        return { kind: 'inspected', command: word };
+      }
+
+      /* ---------------- M9: government, culture and contentment ---------------- */
+
+      // `government` with no argument is a *view* and with one is a *command*, and the
+      // argument is handed to the engine exactly as typed — "is this a government I may
+      // adopt?" is `commands.ts`' `planSetGovernment`, and the refusal below is the
+      // engine's own typed answer (`unknown-government`, `government-tech-required`). A
+      // lookup here would be this file's second opinion about the table, which is the one
+      // thing the REPL is not allowed to have.
+      case 'government': {
+        if (args.length === 0) {
+          write(`${governmentReport(state, ruleset, playerId)}\n`);
+          return { kind: 'inspected', command: word };
+        }
+        if (args.length !== 1) {
+          return malformed(
+            `"government" takes at most one argument: government [<governmentId>] (got ` +
+              `${String(args.length)})`,
+            'usage: government  (the view)  |  government monarchy  (adopt it)',
+          );
+        }
+        const id = args[0] ?? '';
+        if (id === '') {
+          return malformed(
+            '"government" needs a government id when it is given an argument',
+            'usage: government  (the view)  |  government monarchy  (adopt it)',
+          );
+        }
+        return applied({ type: 'SetGovernment', government: asGovernmentId(id) });
+      }
+
+      case 'culture': {
+        if (args.length > 0) {
+          return malformed(
+            `"culture" takes no arguments (got "${args.join(' ')}")`,
+            "usage: culture  (your cities' accumulated culture and the borders it buys)",
+          );
+        }
+        const cities = citiesOf(state, playerId);
+        const lines =
+          cities.length === 0
+            ? ['  you have no cities, so you produce no culture and claim no ground']
+            : cities.map(
+                (city) => `  ${cityLabel(state, city.id)}:\n${cityCultureLine(city, ruleset)}`,
+              );
+        write(
+          `culture: ${String(playerCulture(state, playerId))} accumulated by ` +
+            `${playerLabel(state, playerId)} (the sum of its cities' culture; culture never decreases)\n` +
+            `${lines.join('\n')}\n  your borders reach ${String(ownedLandCount(state, playerId))} tile(s)\n`,
+        );
+        return { kind: 'inspected', command: word };
+      }
+
+      case 'happiness': {
+        if (args.length > 0) {
+          return malformed(
+            `"happiness" takes no arguments (got "${args.join(' ')}")`,
+            "usage: happiness  (each city's contentment and whether it is in disorder)",
+          );
+        }
+        const cities = citiesOf(state, playerId);
+        const wandering = disorderedCities(state, ruleset, playerId);
+        const lines =
+          cities.length === 0
+            ? ['  you have no cities, so nobody is unhappy about anything']
+            : cities.map((city) => happinessLine(state, ruleset, city));
+        write(
+          `happiness: ${String(wandering.length)} of your ${String(cities.length)} ` +
+            `citizen-bearing cit${cities.length === 1 ? 'y' : 'ies'} ${wandering.length === 1 ? 'is' : 'are'} ` +
+            `in disorder (a disordered city produces no shields, no beakers and no gold, and does not grow)\n` +
+            `${lines.join('\n')}\n  happiness is computed from each city and its owner every time it is ` +
+            `asked; nothing about it is stored\n`,
+        );
+        return { kind: 'inspected', command: word };
+      }
+
+      case 'outcome': {
+        if (args.length > 0) {
+          return malformed(
+            `"outcome" takes no arguments (got "${args.join(' ')}")`,
+            'usage: outcome  (whether the game is over, who won and how, and the scores)',
+          );
+        }
+        write(`${outcomeReport(state, ruleset, playerId)}\n`);
         return { kind: 'inspected', command: word };
       }
 

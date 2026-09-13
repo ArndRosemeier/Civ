@@ -293,6 +293,11 @@ const emptyState = (): GameState => ({
   units: [],
   explored: [],
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
 });
@@ -520,18 +525,40 @@ describe('M7b — the planner got cheap without moving a decision', () => {
    * diff — find the decision that moved, and decide there whether it should have.
    */
   it('proposes the same sequence of commands on seed 3, turn for turn', () => {
+    // **Re-pinned for M9+M10, and this is the decision that moved.**
+    //
+    // The paragraph above says the fix for a failure here is *not* to re-pin the digest
+    // but to find the decision that moved and decide whether it should have. Found, and
+    // it should have: the only line in the twelve-line head that changed is the rates
+    // line, and it changed by exactly the government's cap —
+    //
+    //   was  SetRates {"luxury":0,"science":10,"tax":0}
+    //   now  SetRates {"luxury":0,"science":8,"tax":2}
+    //
+    // `despotism` (the shipped catalog's first row, and the row `defaultGovernmentOf`
+    // gives every player) declares `rateCaps: { tax: 8, science: 8, luxury: 2 }`, so
+    // `planSetRates` — which `chooseRates` already put every candidate through before
+    // ranking it — now refuses `science: 10` and the best legal candidate is
+    // `8/2/0`. Every other line of the head is byte-identical, which is the check that
+    // this is the caps and not a second, unnoticed change of mind.
+    //
+    // The trail is also 13 commands shorter (607 -> 594) over the same 30 turns and the
+    // same seed: a player that spends 8 of its 10 commerce on science and 2 on tax grows
+    // and builds on a different schedule, so a few turns have a different number of
+    // legal commands in them. The digest below is the new measured one; the old was
+    // `91f3c655297e0fcb`.
     const trail = commandTrail(3, 30, smartPolicy());
-    expect(trail.length).toBe(607);
-    expect(fnv1a64(trail.join('\n'))).toBe('91f3c655297e0fcb');
+    expect(trail.length).toBe(594);
+    expect(fnv1a64(trail.join('\n'))).toBe('5fb0401516c68a64');
     // The head of it verbatim, so a failure reports *what* moved rather than only that
     // something did: a digest can only ever say "somewhere in these 607 commands".
     expect(trail.slice(0, 12)).toEqual([
       't1 p0 SetResearch {"tech":"ceremonial-burial","type":"SetResearch"}',
-      't1 p0 SetRates {"rates":{"luxury":0,"science":10,"tax":0},"type":"SetRates"}',
+      't1 p0 SetRates {"rates":{"luxury":0,"science":8,"tax":2},"type":"SetRates"}',
       't1 p0 FoundCity {"type":"FoundCity","unitId":0}',
       't1 p0 StartWork {"kind":"irrigation","type":"StartWork","unitId":1}',
       't1 p1 SetResearch {"tech":"ceremonial-burial","type":"SetResearch"}',
-      't1 p1 SetRates {"rates":{"luxury":0,"science":10,"tax":0},"type":"SetRates"}',
+      't1 p1 SetRates {"rates":{"luxury":0,"science":8,"tax":2},"type":"SetRates"}',
       't1 p1 FoundCity {"type":"FoundCity","unitId":2}',
       't1 p1 StartWork {"kind":"irrigation","type":"StartWork","unitId":3}',
       't2 p0 SetProduction {"cityId":0,"item":{"id":"galley","kind":"unit"},"type":"SetProduction"}',
@@ -547,11 +574,29 @@ describe('M7b — the planner got cheap without moving a decision', () => {
   // pinned too — and those four hashes are the same four the pre-optimisation build
   // produced (`8e9ea21`), which is also what the seed-by-seed replay compared.
   it.skipIf(!FULL_TIER)('ends a hundred-turn game on the hash the old build ended on', () => {
+    // **Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9), and this pin is the one that had to
+    // move.** The four digests below were the end states of the *pre-optimisation* build
+    // (`8e9ea21`), which is what made this test a cross-build claim rather than a
+    // self-consistency one. The wave writes three new keys into every state — each player's
+    // stored `government`, each city's `culture`, and the map-wide `tileOwner` ownership
+    // layer — and it also changes the *play*: a civilization's rates are now clamped by its
+    // government's caps, so a hundred-turn smart-policy game takes a different line. Both
+    // reasons move the digest, and the replay comparisons the test makes against the same
+    // build are unaffected:
+    //
+    //   49118125b0f5d85e -> 37a049dba29e940f   (seed 1)
+    //   ce0274371db9c4c7 -> 716941888ee8233c   (seed 2)
+    //   8078a1d07995d486 -> 10f34ffa36647da7   (seed 3)
+    //   8947e9f3488fd0ef -> c9cb51f58657134c   (seed 6)
+    //
+    // The four remain *four distinct* digests for four seeds, which is the property the pin
+    // is really about; the old build's numbers are kept in the ledger above rather than
+    // silently replaced.
     const pins: readonly (readonly [number, string])[] = [
-      [1, '49118125b0f5d85e'],
-      [2, 'ce0274371db9c4c7'],
-      [3, '8078a1d07995d486'],
-      [6, '8947e9f3488fd0ef'],
+      [1, '37a049dba29e940f'],
+      [2, '716941888ee8233c'],
+      [3, '10f34ffa36647da7'],
+      [6, 'c9cb51f58657134c'],
     ];
     const report: string[] = [];
     for (const [seed, pinned] of pins) {
@@ -1117,7 +1162,14 @@ describe('M7 — the walls sweep now has something to measure', () => {
       // the rival is reachable and the fighting happens. Reporting only the first was how a
       // measurement limitation came to look like a finding about the AI.
       const read = walkWalls([7, 23], 40);
-      const duel = walkWalls([1, 2, 3], 60, DUEL_SETTINGS);
+      // **Eight duel seeds rather than three, and M9+M10 is why.** With three, the wave's own
+      // borders and rate caps took the fixture's captures to zero: an AI settler may no longer
+      // found on a rival's territory, and a seat's rates are clamped by its government, so the
+      // three-seed war no longer produced an assault that finished. Widened rather than
+      // weakened: eight seeds capture 15 cities and — for the first time in this file's history —
+      // reach a battle *inside* a walled city (`intoWalledCities=1`), which is the number the
+      // paragraph below used to explain away.
+      const duel = walkWalls([1, 2, 3, 4, 5, 6, 7, 8], 60, DUEL_SETTINGS);
       const render = (label: string, one: WallsRead): string =>
         `${label}: seeds=${String(one.seeds)} citiesWithWalls=${String(one.citiesWithWalls)} ` +
         `battles=${String(one.battles)} intoCities=${String(one.battlesIntoCities)} ` +
@@ -1149,9 +1201,11 @@ describe('M7 — the walls sweep now has something to measure', () => {
       // **What is still NOT asserted, and why — this is the answer to M7's walls question.**
       //
       // `summary` reports how many battles were fought on a city tile, and how many of those
-      // cities held the walls row. Both are **zero on both fixtures**, and pinning a floor they do
-      // not meet would be a lie dressed as a guarantee. What changed in M7 is *why* they are zero,
-      // and the two reasons are now distinguishable from the counters themselves:
+      // cities held the walls row. On the tiny fixture both are still zero; on the eight-seed
+      // duel fixture `intoWalledCities` is **1** as of M9+M10 and `intoCities` is 0 — so the
+      // exposure this section was written to measure now exists, thinly, and pinning a floor
+      // above 1 would still be a lie dressed as a guarantee. The reasons for the thinness are
+      // distinguishable from the counters themselves:
       //
       // 1. (before) the AI never reached a city at all — `citiesCaptured` was 0 on every fixture,
       //    so the sweep's exposure counter had nothing to count on any playing.
@@ -1170,13 +1224,15 @@ describe('M7 — the walls sweep now has something to measure', () => {
       //   pair's assault flips from STORM to decline;
       // - the AI does besiege, and a group assault takes a walled city: section 9's fixture takes
       //   a walled, fortified city with five archers and asserts the capture exactly;
-      // - the sweep itself now names the exposure (`0 of 232` battles at a walled city) instead
-      //   of printing a flat table, and `--policy smart` is what produces that number.
+      // - the sweep itself now names the exposure (`1 of 102` battles at a walled city on the
+      //   widened fixture) instead of printing a flat table, and `--policy smart` is what
+      //   produces that number.
       //
       // What would close it is not a tuning change but more war: a defended city, a longer
       // horizon, or a rival that garrisons what it walls. The number to watch is
-      // `intoWalledCities`, and the second number to watch beside it is `captures` — a zero there
-      // means the army never arrived, which is the limitation that was mistaken for a finding.
+      // `intoWalledCities` — one, on eight seeds, so the knob has a subject and the fixture is
+      // now the thing that limits it rather than the AI — and the second number to watch beside
+      // it is `captures`, which at 15 says the army arrives.
       expect(summary).toContain('intoWalledCities=');
     },
   );

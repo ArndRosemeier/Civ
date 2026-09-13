@@ -72,6 +72,15 @@
  * `State hash` (status). The shell keeps `Map` (application), `End turn` (button) and the
  * turn pipeline's own dispatch.
  *
+ * **M9/M10's new names are stated beside their panels rather than in the frozen table**
+ * (`docs/INTERFACES.md`' M8 section may not be edited): the government selector adds a `combobox`
+ * named `Government`, a `button` named `Set government` and a `status` named `Government verdict`
+ * (`government.ts`), and the end of the game adds a `dialog` named `Game over` with a
+ * `button` named `Show outcome` and a `button` named `Close outcome` (`victory.ts`). The score column
+ * adds a `columnheader` named `Score` to the existing `Scoreboard` table (`scoreboard.ts`), and the
+ * city screen adds the `Culture`, `Happiness` and `Disorder` facts to the `City <name>` dialog
+ * (`city.ts`). None of them collides with a name in the table above.
+ *
  * ## The status strip, and the one number the engine does not have
  *
  * `Turn`, `Treasury`, `Science` and `Luxury` are direct reads of the state — `turn` and the
@@ -118,13 +127,16 @@ import {
   type UnitId,
 } from '@civts/core';
 import { eventLines } from '../events.js';
+import { commandsClosed } from './closed.js';
 import { mountCityPanel, type CityPanelHandle } from './city.js';
 import { mountDebugPanel, type DebugPanelHandle } from './debug.js';
 import { mountEventLog, type EventLogHandle } from './eventlog.js';
+import { mountGovernmentControl, type GovernmentControlHandle } from './government.js';
 import { mountSavePanel, type SavePanelHandle } from './save.js';
 import { mountScoreboard, type ScoreboardHandle } from './scoreboard.js';
 import { mountTechPanel, type TechPanelHandle } from './techtree.js';
 import { defaultUnitId, mountUnitPanel, type UnitPanelHandle } from './unitpanel.js';
+import { mountVictoryPanel, type VictoryPanelHandle } from './victory.js';
 
 /* ------------------------------------------------------------------ *
  * The API the shell implements
@@ -202,6 +214,10 @@ export interface PanelsElements {
   readonly save: HTMLElement;
   readonly debug: HTMLElement;
   readonly debugDialog: HTMLDialogElement;
+  /** M9's government selector row, inside the status strip beside the rates it caps. */
+  readonly government: HTMLElement;
+  /** M10's victory/defeat screen. */
+  readonly outcomeDialog: HTMLDialogElement;
 }
 
 /** What `mountPanels` returns to the shell. */
@@ -370,8 +386,16 @@ const refusalNote = (error: GameError): string => {
  * economy, so the triple is *entered* and the engine judges it, which is the same shape the city
  * screen's worked-tile checkboxes take (`city.ts`).
  */
-export const ratesVerdict = (state: GameState, playerId: PlayerId, rates: Rates): RatesVerdict => {
-  const plan = planSetRates(state, playerId, rates);
+export const ratesVerdict = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+  rates: Rates,
+): RatesVerdict => {
+  // M9: the verdict now includes the player's **government's rate caps**, so the refusal a
+  // field shows is the engine's own sentence about a cap ("a despotism allows at most 2 of
+  // 10 to the luxury slider"), not a second opinion computed here.
+  const plan = planSetRates(state, ruleset, playerId, rates);
   if (plan.ok)
     return { acceptable: true, note: `the engine accepts ${rateTripleText(plan.value.rates)}` };
   return { acceptable: false, note: `the engine refuses it: ${refusalNote(plan.error)}` };
@@ -454,8 +478,10 @@ export const mountRatesControl = (parent: HTMLElement, ctx: PanelContext): Rates
   const read = (key: RateField['key']): number => rateFromInput(inputs.get(key));
 
   const update = (): void => {
-    const verdict = ratesVerdict(ctx.api.state(), ctx.api.playerId(), draft);
-    button.disabled = !verdict.acceptable;
+    const verdict = ratesVerdict(ctx.api.state(), ctx.api.ruleset, ctx.api.playerId(), draft);
+    // M10: a finished game refuses *every* command, so the control is closed with the engine's own
+    // verdict rather than beside it — the keystone property with one more rule behind it.
+    button.disabled = !verdict.acceptable || commandsClosed(ctx.api);
     notice.textContent = verdict.note;
   };
 
@@ -548,6 +574,10 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
   // (treasury, beakers, luxuries) and the economy a player sets (the rates that feed them) are one
   // region rather than two places to look for the same thing.
   const rates: RatesControlHandle = mountRatesControl(statusbar, context());
+  // M9's government selector, beside the rates it caps: a cap is the reason the triple above is
+  // refused, so the control that chooses the government and the control that sets the rates read
+  // as one region rather than two places a player has to connect for themselves.
+  const government: GovernmentControlHandle = mountGovernmentControl(statusbar, context());
 
   const log: EventLogHandle = mountEventLog(root);
   const units: UnitPanelHandle = mountUnitPanel(root, context());
@@ -556,6 +586,7 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
   const score: ScoreboardHandle = mountScoreboard(root, context());
   const save: SavePanelHandle = mountSavePanel(root, context());
   const debug: DebugPanelHandle = mountDebugPanel(root, context());
+  const outcome: VictoryPanelHandle = mountVictoryPanel(root, context());
 
   /**
    * The context handed to every panel. Declared as a function so the panels can be mounted
@@ -608,8 +639,9 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
 
     // The rates row is refreshed beside the pools it feeds, so the triple on screen is always the
     // state's own (unless the player is mid-edit) and the engine's verdict is always the current
-    // triple's.
+    // triple's. The government row beside it follows the same rule.
     rates.refresh();
+    government.refresh();
 
     // The selection is *resolved* here rather than only displayed, so `selection()` and the
     // unit panel's own default cannot disagree: the panel falls back to this player's first
@@ -626,6 +658,9 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
     score.refresh();
     save.refresh();
     debug.refresh();
+    // Last, so the screen shows the outcome of the state every other panel has just rendered —
+    // and so a dialog it opens is never immediately re-rendered by a sibling.
+    outcome.refresh();
   }
 
   refresh();
@@ -664,6 +699,8 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
       save: save.element,
       debug: debug.element,
       debugDialog: debug.dialog,
+      government: government.element,
+      outcomeDialog: outcome.dialog,
     },
   };
 };

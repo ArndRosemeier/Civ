@@ -24,6 +24,7 @@ import {
   type TerrainRole,
   type TileResource,
 } from '../src/map.js';
+
 import { nextUint32, seedRng } from '../src/rng.js';
 
 // A local stand-in ruleset: generation only needs the structural view, so the

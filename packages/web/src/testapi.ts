@@ -34,6 +34,7 @@
 import {
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
   asTechId,
@@ -198,6 +199,18 @@ const productionItemOf = (value: unknown): ProductionItem | undefined => {
 /**
  * Validate an action into a `Command`, or `undefined` when it is not a member of the frozen
  * union. Every field of every member is read and checked; nothing is passed through.
+ *
+ * **Every command the UI can dispatch must be a case here**, and this list is the whole reason the
+ * keystone property is testable: `applyAction` in `main.ts` and the seam's own `dispatch` both read
+ * an action through this function, so a command missing from this switch is refused *before* the
+ * engine ever sees it. That is not a theoretical shape — it is how M9's `SetGovernment` first
+ * arrived. `commands.ts` accepted it, `government.ts`' panel built it correctly and enabled its
+ * button on `planSetGovernment`'s own verdict, and the click dispatched nothing: this reader
+ * answered `undefined`, `applyAction` turned that into `'refused'`, and no engine call was ever
+ * made. The e2e assertion that caught it is the one that reads the recorded dispatch back
+ * (`e2e/m9-m10-ui.spec.ts`, "the menu is the engine’s catalog"): the panel said "the engine accepts
+ * Despotism" while the same command sent through the seam came back `refused`. A command added to
+ * the engine's union must be added here in the same change, or every control for it is inert.
  */
 export const toCommand = (raw: unknown): Command | undefined => {
   if (!isRecord(raw)) return undefined;
@@ -278,6 +291,12 @@ export const toCommand = (raw: unknown): Command | undefined => {
     case 'SetResearch': {
       const tech = stringAt(raw, 'tech');
       return tech === undefined ? undefined : { type: 'SetResearch', tech: asTechId(tech) };
+    }
+    case 'SetGovernment': {
+      const government = stringAt(raw, 'government');
+      return government === undefined
+        ? undefined
+        : { type: 'SetGovernment', government: asGovernmentId(government) };
     }
     default:
       return undefined;

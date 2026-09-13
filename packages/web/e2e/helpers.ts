@@ -174,6 +174,12 @@ export interface UiPlayer {
   readonly luxuries: number;
   readonly techs: readonly string[];
   readonly researching: string | undefined;
+  /**
+   * The government this player is under (M9), as the ENGINE's state holds it. Read here so a test
+   * comparing the selector against the state compares against the state and not against the
+   * selector's own last edit.
+   */
+  readonly government: string;
 }
 
 export interface UiMap {
@@ -192,6 +198,15 @@ export interface UiState {
   readonly cities: readonly UiCity[];
   /** One row per player, indexed by player id: the tiles that player has seen. */
   readonly explored: readonly (readonly boolean[])[];
+  /**
+   * **M9's ownership layer**: one entry per tile in `y * width + x` order, `-1` (`UNOWNED`) for a
+   * tile no city claims and a player id otherwise.
+   *
+   * Read here rather than derived, because it is the ENGINE's stored layer: a border the map paints
+   * and a tile `planSetWorkedTiles` refuses to a rival are the same fact, and a test that recomputed
+   * ownership from cities and culture would be asserting its own arithmetic instead.
+   */
+  readonly tileOwner: readonly number[];
   /** The settings this game was started with — the engine's own stored settings. */
   readonly settings: unknown;
 }
@@ -281,6 +296,9 @@ export const asUiState = (raw: unknown): UiState => {
         asString(tech, 'player.techs[]'),
       ),
       researching: asOptionalString(entry['researching']),
+      // `''` means the state carries no government for this seat, which is what a ruleset with no
+      // government section means; a test that cares distinguishes it from a real id explicitly.
+      government: asOptionalString(entry['government']) ?? '',
     };
   });
 
@@ -299,6 +317,11 @@ export const asUiState = (raw: unknown): UiState => {
     explored: asArray(raw['explored'], 'explored').map((row) =>
       asArray(row, 'explored row').map((flag) => flag === true),
     ),
+    // Absent reads as an empty layer — "nobody owns anything" — which is the reading `ownerAt`
+    // itself takes of a layer a state does not carry, rather than a crash in a helper.
+    tileOwner: asArray(raw['tileOwner'] ?? [], 'tileOwner').map((owner, index) =>
+      asNumber(owner, `tileOwner[${String(index)}]`),
+    ),
     settings: raw['settings'],
   };
 };
@@ -309,7 +332,23 @@ export const readState = async (page: Page): Promise<UiState> =>
     await page.evaluate(() => {
       const api = window.__CIVTS__;
       if (api === undefined) throw new Error('the M8 test seam is missing');
-      return api.state();
+      const state: unknown = api.state();
+      // The ownership layer is an `Int8Array` on the engine's side, so it is converted to a plain
+      // list HERE, in the page, rather than left to the serializer: a typed array crosses the
+      // boundary in whatever shape this Playwright build chooses, and a validator guessing at that
+      // shape would be reading a fact about the transport instead of a fact about the game.
+      if (typeof state !== 'object' || state === null) return state;
+      if (!('tileOwner' in state)) return state;
+      const layer: unknown = state.tileOwner;
+      // `instanceof` rather than `Array.isArray`: the engine holds this layer as a typed array, and
+      // `Array.isArray` narrows to `any[]` — which is exactly the sort of unchecked `any` this
+      // helper set is written to keep out of the assertions.
+      if (layer instanceof Int8Array || layer instanceof Uint8Array) {
+        const list: number[] = [];
+        for (const entry of layer) list.push(entry);
+        return { ...state, tileOwner: list };
+      }
+      return state;
     }),
   );
 
@@ -876,6 +915,14 @@ export interface DrawEntry {
   readonly x: number;
   readonly y: number;
   readonly terrain: string;
+  /**
+   * The tile's owner as the ENGINE's `tileOwner` layer holds it (M9), or `null` for `UNOWNED`.
+   * Read from the trace rather than recomputed, so a renderer that painted a tile as somebody
+   * else's is caught by comparing the two.
+   */
+  readonly owner: number | null;
+  /** Did the frame paint a border band on this tile? See `render.ts` on fog and the world's edge. */
+  readonly border: boolean;
 }
 
 const drawEntry = (raw: unknown, index: number, mapWidth: number): DrawEntry => {
@@ -884,8 +931,21 @@ const drawEntry = (raw: unknown, index: number, mapWidth: number): DrawEntry => 
   const x = raw['x'];
   const y = raw['y'];
   const tile = raw['tile'];
+  // M9's two extra facts, both optional in the shape so a trace that predates the border layer
+  // still parses: `owner: null` means "the frame did not say", which is the honest reading of a
+  // missing field and is distinct from `UNOWNED` (a frame that said "nobody").
+  const owner = raw['owner'];
+  const ownerValue = typeof owner === 'number' ? owner : null;
+  const border = raw['border'] === true;
   if (typeof x === 'number' && typeof y === 'number') {
-    return { x, y, tile: y * mapWidth + x, terrain: asString(terrain, 'draw.terrain') };
+    return {
+      x,
+      y,
+      tile: y * mapWidth + x,
+      terrain: asString(terrain, 'draw.terrain'),
+      owner: ownerValue,
+      border,
+    };
   }
   if (typeof tile === 'number') {
     return {
@@ -893,6 +953,8 @@ const drawEntry = (raw: unknown, index: number, mapWidth: number): DrawEntry => 
       x: tile % mapWidth,
       y: Math.floor(tile / mapWidth),
       terrain: asString(terrain, 'draw.terrain'),
+      owner: ownerValue,
+      border,
     };
   }
   throw new Error(`draw trace entry ${String(index)} names no tile: ${JSON.stringify(raw)}`);

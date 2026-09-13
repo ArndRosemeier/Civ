@@ -133,6 +133,16 @@ export interface BuildingEffects {
   readonly beakerPct: number;
   readonly shieldPct: number;
   readonly growthFood: number;
+  /**
+   * M9: the summed `city-happiness` amount of this city's buildings, **signed**.
+   *
+   * A positive total is contentment — it reduces the city's unhappy count — and a
+   * negative one is misery. Zero, the common case and what a city with no buildings
+   * has, means the buildings say nothing about how the citizens feel, not that they
+   * are content. `happiness.ts` is the only reader, and it reads the sign rather
+   * than a second field.
+   */
+  readonly happiness: number;
 }
 
 /** What a city with no buildings — or with buildings that declare nothing — has. */
@@ -141,6 +151,7 @@ export const NO_BUILDING_EFFECTS: BuildingEffects = {
   beakerPct: 0,
   shieldPct: 0,
   growthFood: 0,
+  happiness: 0,
 };
 
 /**
@@ -153,6 +164,19 @@ export const NO_BUILDING_EFFECTS: BuildingEffects = {
  * yields, which are part of every state hash.
  */
 const positiveWhole = (value: number): number => (Number.isInteger(value) && value > 0 ? value : 0);
+
+/**
+ * A whole number of either sign, or 0 — the read `city-happiness` needs and the
+ * other four do not.
+ *
+ * `positiveWhole` is right for a percentage and an amount of food, both of which
+ * only make sense upwards; contentment is signed on purpose (see `BuildingEffect`),
+ * so clamping it at zero would silently turn every *misery* effect — a building that
+ * makes its citizens unhappy, which is a row content may legitimately write — into
+ * no effect at all. A value this engine cannot read as a whole number is still 0,
+ * for the same reason: it must not reach a count of citizens.
+ */
+const signedWhole = (value: number): number => (Number.isInteger(value) ? value : 0);
 
 /**
  * Whether `value` is something this module can read as a list of effects.
@@ -186,6 +210,7 @@ export const effectTotals = (effects: readonly BuildingEffect[]): BuildingEffect
   let beakerPct = 0;
   let shieldPct = 0;
   let growthFood = 0;
+  let happiness = 0;
 
   for (const effect of effects) {
     switch (effect.kind) {
@@ -201,10 +226,14 @@ export const effectTotals = (effects: readonly BuildingEffect[]): BuildingEffect
       case 'growth-food':
         growthFood += positiveWhole(effect.amount);
         break;
+      case 'city-happiness':
+        // Signed, unlike the four above: see `signedWhole` and `BuildingEffect`.
+        happiness += signedWhole(effect.amount);
+        break;
     }
   }
 
-  return { commercePct, beakerPct, shieldPct, growthFood };
+  return { commercePct, beakerPct, shieldPct, growthFood, happiness };
 };
 
 /**

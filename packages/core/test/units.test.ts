@@ -24,6 +24,7 @@
 import { describe, expect, it } from 'vitest';
 import { canonicalize, hashValue } from '@civts/testing';
 import {
+  asGovernmentId,
   asPlayerId,
   asResourceId,
   asTechId,
@@ -144,6 +145,10 @@ const player = (index: number, tile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   // M4b: the money fields live on every player, so a hand-built player literal has
   // to carry them. The engine's own constants are used rather than literals so the
   // fixture cannot drift from what `newGame` assembles.
@@ -197,6 +202,11 @@ const STATE: GameState = {
   units: UNITS,
   explored: [exploredRow([0, 1, 4, 5]), exploredRow([10, 11, 14, 15])],
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
 };

@@ -13,6 +13,7 @@ import {
   applyCommand,
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
   asTechId,
@@ -67,6 +68,9 @@ const COMMANDS: { readonly [K in Command['type']]: Extract<Command, { readonly t
   SetResearch: { type: 'SetResearch', tech: asTechId('pottery') },
   AttackUnit: { type: 'AttackUnit', unitId: asUnitId(0), target: asTileIndex(0) },
   FortifyUnit: { type: 'FortifyUnit', unitId: asUnitId(0) },
+  // M9's setter: the same exhaustiveness trick, so a `Command` member added without a label
+  // fails to compile rather than rendering as a blank line.
+  SetGovernment: { type: 'SetGovernment', government: asGovernmentId('monarchy') },
 };
 
 describe('unitRows', () => {

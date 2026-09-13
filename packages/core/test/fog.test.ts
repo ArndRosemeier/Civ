@@ -31,6 +31,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  asGovernmentId,
   asPlayerId,
   asTerrainId,
   asTileIndex,
@@ -55,6 +56,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import { describe as describeState } from '../src/textview.js';
 import { type Unit, type UnitDef } from '../src/units.js';
 
@@ -143,6 +145,10 @@ const player = (index: number, tile: number): PlayerState => ({
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   techs: [],
   // M4b: `RATE_TOTAL` is 10, so 7/3/0 is a legal split (the command layer refuses
   // any other sum) and an arbitrary one — nothing in this file reads the rates, and
@@ -214,6 +220,11 @@ const STATE: GameState = {
   explored: [rowOf(ball(P0_START, 2)), rowOf(ball(P1_START, 2))],
   // M3: a hand-built world has no cities; `FoundCity` is the only creator.
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   // M4a: nor any tile improvements — a worker is the only writer, and no unit here
   // is working. The key is an empty array, never `undefined`: it is part of every

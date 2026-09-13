@@ -48,13 +48,7 @@ import { hashValue } from '@civts/testing';
 import { advanceBarbarians } from '../src/barbarians.js';
 import { type BuildingDef, type City } from '../src/cities.js';
 import { applyCommand } from '../src/commands.js';
-import {
-  FREE_UNITS_PER_CITY,
-  FREE_UNITS_BASE,
-  UNIT_SUPPORT_COST,
-  applyEconomy,
-  playerIncome,
-} from '../src/economy.js';
+import { FREE_UNITS_BASE, applyEconomy, playerIncome } from '../src/economy.js';
 import {
   asBuildingId,
   asCityId,
@@ -64,7 +58,9 @@ import {
   asTileIndex,
   asUnitId,
   asUnitTypeId,
+  asGovernmentId,
 } from '../src/ids.js';
+import { defaultGovernmentOf, type GovernmentDef } from '../src/governments.js';
 import { asImprovementId, type ImprovementDef } from '../src/improvements.js';
 import type { GameMap, RulesetView, TerrainDef } from '../src/map.js';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings.js';
@@ -75,6 +71,46 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
+/**
+ * **M9+M10's four catalog sections, as this file's hand-built views state them.**
+ *
+ * `RulesetView` makes all four optional and the engine is total over a view that declares none
+ * — but each absence is a *deliberately degenerate* rule rather than a neutral default, and
+ * three of the four absences would change what this file measures:
+ *
+ * - no `culture` section means every city claims radius 1 for ever (`NO_BORDER_RULES`) and
+ *   nobody is ever unhappy (`NO_HAPPINESS_RULES`), so a fixture written for M3's two-ring
+ *   working radius would have half its tiles refused;
+ * - no `victory` section still lets **conquest** fire (that condition has no threshold), so a
+ *   board where one civilization happens to hold every city would end the game mid-test;
+ * - no `score` section makes every score 0, which is honest but makes the score column
+ *   unreadable.
+ *
+ * So this file states them, once, here — the numbers are visible in one place instead of being
+ * implied by an absence. The unhappy ladder is **empty** (nobody riots, so the M4b numbers this
+ * file pins are still the M4b numbers) and the victory thresholds are **unreachable**, because
+ * this file is not about who wins: M10's own acceptance evidence plays real games through the
+ * shipped catalog, where every threshold is a real one. The score weights are the shipped
+ * five, so a score this file reads is a score a game would show.
+ */
+const HAND_BUILT_SECTIONS = {
+  culture: {
+    borderRadius2Culture: 10,
+    borderRadius3Culture: 100,
+    unhappyThresholds: [],
+    luxuriesPerHappyCitizen: 2,
+    happyPerLuxuryResource: 1,
+  },
+  score: { perPopulation: 2, perCity: 3, perTech: 4, perCulture: 1, perWonder: 8 },
+  victory: {
+    dominationLandPct: 101,
+    dominationPopPct: 101,
+    culturalVictoryCulture: Number.MAX_SAFE_INTEGER,
+    scoreVictoryTurn: Number.MAX_SAFE_INTEGER,
+  },
+} as const;
+
 import { withResearching, type TechDef } from '../src/tech.js';
 import { advanceTurn } from '../src/turn.js';
 import type { Unit, UnitDef } from '../src/units.js';
@@ -204,14 +240,50 @@ const BRONZE_WORKING: TechDef = {
   requires: [],
 };
 
+/**
+ * M9's government row for this file's hand-built world: one row, `despotism`, whose two
+ * magnitudes are the M4b numbers M9 moved into the catalog (2 free units per city, 1 gold
+ * per unit beyond) — so this file's assertions about the *order* of the economy step keep
+ * measuring the same game while reading their numbers from the row the engine reads.
+ */
+const DESPOTISM: GovernmentDef = {
+  id: asGovernmentId('despotism'),
+  name: 'Despotism',
+  rateCaps: { tax: 8, science: 8, luxury: 2 },
+  freeUnitsPerCity: 2,
+  unitSupportCost: 1,
+  happinessModifier: 0,
+};
+
 const RULESET: TechView = {
   terrains: [TERRAIN],
   units: [WARRIOR, WORKER],
   buildings: [TEMPLE, LIBRARY],
   improvements: [MINE],
   techs: [POTTERY, BRONZE_WORKING],
+  governments: [DESPOTISM],
+  // M9+M10's sections, spelled out above. The empty unhappy ladder means nobody in this
+  // file's cities ever riots (so the M4b numbers it pins are still the M4b numbers), and the
+  // unreachable victory thresholds mean a turn's *step order* is observable without the game
+  // ending under it. M9's own ordering assertions — where culture lands in the pipeline —
+  // live in `culture.test.ts`.
+  ...HAND_BUILT_SECTIONS,
   fidelity: 'tuned',
 };
+
+/**
+ * The two M9 magnitudes this file reads out of the ruleset it hands the engine, rather
+ * than as module constants.
+ *
+ * M9 moved the per-city unit allowance and the per-unit support cost out of `economy.ts`
+ * and into the `governments` catalog section, so a body that spelled `2` and `1` for
+ * itself would be a second statement of a rule the sweep can move — and it would go on
+ * passing after a balance change that made the game different. These two reads go through
+ * `governments.ts`' `defaultGovernmentOf`, the same reader `newGame` uses to stamp every
+ * player's opening government, so the number asserted is the number a game starts with.
+ */
+const FREE_PER_CITY = defaultGovernmentOf(RULESET).freeUnitsPerCity;
+const UNIT_COST = defaultGovernmentOf(RULESET).unitSupportCost;
 
 /**
  * A city that earns **5 commerce a turn** — its grassland centre plus four worked
@@ -247,6 +319,7 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   // (see `PlayerState`). The M5 section at the bottom of this file is the one place
   // that sets both, and it sets them through the fixture's own overrides.
   techs: [],
+  government: asGovernmentId('despotism'),
   ...overrides,
 });
 
@@ -281,10 +354,42 @@ const city = (id: number, tile: number, overrides: Partial<City> = {}): City => 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
-const board = (overrides: Partial<GameState> = {}): GameState => ({
+/**
+ * **Player 1's garrison: the unit that keeps this board a game rather than a won one.**
+ *
+ * M10's conquest condition has no threshold in it — "you are the last civilization on the
+ * board" — so a state in which player 1 owns neither a city nor a unit is a state whose game
+ * is already over, and `advanceTurn` refuses to move a finished game. This file measures the
+ * *order of a turn's steps*, so its boards have to be games that are still being played; a
+ * board where the second civilization was never placed is not one, and reading it as a
+ * conquest ("player 1 has been wiped out") would end every assertion here before it ran.
+ *
+ * So every board built by `board()` keeps player 1 in play with one unit, and it is chosen to
+ * be **invisible to this file's numbers**: id `99` (above every id the fixtures allocate),
+ * parked on tile 3 (the far corner from the only tile a barbarian band in this file starts
+ * on, so no band is ever adjacent to it and none is ever drawn toward it), and — because
+ * `economy.ts`
+ * allows `FREE_UNITS_BASE` units before it charges anything — free to support, so the money
+ * ledger it produces for player 1 is exactly the ledger player 1 produced before M10 existed.
+ * A test that supplies its own `units` keeps its own board; the sentinel is appended only
+ * when the override left player 1 with nothing.
+ */
+const GARRISON: Unit = {
+  id: asUnitId(99),
+  type: WARRIOR.id,
+  owner: asPlayerId(1),
+  tile: asTileIndex(3),
+  movementLeft: WARRIOR.movement,
+};
+
+const baseBoard = (overrides: Partial<GameState> = {}): GameState => ({
   schemaVersion: SCHEMA_VERSION,
   revision: 0,
   turn: 1,
@@ -297,10 +402,22 @@ const board = (overrides: Partial<GameState> = {}): GameState => ({
   units: [],
   explored: [Array.from({ length: 16 }, () => false), Array.from({ length: 16 }, () => false)],
   nextCityId: 100,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
   ...overrides,
 });
+
+const board = (overrides: Partial<GameState> = {}): GameState => {
+  const state = baseBoard(overrides);
+  return state.units.some((unit) => Number(unit.owner) === 1)
+    ? state
+    : { ...state, units: [...state.units, GARRISON] };
+};
 
 const P0 = asPlayerId(0);
 
@@ -360,7 +477,12 @@ describe('advanceTurn — the steps run in the contract’s order', () => {
 
     const outcome = advanceTurn(state, RULESET);
 
-    expect(outcome.state.units.map((kept) => Number(kept.id))).toEqual([0, 1, 2, 3]);
+    // Player 0's units, which is what this test is about: M10's conquest rule needs player 1
+    // on the board (see `GARRISON`), and player 1's unit is not part of the disband pass this
+    // assertion measures.
+    expect(
+      outcome.state.units.filter((kept) => kept.owner === P0).map((kept) => Number(kept.id)),
+    ).toEqual([0, 1, 2, 3]);
     expect(eventTypes(state)).toContain('UnitDisbanded');
   });
 
@@ -387,11 +509,11 @@ describe('advanceTurn — the steps run in the contract’s order', () => {
 
 describe('a unit produced this turn costs support from the turn it appears', () => {
   it('bills the produced unit in the same turn, not the next one', () => {
-    // The allowance is FREE_UNITS_BASE with no city plus FREE_UNITS_PER_CITY for
+    // The allowance is FREE_UNITS_BASE with no city plus FREE_PER_CITY for
     // this one, so six units are free. The board holds exactly six and the city
     // finishes a seventh: because production runs *before* the money loop, the
     // bill already sees seven units and charges one gold for the extra one.
-    const allowance = FREE_UNITS_PER_CITY + FREE_UNITS_BASE;
+    const allowance = FREE_PER_CITY + FREE_UNITS_BASE;
     const state = board({
       players: [player(0), player(1)],
       units: unitStack(allowance),
@@ -401,14 +523,14 @@ describe('a unit produced this turn costs support from the turn it appears', () 
     const outcome = advanceTurn(state, RULESET);
     const upkeep = outcome.events.find((event) => event.type === 'UpkeepPaid');
 
-    expect(outcome.state.units).toHaveLength(allowance + 1);
+    expect(outcome.state.units.filter((each) => each.owner === P0)).toHaveLength(allowance + 1);
     expect(eventTypes(state)).toContain('CityProduced');
     expect(upkeep).toEqual({
       type: 'UpkeepPaid',
       playerId: P0,
-      gold: UNIT_SUPPORT_COST,
+      gold: UNIT_COST,
       maintenance: 0,
-      unitSupport: UNIT_SUPPORT_COST,
+      unitSupport: UNIT_COST,
       units: allowance + 1,
       freeUnits: allowance,
     });
@@ -419,7 +541,7 @@ describe('a unit produced this turn costs support from the turn it appears', () 
     // all. The unit count stays at the allowance, so the bill is zero — the two
     // turns differ by exactly one unit and one gold of support, which is the
     // coupling the ordering creates.
-    const allowance = FREE_UNITS_PER_CITY + FREE_UNITS_BASE;
+    const allowance = FREE_PER_CITY + FREE_UNITS_BASE;
     const state = board({
       players: [player(0), player(1)],
       units: unitStack(allowance),
@@ -429,7 +551,7 @@ describe('a unit produced this turn costs support from the turn it appears', () 
     const outcome = advanceTurn(state, RULESET);
     const upkeep = outcome.events.find((event) => event.type === 'UpkeepPaid');
 
-    expect(outcome.state.units).toHaveLength(allowance);
+    expect(outcome.state.units.filter((each) => each.owner === P0)).toHaveLength(allowance);
     expect(eventTypes(state)).not.toContain('CityProduced');
     expect(upkeep).toEqual({
       type: 'UpkeepPaid',
@@ -462,7 +584,7 @@ describe('a unit produced this turn costs support from the turn it appears', () 
       maintenance: TEMPLE.maintenance,
       unitSupport: 0,
       units: 0,
-      freeUnits: FREE_UNITS_PER_CITY + FREE_UNITS_BASE,
+      freeUnits: FREE_PER_CITY + FREE_UNITS_BASE,
     });
   });
 });

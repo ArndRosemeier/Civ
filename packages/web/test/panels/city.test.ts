@@ -21,7 +21,11 @@ import {
   cityRadius,
   cityYields,
   cityProductionOptions,
+  happinessOf,
+  isDisordered,
   newGame,
+  playerCulture,
+  wholeCulture,
   planSetProduction,
   planSetWorkedTiles,
   type GameState,
@@ -99,6 +103,62 @@ describe('cityFacts', () => {
 
   it('answers nothing for a city that is not there', () => {
     expect(cityFacts(STATE, RULESET, asCityId(99))).toBeUndefined();
+  });
+
+  it("shows M9's culture and happiness as the ENGINE reads them, never as a recomputation", () => {
+    const city = cityById(STATE, CITY);
+    if (city === undefined) throw new Error('the founded city is missing');
+    const mine = cityFacts(STATE, RULESET, CITY);
+    if (mine === undefined) throw new Error('no facts for a city that exists');
+    const of = (facts: readonly { label: string; value: string }[], label: string): string => {
+      const fact = facts.find((candidate) => candidate.label === label);
+      if (fact === undefined) throw new Error(`no fact named ${label}`);
+      return fact.value;
+    };
+
+    // Happiness is `happiness.ts`' own count — the same call `cityYields` makes to decide whether
+    // the city is in disorder, so the line on screen and the number the production, growth and
+    // money loops acted on are one number.
+    const mood = happinessOf(STATE, RULESET, city);
+    expect(of(mine, 'Happiness')).toBe(
+      `${String(mood.happy)} happy, ${String(mood.content)} content, ${String(mood.unhappy)} unhappy`,
+    );
+
+    // Culture is the city's own accumulated figure beside the player's DERIVED total — there is no
+    // stored player total in the engine for a panel to disagree with (see `culture.ts`).
+    expect(of(mine, 'Culture')).toContain(String(wholeCulture(city.culture)));
+    expect(of(mine, 'Culture')).toContain(String(playerCulture(STATE, city.owner)));
+
+    // Disorder is asked the OTHER way round — `isDisordered` is the same verdict by city id — so a
+    // panel that re-derived the rule instead of reading it would be caught here.
+    expect(of(mine, 'Disorder')).toBe(
+      isDisordered(STATE, RULESET, CITY)
+        ? 'civil disorder — no shields, no beakers, no gold and no growth this turn'
+        : 'in good order',
+    );
+    expect(mood.disordered).toBe(isDisordered(STATE, RULESET, CITY));
+  });
+
+  it('says a city is in civil disorder when the engine says so', () => {
+    // The fire case: a city too big for its contentment is disordered by the engine's own rule, and
+    // the screen says the engine's sentence rather than inferring "fine" from a happy-looking board.
+    const city = cityById(STATE, CITY);
+    if (city === undefined) throw new Error('the founded city is missing');
+    const crowded = {
+      ...STATE,
+      cities: STATE.cities.map((candidate) =>
+        candidate.id === CITY ? { ...candidate, population: 30 } : candidate,
+      ),
+    };
+    expect(
+      isDisordered(crowded, RULESET, CITY),
+      'a 30-citizen city with no temple, no luxuries and no luxury spending is not disordered — ' +
+        'this case would then prove nothing',
+    ).toBe(true);
+    const facts = cityFacts(crowded, RULESET, CITY);
+    const disorder = facts?.find((fact) => fact.label === 'Disorder');
+    expect(disorder?.value).toContain('civil disorder');
+    expect(disorder?.value).toContain('no shields');
   });
 });
 

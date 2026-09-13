@@ -38,6 +38,7 @@ import {
   type HutRewardKind,
 } from '../src/hut.js';
 import {
+  asGovernmentId,
   asCityId,
   asPlayerId,
   asTerrainId,
@@ -59,6 +60,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import { unitDef, type Unit, type UnitDef, type UnitRole } from '../src/units.js';
 
 const WIDTH = 4;
@@ -171,6 +173,10 @@ const civ = (id: number, tile: number): PlayerState => ({
   color: '#123456',
   startingTile: asTileIndex(tile),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   // M4b: every player carries the money fields, so a hand-built player literal
   // must too. The engine's own constants are used rather than copied literals.
   treasury: STARTING_TREASURY,
@@ -201,6 +207,7 @@ const BARBARIANS: PlayerState = {
   // empty, and it stays empty, because the research step skips them exactly as the
   // money loop does.
   techs: [],
+  government: asGovernmentId('despotism'),
 };
 
 const unit = (id: number, type: UnitTypeId, owner: number, tile: number): Unit => ({
@@ -256,6 +263,11 @@ const board = (options: BoardOptions = {}): GameState => {
     units,
     explored: players.map(() => GRID.map(() => false)),
     nextCityId: 0,
+    // M9: the materialised ownership layer. `[]` is the honest value for a
+    // state nobody has run a turn on: `withOwnership` fills it from the cities the
+    // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+    // layer cannot make a border wrong — it only means none has been claimed yet.
+    tileOwner: [],
     cities: options.cities ?? [],
     // M4a: nothing is built on this hand-built board. The key is present and
     // *empty* — an absent key would make a state that predates M4a, which
@@ -544,6 +556,10 @@ describe('hut.ts — what never triggers', () => {
       queue: [],
       buildings: [],
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     };
     const state = board({ rng: rngFor('barbarians'), cities: [capital] });
 

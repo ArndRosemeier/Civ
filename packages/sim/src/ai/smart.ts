@@ -358,6 +358,11 @@ const withProspectOn = (state: GameState, owner: PlayerId, tile: TileIndex): Gam
     owner,
     name: 'prospect',
     tile,
+    // M9: a prospect is a city the engine may really grow to found, so it carries the same
+    // zero culture `FoundCity` would give it — see `commands.ts`' `planFoundCity`. A
+    // hypothetical with a different culture would project different borders, which is
+    // exactly the number this projection exists to get right.
+    culture: 0,
     population: 1,
     foodBox: 0,
     shields: 0,
@@ -906,7 +911,7 @@ const empireSlot: TurnCacheSlot<EmpireRead> = {
 /** The empire-wide counts a single city's decision needs. */
 const readEmpire = (engine: Engine): EmpireRead =>
   cachedForTurn(empireSlot, engine.state, () => {
-    const support = unitSupport(engine.state, engine.playerId);
+    const support = unitSupport(engine.state, engine.ruleset, engine.playerId);
     const owned = citiesOf(engine.state, engine.playerId);
     return {
       cities: owned.length,
@@ -1410,7 +1415,11 @@ const chooseRates = (
   for (let luxury = 0; luxury <= ceiling; luxury += 1) {
     for (let science = 0; science + luxury <= RATE_TOTAL; science += 1) {
       const tax = RATE_TOTAL - science - luxury;
-      if (!planSetRates(engine.state, engine.playerId, { tax, science, luxury }).ok) continue;
+      if (
+        !planSetRates(engine.state, engine.ruleset, engine.playerId, { tax, science, luxury }).ok
+      ) {
+        continue;
+      }
       const rank = rateRank(engine, tax, science, upkeep);
       const candidate = { tax, science, luxury, rank };
       if (best === undefined) {
@@ -2440,7 +2449,7 @@ const upkeepOf = (engine: Engine): number => {
       maintenance += buildingDef(engine.ruleset, id)?.maintenance ?? 0;
     }
   }
-  return unitSupport(engine.state, engine.playerId).gold + maintenance;
+  return unitSupport(engine.state, engine.ruleset, engine.playerId).gold + maintenance;
 };
 
 /**

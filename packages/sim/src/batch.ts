@@ -48,11 +48,19 @@
  *
  * ## Wins
  *
- * `BatchResult.wins` is **absent**, and the key is omitted rather than written as an
- * empty list. The engine has no victory condition until M5, so there is nothing to
- * count: `wins: []` would claim victories were counted and that none happened. When a
- * victory condition exists, the counts go here ordered by outcome name (the type says
- * so); today the honest report is silence.
+ * `BatchResult.wins` is **absent** — the key omitted, never written as an empty list —
+ * when no game in the batch ended. M5 wrote that rule when the engine had no victory
+ * condition at all and said what would change it: "when a victory condition exists, the
+ * counts go here ordered by outcome name". M10 is that milestone. A batch in which some
+ * games reached a condition now reports them, **ordered by condition id** so the list is
+ * independent of the order the seeds were supplied in (the same reason the runs are
+ * sorted), and `wins` stays absent when nothing ended, because a batch that played twenty
+ * games to the turn limit has no outcome distribution to report and `wins: []` would
+ * claim one had been measured.
+ *
+ * Counted from each run's own `outcome`, which the runner derives from that run's final
+ * state — so a win count here and the `outcome` on the run it came from are the same
+ * fact, never two.
  *
  * ## The planner-failure channel: carried verbatim, never summarised away (M7d)
  *
@@ -87,6 +95,7 @@ import type {
   SimulationOptions,
   SimulationResult,
   TurnMetrics,
+  WinCount,
 } from './types.js';
 
 /* ------------------------------------------------------------------ *
@@ -220,6 +229,33 @@ export const runBatch = (options: BatchOptions): BatchResult => {
   const seeds = [...options.seeds].sort((a, b) => a - b);
   const runs = seeds.map((seed) => runSimulation(optionsForSeed(options, seed)));
 
-  // `wins` is deliberately not written — see the module note.
-  return { runs, aggregates: aggregateRuns(runs) };
+  const aggregates = aggregateRuns(runs);
+  const wins = countWins(runs);
+  // The key is omitted rather than written as `[]`: see the module note on what an empty
+  // list would claim.
+  return wins.length === 0 ? { runs, aggregates } : { runs, aggregates, wins };
+};
+
+/**
+ * How many games reached each victory condition, ordered by condition id.
+ *
+ * A `draw` is counted under its condition like any other ending — "the score condition
+ * ended level" is a result a reader needs to see, and dropping it would make the counts
+ * sum to fewer games than `stoppedBecause: 'game-over'` reports. `winner` is `null` for
+ * those, and `null` is written rather than a placeholder id: the type says a draw has no
+ * winner, and inventing seat 0 would be a lie about who won.
+ */
+const countWins = (runs: readonly SimulationResult[]): readonly WinCount[] => {
+  const counts = new Map<string, WinCount>();
+  for (const run of runs) {
+    const outcome = run.outcome;
+    if (outcome === undefined) continue;
+    const existing = counts.get(outcome.condition);
+    counts.set(outcome.condition, {
+      outcome: outcome.condition,
+      count: (existing?.count ?? 0) + 1,
+      winner: existing === undefined ? outcome.winner : existing.winner,
+    });
+  }
+  return [...counts.values()].sort((a, b) => (a.outcome < b.outcome ? -1 : 1));
 };

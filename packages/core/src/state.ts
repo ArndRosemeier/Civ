@@ -46,6 +46,10 @@
  */
 
 import { generateWorld, type GeneratedWorld } from './gen.js';
+// M9: the one function that decides who owns which tile. `newGame` calls it for the
+// (empty) starting layer, so the layer a fresh game carries comes from the same rule
+// every later recomputation uses — never from a literal written out here.
+import { computeTileOwner } from './borders.js';
 // Type-only: `GameState` gains `cities` in M3, and this module never calls into
 // `cities.ts` at runtime (the city *helpers* are the callers' business). The
 // import is erased, so the type-only edge cannot become a runtime cycle.
@@ -64,6 +68,7 @@ import {
   asPlayerId,
   asTileIndex,
   asUnitId,
+  type GovernmentId,
   type PlayerId,
   type TechId,
   type TileIndex,
@@ -78,6 +83,11 @@ import {
   type TerrainRole,
 } from './map.js';
 import { err, ok, type Result } from './result.js';
+// M9: the one read of "which government does a new player start under", asked rather
+// than restated as a literal here. A `asGovernmentId('despotism')` written in this file
+// would be a second opinion about content, and it would be the wrong one the moment the
+// catalog's first government row changed.
+import { defaultGovernmentOf } from './governments.js';
 import type { RngState } from './rng.js';
 import { MAP_DIMENSIONS, type Settings } from './settings.js';
 // M6: `fullHitPoints` is the one reader of a unit definition's `hitPoints`, so
@@ -136,8 +146,25 @@ import { fullHitPoints, unitCatalog, type Unit, type UnitDef, type UnitRole } fr
  *   golden hash moves and the version records it — regenerated intentionally, through
  *   the harness's documented path (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a
  *   `rehash:` line (INTERFACES.md M6, "Units in play").
+ * - 9 — **M9+M10, one wave and one bump** (INTERFACES.md: "These two milestones share a
+ *   state-schema change, so they land as ONE wave: one `SCHEMA_VERSION` bump, one golden
+ *   regeneration, one rehash"). Three new keys:
+ *
+ *   - `City.culture` — accumulated culture, a whole number, never decreasing;
+ *   - `PlayerState.government` — required, so every player row gains a key;
+ *   - `GameState.tileOwner` — the ownership layer, `width * height` integers, an
+ *     all-`-1` row at `newGame`.
+ *
+ *   The third is the one worth flagging: it is a **dense array of 2 800 entries on the
+ *   shipped `tiny` map** inside every hashed state, where every previous schema change
+ *   added a handful of keys. It is deliberately not summarised, elided or hashed
+ *   separately — a layer that is part of the state is part of the state's identity, and
+ *   a save that lost it would be a save whose borders came back from somewhere else.
+ *   Regenerated intentionally, through the harness's documented path
+ *   (`CIVTS_WRITE_GOLDENS=1`) in the same commit, with a `rehash:` line (INTERFACES.md
+ *   M9+M10, "Acceptance evidence": "A played golden that INCLUDES a victory").
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** What a player *is*: a civilization, or the barbarians. */
 export type PlayerKind = 'civ' | 'barbarian';
@@ -283,6 +310,28 @@ export interface PlayerState {
    * command layer nor the pipeline can write `undefined` into it by accident.
    */
   readonly researching?: TechId;
+  /**
+   * M9: the government this player is ruled by — **required**, never absent, and part
+   * of every state hash.
+   *
+   * Required rather than optional for the reason the contract gives it as
+   * `PlayerState.government: GovernmentId` (required): every player is *ruled by
+   * something*, and an absent field would make "what are this player's rate caps?"
+   * unanswerable for exactly the players nobody thought about — which is the shape of
+   * bug the M4b note on `rates` describes ("every player carries one, barbarians
+   * included, so 'the rates sum to `RATE_TOTAL`' is a statement about every row of
+   * `players` rather than about some of them"). Barbarians carry one too, inert, for
+   * that same reason: one shape for every row of `players`.
+   *
+   * `newGame` writes the catalog's **first** government row for every player
+   * (`governments.ts`' `defaultGovernmentOf`), which is despotism in the shipped
+   * catalog; `SetGovernment` is the only thing that changes it afterwards. A player
+   * whose id names a government this ruleset does not describe is read as the default
+   * one (`governments.ts`' `governmentOf`) and *reported* by `@civts/sim`'s
+   * `government-is-in-catalog` invariant — a save loaded under a different ruleset is a
+   * real case, and it should not be a crash inside a legality check.
+   */
+  readonly government: GovernmentId;
 }
 
 export interface GameState {
@@ -336,6 +385,55 @@ export interface GameState {
    * Absence of a pair *is* "nothing here" — there is no sentinel "none" id.
    */
   readonly improvements: readonly TileImprovement[];
+  /**
+   * M9: the **tile-ownership layer** — one entry per tile, row-major, length
+   * `width * height`. `-1` (`borders.ts`' `UNOWNED`) means nobody owns it; any other
+   * value is the `PlayerId` that does.
+   *
+   * ## Why it is on the state and not on `GameMap`
+   *
+   * `improvements` above establishes the rule: the map is what the world *is*
+   * (generation decides terrain, huts and resources), while this is what a
+   * civilization *did* to it, and a regenerated map must not inherit the borders of
+   * the game it replaced. A border belongs to a player's cities, so it lives beside
+   * them.
+   *
+   * ## A stored value that cannot drift, and why that is not a contradiction
+   *
+   * The contract is emphatic: "Ownership is recomputed from culture every turn (a pure
+   * function of cities + culture), NOT accumulated incrementally — a derived value that
+   * is also stored is a value that can drift."
+   *
+   * Both halves are honoured, and the distinction is exact rather than rhetorical:
+   * this field is **not** a second source of truth, it is the *materialised output* of
+   * `borders.ts`' `computeTileOwner(state, ruleset)` — a pure function of the cities and
+   * their culture that never reads the previous layer. `withOwnership` is its **only
+   * writer**, and it calls that function; no command, pipeline step or save loader ever
+   * edits an entry by hand, because there is no code path that could. What is stored is
+   * therefore not an accumulation but a cache of a pure computation, and the
+   * `tile-owner-matches-culture` invariant in `@civts/sim` recomputes the function on
+   * every checked state and reports a mismatch by name. **That invariant is what makes
+   * this field safe to store**, and it is the reason the materialisation is worth having:
+   * every border question in the game (`foreignOwnerAt`, three times a turn) would
+   * otherwise walk every city's radius.
+   *
+   * ## Why a plain `number[]` and not an `Int8Array`
+   *
+   * The contract offers the choice and asks for the reason. A `number[]` **is** JSON, so
+   * the state remains exactly what a save file is (PLAN.md §4.3), and `canonicalize`
+   * hashes the same bytes whether the state came from a live game or from
+   * `JSON.parse`. An `Int8Array` would hash identically today — the hasher's
+   * `numericView` reads it element by element in index order, not as bytes — but it
+   * would put a non-JSON value inside `GameState` and would make the state's hash depend
+   * on a serializer's byte order the first time anybody reached for one. The layer is
+   * also *written* by comparing it element-wise (`sameOwnership`), which is a read no
+   * typed array makes cheaper in any way that matters at this size.
+   *
+   * Required, never absent, and `newGame` writes it — an all-`UNOWNED` layer, since no
+   * city exists at setup. A state whose layer is missing or of the wrong length is
+   * reported by `tile-owner-length`, and every read here stays total for one.
+   */
+  readonly tileOwner: readonly number[];
 }
 
 export type SetupError =
@@ -657,6 +755,11 @@ export const newGame = (
     // `researching` is deliberately **not** written here: a new player is
     // researching nothing, and that is the *absence* of the key (see `PlayerState`).
     techs: [],
+    // M9: every player is ruled by the catalog's first government — despotism in the
+    // shipped catalog, and `rules.test.ts` pins that by id so a reordering of the
+    // section is a test failure rather than a silent change to every game's opening.
+    // Read, never restated: see the `governments.js` import above.
+    government: defaultGovernmentOf(ruleset).id,
   }));
 
   // M3: barbarians are a player, appended after the civilizations, so that
@@ -691,6 +794,9 @@ export const newGame = (
     // does. The field is present rather than absent for the same reason `explored`
     // gives them a row of nothing rather than a missing row.
     techs: [],
+    // M9: barbarians carry a government too, inert — one shape for every row of
+    // `players`, the same reading `rates` and `techs` above take.
+    government: defaultGovernmentOf(ruleset).id,
   };
   const players: readonly PlayerState[] = [...civs, barbarians];
 
@@ -767,7 +873,19 @@ export const newGame = (
     // an empty list — and it is an *empty array*, never `undefined`, because the
     // key is part of every state hash and `canonicalize` refuses `undefined`.
     improvements: [],
+    // M9: the ownership layer, materialised from a world with no cities. `newGame`
+    // writes it **here** rather than leaving it to the first turn, because it is a
+    // required key of the state: a hash taken before anybody has moved would otherwise
+    // have to spell "no ownership layer", and a state that later grew one would differ
+    // from it by a key rather than by a value. The initial layer is
+    // `computeTileOwner`'s output for an empty city list, produced by the one function
+    // that owns the border rule (`borders.ts`) rather than by an all-`-1` literal
+    // written out again here — a literal would be right today and wrong the moment a
+    // city could be founded at setup. The empty array immediately below is a
+    // placeholder for that one call, two lines down: `computeTileOwner` wants a
+    // `GameState`, and `seeded` is the state it is being built into.
+    tileOwner: [],
   };
 
-  return ok(initialFog(seeded));
+  return ok(initialFog({ ...seeded, tileOwner: computeTileOwner(seeded, ruleset) }));
 };

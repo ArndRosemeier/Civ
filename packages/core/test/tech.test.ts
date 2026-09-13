@@ -26,6 +26,7 @@ import { hashValue } from '@civts/testing';
 import type { BuildingDef, City } from '../src/cities.js';
 import { asImprovementId, type ImprovementDef } from '../src/improvements.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asPlayerId,
   asResourceId,
@@ -58,6 +59,7 @@ import {
   withoutResearching,
   type TechDef,
 } from '../src/tech.js';
+
 import { advanceTurn } from '../src/turn.js';
 import { isErr, isOk } from '../src/result.js';
 import type { UnitDef } from '../src/units.js';
@@ -204,6 +206,10 @@ const player = (index: number, overrides: Partial<PlayerState> = {}): PlayerStat
   color: index === 0 ? '#d12f2f' : '#2f6fd1',
   startingTile: asTileIndex(0),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   treasury: 10,
   rates: { tax: 6, science: 4, luxury: 0 },
   beakers: 0,
@@ -228,6 +234,11 @@ const board = (overrides: Partial<GameState> = {}): GameState => ({
   units: [],
   explored: [Array.from({ length: 4 }, () => false), Array.from({ length: 4 }, () => false)],
   nextCityId: 100,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [] as readonly City[],
   improvements: [],
   ...overrides,

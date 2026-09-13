@@ -151,12 +151,10 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
   FREE_UNITS_BASE,
-  FREE_UNITS_PER_CITY,
   MIN_GROWTH_FOOD,
   RATE_TOTAL,
   SCHEMA_VERSION,
   STARTING_TREASURY,
-  UNIT_SUPPORT_COST,
   advanceTurn,
   applyCommand,
   applyEconomy,
@@ -176,6 +174,7 @@ import {
   cityGrowthTarget,
   cityProductionOptions,
   cityYields,
+  defaultGovernmentOf,
   effectTotals,
   foodBoxSize,
   growthFoodNeeded,
@@ -241,6 +240,20 @@ const RULESET: RulesetView = (() => {
   }
   return validated.value;
 })();
+
+/**
+ * The two M9 magnitudes this file reads out of the ruleset it hands the engine, rather
+ * than as module constants.
+ *
+ * M9 moved the per-city unit allowance and the per-unit support cost out of `economy.ts`
+ * and into the `governments` catalog section, so a body that spelled `2` and `1` for
+ * itself would be a second statement of a rule the sweep can move — and it would go on
+ * passing after a balance change that made the game different. These two reads go through
+ * `governments.ts`' `defaultGovernmentOf`, the same reader `newGame` uses to stamp every
+ * player's opening government, so the number asserted is the number a game starts with.
+ */
+const FREE_PER_CITY = defaultGovernmentOf(RULESET).freeUnitsPerCity;
+const UNIT_COST = defaultGovernmentOf(RULESET).unitSupportCost;
 
 /** A catalog row by role, or a thrown fixture error naming the gap. */
 const unitOfRole = (role: 'settler' | 'worker' | 'military'): UnitTypeId => {
@@ -439,6 +452,12 @@ const cmdKey = (cmd: Command): string => {
       return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
     case 'FortifyUnit':
       return `FortifyUnit ${String(cmd.unitId)}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 
@@ -1329,6 +1348,15 @@ describe('2. effects — exact per building set, compounded once, refused when m
       cost: 10,
       maintenance: 1,
       effects,
+      // M9: `validateRuleset` requires every building row to **declare** `culturePerTurn`
+      // and `happiness` even when both are zero — "a row that says nothing would be a
+      // building whose culture is whatever a reader assumed". Without these two, a row
+      // whose `effects` are perfectly good is refused with two `invalid-value` errors and
+      // `refusalKinds(withEffect([]))` stops being `[]`, which is how this fixture found
+      // out. Both are stated as the explicit zeros they are: this row produces no culture
+      // and contents nobody.
+      culturePerTurn: 0,
+      happiness: 0,
       provenance: placeholder('unsourced: a fixture row, declared here to be refused or read'),
     });
 
@@ -1368,11 +1396,15 @@ describe('2. effects — exact per building set, compounded once, refused when m
     expect(growthFoodNeeded(10, enormous)).toBe(MIN_GROWTH_FOOD);
     expect(growthFoodNeeded(1, enormous)).toBe(MIN_GROWTH_FOOD);
     expect(growthFoodNeeded(foodBoxSize(4), effectTotals([]))).toBe(foodBoxSize(4));
+    // M9+M10 added a fifth accumulated channel — `happiness`, from the `city-happiness`
+    // effect every building's `happiness` field is projected onto. The empty set still
+    // totals zero on all five, which is the point of asking.
     expect(effectTotals([])).toEqual({
       commercePct: 0,
       beakerPct: 0,
       shieldPct: 0,
       growthFood: 0,
+      happiness: 0,
     });
     expect(declaredGrowthFood([GRANARY])).toBe(1);
   });
@@ -1440,7 +1472,16 @@ describe('2. effects — exact per building set, compounded once, refused when m
 
     // The only declared effect of M4c's wonder is the same one, so the wonder's
     // inertness was this defect and not a separate one.
-    expect(PYRAMIDS.effects).toEqual([{ kind: 'growth-food', amount: 1 }]);
+    // M9+M10: `PYRAMIDS` is the **validated** row, and `@civts/rules` projects every
+    // building's `happiness` onto a `city-happiness` effect (replace-not-append, one
+    // projection, one reader). The Pyramids declare `happiness: 1`, so the wonder carries
+    // two effects now: M4c's growth-food and M9's contentment. The assertion is restated
+    // with both rather than relaxed — the growth-food half is still exactly M4c's single
+    // declared effect, which is what "was the wonder really inert before?" was asking.
+    expect(PYRAMIDS.effects).toEqual([
+      { kind: 'growth-food', amount: 1 },
+      { kind: 'city-happiness', amount: 1 },
+    ]);
   });
 });
 
@@ -1996,7 +2037,16 @@ describe('2b. growth-food is APPLIED — the granary, the Pyramids, and the floo
     expect(reductionOf([PYRAMIDS])).toBe(1);
     // The only effect the row declares is the one under test, so a difference between
     // the holder and the control cannot be some other declared effect firing.
-    expect(PYRAMIDS.effects).toEqual([{ kind: 'growth-food', amount: 1 }]);
+    // M9+M10: `PYRAMIDS` is the **validated** row, and `@civts/rules` projects every
+    // building's `happiness` onto a `city-happiness` effect (replace-not-append, one
+    // projection, one reader). The Pyramids declare `happiness: 1`, so the wonder carries
+    // two effects now: M4c's growth-food and M9's contentment. The assertion is restated
+    // with both rather than relaxed — the growth-food half is still exactly M4c's single
+    // declared effect, which is what "was the wonder really inert before?" was asking.
+    expect(PYRAMIDS.effects).toEqual([
+      { kind: 'growth-food', amount: 1 },
+      { kind: 'city-happiness', amount: 1 },
+    ]);
     expect(isWonder(PYRAMIDS)).toBe(true);
 
     const records = playTurns(board, 3);
@@ -3025,8 +3075,7 @@ const maintenanceSweep = (board: GameState, turns: number, label: string): Maint
 
       const units = produced.units.filter((unit) => unit.owner === player.id).length;
       const support =
-        Math.max(0, units - (FREE_UNITS_PER_CITY * cities.length + FREE_UNITS_BASE)) *
-        UNIT_SUPPORT_COST;
+        Math.max(0, units - (FREE_PER_CITY * cities.length + FREE_UNITS_BASE)) * UNIT_COST;
 
       rec.check(
         income.gold === gold && income.beakers === beakers && income.luxuries === luxuries,
@@ -3549,7 +3598,7 @@ describe('8. goldens: still a real gate, and what covers what', () => {
     // rather than the three hashes below: this file cannot recompute it (it holds neither
     // the played script nor a battle board), so it is pinned by name, and the three fresh
     // worlds are still compared value for value against the same three values.
-    expect(computed).toEqual(['0fcbdf5564556c3a', '9209534b36689b8a', '0bebdfa8140c8168']);
+    expect(computed).toEqual(['781d15e49cf79357', '782fe5306476b5d5', '717543ac9b22ed91']);
     const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
     expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([
@@ -3558,11 +3607,12 @@ describe('8. goldens: still a real gate, and what covers what', () => {
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
       'played-civs2-seed42-combat',
+      'played-civs2-seed42-victory',
     ]);
     // 8, not 7: M6's `Unit.hitPointsLeft` (plus the two omitted-when-default keys
     // `experience` and `fortified`). Named rather than written as `> 7`, so the next
     // schema bump has to come here and say so.
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBe(9);
     expect(stored.nodeMajor).toBe(Number(process.versions.node.split('.')[0]));
 
     // The field is really inside the digest, which is what makes the rehash an M4c

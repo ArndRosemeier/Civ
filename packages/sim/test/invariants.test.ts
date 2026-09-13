@@ -30,10 +30,13 @@ import {
   DEFAULT_SETTINGS,
   IMPROVEMENT_KINDS,
   MIN_GROWTH_FOOD,
+  RATE_TOTAL,
   applyCommand,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
+  rateCapsOf,
   asResourceId,
   asTileIndex,
   asUnitId,
@@ -1021,15 +1024,32 @@ describe('every invariant fires on a deliberately broken state', () => {
       expect(
         violations.map((violation) => `${violation.invariant}@${String(violation.turn)}`),
       ).toEqual([]);
-      // ...and every run reached its horizon, so nothing was truncated and no aggregate is
-      // a mean over games of different lengths.
-      expect([...new Set(runs.map(({ result }) => result.stoppedBecause))]).toEqual(['max-turns']);
+      // ...and every run either reached its horizon or **ended** on a victory condition. The
+      // second is M9+M10's addition and it is not a truncation: a game that a victory condition
+      // ended stops with `game-over` and carries an outcome, while a run that stopped for any
+      // other reason would be a run the sweep could not account for.
+      for (const { result } of runs) {
+        if (result.stoppedBecause === 'game-over') {
+          expect(result.outcome, 'a run ended without an outcome').toBeDefined();
+        } else {
+          expect(result.stoppedBecause).toBe('max-turns');
+        }
+      }
+      expect(runs.some(({ result }) => result.stoppedBecause === 'max-turns')).toBe(true);
 
-      // Non-vacuity, so "nothing fired" is not "nothing happened": the sweep really played
-      // 8000 player-turns, cities were founded and grew, and buildings were put up — which
-      // is what the food-box check needs in order to have anything to say.
+      // Non-vacuity, so "nothing fired" is not "nothing happened": the sweep really played at
+      // least `SWEEP_SEEDS.length * SWEEP_TURNS` player-turns, cities were founded and grew, and
+      // buildings were put up — which is what the food-box check needs in order to have anything
+      // to say.
+      //
+      // M9+M10 makes the count a **lower bound** rather than an equality: a game that a victory
+      // condition ends stops the sampler mid-stride, so the sweep is no longer exactly 8000
+      // rows. Measured: 7938. The non-vacuity claim never wanted the exact figure — it wants to
+      // know the sweep really played — so the bound is stated and the exact shortfall is left to
+      // the per-run assertions above, which account for every run individually.
       const rows = runs.flatMap(({ result }) => result.metrics);
-      expect(rows).toHaveLength(SWEEP_SEEDS.length * SWEEP_TURNS * 2);
+      expect(rows.length).toBeLessThanOrEqual(SWEEP_SEEDS.length * SWEEP_TURNS * 2);
+      expect(rows.length).toBeGreaterThan(SWEEP_SEEDS.length * SWEEP_TURNS);
       expect(rows.filter((row) => row.population > 0).length).toBeGreaterThan(0);
       expect(rows.reduce((total, row) => total + row.population, 0)).toBeGreaterThan(rows.length);
       expect(rows.reduce((total, row) => total + row.buildings, 0)).toBeGreaterThan(0);
@@ -1188,6 +1208,10 @@ describe('every invariant fires on a deliberately broken state', () => {
       id: asCityId(Number(BASE_CITY.id) + 900),
       tile: BASE_CITY.tile,
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     };
     const messages = messagesOf(
       'city-tile-unique',
@@ -1810,12 +1834,20 @@ describe('every invariant fires on a deliberately broken state', () => {
       population: 4,
       foodBox: 0,
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     }));
     const starved = withCity(FINAL.state, city.id, (candidate) => ({
       ...candidate,
       population: 1,
       foodBox: 0,
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     }));
     const events: readonly GameEvent[] = [
       { type: 'IncomeCollected', playerId: city.owner, gold: 0, beakers: 0, luxuries: 0 },
@@ -1944,6 +1976,19 @@ describe('every invariant fires on a deliberately broken state', () => {
       'gold-conservation',
       'city-food-conservation',
       'city-shield-conservation',
+      // M9+M10: the **eight** predicates this wave adds, in registry order. A ninth,
+      // `happiness-counts-add-up`, was designed and then removed — it was a tautology about a pure
+      // function *and* claimed an equality that is false on real play (see its note in
+      // `src/invariants.ts`). A predicate that cannot fire is decoration, and one that fires on
+      // correct play is worse.
+      'tile-owner-matches-culture',
+      'tile-owner-names-a-real-player',
+      'tile-owned-by-a-city-in-range',
+      'government-is-in-catalog',
+      'rates-within-government-caps',
+      'city-culture-non-negative-and-integral',
+      'disorder-zeroes-the-yields',
+      'finished-game-does-not-advance',
     ];
     expect(exercised.slice().sort()).toEqual(
       CORE_INVARIANTS.map((invariant) => invariant.name)
@@ -2031,6 +2076,10 @@ const BROKEN_STATES: Readonly<Record<string, () => InvariantContext>> = {
             id: asCityId(Number(BASE_CITY.id) + 901),
             tile: BASE_CITY.tile,
             workedTiles: [],
+            // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+            // from this and `computeTileOwner` reads it, so a hand-built city states a number
+            // rather than leaving the engine to guess one.
+            culture: 0,
           },
         ],
       },
@@ -2199,6 +2248,134 @@ const BROKEN_STATES: Readonly<Record<string, () => InvariantContext>> = {
       events: FINAL.events,
     });
   },
+  'tile-owner-matches-culture': () => {
+    // A tile the stored layer says is owned is set back to UNOWNED. Only the headline
+    // check can see this one: `UNOWNED` names no player and no city, so the other two
+    // ownership predicates have nothing to say about it.
+    const tile = mustFind(
+      BASE.tileOwner.findIndex((owner) => owner !== -1),
+      'an owned tile in the played state',
+    );
+    return contextFor({
+      state: { ...BASE, tileOwner: BASE.tileOwner.map((owner, at) => (at === tile ? -1 : owner)) },
+      previous: FINAL.previous,
+      events: FINAL.events,
+    });
+  },
+  'tile-owner-names-a-real-player': () => {
+    const tile = mustFind(
+      BASE.tileOwner.findIndex((owner) => owner !== -1),
+      'an owned tile in the played state',
+    );
+    return contextFor({
+      state: {
+        ...BASE,
+        tileOwner: BASE.tileOwner.map((owner, at) =>
+          at === tile ? PLAYER_THAT_IS_NOT_THERE : owner,
+        ),
+      },
+      previous: FINAL.previous,
+      events: FINAL.events,
+    });
+  },
+  'tile-owned-by-a-city-in-range': () => {
+    // A real player claims a tile **nobody's** city is near: the stored layer says a
+    // border reached somewhere no city did, which the contract calls impossible.
+    const nowhere = mustFind(
+      BASE.tileOwner.findIndex(
+        (owner, tile) =>
+          owner === -1 &&
+          BASE.cities.every((city) => cityDistance(city.tile, asTileIndex(tile)) > 3),
+      ),
+      'a tile no city could reach',
+    );
+    return contextFor({
+      state: {
+        ...BASE,
+        tileOwner: BASE.tileOwner.map((owner, at) => (at === nowhere ? BASE_CITY.owner : owner)),
+      },
+      previous: FINAL.previous,
+      events: FINAL.events,
+    });
+  },
+  'government-is-in-catalog': () =>
+    contextFor({
+      state: withPlayer(BASE, BASE_CIV.id, (player) => ({
+        ...player,
+        government: asGovernmentId('no-such-government'),
+      })),
+      previous: FINAL.previous,
+      events: FINAL.events,
+    }),
+  'rates-within-government-caps': () => {
+    // **One tenth above the acting player's own tax cap**, read from its government
+    // rather than guessed: the first version of this fixture moved a tenth from science
+    // to tax, which a `6/4/0` default merely turns into `7/3/0` — comfortably legal under
+    // a cap of 8, so nothing fired. The sum is kept at `RATE_TOTAL` on purpose: an
+    // over-cap triple is what this predicate is about, and a triple that also broke the
+    // sum would let the sum branch answer instead.
+    const caps = rateCapsOf(VIEW, BASE_CIV);
+    return contextFor({
+      state: withPlayer(BASE, BASE_CIV.id, (player) => ({
+        ...player,
+        rates: { tax: caps.tax + 1, science: RATE_TOTAL - caps.tax - 1, luxury: 0 },
+      })),
+      previous: FINAL.previous,
+      events: FINAL.events,
+    });
+  },
+  'city-culture-non-negative-and-integral': () =>
+    contextFor({
+      state: withCity(BASE, BASE_CITY.id, (city) => ({ ...city, culture: -1 })),
+      previous: FINAL.previous,
+      events: FINAL.events,
+    }),
+  'disorder-zeroes-the-yields': () => {
+    // **Disordered on both sides of the boundary, and richer anyway.** The previous
+    // snapshot is the played state with this city's population pushed past the unhappy
+    // ladder's top rung, and the after-state is that same city with shields banked — the
+    // one shape the transition half of the check exists to catch. It is built from the
+    // engine's own verdict rather than from an assumed rung: if the ladder moves, the
+    // fixture moves with it.
+    const starved = withPlayer(
+      withCity(BASE, BASE_CITY.id, (city) => ({ ...city, population: 40 })),
+      BASE_CITY.owner,
+      // Luxuries emptied as well as the population pushed up, so the verdict is the
+      // ladder's and not a purse's: the unhappy count at that size is above zero and
+      // there is nothing to content it. Read from the engine's verdict below rather than
+      // assumed — the assertion after the fixture is what keeps this honest if the ladder
+      // is ever re-rung.
+      (player) => ({ ...player, luxuries: 0 }),
+    );
+    return contextFor({
+      state: withCity(starved, BASE_CITY.id, (city) => ({ ...city, shields: city.shields + 5 })),
+      previous: starved,
+      events: FINAL.events,
+    });
+  },
+  'finished-game-does-not-advance': () => {
+    // Player 0 keeps every city and everyone else is off the board — a conquest the
+    // engine's own rule agrees with — and then the turn counter moves anyway.
+    const mine = BASE.cities.filter((city) => city.owner === BASE_CITY.owner);
+    const decided: GameState = {
+      ...BASE,
+      cities: mine,
+      units: BASE.units.filter((unit) => unit.owner === BASE_CITY.owner),
+    };
+    return contextFor({ state: { ...decided, turn: decided.turn + 1 }, previous: decided });
+  },
+};
+
+/** A player id no state in this file contains, for the ownership layer's shape check. */
+const PLAYER_THAT_IS_NOT_THERE = 99;
+
+/** Chebyshev distance between two tiles, for picking a tile no city could reach. */
+const cityDistance = (a: TileIndex, b: TileIndex): number => {
+  const width = BASE.map.width;
+  return Math.max(
+    Math.abs((Number(a) % width) - (Number(b) % width)),
+    Math.abs(Math.floor(Number(a) / width) - Math.floor(Number(b) / width)),
+  );
 };
 
 /* ------------------------------------------------------------------ *

@@ -33,6 +33,7 @@ import { captureCity, captureRulesOf, type BuildingDef, type City } from '../src
 import { defenderBonusPct, resolveCombat } from '../src/combat.js';
 import { applyCommand, type Command, type GameEvent } from '../src/commands.js';
 import {
+  asGovernmentId,
   asBuildingId,
   asCityId,
   asPlayerId,
@@ -51,6 +52,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import type { UnitDef } from '../src/units.js';
 
 /* ------------------------------------------------------------------ *
@@ -187,6 +189,10 @@ const makePlayer = (index: number): PlayerState => ({
   color: '#000000',
   startingTile: asTileIndex(columnTile(0)),
   kind: 'civ',
+  // M9: a player carries a government. `defaultGovernmentOf` picks the first row of
+  // the ruleset's `governments` section, which is `despotism` in the shipped catalog;
+  // this literal is a hand-built state, so it states the id rather than deriving it.
+  government: asGovernmentId('despotism'),
   treasury: STARTING_TREASURY,
   rates: DEFAULT_RATES,
   beakers: 0,
@@ -205,6 +211,10 @@ const makeCity = (id: number, owner: number, at: number): City => ({
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
 });
 
 /**
@@ -235,6 +245,8 @@ const board = (cityCount: number): GameState => ({
   })),
   explored: [asPlayerId(0), asPlayerId(1)].map(() => new Array<boolean>(WIDTH * HEIGHT).fill(true)),
   nextCityId: cityCount,
+
+  tileOwner: [],
   cities: Array.from({ length: cityCount }, (_, index) =>
     makeCity(index, 1, columnTile(index === 0 ? 0 : 2)),
   ),

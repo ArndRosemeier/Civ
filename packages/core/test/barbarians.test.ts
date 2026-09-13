@@ -53,6 +53,7 @@ import { applyCommand, type GameEvent } from '../src/commands.js';
 import type { CombatDef } from '../src/combat.js';
 import {
   asCityId,
+  asGovernmentId,
   asPlayerId,
   asTerrainId,
   asTileIndex,
@@ -72,6 +73,7 @@ import {
   type GameState,
   type PlayerState,
 } from '../src/state.js';
+
 import { advanceTurn } from '../src/turn.js';
 import type { Unit, UnitDef, UnitRole } from '../src/units.js';
 
@@ -220,6 +222,7 @@ const player = (index: number, kind: 'civ' | 'barbarian'): PlayerState => ({
   beakers: 0,
   luxuries: 0,
   techs: [],
+  government: asGovernmentId('despotism'),
 });
 
 const civ0 = player(0, 'civ');
@@ -256,15 +259,67 @@ const city = (id: number, owner: number, tile: number, overrides: Partial<City> 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
 const GRASS_5X5 = mapOf('.....', '.....', '.....', '.....', '.....');
 
+/**
+ * **A garrison for a civilization that would otherwise be off the board**, placed as far as
+ * the map allows from every barbarian band.
+ *
+ * M10's conquest condition has no threshold in it — "you are the last civilization on the
+ * board" — and a civilization that owns neither a city nor a unit is, by that rule, gone. A
+ * board where `civ1` was simply never given anything is therefore a *finished* game, and
+ * `advanceTurn` refuses to move a finished game, so every barbarian approach in this file
+ * would be measured on a board that never advanced.
+ *
+ * This file is about what barbarians do, not about who wins, so `board()` keeps every
+ * civilization in play. The unit is placed on the tile whose **nearest barbarian is
+ * farthest away** (ties to the lowest index), which is what keeps it out of the way: a band
+ * attacks what it is adjacent to, and this file's bands walk diagonals and short routes.
+ * The placement is computed from the board rather than written down, because this file's
+ * maps, city tiles and band starts all differ from test to test and a fixed tile would be
+ * adjacent to one of them.
+ */
+const garrisonTile = (state: {
+  readonly map: GameMap;
+  readonly units: readonly Unit[];
+  readonly cities: readonly City[];
+}): number => {
+  const occupied = new Set<number>([
+    ...state.units.map((each) => Number(each.tile)),
+    ...state.cities.map((each) => Number(each.tile)),
+  ]);
+  const bands = state.units.filter((each) => Number(each.owner) === Number(BARBARIAN_ID));
+  let best = -1;
+  let bestDistance = -1;
+  for (let tile = 0; tile < state.map.width * state.map.height; tile += 1) {
+    if (occupied.has(tile)) continue;
+    let nearest = Number.MAX_SAFE_INTEGER;
+    for (const band of bands) {
+      const dx = Math.abs((tile % state.map.width) - (Number(band.tile) % state.map.width));
+      const dy = Math.abs(
+        Math.floor(tile / state.map.width) - Math.floor(Number(band.tile) / state.map.width),
+      );
+      nearest = Math.min(nearest, Math.max(dx, dy));
+    }
+    if (nearest > bestDistance) {
+      bestDistance = nearest;
+      best = tile;
+    }
+  }
+  return best < 0 ? 0 : best;
+};
+
 const board = (overrides: Partial<GameState> = {}): GameState => {
   const map = overrides.map ?? GRASS_5X5;
   const players = overrides.players ?? [civ0, civ1, BARBARIANS];
-  return {
+  const state = {
     schemaVersion: SCHEMA_VERSION,
     revision: 0,
     turn: 1,
@@ -277,10 +332,34 @@ const board = (overrides: Partial<GameState> = {}): GameState => {
     units: [],
     explored: players.map(() => Array.from({ length: map.width * map.height }, () => false)),
     nextCityId: 100,
+    // M9: the materialised ownership layer. `[]` is the honest value for a
+    // state nobody has run a turn on: `withOwnership` fills it from the cities the
+    // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+    // layer cannot make a border wrong — it only means none has been claimed yet.
+    tileOwner: [],
     cities: [],
     improvements: [],
     ...overrides,
   };
+
+  // Keep every civilization on the board (see `garrisonTile`). A civilization this state does
+  // not mention at all has not been conquered — it has not been placed.
+  const absent = players.filter(
+    (each) =>
+      each.kind === 'civ' &&
+      !state.cities.some((city) => city.owner === each.id) &&
+      !state.units.some((each2) => each2.owner === each.id),
+  );
+  if (absent.length === 0) return state;
+
+  const tile = garrisonTile(state);
+  const garrisoned = absent.map((each, at) => ({
+    ...unit(90 + at, SCOUT, Number(each.id), tile),
+    // One tile cannot hold two units, so each further garrison steps one tile along; this
+    // file's boards never have more than one absent civilization.
+    tile: asTileIndex(tile + at),
+  }));
+  return { ...state, units: [...state.units, ...garrisoned] };
 };
 
 const unitsOf = (state: GameState, owner: PlayerId): readonly Unit[] =>

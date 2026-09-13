@@ -353,10 +353,12 @@
 
 import {
   DEFAULT_RATES,
+  defaultGovernmentOf,
   MAP_DIMENSIONS,
   MIN_CITY_DISTANCE,
   RATE_TOTAL,
   SCHEMA_VERSION,
+  withOwnership,
   STARTING_TREASURY,
   TERRAIN_BY_ROLE,
   applyCommand,
@@ -400,6 +402,7 @@ import {
   type GameEvent,
   type GameMap,
   type GameState,
+  type GovernmentId,
   type ImprovementId,
   type PlayerKind,
   type PlayerState,
@@ -472,6 +475,13 @@ export interface CitySetup {
   readonly queue?: readonly ProductionItem[];
   readonly buildings?: readonly BuildingId[];
   readonly workedTiles?: readonly TileIndex[];
+  /**
+   * M9: accumulated culture for this city (default 0, what `FoundCity` writes). A city's
+   * borders are a function of this number, so a scenario that wants to describe a grown
+   * empire — or to test a border rule at a radius — states it here rather than growing it
+   * over turns.
+   */
+  readonly culture?: number;
 }
 
 /**
@@ -976,6 +986,16 @@ interface PlayerPlacement {
   techs: TechId[];
   /** M5: what it is researching; absent means nothing, never a key holding `undefined`. */
   researching: TechId | undefined;
+  /**
+   * M9: the government this player is under, or `undefined` for "the builder has not been
+   * told" — which resolves to the ruleset's own default row at `build()` time.
+   *
+   * `undefined` rather than a default stamped at `addPlayer`, because the default comes from
+   * the *ruleset* and the builder may legitimately want a custom ruleset's first row. Keeping
+   * "nobody said" distinct from "somebody said despotism" is also what lets a future
+   * `setGovernment` exist without changing the meaning of an existing scenario.
+   */
+  government: GovernmentId | undefined;
 }
 
 /** A goody hut the scenario asked for, in the coordinates it was written in. */
@@ -1029,6 +1049,15 @@ interface CityPlacement {
   readonly queue: readonly ProductionItem[];
   readonly buildings: readonly BuildingId[];
   readonly workedTiles: readonly TileIndex[] | undefined;
+  /**
+   * M9: the city's accumulated culture, resolved to a number at `addCity` time (default 0,
+   * the value `FoundCity` writes). A scenario that wants a city whose borders have already
+   * grown states it; every other scenario gets the value a real game would have.
+   *
+   * Optional here and resolved at `addCity` time, so an omitted field is the 0
+   * `FoundCity` writes rather than a value the caller has to restate.
+   */
+  readonly culture?: number;
 }
 
 /** The mutable world the builder records into. */
@@ -1369,6 +1398,16 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
       // so absence is the only honest spelling of "not researching" here as
       // everywhere else.
       ...(placed.researching === undefined ? {} : { researching: placed.researching }),
+      // M9: every player is governed, and a scenario that says nothing about it gets the
+      // same row `newGame` stamps — the catalog's default, resolved **from the ruleset this
+      // builder was handed** rather than hard-coded, so a scenario over a custom ruleset
+      // gets *that* ruleset's default government. The initialiser is read here, once, for
+      // the same reason the money and knowledge fields above are: a scenario's `setup` reads
+      // top to bottom like the world it describes.
+      //
+      // A builder's own `addPlayer` may name a government explicitly; the field is resolved
+      // at the moment the player was added, so the order the scenario is written in decides.
+      government: placed.government ?? defaultGovernmentOf(world.ruleset).id,
     };
   });
 
@@ -1434,6 +1473,11 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
     explored,
     nextCityId: 0,
     cities: [],
+    // M9: the ownership layer is materialised from the cities, and the builder has none at
+    // this point (they are added below). `withOwnership` at the end of the build is what
+    // fills it, so this is the empty layer rather than a claim nobody derived — see
+    // `state.ts`' `GameState.tileOwner` for why the layer is stored at all.
+    tileOwner: [],
     // M4a: nothing is built here yet — the scenario's own improvements are folded
     // in immediately below, through the engine's `withImprovement`, so the field
     // starts as the empty array every honest state starts with and the ordering
@@ -1505,6 +1549,10 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
       queue: [...placed.queue],
       buildings: [...placed.buildings],
       workedTiles: [],
+      // M9: a scenario may place a city that already has culture (a city whose borders have
+      // grown is a state a real game reaches, and a scenario that had to start every city at
+      // 0 could not describe one), and it defaults to 0 — the value `FoundCity` writes.
+      culture: placed.culture ?? 0,
     };
 
     state = { ...state, cities: [...state.cities, founded] };
@@ -1518,7 +1566,13 @@ const buildState = (world: BuilderWorld): Result<GameState, SetupError> => {
     };
   }
 
-  return ok({ ...state, nextCityId: state.cities.length });
+  // M9: **the ownership layer is materialised from the finished cities**, through the
+  // engine's own writer, so a hand-built world's borders are the borders a real game would
+  // have for the same cities. Computing it here rather than leaving it empty is deliberate:
+  // a scenario is a *state*, and a state whose ownership layer disagrees with its cities is
+  // exactly what the `tile-owner-matches-culture` invariant exists to catch — a test fixture
+  // that tripped it would be a fixture bug reported as an engine bug.
+  return ok({ ...withOwnership(state, world.ruleset), nextCityId: state.cities.length });
 };
 
 /**
@@ -1676,6 +1730,9 @@ export const createScenarioBuilder = (
         // values `newGame` writes for every player.
         techs: [],
         researching: undefined,
+        // M9: "nobody has said" — resolved to the *ruleset's* default row at `build()` time,
+        // so a scenario over a custom ruleset gets that ruleset's own default government.
+        government: undefined,
       });
       return builder;
     },
@@ -1703,6 +1760,11 @@ export const createScenarioBuilder = (
         // an empty list and no selection are the only values that mean anything.
         techs: [],
         researching: undefined,
+        // M9: a barbarian carries a government like every player (`newGame` stamps the
+        // default on it too), and it is **inert** for the same reason the money fields are:
+        // the money loop skips barbarians, so no rate cap and no support cost of theirs is
+        // ever read. Stating `undefined` here means `build()` gives it the ruleset's default.
+        government: undefined,
       });
       return builder;
     },
@@ -2100,6 +2162,11 @@ export const createScenarioBuilder = (
       const population = options.population ?? 1;
       const foodBox = options.foodBox ?? 0;
       const shields = options.shields ?? 0;
+      // M9: accumulated culture, defaulting to what `FoundCity` writes. Checked as a
+      // non-negative whole number because it is a hashed state field and because culture
+      // **never decreases** — a negative starting value is a state no rule can produce.
+      const culture = options.culture ?? 0;
+      checkCount('addCity', 'culture', culture, 0);
       checkCount('addCity', 'population', population, 1);
       checkCount('addCity', 'foodBox', foodBox, 0);
       checkCount('addCity', 'shields', shields, 0);
@@ -2184,6 +2251,7 @@ export const createScenarioBuilder = (
         queue,
         buildings,
         workedTiles,
+        culture,
       });
       return builder;
     },

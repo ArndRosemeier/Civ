@@ -63,6 +63,7 @@ import { HUT_REWARD_KINDS } from '../src/hut.js';
 import {
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asPlayerId,
   asResourceId,
   asTechId,
@@ -113,6 +114,45 @@ import {
   type UnitRole,
   type UnitWork,
 } from '../src/units.js';
+
+/**
+ * **M9+M10's four catalog sections, as this file's hand-built views state them.**
+ *
+ * `RulesetView` makes all four optional and the engine is total over a view that declares none
+ * — but each absence is a *deliberately degenerate* rule rather than a neutral default, and
+ * three of the four absences would change what this file measures:
+ *
+ * - no `culture` section means every city claims radius 1 for ever (`NO_BORDER_RULES`) and
+ *   nobody is ever unhappy (`NO_HAPPINESS_RULES`), so a fixture written for M3's two-ring
+ *   working radius would have half its tiles refused;
+ * - no `victory` section still lets **conquest** fire (that condition has no threshold), so a
+ *   board where one civilization happens to hold every city would end the game mid-test;
+ * - no `score` section makes every score 0, which is honest but makes the score column
+ *   unreadable.
+ *
+ * So this file states them, once, here — the numbers are visible in one place instead of being
+ * implied by an absence. The unhappy ladder is **empty** (nobody riots, so the M4b numbers this
+ * file pins are still the M4b numbers) and the victory thresholds are **unreachable**, because
+ * this file is not about who wins: M10's own acceptance evidence plays real games through the
+ * shipped catalog, where every threshold is a real one. The score weights are the shipped
+ * five, so a score this file reads is a score a game would show.
+ */
+const HAND_BUILT_SECTIONS = {
+  culture: {
+    borderRadius2Culture: 10,
+    borderRadius3Culture: 100,
+    unhappyThresholds: [],
+    luxuriesPerHappyCitizen: 2,
+    happyPerLuxuryResource: 1,
+  },
+  score: { perPopulation: 2, perCity: 3, perTech: 4, perCulture: 1, perWonder: 8 },
+  victory: {
+    dominationLandPct: 101,
+    dominationPopPct: 101,
+    culturalVictoryCulture: Number.MAX_SAFE_INTEGER,
+    scoreVictoryTurn: Number.MAX_SAFE_INTEGER,
+  },
+} as const;
 
 /** Move cost per role; ocean/coast/mountains are impassable. */
 const TERRAIN_ROWS: readonly (readonly [TerrainRole, number, boolean])[] = [
@@ -390,6 +430,7 @@ const RULESET: TechView = {
   improvements: IMPROVEMENTS,
   resources: RESOURCES,
   techs: TECHS,
+  ...HAND_BUILT_SECTIONS,
   fidelity: 'tuned',
 };
 
@@ -417,6 +458,7 @@ const player = (
   // only way this state spells "not researching anything" (see `PlayerState`). The
   // M5 sections below set both where they care.
   techs: [],
+  government: asGovernmentId('despotism'),
 });
 
 const unit = (
@@ -462,6 +504,10 @@ const city = (id: number, owner: number, tile: number, overrides: Partial<City> 
   queue: [],
   buildings: [],
   workedTiles: [],
+  // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+  // from this and `computeTileOwner` reads it, so a hand-built city states a number
+  // rather than leaving the engine to guess one.
+  culture: 0,
   ...overrides,
 });
 
@@ -486,6 +532,11 @@ const STATE: GameState = {
   ],
   explored: [UNSEEN, UNSEEN],
   nextCityId: 0,
+  // M9: the materialised ownership layer. `[]` is the honest value for a
+  // state nobody has run a turn on: `withOwnership` fills it from the cities the
+  // moment ownership matters, and `computeTileOwner` never reads it, so an empty
+  // layer cannot make a border wrong — it only means none has been claimed yet.
+  tileOwner: [],
   cities: [],
   improvements: [],
 };
@@ -1146,6 +1197,7 @@ describe('applyCommand — FoundCity', () => {
         // best tile the placeholder food-first ordering offers (grassland, and the
         // lowest-index 2-food tile in 5's radius).
         workedTiles: [asTileIndex(4)],
+        culture: 0,
       },
     ]);
 
@@ -1313,6 +1365,7 @@ describe('applyCommand — FoundCity', () => {
         queue: [],
         buildings: [],
         workedTiles: [asTileIndex(4)],
+        culture: 0,
       },
     ]);
     expect(outcome.events).toStrictEqual([
@@ -4154,13 +4207,42 @@ const battleBoard = (options: {
  * phalanx standing in it when `defended`. `city` overrides the city's fields, so a
  * capture test states the city it is capturing in one line.
  */
+/**
+ * **The residents: the units that keep a siege from ending the world.**
+ *
+ * M10's conquest condition has no threshold in it — "you are the last civilization on the
+ * board" — so a board where player 1 owns one city and nothing else becomes a *finished* game
+ * the instant that city is taken, and `applyCommand` then refuses the very next command with
+ * `game-over`. Several tests here capture the city and then keep playing (the capture's
+ * movement is refilled and the mover walks in, a barbarian takes the same city), which is
+ * exactly the behaviour they are pinning, so the board has to be one where the siege does not
+ * end the game.
+ *
+ * Tiles 14 and 13 are the two grassland tiles of this 4×4 fixture that are **not adjacent**
+ * to the city at tile 6 or to the attacker's start at tile 5 — every other land tile is a
+ * neighbour of one of them, and the rest are ocean, coast or mountains. Near enough to be on
+ * the same board, far enough that no adjacency rule in this file can see them.
+ *
+ * It is a fixture, not a claim about M10: the conquest condition's own behaviour is pinned by
+ * M10's tests, on boards built for it.
+ */
+const SIEGE_RESIDENT_TILE = 14;
+const SIEGE_RESIDENT_TILE_B = 13;
+
 const siegeBoard = (
   options: { readonly defended?: boolean; readonly city?: Partial<City> } = {},
 ): GameState => {
   const units: readonly Unit[] =
     options.defended === true
-      ? [unit(ATTACKER, LEGION, 0, 5, LEGION.movement), unit(DEFENDER, PHALANX, 1, 6, 0)]
-      : [unit(ATTACKER, LEGION, 0, 5, LEGION.movement)];
+      ? [
+          unit(ATTACKER, LEGION, 0, 5, LEGION.movement),
+          unit(DEFENDER, PHALANX, 1, 6, 0),
+          unit(91, WARRIOR, 1, SIEGE_RESIDENT_TILE, 0),
+        ]
+      : [
+          unit(ATTACKER, LEGION, 0, 5, LEGION.movement),
+          unit(91, WARRIOR, 1, SIEGE_RESIDENT_TILE, 0),
+        ];
   const base = withUnits({ ...STATE, rng: seedWithFirstRoll(0) }, units);
   return withCities(base, [city(0, 1, 6, { name: 'City 1', population: 5, ...options.city })]);
 };
@@ -4893,7 +4975,16 @@ describe('applyCommand — capture changes exactly what M6 says it changes', () 
       ...siegeBoard(),
       players: [...STATE.players, player(2, 7, 'barbarian')],
     };
-    const horde = withUnits(barbarians, [unit(ATTACKER, LEGION, 2, 5, LEGION.movement)]);
+    // `withUnits` replaces the board's units, so player 1's resident goes with them — and
+    // with player 0 given nothing either, the only civilization still on the board would be
+    // player 1, whose city this barbarian is about to take. M10's conquest rule would then
+    // end the game before the barbarian's attack could be applied. One resident per
+    // civilization keeps the board a contest (see `SIEGE_RESIDENT_TILE`).
+    const horde = withUnits(barbarians, [
+      unit(ATTACKER, LEGION, 2, 5, LEGION.movement),
+      unit(91, WARRIOR, 1, SIEGE_RESIDENT_TILE, 0),
+      unit(92, WARRIOR, 0, SIEGE_RESIDENT_TILE_B, 0),
+    ]);
     const outcome = mustOk(apply(horde, asPlayerId(2), attack(ATTACKER, 6), M6_RULESET));
 
     expect(cityById(outcome.state, asCityId(0))?.owner).toBe(asPlayerId(2));

@@ -9,11 +9,13 @@
  * 1. work progress for every unit (unit-id order), then
  * 2. growth for every city (city-id order), then
  * 3. production for every city (city-id order), then
- * 4. research for every civilization (player-id order) — M5, then
- * 5. the money loop for every civilization (player-id order) — M4b, then
- * 6. the barbarian step (unit-id order) — M6, then
- * 7. every unit's movement refilled, then
- * 8. `turn += 1`.
+ * 4. **culture** for every city (city-id order) — M9, then
+ * 5. research for every civilization (player-id order) — M5, then
+ * 6. the money loop for every civilization (player-id order) — M4b, then
+ * 7. the barbarian step (unit-id order) — M6, then
+ * 8. every unit's movement refilled, then
+ * 9. **the ownership layer recomputed** from the cities — M9, then
+ * 10. `turn += 1`.
  *
  * Why it is a module rather than a branch of `EndTurn`: the ordering is the kind
  * of rule that quietly gets re-derived. The CLI, a scenario harness, a "skip
@@ -123,6 +125,14 @@ import type { GameEvent } from './commands.js';
 // never while modules are being evaluated, so both directions work whichever one is
 // imported first. `barbarians.ts`' module note argues this at length.
 import { advanceBarbarians } from './barbarians.js';
+// M9: the ownership layer's one writer. This module never computes a border — it asks
+// `borders.ts` to recompute the whole layer from the cities, which is what makes the
+// stored layer a cache of a pure function rather than an accumulation. A value import,
+// and a one-way edge at runtime: `borders.ts` imports `turn.ts` not at all.
+import { withOwnership } from './borders.js';
+// M9: the culture step. `culture.ts` owns the per-turn accumulation and the one-off
+// wonder bonus; this module decides only *when* the accumulation runs.
+import { applyCulture } from './culture.js';
 // M4b's step of the pipeline. `economy.ts` imports `GameEvent` from `commands.ts`
 // type-only, so this is the only runtime edge in the pair and there is no cycle.
 import { applyEconomy } from './economy.js';
@@ -135,6 +145,9 @@ import type { GameState } from './state.js';
 // type-only, so — like `economy.ts` above — this is the only runtime edge in the pair
 // and there is no cycle.
 import { applyResearch } from './tech.js';
+// M9: the victory *rule*, asked before the first step so that a finished game cannot
+// advance. `victory.ts` imports `turn.ts` not at all, so the edge is one-way.
+import { gameOutcomeOf } from './victory.js';
 import { unitDef, withoutWork, type Unit } from './units.js';
 
 /** The state after a turn, and everything that happened during it. */
@@ -306,14 +319,38 @@ const refillMovement = (state: GameState, ruleset: RulesetView): GameState => {
  * modified, and the same `(state, ruleset)` always yields an equal result.
  */
 export const advanceTurn = (state: GameState, ruleset: RulesetView): TurnOutcome => {
+  // **M9: a finished game does not advance.** `EndTurn` is the one command the
+  // victory gate in `commands.ts` still accepts on a finished game (it is how a runner
+  // *reports* the ending rather than how it plays on), so the pipeline itself has to be
+  // the thing that refuses to move the world once a condition holds — otherwise the
+  // turn counter would keep climbing and the outcome's own `turn` would stop being the
+  // turn the game ended on.
+  //
+  // It is asked **first**, before any step, for the same reason `applyCommand`'s gate is
+  // asked before its `switch`: one check covers every step, and no future step can be
+  // added in a place this misses. The returned state is the input object itself — not a
+  // copy — so an `EndTurn` on a finished game is provably a no-op, and `EndTurn`'s
+  // `revision` bump in the command layer is the only thing that moves (which is
+  // correct: a command *was* applied, and it changed only the command counter).
+  if (gameOutcomeOf(state, ruleset) !== null) return { state, events: [] };
+
   const worked = advanceWork(state);
   const grown = applyGrowth(worked.state, ruleset);
   const produced = applyProduction(grown.state, ruleset);
-  // M5, step 4: what each civilization's banked beakers buy. Reads the pool the
+  // M9, step 4: **culture**, in city-id order. It sits after production and before
+  // research, which is the contract's position and is observable in both directions:
+  // a culture-producing building completed this turn banks its first culture this turn
+  // (the M4c rule, applied one step later in the same direction as growth, production
+  // and research), and nothing about culture is read by the research step, so the
+  // position costs nothing on the other side. A wonder's *one-off* bonus does **not**
+  // come from here — `production.ts` applies it at the moment of completion, for
+  // exactly the same reason.
+  const cultured = applyCulture(produced.state, ruleset);
+  // M5, step 5: what each civilization's banked beakers buy. Reads the pool the
   // money loop below has not touched yet — that is the point of the position, not an
   // oversight; see the module note above and `tech.ts`'s.
-  const researched = applyResearch(produced.state, ruleset);
-  // M4b, step 5: income, upkeep and bankruptcy for every civilization.
+  const researched = applyResearch(cultured.state, ruleset);
+  // M4b, step 6: income, upkeep and bankruptcy for every civilization.
   const paid = applyEconomy(researched.state, ruleset);
   // M6, step 6: the barbarians' turn. Engine behaviour with no policy behind it, run
   // *after* the money loop (so a city a barbarian captures this turn still paid its
@@ -322,13 +359,25 @@ export const advanceTurn = (state: GameState, ruleset: RulesetView): TurnOutcome
   // Moving this call changes outcomes in both directions — `turn.test.ts` pins both.
   const barbarians = advanceBarbarians(paid.state, ruleset);
   const refilled = refillMovement(barbarians.state, ruleset);
+  // M9, step 8: the ownership layer, recomputed from the cities and their culture —
+  // which are exactly what the culture step above just moved. It runs *after* the
+  // barbarian step so that a city a barbarian captured this turn transfers its claim on
+  // this turn rather than the next one, and *before* the turn increments because the
+  // layer is a property of the turn that produced it.
+  //
+  // This is the second of this module's three writes to the layer and neither of them
+  // computes a border: `borders.ts`' `withOwnership` recomputes from the cities, so
+  // there is one rule and no accumulation to drift (the state's own doc says why the
+  // materialisation is safe at all).
+  const owned = withOwnership(refilled, ruleset);
 
   return {
-    state: { ...refilled, turn: refilled.turn + 1 },
+    state: { ...owned, turn: owned.turn + 1 },
     events: [
       ...worked.events,
       ...grown.events,
       ...produced.events,
+      ...cultured.events,
       ...researched.events,
       ...paid.events,
       ...barbarians.events,

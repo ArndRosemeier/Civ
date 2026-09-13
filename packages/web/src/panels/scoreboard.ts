@@ -1,28 +1,37 @@
 /**
- * The scoreboard: `table` named `Scoreboard`, one row per player.
- * See docs/INTERFACES.md, M8 ("The accessibility contract").
+ * The scoreboard: `table` named `Scoreboard`, one row per player **and the score column M8 could
+ * not have**.
+ * See docs/INTERFACES.md, M8 ("The accessibility contract") and M9+M10 ("Victory and score").
  *
- * ## There is no score in the engine, so there is no score column here
+ * ## The score column arrived with the scoring rule, and reads it
  *
- * M8 asks for a scoreboard and this project has no scoring rule: nothing in `@civts/core`
- * ranks players, and victory conditions are M10's work (`@civts/sim`'s batch module says the
- * same thing about win counts). Inventing a points formula in the UI would be a **game rule
- * living in the presentation layer** — the exact thing this package's hard rule forbids — and
- * it would be a rule no test, no AI and no future milestone could see or agree with.
+ * M8 asked for a scoreboard and this project had no scoring rule: nothing in `@civts/core` ranked
+ * players, and inventing a points formula in the UI would have been a **game rule living in the
+ * presentation layer** — the exact thing this package's hard rule forbids — and a rule no test, no
+ * AI and no future milestone could see or agree with. So the column was left out and the reason was
+ * written down here.
  *
- * So the table reports what the engine *does* know, as counts and totals read straight off
- * the state: cities, units, population, treasury, techs, beakers. Every figure is a direct
- * read (a `length`, a `sum`, a stored field) with no weighting, no rounding and no formula.
- * When M10 gives scoring a home, the column arrives from there.
+ * M10 landed `score.ts`: five weighted terms over population, cities, techs, culture and wonders,
+ * with the weights in the catalog. `scoreTable(state, ruleset)` is the **one** scoring function in
+ * the engine, and it is also what the score victory condition reads through `highestScore` — so the
+ * figure in this table and the figure that decides the game cannot disagree, which is the same
+ * "one computation, two readers" discipline `cityYields` and `happinessOf` follow. The UI computes
+ * no weighted sum of its own; it prints the engine's number.
  *
- * ## Totals are sums of engine values, not new rules
+ * ## Everything else is still a direct read
  *
- * Population is the sum of the player's cities' `population`; the unit count sums the units
- * that player owns. Both are arithmetic over stored fields — the same kind of reading
- * `textview.ts` does — and neither consults terrain, buildings or the catalog.
+ * The remaining columns report what the engine *does* know, as counts and totals read straight off
+ * the state: cities, units, population, treasury, techs, beakers. Every figure is a direct read (a
+ * `length`, a `sum`, a stored field) with no weighting, no rounding and no formula.
  */
 
-import { civPlayers, type GameState, type PlayerId } from '@civts/core';
+import {
+  civPlayers,
+  scoreTable,
+  type GameState,
+  type PlayerId,
+  type RulesetView,
+} from '@civts/core';
 import type { PanelContext } from './index.js';
 
 /** One row of the scoreboard. */
@@ -36,6 +45,8 @@ export interface ScoreRow {
   readonly treasury: number;
   readonly techs: number;
   readonly beakers: number;
+  /** The engine's own score — `scoreTable`, the same number the score victory reads. */
+  readonly score: number;
 }
 
 /**
@@ -45,9 +56,17 @@ export interface ScoreRow {
  * `treasury` and an `explored` row: one shape for every player, and a scoreboard that
  * silently omitted a player with units on the map would be a table that disagrees with the
  * world it describes.
+ *
+ * `scoreTable` answers one row per player in the same id order, so the lookup below is total for
+ * every state this function is handed; the `?? 0` is the reading a value the table did not carry
+ * gets — the same total reading `score.ts` gives a missing field, rather than a screen that
+ * throws on a hand-built state.
  */
-export const scoreboardRows = (state: GameState): readonly ScoreRow[] =>
-  state.players.map((player) => {
+export const scoreboardRows = (state: GameState, ruleset: RulesetView): readonly ScoreRow[] => {
+  const scores = new Map<number, number>(
+    scoreTable(state, ruleset).map((row) => [Number(row.playerId), row.score]),
+  );
+  return state.players.map((player) => {
     const cities = state.cities.filter((city) => city.owner === player.id);
     return {
       id: player.id,
@@ -59,13 +78,15 @@ export const scoreboardRows = (state: GameState): readonly ScoreRow[] =>
       treasury: player.treasury,
       techs: player.techs.length,
       beakers: player.beakers,
+      score: scores.get(Number(player.id)) ?? 0,
     };
   });
+};
 
 /** The civilizations only — the rows a player can actually be on the scoreboard with. */
-export const civilizationRows = (state: GameState): readonly ScoreRow[] => {
+export const civilizationRows = (state: GameState, ruleset: RulesetView): readonly ScoreRow[] => {
   const civs = new Set<number>(civPlayers(state).map((player) => Number(player.id)));
-  return scoreboardRows(state).filter((row) => civs.has(Number(row.id)));
+  return scoreboardRows(state, ruleset).filter((row) => civs.has(Number(row.id)));
 };
 
 /* ------------------------------------------------------------------ *
@@ -80,6 +101,7 @@ const COLUMNS = [
   'Treasury',
   'Techs',
   'Beakers',
+  'Score',
 ] as const;
 
 const el = <K extends keyof HTMLElementTagNameMap>(
@@ -127,7 +149,7 @@ export const mountScoreboard = (parent: HTMLElement, ctx: PanelContext): Scorebo
   const refresh = (): void => {
     const state = ctx.api.state();
     body.replaceChildren();
-    for (const row of scoreboardRows(state)) {
+    for (const row of scoreboardRows(state, ctx.api.ruleset)) {
       const tr = el(doc, 'tr');
       const values: readonly string[] = [
         row.player,
@@ -137,6 +159,9 @@ export const mountScoreboard = (parent: HTMLElement, ctx: PanelContext): Scorebo
         String(row.treasury),
         String(row.techs),
         String(row.beakers),
+        // The engine's own score — `scoreTable`, never a sum computed here. `String` is a
+        // presentation of the number, not a second derivation of it.
+        String(row.score),
       ];
       for (const value of values) tr.append(el(doc, 'td', value));
       body.append(tr);

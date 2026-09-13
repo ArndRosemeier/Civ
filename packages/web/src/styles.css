@@ -286,6 +286,39 @@ dialog::backdrop {
 }
 
 /*
+ * The government row (M9), beside the rates it caps: the same shape as the rates row, so the two
+ * player-level setters read as one region rather than two unrelated controls.
+ */
+[data-panel='government'] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  width: 100%;
+  border: 1px solid #2b333d;
+}
+
+[data-panel='government'] [role='status'] {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+/*
+ * The victory/defeat screen (M10). It is a `dialog` like the city, tech and debug panels, so it
+ * inherits the docked layout above; this only makes the end of a game read as an end — a larger
+ * heading with the summary line quiet beneath it. Nothing here is a rule: the words are
+ * `victory.ts`', and the figure is the engine's.
+ */
+[data-panel='outcome-dialog'] h2 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+[data-panel='outcome-dialog'] p {
+  margin: 0 0 8px;
+}
+
+/*
  * The log's own list numbering has to fit inside the box.
  *
  * `padding-left` was 22px, which holds a one-digit marker and nothing wider: `overflow: auto` clips

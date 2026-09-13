@@ -142,13 +142,14 @@ const LISTED_COMMANDS = new Set([
  *
  * Each one is a command the engine accepts and no generator enumerates, so a missing control for
  * one is a keystone gap ("every action the engine accepts for a unit or city must be reachable
- * from the UI") that only a sweep like that one can see. All three are exercised there: the city
- * screen's worked-tile checkboxes (`SetWorkedTiles`), the tech tree's rows (`SetResearch`) and the
- * status strip's rates control (`SetRates`). `FortifyUnit` is deliberately *not* here — its control
- * is a unit order, and the offered-direction sweep in this same file clicks it through
- * `Abilities for unit <id>`.
+ * from the UI") that only a sweep like that one can see. All four are exercised there: the city
+ * screen's worked-tile checkboxes (`SetWorkedTiles`), the tech tree's rows (`SetResearch`), the
+ * status strip's rates control (`SetRates`) and — M9 — the government selector beside it
+ * (`SetGovernment`, whose rows are the catalog and whose judge is `planSetGovernment`).
+ * `FortifyUnit` is deliberately *not* here — its control is a unit order, and the offered-direction
+ * sweep in this same file clicks it through `Abilities for unit <id>`.
  */
-const QUERIED_SETTERS = ['SetRates', 'SetResearch', 'SetWorkedTiles'] as const;
+const QUERIED_SETTERS = ['SetRates', 'SetResearch', 'SetWorkedTiles', 'SetGovernment'] as const;
 
 /** A cap, so a sweep over a page that grows as it is clicked still terminates. */
 const MAX_SWEEP_CLICKS = 120;
@@ -765,7 +766,7 @@ test('adversarial keystone — the queried setters: every setter the engine acce
   expect(started.ok, 'the engine could not start the same game headlessly').toBe(true);
   if (started.ok) {
     expect(
-      planSetRates(started.value, owner, { tax: 5, science: 5, luxury: 0 }).ok,
+      planSetRates(started.value, RULESET, owner, { tax: 5, science: 5, luxury: 0 }).ok,
       'the engine refused a legal rates triple, so nothing below would prove anything',
     ).toBe(true);
 
@@ -792,6 +793,34 @@ test('adversarial keystone — the queried setters: every setter the engine acce
     ).toBe(true);
     for (const entry of ratesDispatched) {
       records.push({ where: 'status strip', label: 'Set rates', action: entry.action });
+    }
+
+    /* --- SetGovernment: reachable, through M9's government selector --- */
+
+    // The selector lists `governmentCatalog`'s rows and lets `planSetGovernment` — the evaluator
+    // `applyCommand` refuses with — judge the click, so a control it enables is a command the
+    // applier accepts. This is the same guard the `Set rates` block above applies, one panel over.
+    const governmentButton = page.getByRole('button', { name: /^Set government$/ });
+    expect(
+      await governmentButton.count(),
+      'no `Set government` control exists, so "SetGovernment is reachable" would be vacuous',
+    ).toBeGreaterThan(0);
+    await clearDispatchLog(page);
+    await governmentButton.first().click();
+    const governmentDispatched = (await dispatchLog(page)).filter(
+      (entry) => actionType(entry.action) === 'SetGovernment',
+    );
+    expect(
+      governmentDispatched.length,
+      'the `Set government` control dispatched no SetGovernment command at all',
+    ).toBeGreaterThan(0);
+    expect(
+      governmentDispatched.every((entry) => entry.result === 'ok'),
+      'the `Set government` control dispatched a SetGovernment the engine refused, which is the ' +
+        'keystone property broken at this panel',
+    ).toBe(true);
+    for (const entry of governmentDispatched) {
+      records.push({ where: 'status strip', label: 'Set government', action: entry.action });
     }
 
     const reached = new Set(records.map((record) => actionType(record.action)));

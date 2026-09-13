@@ -15,6 +15,7 @@ import {
   DEFAULT_SETTINGS,
   asBuildingId,
   asCityId,
+  asGovernmentId,
   asImprovementId,
   asPlayerId,
   asResourceId,
@@ -192,6 +193,28 @@ const SAMPLES: { readonly [K in GameEvent['type']]: Extract<GameEvent, { readonl
     population: 1,
     destroyed: [asBuildingId('granary')],
   },
+  // M9: the three new members. They are samples rather than fixtures with meaning — the
+  // assertions below are about the *log line*, and this file's whole point is that every
+  // member has one.
+  CityCultureGrew: {
+    type: 'CityCultureGrew',
+    cityId: asCityId(0),
+    owner: asPlayerId(0),
+    gain: 1,
+  },
+  CityCultureGained: {
+    type: 'CityCultureGained',
+    cityId: asCityId(0),
+    owner: asPlayerId(0),
+    bonus: 10,
+    building: asBuildingId('pyramids'),
+  },
+  GovernmentChanged: {
+    type: 'GovernmentChanged',
+    playerId: asPlayerId(0),
+    from: asGovernmentId('despotism'),
+    to: asGovernmentId('monarchy'),
+  },
 };
 
 const ctx = { state: STATE, ruleset: RULESET };
@@ -209,7 +232,20 @@ describe('eventLine', () => {
 
   it('covers every member, and no two members render the same line', () => {
     const lines = Object.values(SAMPLES).map((event) => eventLine(event, ctx));
-    expect(lines).toHaveLength(20);
+    // The count is **derived from the union**, never written down. `SAMPLES` is a mapped type over
+    // `GameEvent['type']`, so its keys are exactly that union's members: a member with no sample is
+    // a compile error above, and a sample for a member the engine does not have is an
+    // excess-property error — which makes `Object.keys(SAMPLES).length` the size of the union and
+    // nothing else. It used to be the literal `20`, and M9 moved it: the engine grew
+    // `CityCultureGrew`, `CityCultureGained` and `GovernmentChanged`, this file grew a sample for
+    // each (as the mapped type forces), and the literal reported
+    // `expected [ …(23) ] to have a length of 20` — a failure that named the count and said nothing
+    // about which member was uncovered, which is exactly the drift the derived number removes.
+    expect(lines).toHaveLength(Object.keys(SAMPLES).length);
+    // …and it is not vacuous: the union is larger than the twenty members M8 froze. This is the one
+    // honest floor, and it is a floor rather than an equality so a new member still needs only a
+    // sample — not an edit here as well.
+    expect(lines.length).toBeGreaterThan(20);
     expect(new Set(lines).size).toBe(lines.length);
   });
 

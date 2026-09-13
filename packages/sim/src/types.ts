@@ -42,6 +42,7 @@ import type {
   BuildingEffect,
   Command,
   GameEvent,
+  GameOutcome,
   GameState,
   ImprovementKind,
   PlayerId,
@@ -170,7 +171,18 @@ export interface PolicyContext {
  * ------------------------------------------------------------------ */
 
 /** Why a run stopped. Part of `SimulationResult`, named so callers can match on it. */
-export type StopReason = 'max-turns' | 'violation' | 'no-commands';
+/**
+ * Why a run stopped.
+ *
+ * `'game-over'` is M10's addition, and it is a **success**, not a failure: a run that
+ * reaches a victory condition stops there because the engine refuses to play a finished
+ * game (see `turn.ts` on the early return and `finished-game-does-not-advance` in
+ * `@civts/sim`'s registry). Before M10 an ended game was reported as `'no-commands'` —
+ * every command refused with `game-over`, so no command applied — which described the
+ * *symptom* and hid the fact that the run had produced a winner. It exists so a batch can
+ * say how many games ended and how.
+ */
+export type StopReason = 'max-turns' | 'violation' | 'no-commands' | 'game-over';
 
 export interface SimulationOptions {
   readonly seed: number;
@@ -233,6 +245,19 @@ export interface SimulationResult {
    */
   readonly plannerFailures: readonly PlannerFailure[];
   readonly stoppedBecause: StopReason;
+  /**
+   * **How the game ended**, read from the final state through `gameOutcomeOf` (M10).
+   *
+   * `undefined` — the key omitted, never written as `undefined` — means the game was
+   * still in play when the run stopped, which is the normal outcome of a turn-limited
+   * run. It is derived on the read rather than stored during the run for the contract's
+   * own reason: an outcome is "a DERIVED value on the result/state read, never a stored
+   * flag that can disagree with the board", and the final state is right here.
+   *
+   * The `turn` is the state's own turn, the same convention every other row in this file
+   * follows, so "the game ended on turn 14" is checkable against `finalState.turn`.
+   */
+  readonly outcome?: GameOutcome;
 }
 
 /* ------------------------------------------------------------------ *
@@ -329,10 +354,22 @@ export interface MetricAggregate {
   readonly max: number;
 }
 
-/** One victory outcome and how many seeds reached it. */
+/**
+ * One victory outcome and how many seeds reached it.
+ *
+ * M10 fills this in. It was declared for M5 with the note that the key was *absent* while
+ * the engine had no victory condition — "a `wins: []` would claim victories were counted
+ * and none happened" — and that is now false in the other direction: there are four
+ * conditions, so a batch that reported no wins would be hiding them.
+ *
+ * `outcome` is the **condition id**, not a prose label, so a consumer counting these is
+ * counting the same vocabulary `GameOutcome.condition` uses. `winner` is the seat, so
+ * "who won" is answerable without walking the runs.
+ */
 export interface WinCount {
   readonly outcome: string;
   readonly count: number;
+  readonly winner: PlayerId | null;
 }
 
 export interface BatchOptions {
@@ -375,7 +412,15 @@ export type OverrideSection =
   /** M6b: the combat globals — one section, not a record of rows. See `CombatPatch`. */
   | 'combat'
   /** M7: the capture rule — the second singleton section. See `CapturePatch`. */
-  | 'capture';
+  | 'capture'
+  /** M9: the culture and contentment model — the third singleton section. See `CulturePatch`. */
+  | 'culture'
+  /** M9: the government rows — a *row* section, like units and buildings. See `GovernmentPatch`. */
+  | 'governments'
+  /** M10: the score weights — the fourth singleton section. See `ScorePatch`. */
+  | 'score'
+  /** M10: the victory thresholds — the fifth singleton section. See `VictoryPatch`. */
+  | 'victory';
 
 /** A partial of a yield triple: a patch may set one channel without the others. */
 export type YieldsPatch = Partial<TerrainYields>;
@@ -457,6 +502,27 @@ export interface BuildingPatch {
   readonly maintenance?: number;
   /** Replaces the effect list wholesale — a list, so a partial of it is ambiguous. */
   readonly effects?: readonly BuildingEffect[];
+  /**
+   * Culture this building gives its own city each turn (M9).
+   *
+   * Patchable because it is a magnitude the standing requirement puts in the catalog, and
+   * because a balance sweep has to be able to ask "what does the game look like if a
+   * temple is worth three culture instead of one?" — which is exactly the question the
+   * border thresholds below need answered in order to be tuned at all.
+   */
+  readonly culturePerTurn?: number;
+  /**
+   * The one-off culture this building grants on completion (M9).
+   *
+   * Patchable, and it cannot be *removed* by a patch for the reason `requiresResource`
+   * states: a `??` merge can set a value, never delete a key. That is the right
+   * limitation rather than a gap — the catalog is where "this wonder has no bonus" is
+   * decided, and a sweep that wants a wonder without one patches the bonus to a value
+   * `validateRuleset` accepts and reads the difference.
+   */
+  readonly cultureBonus?: number;
+  /** Content citizens this building makes (M9). Signed: an unhappy-making row is legal. */
+  readonly happiness?: number;
   /** `true` only. A `false` is not how this project spells "not a wonder". */
   readonly wonder?: true;
   /** The technology a city must know before it may build this (M5's gating). */
@@ -576,6 +642,141 @@ export interface CapturePatch {
 }
 
 /**
+ * **M9's culture and contentment model** — the third singleton section, and the one the
+ * border and disorder magnitudes live in.
+ *
+ * ## Six fields, and why a sweep wants all six
+ *
+ * The two border thresholds decide **when a city's reach grows**; the unhappy ladder and
+ * the three luxury magnitudes decide **when a city stops producing**. They are the two
+ * halves of one question ("what does a developed city look like?") and a sweep that could
+ * move only one of them would be measuring an incoherent game. So the patch surface names
+ * every field of the section except `provenance`.
+ *
+ * ## `unhappyThresholds` replaces the ladder wholesale
+ *
+ * A list, so a partial of it is ambiguous — the same choice `BuildingPatch.effects`
+ * makes, and for the same reason: "the ladder, with the third rung changed" is not a
+ * thing a merge can express without an index, and an index-addressed patch of a list
+ * whose *order is the rule* would let a caller write a ladder that validation refuses.
+ * A sweep that wants one rung moved restates the ladder, and `validateRuleset` checks it
+ * — ascending, non-empty, beginning at `minPopulation <= 1` — exactly as it checks a
+ * hand-written catalog's.
+ *
+ * ## The rules validation attaches
+ *
+ * `borderRadius3Culture >= borderRadius2Culture >= 0`, `luxuriesPerHappyCitizen >= 1`,
+ * `happyPerLuxuryResource >= 0`, and an ascending ladder. A patch that breaks any of them
+ * produces a catalog that **fails validation**, exactly as a hand-edited catalog would:
+ * overrides are applied *before* `validateRuleset` on purpose, so an impossible sweep
+ * value is refused rather than blessed.
+ */
+export interface CulturePatch {
+  /** The culture at which a city's borders reach radius 2. Integer `>= 0`. */
+  readonly borderRadius2Culture?: number;
+  /** The culture at which a city's borders reach radius 3. Integer `>= borderRadius2Culture`. */
+  readonly borderRadius3Culture?: number;
+  /** The size-to-unhappy ladder, **replaced wholesale**. See the note above. */
+  readonly unhappyThresholds?: readonly UnhappyThresholdPatch[];
+  /** Connected luxuries needed per content citizen. Integer `>= 1`. */
+  readonly luxuriesPerHappyCitizen?: number;
+  /** Happiness each connected luxury is worth on its own. Integer `>= 0`. */
+  readonly happyPerLuxuryResource?: number;
+}
+
+/** One rung of a patched `CulturePatch.unhappyThresholds`. */
+export interface UnhappyThresholdPatch {
+  readonly minPopulation?: number;
+  readonly unhappy?: number;
+}
+
+/**
+ * **M9's government rows** — a *row* section, patchable by id exactly as units and
+ * buildings are.
+ *
+ * ## Why a patch wants this
+ *
+ * The government table is where M4b's two economy constants now live (the `despotism`
+ * row) and where the rate caps and the happiness modifiers live. The single most
+ * interesting balance question M9 raises — "what happens if a despotism supports four
+ * units per city instead of two?" — is a one-field patch on one row, and before this
+ * surface existed the answer would have been "edit the catalog".
+ *
+ * ## `id` and `provenance` are not patchable
+ *
+ * The module-wide rule: the id is the key a row is addressed by, and provenance is
+ * authorship rather than a magnitude. `requiresTech` **is** patchable, and it can be set
+ * but never removed (a `??` merge) — a sweep may gate a government behind a tech, and
+ * un-gating one is a catalog edit. That asymmetry is stated rather than hidden, and it is
+ * the same one `UnitPatch.requiresResource` has.
+ *
+ * ## The rules validation attaches
+ *
+ * Every cap an integer in `[1, RATE_TOTAL]`, the two economy numbers integers `>= 0`, the
+ * happiness modifier an integer of either sign, and — where the row declares one — a
+ * `requiresTech` that names a tech the catalog defines. A patch that breaks any of them
+ * produces a catalog that fails validation.
+ */
+export interface GovernmentPatch {
+  readonly name?: string;
+  /** The per-slider ceilings. Partial, so a sweep may move one slider's cap. */
+  readonly rateCaps?: GovernmentRateCapsPatch;
+  /** Units supported free per city owned. Integer `>= 0`. */
+  readonly freeUnitsPerCity?: number;
+  /** Gold per turn per unit beyond the free allowance. Integer `>= 0`. */
+  readonly unitSupportCost?: number;
+  /** Added to a city's unhappy count. Signed integer. */
+  readonly happinessModifier?: number;
+  /** The technology this government requires. Set or changed, never removed. */
+  readonly requiresTech?: TechId;
+}
+
+/** A partial of a government's rate caps, so one slider may move alone. */
+export interface GovernmentRateCapsPatch {
+  readonly tax?: number;
+  readonly science?: number;
+  readonly luxury?: number;
+}
+
+/**
+ * **M10's score weights** — the fourth singleton section.
+ *
+ * Five magnitudes and no rule of their own beyond "integers `>= 0`"
+ * (`validateRuleset`'s check). A sweep patches one weight to ask "does the scoreboard
+ * still order the players the way the game played out?", which is the only question a
+ * score model can usefully be tuned against.
+ */
+export interface ScorePatch {
+  readonly perPopulation?: number;
+  readonly perCity?: number;
+  readonly perTech?: number;
+  readonly perCulture?: number;
+  readonly perWonder?: number;
+}
+
+/**
+ * **M10's victory thresholds** — the fifth singleton section, and the one a sweep will
+ * reach for first, because "where does this game end?" is the question every other
+ * balance number is measured against.
+ *
+ * Four magnitudes, each with the rule `validateRuleset` attaches: the two shares are
+ * integers in `[1, 100]`, the culture threshold is an integer `>= 1`, and the score turn
+ * is an integer `>= 1`. A patch that sets `culturalVictoryCulture` to 0 produces a catalog
+ * that **fails validation** rather than a game every player wins at turn zero.
+ *
+ * **`scoreVictoryTurn` is a catalog horizon, not an experiment's budget.** A patch that
+ * moves it changes when the score victory fires; it does not change when a *simulation*
+ * stops. `SimulationOptions.maxTurns` is the experiment's own limit, and the two are
+ * deliberately separate values that a sweep can move independently.
+ */
+export interface VictoryPatch {
+  readonly dominationLandPct?: number;
+  readonly dominationPopPct?: number;
+  readonly culturalVictoryCulture?: number;
+  readonly scoreVictoryTurn?: number;
+}
+
+/**
  * A **deep-partial of the catalog, addressed by id** — the balance knob the
  * standing requirement asks for ("every magnitude it introduces lives in the rules
  * catalog … or an explicit override").
@@ -639,4 +840,24 @@ export interface RulesetPatch {
    * capture sweep cannot be measuring a combat change by accident.
    */
   readonly capture?: CapturePatch;
+  /**
+   * M9's culture and contentment model — **partial**, so a sweep moves one border
+   * threshold and leaves the contentment ladder exactly as the catalog declares it.
+   *
+   * Added to this surface for the reason M6b added `combat` and M7 added `capture`: M9's
+   * border thresholds, unhappy ladder and luxury magnitudes are the largest block of new
+   * rules numbers this wave introduces, and a knob no sweep can turn is a knob nobody will
+   * ever tune. `overrides.test.ts` asserts field by field that moving one leaves the
+   * others untouched.
+   */
+  readonly culture?: CulturePatch;
+  /**
+   * M9's government rows — addressed **by id**, like units and buildings, because they are
+   * rows. See `GovernmentPatch`.
+   */
+  readonly governments?: Readonly<Record<string, GovernmentPatch>>;
+  /** M10's score weights — partial, one weight at a time. See `ScorePatch`. */
+  readonly score?: ScorePatch;
+  /** M10's victory thresholds — partial, one threshold at a time. See `VictoryPatch`. */
+  readonly victory?: VictoryPatch;
 }

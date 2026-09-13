@@ -84,20 +84,32 @@
 import {
   IMPROVEMENT_KINDS,
   MIN_GROWTH_FOOD,
-  UNIT_SUPPORT_COST,
+  RATE_TOTAL,
+  UNOWNED,
+  asPlayerId,
   captureRulesOf,
   cityAt,
   cityRadius,
   cityYields,
+  cityYieldsIgnoringDisorder,
+  claimedRadius,
   combatRulesOf,
+  cultureRulesOf,
   compareTileResources,
+  computeTileOwner,
+  distance8,
   foodBoxSize,
+  gameOutcomeOf,
+  governmentCatalog,
+  isDisordered,
   hitPointsLeftOf,
   itemCost,
   maxHitPointsOf,
   neighbors8,
+  rateCapsOf,
   unitById,
   unitDef,
+  unitSupportCost,
   unitsOnTile,
   type BuildingDef,
   type BuildingId,
@@ -1646,10 +1658,25 @@ const goldConservation = (ctx: InvariantContext): readonly string[] => {
     }
   }
   for (const event of disbands) {
-    if (!(event.saved >= 0) || event.saved > UNIT_SUPPORT_COST) {
+    // M9: **one unit's removal saves that unit's cost under *its owner's* government**, so
+    // the bound is read from the government row rather than from a module constant. The
+    // player is looked up in the previous state (the disband happened during the step that
+    // produced `ctx.state`, and `previous` is the state the event was computed against);
+    // an unknown player is reported as such rather than compared against a guess.
+    const owner = previous.players.find((candidate) => candidate.id === event.playerId);
+    if (owner === undefined) {
+      problems.push(
+        `UnitDisbanded names player ${String(event.playerId)}, which the previous state does ` +
+          `not contain; a disband is charged to a player`,
+      );
+      continue;
+    }
+    const perUnit = unitSupportCost(ctx.ruleset, owner);
+    if (!(event.saved >= 0) || event.saved > perUnit) {
       problems.push(
         `disbanding unit ${String(event.unitId)} reports saving ${String(event.saved)} gold, ` +
-          `outside [0, ${String(UNIT_SUPPORT_COST)}] — one unit's removal saves one unit's support`,
+          `outside [0, ${String(perUnit)}] — one unit's removal saves one unit's support, and ` +
+          `that is what ${owner.government} charges per unit beyond the free allowance`,
       );
     }
     if (ctx.state.units.some((unit) => unit.id === event.unitId)) {
@@ -2329,6 +2356,419 @@ const placementBlocked = (state: GameState, city: City): boolean => {
 };
 
 /* ------------------------------------------------------------------ *
+ * M9+M10: borders, governments, happiness, culture, victory
+ * ------------------------------------------------------------------ */
+
+/**
+ * `tile-owner-matches-culture` — **the headline M9 invariant**: the materialised
+ * ownership layer is exactly the one `computeTileOwner` derives from the cities and
+ * their culture.
+ *
+ * The contract is explicit that ownership is "recomputed from culture every turn (a
+ * pure function of cities + culture), NOT accumulated incrementally — a derived value
+ * that is also stored is a value that can drift". `tileOwner` *is* stored, because
+ * rendering and the worked-tile rule need it without a recomputation, so the thing
+ * that can drift is the stored copy. This check is the pair: it recomputes the pure
+ * function and compares, element by element, so a `withOwnership` call that was
+ * forgotten at one of its call sites (a new command that moves a city, a capture that
+ * forgot to clear the previous owner's tiles) is caught on the turn it happens rather
+ * than by a player noticing a border that never shrank.
+ *
+ * ## The one case that is not a violation
+ *
+ * A state with **no cities and an unmaterialised layer** (`tileOwner.length === 0`)
+ * claims nothing and stores nothing, and the two agree trivially — `computeTileOwner`
+ * would return a layer of `UNOWNED`. Hand-built fixtures in other packages are exactly
+ * this state (a board made by placing units, before any city exists), and calling them
+ * broken would be this check inventing a rule the engine does not have. A layer of the
+ * **wrong length** is a different matter: the contract fixes it at `width * height`, so
+ * a non-empty layer of any other length is reported.
+ */
+const tileOwnerMatchesCulture = (ctx: InvariantContext): readonly string[] => {
+  const expected = computeTileOwner(ctx.state, ctx.rulesetView);
+  const actual = ctx.state.tileOwner;
+
+  if (actual.length === 0 && ctx.state.cities.length === 0) return [];
+  if (actual.length !== expected.length) {
+    return [
+      `the ownership layer has ${String(actual.length)} entries and the map is ` +
+        `${String(ctx.state.map.width)}x${String(ctx.state.map.height)} ` +
+        `(${String(expected.length)} tiles); the contract fixes the layer at one entry per tile`,
+    ];
+  }
+
+  const problems: string[] = [];
+  for (let tile = 0; tile < expected.length; tile += 1) {
+    const stored = wholeNumber(actual[tile]);
+    const derived = expected[tile];
+    if (stored === derived) continue;
+    // One line per disagreeing tile, and the first few carry the whole story; a
+    // hundred identical lines would bury the tile that is different from the rest.
+    if (problems.length >= 8) {
+      problems.push('… and more tiles disagree; the layer is not the one culture derives');
+      break;
+    }
+    problems.push(
+      `tile ${String(tile)} is owned by ${stored === undefined ? 'a non-number' : String(stored)} ` +
+        `in the stored layer and by ${derived === undefined ? 'nothing derivable' : String(derived)} ` +
+        'when recomputed from the cities and their culture — ownership is a pure function of ' +
+        'culture and the stored copy has drifted from it',
+    );
+  }
+  return problems;
+};
+
+/**
+ * `tile-owner-names-a-real-player` — every claim in the layer is either `UNOWNED` or a
+ * player this state has.
+ *
+ * The contract says the layer's values are "`-1` for unowned and any other value a
+ * `PlayerId`". A layer naming a player who does not exist is a border with no player
+ * behind it — a tint that would render, a worked-tile refusal that would fire against
+ * nobody — and it is the shape a stale layer from a *different* game produces.
+ */
+const tileOwnerNamesARealPlayer = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  const seen = new Set<number>();
+  for (const value of ctx.state.tileOwner) {
+    const owner = wholeNumber(value);
+    if (owner === undefined || owner === UNOWNED || seen.has(owner)) continue;
+    seen.add(owner);
+    if (!playerExists(ctx.state, asPlayerId(owner))) {
+      problems.push(
+        `the ownership layer claims tile(s) for player ${String(owner)}, who is not in ` +
+          `state.players; a border must belong to a player the state has`,
+      );
+    }
+  }
+  return problems;
+};
+
+/**
+ * `tile-owned-by-a-city-in-range` — **no player owns a tile no city of theirs claims**.
+ *
+ * This is the contract's own words: "a tile owned by a player with no city in range is
+ * a state no command can produce and must be impossible". It is the weaker, per-player
+ * reading of the headline check on purpose, and it is worth having separately because it
+ * is the one that survives a **wrong radius**: if the radius table were misread, the
+ * stored layer and the recomputation would agree with each other (both wrong) and the
+ * headline check would stay silent, while this one still asks the question a player
+ * asks — "why is this tile mine when none of my cities is near it?".
+ */
+const tileOwnedByACityInRange = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  const seen = new Set<number>();
+  for (let tile = 0; tile < ctx.state.tileOwner.length; tile += 1) {
+    const owner = wholeNumber(ctx.state.tileOwner[tile]);
+    if (owner === undefined || owner === UNOWNED || seen.has(tile)) continue;
+    const claimants = ctx.state.cities.filter((city) => {
+      if (city.owner !== owner) return false;
+      const radius = claimedRadius(cultureRulesOf(ctx.rulesetView), city.culture);
+      if (radius <= 0) return false;
+      return distance8(ctx.state.map, tile, city.tile) <= radius;
+    });
+    if (claimants.length === 0) {
+      seen.add(tile);
+      problems.push(
+        `tile ${String(tile)} is owned by player ${String(owner)}, and no city of theirs has ` +
+          'it inside its culture radius — the contract calls that state impossible',
+      );
+    }
+  }
+  return problems;
+};
+
+/**
+ * `government-is-in-catalog` — every player's `government` names a row of this
+ * ruleset's `governments` section.
+ *
+ * `PlayerState.government` is **required** and is read on every rate change, every
+ * upkeep payment and every happiness computation. `governmentOf` is deliberately total
+ * (an unknown id falls back to the default government so a corrupt save is *reported*
+ * rather than crashed on), which means the fallback can hide a broken id for as long as
+ * nobody asks. This is the check that asks.
+ *
+ * A ruleset with no `governments` section stamps every player with the empty id — that
+ * is `NO_GOVERNMENT`, and it is not a catalog row. It is reported here rather than
+ * excused, because a run under such a ruleset is a run whose money loop, rate caps and
+ * happiness all came from a default nobody declared.
+ */
+const governmentIsInCatalog = (ctx: InvariantContext): readonly string[] => {
+  const catalog = governmentCatalog(ctx.rulesetView);
+  if (catalog.length === 0) {
+    return [
+      'this ruleset declares no governments, so every player plays under a default that is ' +
+        'not a catalog row — the contract requires at least despotism, monarchy and republic',
+    ];
+  }
+  const problems: string[] = [];
+  for (const player of ctx.state.players) {
+    if (player.kind !== 'civ') continue;
+    if (catalog.some((row) => row.id === player.government)) continue;
+    problems.push(
+      `player ${String(player.id)} has government ${JSON.stringify(player.government)}, which ` +
+        `is not a row of this ruleset's governments (${catalog
+          .map((row) => JSON.stringify(row.id))
+          .join(', ')})`,
+    );
+  }
+  return problems;
+};
+
+/**
+ * `rates-within-government-caps` — every player's current rates respect the caps of
+ * their own government.
+ *
+ * `SetRates` clamps against the caps, so the *command* is checked; this is the same
+ * claim about the *state*, which is the half that catches a government change. Switching
+ * from a government that allows `8/2/0` to one that caps tax at 6 leaves illegal rates
+ * in place unless the transition re-clamps them, and the contract's own words for the
+ * government command are "effects, all read from the spec and applied in one place".
+ *
+ * Also checks the sum, because `RATE_TOTAL` is the other half of the rate rule and a
+ * stored triple that does not sum to it can only come from a state this engine did not
+ * build.
+ */
+const ratesWithinGovernmentCaps = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  for (const player of ctx.state.players) {
+    if (player.kind !== 'civ') continue;
+    const caps = rateCapsOf(ctx.rulesetView, player);
+    const rates = player.rates;
+    const total = rates.tax + rates.science + rates.luxury;
+    if (total !== RATE_TOTAL) {
+      problems.push(
+        `player ${String(player.id)} has rates ${String(rates.tax)}/${String(rates.science)}/` +
+          `${String(rates.luxury)}, summing to ${String(total)} rather than RATE_TOTAL ` +
+          String(RATE_TOTAL),
+      );
+      continue;
+    }
+    for (const channel of ['tax', 'science', 'luxury'] as const) {
+      if (rates[channel] <= caps[channel]) continue;
+      problems.push(
+        `player ${String(player.id)} has ${channel} at ${String(rates[channel])}, above the ` +
+          `${String(caps[channel])} its government caps that channel at`,
+      );
+    }
+  }
+  return problems;
+};
+
+/**
+ * `city-culture-non-negative-and-integral` — accumulated culture is a whole number that
+ * never went below zero.
+ *
+ * `City.culture` is the input to the radius table, to the cultural victory total and to
+ * the score. It is described as "accumulated, integer, never decreases", so a negative
+ * or fractional value is a state no rule produces; and with a `previous` snapshot this
+ * also checks the monotonic half — culture may go UP by any amount (a wonder's one-off
+ * bonus lands the turn it completes) but never down, in this or any later milestone.
+ */
+const cityCultureNonNegativeAndIntegral = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  for (const city of ctx.state.cities) {
+    const culture = wholeNumber(city.culture);
+    if (culture === undefined) {
+      problems.push(
+        `city ${String(city.id)} (${city.name}) has culture ${String(city.culture)}, which is ` +
+          'not a whole number',
+      );
+      continue;
+    }
+    if (culture < 0) {
+      problems.push(
+        `city ${String(city.id)} (${city.name}) has negative culture (${String(culture)}); ` +
+          'culture accumulates and never decreases',
+      );
+      continue;
+    }
+    if (ctx.previous === undefined) continue;
+    const before = ctx.previous.cities.find((each) => each.id === city.id);
+    if (before === undefined) continue;
+    const was = wholeNumber(before.culture);
+    if (was === undefined || culture >= was) continue;
+    problems.push(
+      `city ${String(city.id)} (${city.name}) went from ${String(was)} culture to ` +
+        `${String(culture)} between two snapshots; culture accumulates and never decreases`,
+    );
+  }
+  return problems;
+};
+
+/*
+ * **`happiness-counts-add-up` was designed, implemented, and then removed — and the
+ * measurement is the reason.**
+ *
+ * The invariant claimed that a city's happy + content + unhappy citizens are exactly its
+ * population. That sentence is a tautology about a *pure* function (`happinessOf` derives all
+ * three from the city and its owner), so no corruption of a state could ever make it fail —
+ * and the solution the other derived predicates took, a transition invariant, does not apply
+ * either, because there is no stored copy to drift.
+ *
+ * Worse, the equality it claimed is **false on real play**, which is how it was found: the
+ * full tier's 200-seed sweep reported it at turns 9, 14 and 14. `happiness.ts` floors
+ * `content` at zero (`content = max(0, population - unhappy - happy)`), so a city whose happy
+ * and unhappy counts *overlap* — a small city with a large luxury purse — sums to more than
+ * its population by design. The registered predicate asserted the stronger reading, and a
+ * check that fires on correct play is worse than no check: it trains a reader to ignore the
+ * harness.
+ *
+ * What the contract actually asks for around happiness is the *disorder* rule —
+ * "if unhappy > happy, the city is in civil disorder — it produces no shields, no beakers and
+ * no gold that turn, growth food is not accumulated" — and that is `disorder-zeroes-the-yields`
+ * below, which is a claim about a **turn** rather than about a derivation, and is proved
+ * firable by the corruption battery. The split's own arithmetic is covered where it belongs:
+ * `m9-m10-adversarial.test.ts` section 3 compares the three counts against the population in
+ * both the partitioning and the overlapping case, and section 7 checks the panel's readouts
+ * against `happinessOf` directly.
+ */
+/**
+ * `disorder-zeroes-the-yields` — **a disordered city really produces nothing**: no
+ * shields, no beakers, no gold, and no growth food.
+ *
+ * This is the contract's "Disorder is real" sentence expressed as a check rather than as
+ * a comment, and it is a *consistency* check rather than a prohibition: `isDisordered`
+ * is the engine's own one verdict, and any reader of yields must agree with it. The
+ * check compares the engine's two reads of the same city — `cityYields`, which is what
+ * the production, growth and money steps consume, and `cityYieldsIgnoringDisorder`,
+ * which is what the number would be if the city were content — so it catches both
+ * directions of the mistake: a disorder verdict that failed to zero a channel (the city
+ * produces while in revolt) and a zeroing that happened without the verdict (a
+ * content city starved for no reason).
+ *
+ * **It is deliberately not "no disordered city may exist".** A city in disorder is a
+ * legal, reachable, and sometimes *correct* state — it is what a policy that never
+ * builds a temple produces. What must never happen is a disordered city that still
+ * produces, and that is what is checked.
+ */
+const disorderZeroesTheYields = (ctx: InvariantContext): readonly string[] => {
+  const problems: string[] = [];
+  for (const city of ctx.state.cities) {
+    const disordered = isDisordered(ctx.state, ctx.rulesetView, city.id);
+    const raw = cityYieldsIgnoringDisorder(ctx.state, ctx.rulesetView, city.id);
+    const effective = cityYields(ctx.state, ctx.rulesetView, city.id);
+    const label = `city ${String(city.id)} (${city.name})`;
+
+    if (!disordered) {
+      if (
+        effective.shields !== raw.shields ||
+        effective.commerce !== raw.commerce ||
+        effective.foodSurplus !== raw.foodSurplus
+      ) {
+        problems.push(
+          `${label} is NOT in disorder (the engine's own verdict), and its yields are ` +
+            `${String(effective.shields)} shields / ${String(effective.commerce)} commerce / ` +
+            `${String(effective.foodSurplus)} food surplus against ` +
+            `${String(raw.shields)} / ${String(raw.commerce)} / ${String(raw.foodSurplus)} ` +
+            'before the disorder rule — a content city may not be starved',
+        );
+      }
+      continue;
+    }
+
+    if (effective.shields !== 0 || effective.commerce !== 0 || effective.foodSurplus !== 0) {
+      problems.push(
+        `${label} is in CIVIL DISORDER and still yields ${String(effective.shields)} shields, ` +
+          `${String(effective.commerce)} commerce and ${String(effective.foodSurplus)} food ` +
+          'surplus; the contract says a disordered city produces no shields, no beakers, no ' +
+          'gold and accumulates no growth food',
+      );
+    }
+
+    // **The transition half, and the one that can actually fail.** The comparison above is
+    // between two pure functions of the same state, so no state corruption can break it —
+    // it states the rule, it cannot detect a drift. What CAN drift is the *stored*
+    // consequence: a city that was in disorder at the previous boundary and is still in
+    // disorder now must not have banked anything in between. `shields` and `foodBox` are
+    // the two accumulators the pipeline writes, so this is production and growth being
+    // checked against the verdict that is supposed to have stopped them.
+    //
+    // The preconditions are deliberately narrow, because a false alarm stops a run:
+    //
+    //   - **disordered on BOTH sides of the boundary.** A city that became disordered
+    //     during the turn has a legitimate reason to have banked shields before that
+    //     happened (a temple lost to bankruptcy at the money step, which runs after
+    //     production, is the real case), and a city that was cured during the turn
+    //     legitimately produced the turn it was cured.
+    //   - the city exists in both snapshots, and the previous culture read is a whole
+    //     number.
+    //
+    // A city in disorder in both snapshots is stuck: no surplus, so no growth; no
+    // shields, so nothing banks; and the only thing that could change in between is a
+    // command, none of which adds shields.
+    if (ctx.previous === undefined) continue;
+    const before = ctx.previous.cities.find((each) => each.id === city.id);
+    if (before === undefined) continue;
+    if (!isDisordered(ctx.previous, ctx.rulesetView, city.id)) continue;
+    const bankedBefore = wholeNumber(before.shields);
+    const boxBefore = wholeNumber(before.foodBox);
+    if (bankedBefore !== undefined && city.shields > bankedBefore) {
+      problems.push(
+        `${label} was in disorder at both ends of the turn and banked ` +
+          `${String(city.shields - bankedBefore)} shields (${String(bankedBefore)} -> ` +
+          `${String(city.shields)}); a city in civil disorder produces no shields`,
+      );
+    }
+    if (boxBefore !== undefined && city.foodBox > boxBefore) {
+      problems.push(
+        `${label} was in disorder at both ends of the turn and its food box grew ` +
+          `(${String(boxBefore)} -> ${String(city.foodBox)}); a city in civil disorder ` +
+          'accumulates no growth food',
+      );
+    }
+    // Food itself is NOT zeroed: disorder does not starve the citizens that are already
+    // there, it stops the box filling. The check states that too, so a future "fix" that
+    // zeroed food would be a violation rather than a silent behaviour change.
+    if (effective.food !== raw.food) {
+      problems.push(
+        `${label} is in disorder and its raw food changed from ${String(raw.food)} to ` +
+          `${String(effective.food)}; disorder stops growth food accumulating, it does not ` +
+          'take food away',
+      );
+    }
+  }
+  return problems;
+};
+
+/**
+ * `finished-game-does-not-advance` — **a game that was already over is not played on.**
+ *
+ * The contract's words are "a finished game REFUSES further commands with a typed error,
+ * which is the difference between a victory screen and a game that keeps playing behind
+ * it", and `turn.ts` implements it as an early return: a turn applied to a state whose
+ * `gameOutcomeOf` is non-null returns the state unchanged and emits nothing. This check is
+ * that early return, asked from outside — if it is ever removed, or a step is added above
+ * it, the turn counter moves and this invariant says so.
+ *
+ * ## Why the verdict is a *transition* and not a shape
+ *
+ * `GameOutcome` is derived on purpose ("never a stored flag that can disagree with the
+ * board"), so there is no stored field a state corruption could make inconsistent: any
+ * state's outcome is whatever the pure function says it is, and it always agrees with
+ * itself. What a corrupted state *can* show is a game that was over and then advanced,
+ * which is exactly the failure mode the early return exists to prevent — so `previous` is
+ * the half that carries the claim, and there is deliberately no shape-only sibling.
+ *
+ * The precondition is `previous` being finished and the turn having moved. **It does not
+ * fire on the turn the game is won**: `previous` is then still in play, and the transition
+ * that ends a game is a legal one.
+ */
+const finishedGameDoesNotAdvance = (ctx: InvariantContext): readonly string[] => {
+  const previous = ctx.previous;
+  if (previous === undefined) return [];
+  const wasOver = gameOutcomeOf(previous, ctx.rulesetView);
+  if (wasOver === null) return [];
+  if (ctx.state.turn === previous.turn) return [];
+
+  return [
+    `the game was already decided (${wasOver.condition}) at turn ${String(previous.turn)} and ` +
+      `the turn counter still moved to ${String(ctx.state.turn)}; a finished game refuses ` +
+      'further commands and the turn loop must return it unchanged',
+  ];
+};
+
+/* ------------------------------------------------------------------ *
  * The registry
  * ------------------------------------------------------------------ */
 
@@ -2463,6 +2903,51 @@ export const CORE_INVARIANTS: readonly Invariant[] = [
     name: 'wonder-held-by-one-city',
     description: 'A wonder is held by at most one city in the world.',
     check: wonderHeldByOneCity,
+  },
+  {
+    name: 'tile-owner-matches-culture',
+    description:
+      'The stored ownership layer is exactly the one `computeTileOwner` derives from the ' +
+      'cities and their culture (M9).',
+    check: tileOwnerMatchesCulture,
+  },
+  {
+    name: 'tile-owner-names-a-real-player',
+    description: 'Every claim in the ownership layer is UNOWNED or a player this state has (M9).',
+    check: tileOwnerNamesARealPlayer,
+  },
+  {
+    name: 'tile-owned-by-a-city-in-range',
+    description:
+      'No player owns a tile outside the culture radius of one of their own cities (M9).',
+    check: tileOwnedByACityInRange,
+  },
+  {
+    name: 'government-is-in-catalog',
+    description: "Every civilization's government names a row of this ruleset (M9).",
+    check: governmentIsInCatalog,
+  },
+  {
+    name: 'rates-within-government-caps',
+    description: "Every player's rates sum to RATE_TOTAL and respect their government's caps (M9).",
+    check: ratesWithinGovernmentCaps,
+  },
+  {
+    name: 'city-culture-non-negative-and-integral',
+    description: 'Accumulated culture is a whole number that never decreased (M9).',
+    check: cityCultureNonNegativeAndIntegral,
+  },
+  {
+    name: 'disorder-zeroes-the-yields',
+    description:
+      'A disordered city produces no shields, commerce or growth food, and a content one is ' +
+      'not starved (M9).',
+    check: disorderZeroesTheYields,
+  },
+  {
+    name: 'finished-game-does-not-advance',
+    description: 'A state whose game is already over is returned unchanged by the turn loop (M10).',
+    check: finishedGameDoesNotAdvance,
   },
   {
     name: 'gold-conservation',

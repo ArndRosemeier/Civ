@@ -216,6 +216,7 @@
 
 import {
   advanceTurn,
+  gameOutcomeOf,
   applyCommand,
   civPlayers,
   newGame,
@@ -722,6 +723,20 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
     events.push(...advanced.events);
     turnsPlayed += 1;
 
+    // **M10: a decided game ends the run.** `advanceTurn` returns a finished state
+    // unchanged (see `turn.ts`), and `applyCommand` refuses every command on one with
+    // `game-over`, so a loop that kept going would spend its remaining turns polling
+    // policies whose every proposal is refused and then report `no-commands` — the
+    // symptom, not the fact. Stopping here is what makes `outcome` below the run's own
+    // ending rather than a fact the harness noticed afterwards.
+    //
+    // Checked *after* the turn rather than before it, because the condition is evaluated
+    // inside the pipeline: the turn that wins the game is a turn that was really played.
+    if (gameOutcomeOf(state, rulesetView) !== null) {
+      stopped = 'game-over';
+      break;
+    }
+
     // Sampled after the pipeline, so a row describes a fully settled turn: this
     // turn's income and upkeep ledger is in `events`, and the state is the one the
     // next turn begins from. The row's `turn` is the state's own turn, so the first
@@ -746,9 +761,21 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
     }
   }
 
-  if (stopped !== 'violation' && appliedCommands === 0) stopped = 'no-commands';
+  if (stopped !== 'violation' && stopped !== 'game-over' && appliedCommands === 0) {
+    stopped = 'no-commands';
+  }
 
-  return {
+  // The outcome is read from the final state, not accumulated during the run: it is a
+  // pure function of the board, and a second copy is a second thing that can disagree.
+  // `undefined` means the run stopped with the game still in play, and the key is then
+  // **omitted** rather than written as `undefined` (the project's hashability rule).
+  //
+  // The `kind` is built here rather than taken from `outcomeFor`, because that function
+  // answers "what does this mean for *this seat*" and a run has no seat: `victory` and
+  // `defeat` are a viewer's words. A decided run with a winner is a `victory` and one
+  // without is a `draw` — the two readings a batch can honestly report.
+  const ending = gameOutcomeOf(state, rulesetView);
+  const result: SimulationResult = {
     seed,
     turnsPlayed,
     finalHash: hashValue(state),
@@ -761,5 +788,16 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
     // reference to it.
     plannerFailures: plannerFailures.collected,
     stoppedBecause: stopped,
+  };
+  if (ending === null) return result;
+
+  return {
+    ...result,
+    outcome: {
+      kind: ending.winner === null ? 'draw' : 'victory',
+      condition: ending.condition,
+      winner: ending.winner,
+      turn: state.turn,
+    },
   };
 };

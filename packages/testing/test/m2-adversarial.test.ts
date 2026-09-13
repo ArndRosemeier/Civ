@@ -187,6 +187,7 @@ import {
   legalActions,
   neighbors8,
   newGame,
+  governmentOf,
   planSetRates,
   resolveHutEntry,
   terrainAtIndex,
@@ -344,6 +345,12 @@ const cmdKey = (cmd: Command): string => {
       return `AttackUnit ${String(cmd.unitId)} -> ${String(cmd.target)}`;
     case 'FortifyUnit':
       return `FortifyUnit ${String(cmd.unitId)}`;
+
+    // M9: the government setter, keyed by the government it names for the same M4a
+    // reason as its neighbours — two `SetGovernment`s naming different rows are
+    // different commands, and a key that dropped the id would call them equal.
+    case 'SetGovernment':
+      return `SetGovernment ${String(cmd.government)}`;
   }
 };
 
@@ -946,7 +953,7 @@ describe('keystone — the engine and the generator agree, in both directions', 
 
     const legal: Rates[] = [];
     for (const rates of triples) {
-      const planned = planSetRates(state, player.id, rates);
+      const planned = planSetRates(state, RULESET, player.id, rates);
       const applied = applyCommand(state, player.id, { type: 'SetRates', rates }, RULESET);
       // The two directions, per triple: the planner's verdict *is* the applier's.
       expect(applied.ok, rateKey(rates)).toBe(planned.ok);
@@ -978,8 +985,28 @@ describe('keystone — the engine and the generator agree, in both directions', 
     // and accepted ones, so neither half of the equality above is empty.
     expect(legal.length).toBeGreaterThan(0);
     expect(legal.length).toBeLessThan(triples.length);
-    expect(legal).toContainEqual({ tax: RATE_TOTAL, science: 0, luxury: 0 });
-    expect(legal).toContainEqual({ tax: 0, science: 0, luxury: RATE_TOTAL });
+    // **M9 moved where the corner of the legal space is, and the corner is read from the
+    // engine rather than written here.** Before M9 the only constraint was "three integers
+    // >= 0 summing to `RATE_TOTAL`", so the two extremes were `10 0 0` and `0 0 10`. A
+    // player now carries a government whose `rateCaps` clamp each share, and the shipped
+    // `despotism` caps are `{ tax: 8, science: 8, luxury: 2 }` — so `10 0 0` is refused
+    // (tax 10 > 8) and so is `0 0 10` (luxury 10 > 2). The two corners are therefore the
+    // capped ones, spelled in terms of the caps `governmentOf` reports: the first triple
+    // spends the whole budget on the two capped channels that can hold it, the second
+    // takes the science ceiling and the luxury ceiling. Deriving them means a future
+    // retune of `despotism` moves this assertion with it instead of failing it, which is
+    // the difference between a test that states the rule and one that restates a number.
+    const caps = governmentOf(RULESET, player).rateCaps;
+    expect(legal).toContainEqual({ tax: caps.tax, science: 0, luxury: caps.luxury });
+    expect(legal).toContainEqual({ tax: 0, science: caps.science, luxury: caps.luxury });
+    expect(
+      caps.tax + caps.luxury === RATE_TOTAL && caps.science + caps.luxury === RATE_TOTAL,
+      'the two corners above must be triples that sum to RATE_TOTAL',
+    ).toBe(true);
+    // …and the two triples that used to be the corners are now *refused*, which is the
+    // half that says the caps are really doing work rather than having been sidestepped.
+    expect(legal).not.toContainEqual({ tax: RATE_TOTAL, science: 0, luxury: 0 });
+    expect(legal).not.toContainEqual({ tax: 0, science: 0, luxury: RATE_TOTAL });
 
     // (b) …and the conditional generator claim (see the comment above).
     const yielded = [...legalActions(state, RULESET, player.id)].flatMap((cmd) =>
@@ -2143,8 +2170,9 @@ describe('goldens — still a real, non-vacuous gate', () => {
       'tiny-civs2-seed1337',
       'played-civs2-seed42',
       'played-civs2-seed42-combat',
+      'played-civs2-seed42-victory',
     ]);
-    expect(new Set(stored.entries.map((entry) => entry.hash)).size).toBe(GOLDEN_SEEDS.length + 2);
+    expect(new Set(stored.entries.map((entry) => entry.hash)).size).toBe(GOLDEN_SEEDS.length + 3);
     expect(
       stored.entries.every((entry) => /^[0-9a-f]{16}$/.test(entry.hash)),
       'every hash is a 16-character FNV-1a 64 digest',

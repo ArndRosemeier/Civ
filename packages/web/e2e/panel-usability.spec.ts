@@ -32,7 +32,7 @@
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-import { applyCommand, ratesProblem } from '@civts/core';
+import { RATE_TOTAL, applyCommand, planSetRates, rateCapsOf, ratesProblem } from '@civts/core';
 
 import {
   actionType,
@@ -347,11 +347,39 @@ test('X1 rates: setting the rates through the status strip moves the ENGINE’s 
 
   // A change the control did not make (a load, another seat, a command from a test) lands on
   // screen too: the panel re-reads the state rather than trusting its own last edit.
-  const elsewhere = { tax: 1, science: 1, luxury: 8 } as const;
+  //
+  // This triple USED to be `{ tax: 1, science: 1, luxury: 8 }` and it moved in M9: `planSetRates`
+  // now refuses a rate above the GOVERNMENT's own cap (`rateCapsOf`, M9's "rate caps clamp
+  // `SetRates` legality"), and every game starts under the shipped `despotism` row, whose luxury
+  // cap is 2. So 1/1/8 came back `refused` and the three assertions below stopped seeing a change
+  // at all. The replacement is not another hand-picked triple — it is asked of the engine that
+  // owns the rule: the caps come from the row the state holds, so this cannot go stale again when
+  // a catalog number moves, and `planSetRates` is consulted before the dispatch so a triple the
+  // engine would refuse fails here rather than looking like a UI defect.
+  const seat = started.value.players.find((candidate) => candidate.id === owner);
+  expect(seat, 'the headless state has no seat to read the rate caps from').toBeDefined();
+  if (seat === undefined) return;
+  const caps = rateCapsOf(RULESET, seat);
+  // Both halves of the engine's rate rule are asked of the engine rather than written down here:
+  // the sum `RATE_TOTAL` fixes, and the GOVERNMENT's own cap on each rate (`rateCapsOf`, M9 — the
+  // ceiling `planSetRates` refuses above). The largest tax allocation the caps allow, the remainder
+  // on luxury, and what is left on science sums to `RATE_TOTAL` by construction.
+  const luxury = Math.min(caps.luxury, RATE_TOTAL - caps.tax);
+  const elsewhere = {
+    tax: caps.tax,
+    luxury,
+    science: RATE_TOTAL - caps.tax - luxury,
+  } as const;
+  expect(
+    planSetRates(started.value, RULESET, owner, elsewhere).ok,
+    `the engine refuses ${String(elsewhere.tax)}/${String(elsewhere.science)}/${String(
+      elsewhere.luxury,
+    )}, which is the triple this test uses to prove the strip follows the state`,
+  ).toBe(true);
   expect(await dispatch(page, { type: 'SetRates', rates: elsewhere })).toBe('ok');
-  await expect(taxRate(page)).toHaveValue('1');
-  await expect(scienceRate(page)).toHaveValue('1');
-  await expect(luxuryRate(page)).toHaveValue('8');
+  await expect(taxRate(page)).toHaveValue(String(elsewhere.tax));
+  await expect(scienceRate(page)).toHaveValue(String(elsewhere.science));
+  await expect(luxuryRate(page)).toHaveValue(String(elsewhere.luxury));
 });
 
 test('X1 rates: an illegal triple is refused by the ENGINE, in the engine’s own words, and never dispatched', async ({

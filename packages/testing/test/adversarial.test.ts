@@ -122,6 +122,7 @@ import {
   type UnitRole,
   type UnitTypeId,
 } from '@civts/core';
+
 import { CATALOG, type TerrainSpec } from '@civts/rules';
 import { canonicalize, fnv1a64, hashValue } from '../src/index.js';
 import { goldensPath, loadGoldens } from '../src/goldens.js';
@@ -182,6 +183,23 @@ const RULESET: RulesetView = {
   // two views carry the same catalogs.
   buildings: CATALOG.buildings,
   resources: CATALOG.resources,
+  // M9+M10: the four sections the engine reads for culture, borders, governments,
+  // victory and score. They are *optional* on `RulesetView` — that is what makes an
+  // M2-M8 structural view still typecheck — so this fixture compiled without them
+  // and played under the degenerate fallbacks. The government one is the reason they
+  // have to be here rather than left off: `PlayerState.government` is a **stored,
+  // hashed** field, and the degenerate `NO_GOVERNMENT` carries the id `''` while the
+  // shipped catalog's first row is `despotism`, so a view without this section builds
+  // a state that hashes differently from the one `golden.test.ts` stores — for a
+  // reason that has nothing to do with any rule this file tests. That is the same
+  // argument the comment above makes about `resources`, applied to M9's sections.
+  //
+  // Passed through from `CATALOG` verbatim, like the catalogs above, so the two
+  // harnesses cannot drift.
+  culture: CATALOG.culture,
+  governments: CATALOG.governments,
+  score: CATALOG.score,
+  victory: CATALOG.victory,
   fidelity: 'tuned',
 };
 const ROLE_BY_ID: ReadonlyMap<TerrainId, TerrainRole> = new Map(
@@ -419,7 +437,18 @@ const freshProcessScript = (cases: readonly HashCase[]): string => `
     buildings: CATALOG.buildings,
     improvements: CATALOG.improvements,
     resources: CATALOG.resources,
-    fidelity: 'tuned',
+    // M9+M10: the four sections whose absence is *hashed*, for the reason spelled out
+    // beside the in-process fixture above. PlayerState.government is stored, and a view
+    // without the governments section stores the degenerate empty id instead of the shipped
+    // catalog's first row — so a child missing these four sections prints a different hash
+    // for every case and the mismatch looks like a determinism failure. Measured: this was
+    // the whole of a full-tier failure, and the child's hand-built view was the only
+    // difference between it and the in-process fixture.
+    culture: CATALOG.culture,
+    governments: CATALOG.governments,
+    score: CATALOG.score,
+    victory: CATALOG.victory,
+      fidelity: 'tuned',
   };
   console.log('pid ' + String(process.pid));
   for (const c of ${JSON.stringify(cases)}) {
@@ -516,6 +545,9 @@ describe('adversarial: determinism', () => {
       cities: state.cities,
       nextCityId: state.nextCityId,
       improvements: state.improvements,
+      // M9: the ownership layer, written in the middle of the object rather than at the end
+      // like `newGame` writes it — the same reordering the rest of this literal is for.
+      tileOwner: state.tileOwner,
       players: state.players,
       map: state.map,
       rng: state.rng,
@@ -671,6 +703,10 @@ describe('adversarial: hash sensitivity (non-vacuous golden)', () => {
               queue: [],
               buildings: [],
               workedTiles: [],
+              // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+              // from this and `computeTileOwner` reads it, so a hand-built city states a number
+              // rather than leaving the engine to guess one.
+              culture: 0,
             },
           ],
         },

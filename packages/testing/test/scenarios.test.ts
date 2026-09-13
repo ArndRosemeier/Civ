@@ -41,7 +41,6 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_RATES,
   FREE_UNITS_BASE,
-  FREE_UNITS_PER_CITY,
   HUT_REWARD_KINDS,
   HUT_REWARD_PROVENANCE,
   MAP_DIMENSIONS,
@@ -49,7 +48,6 @@ import {
   SCHEMA_VERSION,
   STARTING_TREASURY,
   TERRAIN_BY_ROLE,
-  UNIT_SUPPORT_COST,
   VISIBILITY_RADIUS,
   applyCommand,
   applyEconomy,
@@ -77,6 +75,7 @@ import {
   civPlayers,
   connected,
   combatRulesOf,
+  defaultGovernmentOf,
   defenderBonusPct,
   drawsWin,
   experienceOf,
@@ -201,6 +200,20 @@ const RULESET: RulesetView = (() => {
   }
   return validated.value;
 })();
+
+/**
+ * The two M9 magnitudes this file reads out of the ruleset it hands the engine, rather
+ * than as module constants.
+ *
+ * M9 moved the per-city unit allowance and the per-unit support cost out of `economy.ts`
+ * and into the `governments` catalog section, so a body that spelled `2` and `1` for
+ * itself would be a second statement of a rule the sweep can move — and it would go on
+ * passing after a balance change that made the game different. These two reads go through
+ * `governments.ts`' `defaultGovernmentOf`, the same reader `newGame` uses to stamp every
+ * player's opening government, so the number asserted is the number a game starts with.
+ */
+const FREE_PER_CITY = defaultGovernmentOf(RULESET).freeUnitsPerCity;
+const UNIT_COST = defaultGovernmentOf(RULESET).unitSupportCost;
 
 /**
  * **The nine combat magnitudes, as the resolver reads them** (M6b).
@@ -1840,7 +1853,7 @@ describe('M3 scenario: starvation', () => {
       // the plains centre is 1/2/1, so 1 commerce at 6/4/0 floors to 0 gold and 0
       // beakers and the leftover 1 becomes gold. Rome owns no unit (its settler
       // became the city) and Carthage's single warrior is inside its free
-      // allowance of `FREE_UNITS_PER_CITY * 0 + FREE_UNITS_BASE = 4`.
+      // allowance of `FREE_PER_CITY * 0 + FREE_UNITS_BASE = 4`.
       incomeEvent(ROME, 1, 0, 0),
       upkeepEvent(ROME, 0, 0, 0, 0, 6),
       incomeEvent(CARTHAGE, 0, 0, 0),
@@ -1851,6 +1864,10 @@ describe('M3 scenario: starvation', () => {
       population: 1,
       foodBox: 0,
       workedTiles: [],
+      // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
+      // from this and `computeTileOwner` reads it, so a hand-built city states a number
+      // rather than leaving the engine to guess one.
+      culture: 0,
     });
 
     let state = starved.state;
@@ -3860,8 +3877,8 @@ describe('the M4a scenario assertions discriminate (they are not decoration)', (
 
 /**
  * EVERY number in this section is a **placeholder** and is asserted as one. The
- * tuning constants it leans on — `FREE_UNITS_PER_CITY` (2), `FREE_UNITS_BASE` (4),
- * `UNIT_SUPPORT_COST` (1), `RATE_TOTAL` (10), `DEFAULT_RATES` (6/4/0) and
+ * tuning constants it leans on — `FREE_PER_CITY` (2), `FREE_UNITS_BASE` (4),
+ * `UNIT_COST` (1), `RATE_TOTAL` (10), `DEFAULT_RATES` (6/4/0) and
  * `STARTING_TREASURY` (10) — are M4b's own tuned values (docs/INTERFACES.md M4b,
  * "Rates and the commerce split" / "The money loop"), chosen to be playable and
  * explicitly **not** sourced from Civ 3: no row below claims that any of them is
@@ -4037,8 +4054,8 @@ const bankruptcySetup = (b: ScenarioBuilder): ScenarioBuilder => {
  *
  * The arithmetic, on the frozen placeholder constants:
  *
- * - Rome's allowance is `FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE` = 2 + 4 = **6**,
- *   so of its twelve workers **6** cost `UNIT_SUPPORT_COST` = 1 gold each: an
+ * - Rome's allowance is `FREE_PER_CITY * 1 + FREE_UNITS_BASE` = 2 + 4 = **6**,
+ *   so of its twelve workers **6** cost `UNIT_COST` = 1 gold each: an
  *   upkeep of **6** a turn. Carthage has no city, so its allowance is 4 and its
  *   single warrior is free.
  * - Rome's income is its one city's commerce 2 (grassland centre 1 + the worked
@@ -4079,7 +4096,7 @@ const bankruptcyScenario = defineScenario({
   run: [endTurn(), endTurn(), endTurn()],
   assert: (after, ruleset) => {
     const army = after.units.filter((unit) => unit.owner === ROME);
-    const support = unitSupport(after, ROME);
+    const support = unitSupport(after, ruleset, ROME);
     const income = playerIncome(after, ruleset, ROME);
 
     // The two turns after the run stops: the first takes nobody, the second grows
@@ -4107,9 +4124,9 @@ const bankruptcyScenario = defineScenario({
 
     return [
       check(
-        support.free === FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE &&
-          support.gold === UNIT_SUPPORT_COST * support.supported,
-        `the allowance is the engine's own formula — FREE_UNITS_PER_CITY per city plus FREE_UNITS_BASE, and UNIT_SUPPORT_COST for each unit beyond it: ${String(FREE_UNITS_PER_CITY)}*1 + ${String(FREE_UNITS_BASE)} = ${String(support.free)} free, ${String(UNIT_SUPPORT_COST)} * ${String(support.supported)} = ${String(support.gold)} owed (the PLACEHOLDER 2/4/1)`,
+        support.free === FREE_PER_CITY * 1 + FREE_UNITS_BASE &&
+          support.gold === UNIT_COST * support.supported,
+        `the allowance is the engine's own formula — FREE_PER_CITY per city plus FREE_UNITS_BASE, and UNIT_COST for each unit beyond it: ${String(FREE_PER_CITY)}*1 + ${String(FREE_UNITS_BASE)} = ${String(support.free)} free, ${String(UNIT_COST)} * ${String(support.supported)} = ${String(support.gold)} owed (the PLACEHOLDER 2/4/1)`,
       ),
       check(
         support.free === 6 &&
@@ -4163,7 +4180,8 @@ const bankruptcyScenario = defineScenario({
       ),
       check(
         afterLater !== undefined &&
-          unitSupport(afterLater, ROME).gold === playerIncome(afterLater, ruleset, ROME).gold,
+          unitSupport(afterLater, ruleset, ROME).gold ===
+            playerIncome(afterLater, ruleset, ROME).gold,
         "and the state it settles in is the money loop's fixed point: the bill equals the income",
       ),
     ];
@@ -4177,21 +4195,29 @@ const bankruptcyScenario = defineScenario({
 const RATES_TILE_A = at(4, 3);
 const RATES_TILE_B = at(5, 3);
 
-/** The triple this scenario switches to: 3/3/4 tenths, which does not divide evenly. */
-const SPLIT_RATES: Rates = { tax: 3, science: 3, luxury: 4 };
+/**
+ * The triple this scenario switches to: 3/5/2 tenths, which does not divide evenly.
+ *
+ * M9+M10 moved it from `3/3/4`. The opening government's `rateCaps` clamp luxury to 2 of
+ * the 10 rate points, so `3/3/4` is refused with `invalid-argument` and the whole scenario
+ * — whose subject is the *remainder* rule — stopped applying its own command. `3/5/2` has
+ * exactly the property the scenario is about: the three floors of 5 commerce do not sum to
+ * it, so the remainder has somewhere to go and gold is not `floor(5*3/10)`.
+ */
+const SPLIT_RATES: Rates = { tax: 3, science: 5, luxury: 2 };
 
 /**
  * RATES SPLIT. One city whose commerce is **exactly 5** — a grassland centre (1
  * commerce) plus two grassland tiles carrying a road (1 + the road's +1 each) —
- * with two citizens working them, at the default 6/4/0 and then at 3/3/4.
+ * with two citizens working them, at the default 6/4/0 and then at 3/5/2.
  *
  * The split, channel by channel, on the frozen `RATE_TOTAL = 10`:
  *
  * - at **6/4/0**: gold `floor(5*6/10)` = 3, beakers `floor(5*4/10)` = 2, luxuries
  *   `floor(5*0/10)` = 0 — the three floors already sum to the whole commerce, so
  *   nothing is left over. Treasury 3, beakers 2, luxuries 0.
- * - at **3/3/4**: gold `floor(15/10)` = 1, beakers `floor(15/10)` = 1, luxuries
- *   `floor(20/10)` = 2 — the floors sum to **4 of the 5**, and the **remainder goes
+ * - at **3/5/2**: gold `floor(15/10)` = 1, beakers `floor(25/10)` = 2, luxuries
+ *   `floor(10/10)` = 1 — the floors sum to **4 of the 5**, and the **remainder goes
  *   to gold**, so gold is 2, not 1. That is the rule this scenario exists to pin:
  *   round-half-up would give 2/2/2 = 6 (more than the city made), dropping the
  *   remainder would give 1/1/2 = 4 (a gold piece vanished), and "whatever floating
@@ -4271,9 +4297,9 @@ const ratesSplitScenario = defineScenario({
     return [
       check(
         ratesProblem(DEFAULT_RATES) === undefined &&
-          ratesProblem({ tax: RATE_TOTAL - 1, science: 1, luxury: 0 }) === undefined &&
-          ratesProblem({ tax: RATE_TOTAL - 1, science: 1, luxury: 1 }) !== undefined,
-        `the default triple is a legal split and RATE_TOTAL = ${String(RATE_TOTAL)} is the total it is legal against: taking a tenth off is still legal and adding one is not (the PLACEHOLDER ${String(RATE_TOTAL)} and ${JSON.stringify(DEFAULT_RATES)})`,
+          ratesProblem({ tax: RATE_TOTAL - 2, science: 2, luxury: 0 }) === undefined &&
+          ratesProblem({ tax: RATE_TOTAL - 2, science: 2, luxury: 1 }) !== undefined,
+        `the default triple is a legal split and RATE_TOTAL = ${String(RATE_TOTAL)} is the total it is legal against: the same split with a tenth moved from tax to science is still legal and adding one is not (the PLACEHOLDER ${String(RATE_TOTAL)} and ${JSON.stringify(DEFAULT_RATES)})`,
       ),
       check(
         yields.commerce === 5,
@@ -4295,8 +4321,8 @@ const ratesSplitScenario = defineScenario({
         changed !== undefined &&
           ratesAfter !== undefined &&
           ratesAfter.tax === 3 &&
-          ratesAfter.science === 3 &&
-          ratesAfter.luxury === 4,
+          ratesAfter.science === 5 &&
+          ratesAfter.luxury === 2,
         `SetRates wrote the new triple (rates ${JSON.stringify(ratesAfter)})`,
       ),
       check(
@@ -4309,23 +4335,23 @@ const ratesSplitScenario = defineScenario({
         `and the rate change affected NOTHING that already happened: revision +1, the turn unchanged, and the treasury/beakers/luxuries are still ${JSON.stringify(collected)} (got ${afterChange === undefined ? 'no state' : JSON.stringify(moneyOf(afterChange, ROME))})`,
       ),
       check(
-        splitAtNew.gold === 2 && splitAtNew.beakers === 1 && splitAtNew.luxuries === 2,
-        `at 3/3/4 the same 5 commerce is 2 gold / 1 beaker / 2 luxuries: floor(5*3/10) = 1 and floor(5*4/10) = 2 leave 4 of the 5 paid out, so the REMAINDER 1 goes to gold — 2, not 1 (got ${JSON.stringify(splitAtNew)})`,
+        splitAtNew.gold === 2 && splitAtNew.beakers === 2 && splitAtNew.luxuries === 1,
+        `at 3/5/2 the same 5 commerce is 2 gold / 2 beakers / 1 luxury: floor(5*3/10) = 1, floor(5*5/10) = 2 and floor(5*2/10) = 1 leave 4 of the 5 paid out, so the REMAINDER 1 goes to gold — 2, not 1 (got ${JSON.stringify(splitAtNew)})`,
       ),
       check(
         nextIncome !== undefined &&
           nextIncome.gold === 2 &&
-          nextIncome.beakers === 1 &&
-          nextIncome.luxuries === 2 &&
+          nextIncome.beakers === 2 &&
+          nextIncome.luxuries === 1 &&
           nextIncome.gold + nextIncome.beakers + nextIncome.luxuries === yields.commerce,
         `the NEXT turn's collection is that split, and the three channels still add up to the 5 commerce that was divided (event ${JSON.stringify(nextIncome)})`,
       ),
       check(
         afterNext !== undefined &&
           moneyOf(afterNext, ROME).treasury === 5 &&
-          moneyOf(afterNext, ROME).beakers === 3 &&
-          moneyOf(afterNext, ROME).luxuries === 2,
-        `so the pools move by exactly that: 3 + 2 = 5 gold, 2 + 1 = 3 beakers, 0 + 2 = 2 luxuries (got ${afterNext === undefined ? 'no state' : JSON.stringify(moneyOf(afterNext, ROME))})`,
+          moneyOf(afterNext, ROME).beakers === 4 &&
+          moneyOf(afterNext, ROME).luxuries === 1,
+        `so the pools move by exactly that: 3 + 2 = 5 gold, 2 + 2 = 4 beakers, 0 + 1 = 1 luxury (got ${afterNext === undefined ? 'no state' : JSON.stringify(moneyOf(afterNext, ROME))})`,
       ),
       check(
         afterChange !== undefined &&
@@ -4513,9 +4539,9 @@ const conservationScenario = defineScenario({
         `neither treasury is negative after 120 turns (Rome ${String(rome.treasury)}, Carthage ${String(carthage.treasury)})`,
       ),
       check(
-        unitSupport(after, ROME).supported === 1 &&
+        unitSupport(after, ruleset, ROME).supported === 1 &&
           playerIncome(after, ruleset, ROME).gold === 1 &&
-          unitSupport(after, ROME).gold === playerIncome(after, ruleset, ROME).gold,
+          unitSupport(after, ruleset, ROME).gold === playerIncome(after, ruleset, ROME).gold,
         'and the world it ends in is the fixed point: one billable worker, 1 gold of income, and nothing left over',
       ),
     ];
@@ -4635,7 +4661,7 @@ describe('M4b scenario: bankruptcy', () => {
     // 1 gold a unit beyond that) and the starting treasury the DSL defaults a
     // civilization to. None of them is a Civ 3 figure; all of them are asserted in
     // the scenario's own words above as `2*1 + 4 = 6` and `1 * 6 = 6`.
-    expect([FREE_UNITS_PER_CITY, FREE_UNITS_BASE, UNIT_SUPPORT_COST]).toEqual([2, 4, 1]);
+    expect([FREE_PER_CITY, FREE_UNITS_BASE, UNIT_COST]).toEqual([2, 4, 1]);
     expect(STARTING_TREASURY).toBe(10);
 
     const after = result.finalState;
@@ -4909,23 +4935,23 @@ describe('M4b scenario: the commerce split at the player’s rates', () => {
     expect(tileYields(after, RULESET, RATES_TILE_A)).toEqual({ food: 2, shields: 1, commerce: 2 });
     expect(tileYields(after, RULESET, RATES_TILE_B)).toEqual({ food: 2, shields: 1, commerce: 2 });
 
-    // The rate change, and the next turn under it: 1 + 1 + 2 from the floors, and
+    // The rate change, and the next turn under it: 1 + 2 + 1 from the floors, and
     // the 1 that was left over goes to gold, so gold is 2 rather than 1.
     const changed = applyFor(after, ROME, setRates(SPLIT_RATES), RULESET);
     expect(moneyOf(changed.state, ROME)).toEqual({ treasury: 3, beakers: 2, luxuries: 0 });
 
     const next = applyFor(changed.state, ROME, endTurn(), RULESET);
     expect(incomeLines(next.events, ROME)).toEqual([
-      { type: 'IncomeCollected', playerId: ROME, gold: 2, beakers: 1, luxuries: 2 },
+      { type: 'IncomeCollected', playerId: ROME, gold: 2, beakers: 2, luxuries: 1 },
     ]);
-    expect(moneyOf(next.state, ROME)).toEqual({ treasury: 5, beakers: 3, luxuries: 2 });
+    expect(moneyOf(next.state, ROME)).toEqual({ treasury: 5, beakers: 4, luxuries: 1 });
 
     // The floors, spelled out: 5 commerce is not divisible by 10 tenths into three
     // whole channels, and the contract says which one gets what is left.
     expect(Math.floor((5 * SPLIT_RATES.tax) / RATE_TOTAL)).toBe(1);
-    expect(Math.floor((5 * SPLIT_RATES.science) / RATE_TOTAL)).toBe(1);
-    expect(Math.floor((5 * SPLIT_RATES.luxury) / RATE_TOTAL)).toBe(2);
-    expect(5 - 1 - 1 - 2).toBe(1); // the remainder, which is gold: 1 + 1 = 2 above
+    expect(Math.floor((5 * SPLIT_RATES.science) / RATE_TOTAL)).toBe(2);
+    expect(Math.floor((5 * SPLIT_RATES.luxury) / RATE_TOTAL)).toBe(1);
+    expect(5 - 1 - 2 - 1).toBe(1); // the remainder, which is gold: 1 + 1 = 2 above
   });
 });
 
@@ -5750,7 +5776,7 @@ describe('M4c scenario: building effects (gold, beakers, shields, compound floor
       maintenance: 7,
       unitSupport: 0,
       units: 1,
-      freeUnits: FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE,
+      freeUnits: FREE_PER_CITY * 1 + FREE_UNITS_BASE,
     });
   });
 });
@@ -6454,7 +6480,7 @@ const MAINTENANCE_UNPAID = 6;
  * surplus of 0: the city never grows), 3 shields and **1 commerce**, which at the
  * default 6/4/0 is `floor(0.6) = 0` gold plus the leftover 1 — **1 gold a turn**.
  * Five buildings cost **7 gold a turn**. Rome's single worker is well inside the
- * `FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE = 6` free allowance, so there is no
+ * `FREE_PER_CITY * 1 + FREE_UNITS_BASE = 6` free allowance, so there is no
  * unit to disband: the shortfall reaches `TreasuryShortfall`, and what pays is the
  * buildings themselves.
  */
@@ -6503,7 +6529,7 @@ const maintenanceScenario = defineScenario({
     const before = withBuildings(after, MAINTENANCE_CITY, MAINTENANCE_BUILDINGS);
     const owed = cityMaintenance(catalog, cityOf(before, MAINTENANCE_CITY));
     const income = playerIncome(after, ruleset, ROME);
-    const support = unitSupport(after, ROME);
+    const support = unitSupport(after, ruleset, ROME);
     const next = applyFor(after, ROME, endTurn(), ruleset);
     const rows = MAINTENANCE_BUILDINGS.map((id) => buildingRowOf(ruleset, id));
     const specs = CATALOG.buildings.filter((spec) => MAINTENANCE_BUILDINGS.includes(spec.id));
@@ -6595,7 +6621,7 @@ describe('M4c scenario: maintenance drives a real TreasuryShortfall from shipped
       maintenance: 7,
       unitSupport: 0,
       units: 1,
-      freeUnits: FREE_UNITS_PER_CITY * 1 + FREE_UNITS_BASE,
+      freeUnits: FREE_PER_CITY * 1 + FREE_UNITS_BASE,
     });
     expect(cityOf(walked.state, MAINTENANCE_CITY).buildings).toEqual([MARKETPLACE]);
     expect(moneyOf(walked.state, ROME).treasury).toBe(0);
@@ -7647,6 +7673,13 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
       cost: 6,
       maintenance: 1,
       effects: [{ kind: 'beaker-multiplier', pct: 25 }],
+      // M9: `validateRuleset` requires every building row to **declare** `culturePerTurn`
+      // and `happiness`, even when both are zero — "a row that says nothing would be a
+      // building whose culture is whatever a reader assumed". So this fixture states its
+      // zeros rather than staying silent about them; the observatory observes and does not
+      // content anybody, and the two zeros are that fact written down.
+      culturePerTurn: 0,
+      happiness: 0,
       requiresTech: POTTERY,
       provenance: placeholder(
         'unsourced and chosen to be playable: a fixture row, added so the engine has a building that declares requiresTech',
