@@ -193,7 +193,8 @@ export interface SimulationResult {
   readonly metrics: readonly TurnMetrics[];
   readonly violations: readonly Violation[];
   /**
-   * **Every planner failure a policy reported while this run polled it, oldest first.**
+   * **Every planner failure a policy reported while this run polled it, oldest first — each one
+   * naming a throw that actually happened in *this* run.**
    *
    * M7c made a thrown planner error a typed `PlannerFailure` instead of a silence, and the
    * verifier found the fix real but **unwired**: the CLI printed a warning to stderr while
@@ -204,10 +205,18 @@ export interface SimulationResult {
    * beside it.
    *
    * **A failure recorded before this run started is not reported here**, and a pass that throws on
-   * every turn of the run contributes one entry rather than one per turn: the runner reads each
-   * policy's own `failureCount` as its baseline and appends a record only when that count moves
-   * *during* the run. `runner.ts`'s "Carrying a planner failure" states the whole rule, including
-   * why a run has to be measured against the count rather than against the record list.
+   * every turn of the run contributes one entry per seat rather than one per turn. The runner reads
+   * each policy's own `failureCount` as its baseline and collects only when that count moves *during*
+   * the run — that is the **whether**, and the count is the only monotone thing a policy hands out —
+   * and it takes the **records** from the policy's own latest-per-pass list, which every throw of the
+   * run has rewritten. Both halves matter, and the second is the one a reader can be misled by: a
+   * policy instance is reusable (`SMART_POLICY` is a singleton, and the batch, the tournament and the
+   * CLI each hand **one instance to every seat of every run**), so its first-per-pass list is a
+   * memory of *earlier* runs as well as this one, and a run that re-threw in a pass an earlier run
+   * had recorded would otherwise report that earlier run's turn, pass, player and detail — a real
+   * throw, located in a game that had already finished. H1/G2-1. `runner.ts`'s "Carrying a planner
+   * failure" states the whole rule, including why a run has to be measured against the count *and*
+   * why the record comes from the latest-per-pass list.
    *
    * **Required and always present, an empty array when there are none** — exactly how
    * `violations` works, so a consumer cannot forget it. Not optional: an optional field is

@@ -3087,13 +3087,43 @@ export interface PlannerFailure {
   readonly turn: number;
   /** Whose turn it was. */
   readonly playerId: number;
-  /** Which pass was running. */
-  readonly phase: PlannerPhase;
-  /** What it was working on: `city 3`, `unit 7 (settler)`, or `the turn`. */
-  readonly detail: string;
+  /**
+   * Which pass was running — **absent when the reporter cannot say.**
+   *
+   * A policy records this itself (`PlanState` is where the planner keeps it), so a record that
+   * came out of a planner always carries it and every assertion in this repository reads it. It
+   * is optional for one reason and no other: a `PolicyReport` written *elsewhere* may hold a
+   * record that cannot say which pass it came from, and the honest answer there is to say less
+   * rather than to borrow a pass — the runner reads such a record as having no pass to key on and
+   * falls back to its object identity, and the reporter prints the part it knows (`runner.ts`,
+   * "Carrying a planner failure", and `sim-cli.ts`'s `plannerPassText`). A key that is not known
+   * is **omitted**, never written holding `undefined`, because `canonicalize` refuses that and
+   * this project has paid for it three times.
+   */
+  readonly phase?: PlannerPhase;
+  /**
+   * What it was working on: `city 3`, `unit 7 (settler)`, or `the turn`.
+   *
+   * Optional for exactly the same reason, and on exactly the same records, as `phase` above.
+   */
+  readonly detail?: string;
   /** The thrown value, as `Name: message` (or `String(value)` for a non-`Error`). */
   readonly error: string;
 }
+
+/**
+ * What a policy has to say about a failure its planner caught, **with** the two fields
+ * `PlannerFailure` marks optional.
+ *
+ * `phase` and `detail` are optional on `PlannerFailure` because a *reporter* may not know them
+ * (see the field notes); the planner does, always — it keeps its own `phase` and `detail` as it
+ * plans — so this is the shape it hands to its recorder, and the shape a record it made therefore
+ * always satisfies. Spelled as "the optional fields narrowed to required" rather than restated
+ * field by field, so a field added to `PlannerFailure` cannot silently fail to reach the planner's
+ * own record, and so `smartPolicy` can key its per-pass maps by `phase` without an assertion.
+ */
+export type PlannerFailureDraft = Omit<PlannerFailure, 'policy' | 'phase' | 'detail'> &
+  Required<Pick<PlannerFailure, 'phase' | 'detail'>>;
 
 /**
  * What a policy can be asked for after a run: every failure it recorded, and how many
@@ -3109,8 +3139,50 @@ export interface PolicyReport {
    * that say nothing the first one did not. Which passes have failed is the fact a reader
    * needs, and it is bounded by the five passes named in `PlannerPhase` — no cap to choose,
    * and so no cap to get wrong.
+   *
+   * **This list is the whole of a policy's memory, and that is what makes it the wrong thing to
+   * attribute a run with.** A policy that has already failed a pass keeps that pass's first
+   * record for the rest of its life, so this entry answers *which passes have ever failed* — and
+   * a later run cannot tell from it whether the pass threw *again* during that run. That question
+   * is `latestFailures`', and it is why both lists exist. Keep this one for readers asking
+   * "has this pass ever failed?"; it is what `plannerFailuresOf` hands back, and its first-per-pass
+   * bound is deliberate.
    */
   readonly failures: readonly PlannerFailure[];
+  /**
+   * The **most recent** failure in each pass, so a reader can tell what a run's OWN throws were.
+   *
+   * ## Why this cannot be derived from `failures`
+   *
+   * The record of a run is the record of a *run*, and `failures` cannot say what happened in one.
+   * A policy instance is reusable — `SMART_POLICY` is a module-level singleton, and the batch, the
+   * tournament and the CLI all hand **one instance to every seat of every run** — so a run that
+   * threw in a pass an earlier run had already recorded leaves `failures` completely unchanged
+   * while it throws on every single turn. A reader that reconstructs a run's evidence from
+   * `failures` therefore reports the earlier run's turn, phase and detail for a failure that
+   * happened in *this* one: `seed 2, turn 4 — smart, player 0, cities pass (city 0)` for a game
+   * whose planner only ever threw on turns 6, 7 and 8. The count says *whether* a throw happened
+   * in a run (M7e put that on a firm footing and it stays); this list is what says *what* the
+   * throw was, and nothing else can.
+   *
+   * ## What it holds, and why it is safe to hand out
+   *
+   * One entry per pass, **replaced** by every later throw in that pass, so it is bounded exactly
+   * like `failures` (five passes, no cap to choose) and stays current rather than frozen. The
+   * entries are **fresh objects per throw and never mutated afterwards**, so a record a run has
+   * already taken stays the snapshot of that throw: run 1's result is not rewritten by run 2's
+   * throw, and no reader can watch a value change underneath it. That freshness is load bearing in
+   * both directions — it is why a *reader* can hold a run's record safely, and it is why a reader
+   * must not use object identity to decide whether a run has already reported a pass: an honest
+   * policy mints a new object for every throw. The runner keys its per-run deduplication on
+   * `phase` for exactly that reason (`runner.ts`, "Carrying a planner failure").
+   *
+   * Optional, so that a `PolicyReport` written before this field existed still typechecks — and the
+   * runner reads an absent list as "this policy cannot say what its own throw was": it reports only
+   * what it can prove (that a throw happened, counted on this run's own poll) rather than reaching
+   * for `failures` and naming another run's turn and pass.
+   */
+  readonly latestFailures?: readonly PlannerFailure[];
   /** How many failures happened in total, so the list is never mistaken for a complete one. */
   readonly failureCount: number;
 }
@@ -3146,13 +3218,16 @@ interface Reportable extends Policy {
  * **The whole seam**, in its widest form: this policy's `PolicyReport`, or `undefined` for a
  * policy that cannot report at all (the control policies, or any hand-written one).
  *
- * It exists because a reader needs both halves of the report and they answer different
- * questions: `failures` is *which* passes failed, and `failureCount` is *how many times* the
- * planner threw — which is not the length of the list (see `PolicyReport`), and is the only
- * monotone thing a policy hands out. The runner baselines on the count for exactly that
- * reason (`runner.ts`, "Carrying a planner failure"): a pass that threw before a run started
- * is a fact about an earlier run, while a pass that throws *again* during this one is a fact
- * about this one, and only the count can tell the two apart once the list has stopped growing.
+ * It exists because a reader needs the report and its halves answer different questions:
+ * `failures` is *which* passes have ever failed, `latestFailures` is *what this policy's most
+ * recent throw in each pass was* — the one a run attributes itself with, because a reused instance
+ * keeps the first record of a pass for its whole life and that record can predate the run entirely
+ * (see `PolicyReport.latestFailures`) — and `failureCount` is *how many times* the planner threw,
+ * which is not the length of either list, and is the only monotone thing a policy hands out. The
+ * runner baselines on the count for exactly that reason (`runner.ts`, "Carrying a planner
+ * failure"): a pass that threw before a run started is a fact about an earlier run, while a pass
+ * that throws *again* during this one is a fact about this one, and only the count can tell the two
+ * apart once the first-per-pass list has stopped growing.
  */
 export const plannerReportOf = (policy: Policy): PolicyReport | undefined => {
   const readable: Reportable = policy;
@@ -3178,12 +3253,22 @@ export const plannerFailuresOf = (policy: Policy): readonly PlannerFailure[] =>
 /** The same records as printable lines, one per line, in the order they happened. */
 export const describePlannerFailures = (policy: Policy): readonly string[] => {
   const failures = plannerFailuresOf(policy);
-  return failures.map(
-    (failure) =>
-      `${failure.policy} failed to plan on turn ${String(failure.turn)} for player ${String(
-        failure.playerId,
-      )} in ${failure.phase} (${failure.detail}): ${failure.error}`,
-  );
+  return failures.map((failure) => {
+    // `phase` and `detail` are absent only on a record that reports less than it knows (see
+    // `PlannerFailure`); the line then says where it can and stops, rather than printing a
+    // placeholder that reads like a pass name.
+    const where =
+      failure.phase === undefined
+        ? failure.detail === undefined
+          ? ''
+          : ` in an unrecorded pass (${failure.detail})`
+        : failure.detail === undefined
+          ? ` in ${failure.phase}`
+          : ` in ${failure.phase} (${failure.detail})`;
+    return `${failure.policy} failed to plan on turn ${String(failure.turn)} for player ${String(
+      failure.playerId,
+    )}${where}: ${failure.error}`;
+  });
 };
 
 /**
@@ -3200,19 +3285,23 @@ export const describePlannerFailures = (policy: Policy): readonly string[] => {
  *
  * **Who reads the record, stated accurately.** Since M7d the record is carried by the results
  * themselves: `SimulationResult.plannerFailures` and `TournamentResult.plannerFailures` are
- * required fields, filled by the runner from this policy's own report, so a reader holding only
- * a structured result can tell a partial turn from a quiet one — `index.ts` states the chain,
- * and `types.ts` the fields. The reader that *prints* it is `@civts/headless`'s `sim-cli.ts`:
- * `plannerFailureWarning` renders the failures **off the report it just built** (never by asking
- * the policies again) to stderr, on both the text and `--json` paths, and they fail the exit
- * code (checked end to end in `headless/test/sim-cli.test.ts`). `ai.test.ts` covers the other
- * half here — the degenerate states that must produce a plan without failing at all, and a state
- * that makes the planner throw, whose failure must come back typed, named and located.
+ * required fields, filled by the runner from this policy's own report — the entry it takes is the
+ * **latest** record of the pass that threw, so what a run reports is a throw that happened in that
+ * run rather than a first-per-pass record an earlier run may have made (`PolicyReport.latestFailures`
+ * states why the two lists exist and `runner.ts`'s "Carrying a planner failure" how the count and
+ * the record are read together). So a reader holding only a structured result can tell a partial
+ * turn from a quiet one — `index.ts` states the chain, and `types.ts` the fields. The reader that
+ * *prints* it is `@civts/headless`'s `sim-cli.ts`: `plannerFailureWarning` renders the failures
+ * **off the report it just built** (never by asking the policies again) to stderr, on both the text
+ * and `--json` paths, and they fail the exit code (checked end to end in
+ * `headless/test/sim-cli.test.ts`). `ai.test.ts` covers the other half here — the degenerate states
+ * that must produce a plan without failing at all, and a state that makes the planner throw, whose
+ * failure must come back typed, named and located.
  */
 const planTurn = (
   ctx: PolicyContext,
   weights: SmartWeights,
-  record: (failure: Omit<PlannerFailure, 'policy'>) => void,
+  record: (failure: PlannerFailureDraft) => void,
 ): readonly Command[] => {
   const planned: Command[] = [];
   let state: GameState = ctx.state;
@@ -3330,21 +3419,40 @@ export const smartPolicy = (patch: SmartWeightsPatch = {}): DiagnosedPolicy => {
   // Per-policy, not module-global: two policies built from different patches are two
   // different strategies, and a failure belongs to the one that threw. A tournament that
   // builds a policy per seat reads one seat's failures without the other seat's mixed in.
+  //
+  // Two maps, and they answer the two different questions a reader asks of a policy
+  // (see `PolicyReport`): `firstByPhase` is the instance's whole memory — the first failure
+  // of each pass, so "which passes have ever failed" is bounded by the five passes rather than
+  // by a cap somebody chose — while `latestByPhase` is replaced by **every** throw, so the
+  // record a run reads is the record of a throw that happened during that run even when the
+  // pass failed in an earlier one. Keeping only the first map is what made a reused instance
+  // report an earlier run's turn and detail for its own throw (H1/G2-1).
   const firstByPhase = new Map<PlannerPhase, PlannerFailure>();
+  const latestByPhase = new Map<PlannerPhase, PlannerFailure>();
   let failureCount = 0;
   return {
     name: SMART_POLICY_NAME,
     chooseCommands: (ctx) =>
       planTurn(ctx, weights, (failure) => {
         failureCount += 1;
-        if (!firstByPhase.has(failure.phase)) {
-          firstByPhase.set(failure.phase, { policy: SMART_POLICY_NAME, ...failure });
-        }
+        // A **new object** per throw, always: the maps hold snapshots, never a value that is
+        // written again afterwards. That is what lets a run tell "the record I took" from "the
+        // record that was there when I started" by identity alone (a mutation would rewrite the
+        // earlier run's answer in place), and it is why `latestByPhase` has to be *replaced*
+        // rather than updated.
+        const minted: PlannerFailure = { policy: SMART_POLICY_NAME, ...failure };
+        if (!firstByPhase.has(failure.phase)) firstByPhase.set(failure.phase, minted);
+        latestByPhase.set(failure.phase, minted);
       }),
-    // A fresh array per call, so a caller reading the report cannot watch it change
-    // underneath a run and cannot append to it, and `failureCount` stays the count of
-    // everything that happened rather than the length of what is kept.
-    report: () => ({ failures: [...firstByPhase.values()], failureCount }),
+    // Fresh arrays per call, so a caller reading the report cannot watch it change underneath a
+    // run and cannot append to it; `failureCount` stays the count of everything that happened
+    // rather than the length of what is kept, and the two lists stay the two different answers
+    // their own notes describe.
+    report: () => ({
+      failures: [...firstByPhase.values()],
+      latestFailures: [...latestByPhase.values()],
+      failureCount,
+    }),
   };
 };
 

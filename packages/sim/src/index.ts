@@ -95,11 +95,24 @@ export { policyRngFor, runSimulation } from './runner.js';
 // plausible hash. M7c gave that record a type and a reader (`plannerFailuresOf`); M7d wired it
 // into `SimulationResult.plannerFailures` and `TournamentResult.plannerFailures`, so a reader
 // holding only the structured result can tell a partial turn from a quiet one and
-// `tournamentVerdict(...).passed` fails a run that contains one. Both functions work on any
-// `Policy` and answer `[]` for one that cannot report (the controls), so calling them costs no
-// knowledge of the AI; `sim-cli.ts` is the consumer that renders them and fails the run.
-export { describePlannerFailures, plannerFailuresOf } from './ai/index.js';
-export type { DiagnosedPolicy, PlannerFailure, PlannerPhase, PolicyReport } from './ai/index.js';
+// `tournamentVerdict(...).passed` fails a run that contains one. All three functions work on any
+// `Policy` and answer `undefined`/`[]` for one that cannot report (the controls), so calling them
+// costs no knowledge of the AI; `sim-cli.ts` is the consumer that renders them and fails the run.
+//
+// `plannerReportOf` is the **whole** report — `failures` (which passes have ever failed),
+// `latestFailures` (this policy's most recent throw in each pass, which is what a run attributes
+// itself with: see `PolicyReport`) and `failureCount` (the only monotone thing a policy hands
+// out, and the number the runner baselines *whether* against). It is exported here rather than
+// left one module deep because the count is a figure a consumer can want and neither narrower
+// reader carries it — the runner itself once reached past this surface for it (H1/G2-5).
+export { describePlannerFailures, plannerFailuresOf, plannerReportOf } from './ai/index.js';
+export type {
+  DiagnosedPolicy,
+  PlannerFailure,
+  PlannerFailureDraft,
+  PlannerPhase,
+  PolicyReport,
+} from './ai/index.js';
 
 export { aggregateRuns, runBatch } from './batch.js';
 

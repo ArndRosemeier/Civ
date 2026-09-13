@@ -1230,11 +1230,15 @@ export const parseSimArgs = (args: readonly string[]): Result<SimFlags, string> 
  * second entry for that pass, by design — see `PolicyReport`). A diagnostic that can only fire
  * once per process is exactly the kind of half-wired evidence M7d exists to end.
  *
- * So each command builds its own instance, and `runSimulation`'s baseline rule (a run reports
- * the failures recorded *after* it started) then subtracts nothing: what an invocation reports
- * is what happened during that invocation. The policy is stateless in every other respect —
- * its decisions are a pure function of `(state, playerId, ruleset, weights)`, which is why two
- * instances produce byte-identical games — so this changes the games not at all and the
+ * So each command builds its own instance, and `runSimulation`'s baseline rule (a run reports the
+ * throws that happened *after* it started, read from the policy's monotone count and from the
+ * records that appeared while it played) then subtracts nothing: what an invocation reports is what
+ * happened during that invocation. Note that this is about the *invocation*, not about one game —
+ * the batch and the tournament hand this one instance to **every seat of every run** of the command,
+ * which is exactly the reused-instance case the runner's second baseline exists for (H1/G2-1:
+ * a game must not be handed an earlier game's turn and pass). The policy is stateless in every
+ * other respect — its decisions are a pure function of `(state, playerId, ruleset, weights)`, which
+ * is why two instances produce byte-identical games — so this changes the games not at all and the
  * evidence for the better. The singleton stays exported (`@civts/sim`'s `SMART_POLICY`) for
  * callers that want the shared one, and the two are constructed identically.
  */
@@ -1315,19 +1319,32 @@ export interface ReportedViolation {
  * itself inside its own records — so the report qualifies each record with its `seed`, exactly
  * as it does for a violation, and `value` when the report comes from a sweep.
  *
+ * **The record is about the run it is filed under**, which is a property of the engine's seam
+ * rather than of this file: a policy instance is reusable — `SMART_POLICY` is a singleton, and this
+ * CLI hands one instance to every seat of every run — so a record taken from the policy's
+ * first-per-pass memory could name a turn and a pass from an invocation that had already finished.
+ * The runner collects each run's own throws (`@civts/sim`'s "Carrying a planner failure", H1/G2-1),
+ * so what arrives here is this game's turn, pass, player and detail. The report copies them.
+ *
  * The M7d acceptance line asks for exactly this: a tournament containing a planner failure
  * "exits non-zero and says **which game, turn and phase** failed". Every field here is copied
  * from the engine's record rather than recomputed, `value` is **optional and omitted** when
  * there is none (an explicit `undefined` is not representable in canonical JSON), and nothing
  * in this report ever filters, caps or averages the list.
+ *
+ * `phase` and `detail` are optional too, and for the same reason `value` is: the engine's own
+ * `PlannerFailure` carries them only when the policy could say where its throw happened. A record
+ * that cannot say is rendered as saying less — never given a placeholder that reads like a pass
+ * name, and never given another run's. In practice the shipped AI always knows: it records its
+ * own pass as it plans.
  */
 export interface ReportedPlannerFailure {
   readonly seed: number;
   readonly policy: string;
   readonly turn: number;
   readonly playerId: number;
-  readonly phase: PlannerPhase;
-  readonly detail: string;
+  readonly phase?: PlannerPhase;
+  readonly detail?: string;
   readonly error: string;
   /** The swept knob value this batch ran, when the report comes from a sweep. */
   readonly value?: number;
@@ -1507,8 +1524,12 @@ const reportedPlannerFailures = (
     policy: failure.policy,
     turn: failure.turn,
     playerId: failure.playerId,
-    phase: failure.phase,
-    detail: failure.detail,
+    // Omitted, never written as `undefined`: the engine's record carries these only when the
+    // policy could say where its throw happened, and `canonicalize` refuses an explicit
+    // `undefined` outright. Built in the order the type declares, so the canonical writer's
+    // sorted keys and a reader's eye agree.
+    ...(failure.phase === undefined ? {} : { phase: failure.phase }),
+    ...(failure.detail === undefined ? {} : { detail: failure.detail }),
     error: failure.error,
     ...(knobValue === undefined ? {} : { value: knobValue }),
   }));
@@ -1646,6 +1667,28 @@ const violationBannerLines = (
 };
 
 /**
+ * Where in a turn a planner failure happened, as one clause — and **only as much as is known**.
+ *
+ * The engine's record carries `phase` and `detail` whenever the policy could say where its throw
+ * happened, which is every record the shipped AI writes (it tracks its own pass as it plans). They
+ * are absent only on a record that reports less than it knows, and the honest rendering of that is
+ * to say less: a placeholder such as `unknown pass` would read like a pass name and invite a reader
+ * to believe the engine has a pass called that, which is exactly the "plausible claim about the AI"
+ * this project treats as the worst outcome. So the clause shrinks, and both renderers — the stderr
+ * warning and the text banner — call this one function so they cannot shrink differently.
+ */
+const plannerPassText = (failure: ReportedPlannerFailure): string => {
+  if (failure.phase === undefined) {
+    return failure.detail === undefined
+      ? 'at an unrecorded point in the turn'
+      : `at an unrecorded point in the turn (${failure.detail})`;
+  }
+  return failure.detail === undefined
+    ? `in the ${failure.phase} pass`
+    : `in the ${failure.phase} pass (${failure.detail})`;
+};
+
+/**
  * **The banner M7d added: a policy threw while planning, and the run is not clean evidence.**
  *
  * Modelled on `violationBannerLines` deliberately — same rule, same shape, same place in the
@@ -1658,7 +1701,13 @@ const violationBannerLines = (
  *   so its numbers stop there, while a partial turn keeps playing — which is precisely why the
  *   metrics of such a game look plausible and why the record has to be printed rather than
  *   inferred from a short run;
- * - it names the pass, the player and the error, which are the engine's own fields.
+ * - it names the pass, the player and the error, which are the engine's own fields — and the
+ *   pass only when the record carries one: a record that cannot say where the throw happened
+ *   prints what it knows rather than a placeholder that reads like a pass name (see
+ *   `ReportedPlannerFailure`);
+ * - and the turn it prints is the turn of **this** game's throw, because the runner files each
+ *   run's own records (`@civts/sim`'s "Carrying a planner failure", H1/G2-1) — a reused policy
+ *   instance's earlier turn is not this game's, and is not printed here.
  *
  * It is rendered from the report's `plannerFailures` — the structured value — never from the
  * policies, so the text and `--json` cannot disagree about what happened.
@@ -1683,7 +1732,7 @@ const plannerFailureBannerLines = (
           String(failure.turn);
     lines.push(
       `!!   ${where} — ${failure.policy}, player ${String(failure.playerId)}, ` +
-        `${failure.phase} pass (${failure.detail})`,
+        plannerPassText(failure),
     );
     lines.push(`!!     ${failure.error}`);
   }
@@ -1695,12 +1744,12 @@ const plannerFailureBannerLines = (
     '!! turn: the commands decided before the throw were applied and the run continued, which',
   );
   lines.push(
-    '!! is why its metrics look plausible. One line per failed planning pass, and a run taking',
+    '!! is why its metrics look plausible. One line per seat that failed a planning pass —',
   );
   lines.push(
-    '!! part in a batch or a tournament FAILS (exit 1); the same records are in the --json',
+    '!! not one per turn — and a run taking part in a batch or a tournament FAILS (exit 1);',
   );
-  lines.push('!! report, as "plannerFailures".');
+  lines.push('!! the same records are in the --json report, as "plannerFailures".');
   lines.push(bannerRule());
   return lines;
 };
@@ -2127,7 +2176,7 @@ export const plannerFailureWarning = (failures: readonly ReportedPlannerFailure[
         : `in the run at knob ${String(failure.value)}, game ${String(failure.seed)}`;
     return (
       `${where}, ${failure.policy} threw while planning on turn ${String(failure.turn)} for ` +
-      `player ${String(failure.playerId)}, in the ${failure.phase} pass (${failure.detail}): ` +
+      `player ${String(failure.playerId)}, ${plannerPassText(failure)}: ` +
       `${failure.error} — it returned the commands decided before the throw, so the run ` +
       'continued and its numbers describe a game in which part of a turn was not played'
     );

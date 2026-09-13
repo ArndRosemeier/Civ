@@ -234,9 +234,13 @@ export interface TournamentResult {
    * It is exactly `games.flatMap((game) => game.plannerFailures)` and nothing else is computed
    * from it. How many entries that is per game is the runner's rule, stated once in `runner.ts`
    * ("Carrying a planner failure"): a run carries a failure only if the policy's `failureCount`
-   * moved while that run played, and a pass that throws every turn contributes one entry rather
-   * than one per turn. One game with a failure is enough for the whole tournament to fail, which
-   * is the property `tournamentVerdict` is built on.
+   * moved while that run played, and the entries it carries are the policy's own current records
+   * of the passes that threw — **one per seat that threw in a pass, not one per turn**. A
+   * hundred-turn game whose planner throws every turn on both seats therefore carries two entries
+   * per throwing pass, not two hundred: H1 re-decided the earlier "one per pass" reading, which
+   * was an artefact of one record frozen per pass and silently dropped a second seat's throw. One
+   * game with a failure is enough for the whole tournament to fail, which is the property
+   * `tournamentVerdict` is built on.
    */
   readonly plannerFailures: readonly PlannerFailure[];
   /** The budget this run was judged against — always stated, never implied. */

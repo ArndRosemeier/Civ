@@ -50,6 +50,7 @@ import {
   METRIC_KEY_ORDER,
   SIMPLE_POLICY,
   plannerFailuresOf,
+  plannerReportOf,
   policyRngFor,
   runSimulation,
   smartPolicy,
@@ -657,14 +658,41 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
     if (first === undefined) throw new Error('the run carried no failure');
     expect(first.policy).toBe(broken.name);
     expect(first.error).toContain('the board is unreadable');
+    // The planner always knows where it was: `phase` and `detail` are optional on the record only
+    // so that a reporter which cannot say *omits* them, and this one can. Guarded rather than
+    // loosened, so a record that came back without them fails here instead of passing a weaker
+    // assertion.
+    if (first.detail === undefined) throw new Error('the record lost the detail of the pass');
     expect(first.detail.length).toBeGreaterThan(0);
     expect(first.turn).toBeGreaterThanOrEqual(1);
     expect(PLANNER_PHASES).toContain(first.phase);
     expect(Number.isInteger(first.playerId)).toBe(true);
 
     // The result carries the policy's **own** records — the same objects, not a second shape
-    // derived from them — so a reader never has to reconcile two accounts of one throw.
-    expect(result.plannerFailures).toEqual(plannerFailuresOf(broken));
+    // derived from them — so a reader never has to reconcile two accounts of one throw. There is
+    // one entry per seat here, because both seats were polled and both threw: the bound is one
+    // entry per (seat, pass) per run, not one per run (see `runner.ts`'s collector, and the
+    // reused-instance test at the end of this block for what the entries must name).
+    expect(result.plannerFailures).toHaveLength(2);
+
+    // The entries are the report's **own** records — the objects it holds, not a second shape derived
+    // from them — which is checked on the run whose policy this is: two seats share `broken`, so
+    // `broken`'s report is what the run read and `latestFailures` is the list it read from. The
+    // record a run takes is the one that *explains* its throw (the first it saw for that pass), and
+    // the policy's list moves on with every later throw, so the run's entry is checked against the
+    // report rather than assumed to be its current contents.
+    // One seat, so the run's entry is the only thing the report will ever be asked for: the record
+    // the run took is a record the policy itself holds, object for object, and the policy's
+    // first-per-pass list is the one it was taken from (`latestFailures` moves on with every later
+    // throw of the same pass, so the run's entry is the pass's *first* record — the throw the run
+    // started failing at — and the report still holds it in `failures`).
+    const oneSeat = boardBlindPolicy();
+    const solo = runSimulation(optionsFor(11, [oneSeat, DO_NOTHING_POLICY], 3));
+    expect(solo.plannerFailures).toHaveLength(1);
+    const soloReport = plannerReportOf(oneSeat);
+    if (soloReport === undefined) throw new Error('the policy cannot report at all');
+    expect(soloReport.failures).toContain(solo.plannerFailures[0]);
+    expect(soloReport.failures).toEqual(plannerFailuresOf(oneSeat));
   });
 
   it('still plays the whole horizon, so the batch’s aggregates keep one horizon', () => {
@@ -703,6 +731,13 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
     // claim only what happened during it. This drives the seam directly (`plannerFailuresOf`
     // reads `report()`), which is the only way to tell a stale record from a fresh one
     // without depending on which pass a corrupted board happens to fail in.
+    //
+    // The two records are the same pass on purpose, which is the case that matters: `cities`
+    // already failed before this run began, so `failures` holds `stale` for the rest of the
+    // instance's life, and `latestFailures` holds it too — until this run's own throw in that pass
+    // replaces it. The count is what says a throw happened during the run; the record it reports is
+    // the one `latestFailures` holds *after* that, which is `fresh`. Reading the frozen list instead
+    // would name the record of a run that has finished.
     const stale: PlannerFailure = {
       policy: 'driven',
       turn: 1,
@@ -713,96 +748,269 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
     };
     const fresh: PlannerFailure = {
       policy: 'driven',
-      turn: 1,
+      turn: 2,
       playerId: 0,
-      phase: 'units',
+      phase: 'cities',
       detail: 'this run',
       error: 'Error: fresh',
     };
     let recorded: readonly PlannerFailure[] = [stale];
+    let latest: readonly PlannerFailure[] = [stale];
     let polls = 0;
     const driven: DiagnosedPolicy = {
       name: 'driven',
       chooseCommands: () => {
         polls += 1;
-        if (polls === 1) recorded = [stale, fresh];
+        // This run's throw in a pass that has already failed: the first-per-pass list cannot move,
+        // and the latest-per-pass list moves to the record this throw minted.
+        if (polls === 1) {
+          recorded = [stale];
+          latest = [fresh];
+        }
         return [];
       },
-      // A fresh array per call, holding the same records — the shape `PolicyReport` promises.
-      report: () => ({ failures: [...recorded], failureCount: recorded.length }),
+      // Fresh arrays per call, holding the same records — the shape `PolicyReport` promises.
+      report: () => ({
+        failures: [...recorded],
+        latestFailures: [...latest],
+        failureCount: polls,
+      }),
     };
 
     const result = runSimulation(optionsFor(14, [driven, driven], 2));
 
-    expect(result.plannerFailures.map((failure) => failure.error)).toEqual(['Error: fresh']);
+    // Both seats are polled, and both threw during this run, so both are named — the stale record,
+    // which the frozen first-per-pass list still holds and would happily hand over, is not.
+    expect(result.plannerFailures.map((failure) => failure.error)).toEqual([
+      'Error: fresh',
+      'Error: fresh',
+    ]);
+    expect(result.plannerFailures).not.toContain(stale);
+    expect(result.plannerFailures.map((failure) => failure.turn)).toEqual([2, 2]);
   });
 
-  it('reports a re-throw that the record list cannot show, because the count can (F2-1)', () => {
-    // The failure the runner baselines against is `failureCount`, not the identity of the records
-    // in `failures`, and this is the case that separates them: the list holds ONE record for the
-    // whole life of the instance (which is what `smartPolicy` does — one record per pass), while
-    // the count grows with every throw. Baselining on the list calls the second run clean, which
-    // is a silent pass; baselining on the count reports it.
+  it('reports a re-throw that the record list cannot show, because the count can (F2-1 and H1)', () => {
+    // **Two findings, one fixture, and the fixture's shape is what separates them.**
     //
-    // Two instances, reused across BOTH runs, one turn each. Each keeps a single-element
-    // `failures` list for its whole life — like `firstByPhase` — and rewrites that record on each
-    // throw, so the two runs are distinguishable by what they read: run 1's report says "throw 1",
-    // run 2's says "throw 2". A record is a snapshot in the real policy too; the count is the only
-    // thing that says a *second* throw happened at all.
+    // F2-1 (why the baseline is the count): a policy keeps ONE record per pass for the whole life of
+    // the instance — `firstByPhase`, exactly like the shipped `smartPolicy` — so a second run that
+    // throws in a pass the first run already recorded is handed *the same frozen record object*.
+    // Baselining on the identity of the records in `failures` calls that second run clean, which is
+    // a silent pass.
+    //
+    // H1/G2-1 (why the *record* comes from `latestFailures`): the record that made the run visible
+    // was the last entry of the frozen list, so the second run reported the FIRST run's turn, player
+    // and detail — a throw that did not happen in it. The record it reports now is the policy's
+    // **current** record for the pass, which is why the fixture keeps `latestByPhase` beside
+    // `firstByPhase`, and why the assertions below pin the throw of the run being described.
+    //
+    // The fixture is frozen on purpose: `firstByPhase` holds the record minted on the very first
+    // throw of each pass and `report()` hands that same object back forever. That is precisely the
+    // property that made the old baseline blind to a re-throw, so a test whose fixture minted a
+    // fresh record per throw would pass under the old baseline too — it would be decoration. Every
+    // assertion here fails on the pre-M7e identity baseline (both runs then report `[]`, because no
+    // record in the list is new to the second run) and on the pre-H1 record choice (run 2 then
+    // reports turn 1, the record of the run before it).
     const driven = (playerId: number): DiagnosedPolicy => {
+      const firstByPhase = new Map<PlannerPhase, PlannerFailure>();
+      const latestByPhase = new Map<PlannerPhase, PlannerFailure>();
       let count = 0;
-      let latest: PlannerFailure = {
-        policy: 'driven',
-        turn: 1,
-        playerId,
-        phase: 'units',
-        detail: 'the units',
-        // The pre-run state: nothing has failed, and this record is never handed to a run.
-        error: 'Error: nothing has failed yet',
+      // The phase's throw ledger: a snapshot per throw, never mutated afterwards, so a run that has
+      // taken one keeps the values that throw had (`PolicyReport.latestFailures`).
+      const throwRecord = (phase: PlannerPhase, turn: number, detail: string): PlannerFailure => {
+        count += 1;
+        const record: PlannerFailure = {
+          policy: 'driven',
+          turn,
+          playerId,
+          phase,
+          detail,
+          error: `Error: the board is unreadable for seat ${String(playerId)} (turn ${String(turn)})`,
+        };
+        if (!firstByPhase.has(phase)) firstByPhase.set(phase, record);
+        latestByPhase.set(phase, record);
+        return record;
       };
       return {
         name: 'driven',
-        chooseCommands: () => {
-          count += 1;
-          latest = {
-            ...latest,
-            error: `Error: the board is unreadable for seat ${String(playerId)} (throw ${String(count)})`,
-          };
+        chooseCommands: (ctx) => {
+          // The turn the state is really on, so "run 2 borrowed run 1's turn" is testable: 1 and 4
+          // cannot be confused, and both are turns this fixture was genuinely handed.
+          throwRecord('units', ctx.state.turn, 'the units');
           return [];
         },
-        // One record, ever — a fresh array holding exactly that record, like `firstByPhase`.
-        report: () => ({ failures: [latest], failureCount: count }),
+        // One record per pass, ever — fresh arrays holding the same records, like `firstByPhase`.
+        report: () => ({
+          failures: [...firstByPhase.values()],
+          latestFailures: [...latestByPhase.values()],
+          failureCount: count,
+        }),
       };
     };
     const seats = [driven(0), driven(1)];
 
-    // Run 1: each seat's record is still new to the run, so both are collected.
+    // Run 1: both seats' records are new to the run, so both are collected — and they name run 1's
+    // own turn.
     const first = runSimulation(optionsFor(15, seats, 1));
-    expect(first.plannerFailures.map((failure) => failure.error)).toEqual([
-      'Error: the board is unreadable for seat 0 (throw 1)',
-      'Error: the board is unreadable for seat 1 (throw 1)',
+    expect(first.plannerFailures.map((failure) => failure.turn)).toEqual([1, 1]);
+    expect(first.plannerFailures.map((failure) => failure.detail)).toEqual([
+      'the units',
+      'the units',
     ]);
+    for (const failure of first.plannerFailures) {
+      expect(failure.phase).toBe('units');
+      expect(failure.error).toContain('(turn 1)');
+    }
 
-    // Run 2 re-throws in the pass run 1 already recorded, and the list it is handed is still that
-    // one record — nothing about its *shape* says a new throw happened. The counts moved, so the
-    // run reports them, and the record it reports is the policy's own latest.
+    // Run 2 re-throws in the pass run 1 already recorded, and the *lists it is handed* are the ones
+    // that decide what it can report. `failures` is unchanged — the same frozen objects, one per
+    // pass, minted in run 1 — so a baseline taken on that list sees nothing new and reports a clean
+    // run. The counts moved, so the run is reported, and what it reports is out of
+    // `latestFailures`, which run 2's throws have replaced.
+    //
+    // Both runs are one turn long, deliberately: the fixture hands the policy the turn it is really
+    // planning, so with unequal horizons "run 2 reported run 1's turn" and "run 2 reported a turn of
+    // its own that happens to have the same number" would be the same assertion. The unequal-horizon
+    // case is the next test, which is the defect as it was reported.
     const second = runSimulation(optionsFor(16, seats, 1));
-    expect(second.plannerFailures.map((failure) => failure.error)).toEqual([
-      'Error: the board is unreadable for seat 0 (throw 2)',
-      'Error: the board is unreadable for seat 1 (throw 2)',
-    ]);
+
+    // The silent pass this pins: run 2 reported NOTHING before F2-1, and it reports its own throw
+    // now — the same number of entries as run 1, from the same two seats.
+    expect(first.plannerFailures.length).toBeGreaterThan(0);
+    expect(second.plannerFailures).toHaveLength(first.plannerFailures.length);
+    for (const failure of second.plannerFailures) {
+      expect(failure.phase).toBe('units');
+      expect(Number.isInteger(failure.playerId)).toBe(true);
+    }
+    // The entry is the record object the policy minted for that throw — not one borrowed from the
+    // frozen first-per-pass list, which is checked to be a *different* object below.
+    const seatOf = (index: number): DiagnosedPolicy => {
+      const seat = seats[index];
+      if (seat === undefined) throw new Error(`no seat ${String(index)}`);
+      return seat;
+    };
+    expect(second.plannerFailures).toContain(seatOf(0).report().latestFailures?.[0]);
+    expect(second.plannerFailures).toContain(seatOf(1).report().latestFailures?.[0]);
+    for (const failure of second.plannerFailures) {
+      expect(seatOf(0).report().failures).not.toContain(failure);
+      expect(seatOf(1).report().failures).not.toContain(failure);
+    }
     // Run 1 is not retroactively rewritten by run 2: each run kept the record it read.
-    expect(first.plannerFailures).not.toStrictEqual(second.plannerFailures);
     expect(first.plannerFailures.map((failure) => failure.error)).toEqual([
-      'Error: the board is unreadable for seat 0 (throw 1)',
-      'Error: the board is unreadable for seat 1 (throw 1)',
+      'Error: the board is unreadable for seat 0 (turn 1)',
+      'Error: the board is unreadable for seat 1 (turn 1)',
     ]);
+    // ...and the two runs do not report the same objects, even though both are about turn 1.
+    expect(first.plannerFailures).not.toContain(second.plannerFailures[0]);
 
     // The count is exactly why: it grew during each run, while each `failures` list stayed at one
-    // record — so `failureCount` is the only thing a later run can measure against.
+    // record per pass — the frozen record of the very first throw in it.
     for (const seat of seats) {
       expect(seat.report().failures).toHaveLength(1);
+      expect(seat.report().failures[0]?.turn).toBe(1);
+      expect(seat.report().latestFailures).toHaveLength(1);
+      expect(seat.report().latestFailures?.[0]?.turn).toBe(1);
       expect(seat.report().failureCount).toBe(2);
+      // The two records are different objects with the same turn: this is the fixture property that
+      // makes the test discriminate, so it is asserted rather than assumed.
+      expect(seat.report().failures[0]).not.toBe(seat.report().latestFailures?.[0]);
     }
+  });
+
+  it('names nothing rather than an earlier run, for a report that carries no records', () => {
+    // The H1/G2-1 rule at its limit. A `PolicyReport` written before `latestFailures` existed is
+    // still a valid report — the field is optional — and its count can still say that a throw
+    // happened during a run. What it cannot say is *which* throw: its only list is the
+    // first-per-pass one, which on a reused instance holds a record from a run that has finished.
+    //
+    // Reaching into that list is exactly the defect this wave closes (run B reporting run A's
+    // `turn 4 … cities pass`), so the runner reports nothing and keeps the honest part: the count
+    // moved, so the run is not silent about having thrown, and no game is stamped with a location
+    // that belongs to another.
+    const stale: PlannerFailure = {
+      policy: 'silent',
+      turn: 4,
+      playerId: 0,
+      phase: 'cities',
+      detail: 'city 0',
+      error: 'Error: an earlier run left this here',
+    };
+    let count = 0;
+    const silent: DiagnosedPolicy = {
+      name: 'silent',
+      chooseCommands: () => {
+        count += 1;
+        return [];
+      },
+      // No `latestFailures`, and no other change: the shape a pre-H1 reporter has.
+      report: () => ({ failures: [stale], failureCount: count }),
+    };
+
+    const first = runSimulation(optionsFor(17, [silent, silent], 1));
+    const second = runSimulation(optionsFor(18, [silent, silent], 1));
+
+    expect(first.plannerFailures).toEqual([]);
+    expect(second.plannerFailures).toEqual([]);
+    // The throw is not hidden — it is counted, and the stale record is still the policy's own
+    // answer to "which passes have ever failed". What a run does not do is claim it.
+    expect(silent.report().failureCount).toBe(4);
+    expect(silent.report().failures).toEqual([stale]);
+  });
+
+  it('does not hand a reused instance’s later run the earlier run’s turn (H1/G2-1)', () => {
+    // **The reported defect, in the exact shape it was reported in.** One smart policy instance —
+    // the singleton the batch, the tournament and the CLI all share across every seat of every run
+    // — is handed a board it can read for a while and then cannot. Run A goes blind from turn 4;
+    // run B, on the same instance, only from turn 6.
+    //
+    // Run B's planner threw on turns 6, 7 and 8 and on no other turn. Before this fix its result
+    // reported `turn 4 … cities pass (city 0)`: the *first* record of the cities pass, frozen onto
+    // the instance by run A, read because the count (honestly) moved in run B. The CLI printed
+    // exactly that, seed-qualified — `seed 2, turn 4 — smart, player 0, cities pass (city 0)` — for
+    // a turn B never failed on. The WHETHER was right and the WHAT was another game's.
+    const inner = smartPolicy();
+    // The turn both seats' boards stop being readable from; `Infinity` means "not in this run".
+    let blindFromTurn = Number.POSITIVE_INFINITY;
+    const shared: DiagnosedPolicy = {
+      name: inner.name,
+      chooseCommands: (ctx) =>
+        inner.chooseCommands(
+          ctx.state.turn >= blindFromTurn
+            ? { ...ctx, state: boardWithoutAReadableMap(ctx.state) }
+            : ctx,
+        ),
+      report: () => inner.report(),
+    };
+
+    blindFromTurn = 4;
+    const runA = runSimulation(optionsFor(2, [shared, shared], 8));
+    blindFromTurn = 6;
+    const runB = runSimulation(optionsFor(2, [shared, shared], 8));
+
+    // Run A failed from its own turn 4, and every entry it reports is a cast this run really made:
+    // a phase that threw, on a turn the run was on.
+    expect(runA.plannerFailures.length).toBeGreaterThan(0);
+    for (const failure of runA.plannerFailures) {
+      expect(failure.policy).toBe('smart');
+      expect(failure.error).toContain('the board is unreadable');
+      expect(failure.turn).toBeGreaterThanOrEqual(4);
+    }
+
+    // Run B: every entry is one of run B's OWN turns — never run A's turn 4 — and no entry is the
+    // record object run A was handed.
+    expect(runB.plannerFailures.length).toBeGreaterThan(0);
+    for (const failure of runB.plannerFailures) {
+      expect(failure.policy).toBe('smart');
+      expect(failure.error).toContain('the board is unreadable');
+      expect(failure.turn).toBeGreaterThanOrEqual(6);
+      expect(runA.plannerFailures).not.toContain(failure);
+    }
+    // The frozen first-per-pass list is the thing that made the old reading possible, and it is
+    // still there — one record per pass, the first one the instance ever made, at run A's turn 4.
+    // A run reports from the other list, so the presence of this record cannot reach a result.
+    const frozen = inner.report().failures;
+    expect(frozen.length).toBeGreaterThan(0);
+    for (const stale of frozen) expect(stale.turn).toBe(4);
+    for (const stale of frozen) expect(runB.plannerFailures).not.toContain(stale);
   });
 });

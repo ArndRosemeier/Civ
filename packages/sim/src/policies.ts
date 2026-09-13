@@ -1186,8 +1186,11 @@ export { SMART_POLICY, SMART_POLICY_NAME, smartPolicy } from './ai/smart.js';
 // report belongs beside the policy itself: a caller holding `SMART_POLICY` from here can
 // ask `plannerFailuresOf(SMART_POLICY)` without importing the AI's own module. Both work on
 // any `Policy` — the two control policies above answer `[]` — so a reporter needs no branch
-// for which policy it is looking at.
-export { describePlannerFailures, plannerFailuresOf } from './ai/smart.js';
+// for which policy it is looking at. `plannerReportOf` is the same seam asked for the whole
+// report (both record lists and the monotone count), and it is re-exported here beside its two
+// narrower readers so that every reader in this package — `runner.ts` included — reaches one
+// module path instead of two spellings of one question (H1/G2-5).
+export { describePlannerFailures, plannerFailuresOf, plannerReportOf } from './ai/smart.js';
 export type { DiagnosedPolicy, PlannerFailure, PlannerPhase, PolicyReport } from './ai/smart.js';
 export {
   DEFAULT_SMART_WEIGHTS,

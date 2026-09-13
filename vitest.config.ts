@@ -73,13 +73,19 @@ const resolvePath = (p: string): string => fileURLToPath(new URL(p, import.meta.
  * the two files carried 102 s of a 104 s gate between them, and nothing else in the collection
  * was within 5 s of them.
  *
- * The result of that move, as the raw output of the command the criterion names:
+ * The result of that move, as the raw output of the command the criterion names. **These are
+ * readings, not claims about what the tier costs now** — each is labelled with the box it was taken
+ * on, because a figure that reads as current is a figure that goes stale silently, and this project
+ * has already corrected that drift twice (a `~100 s` comment over a 489 s tier, and the five-file
+ * budget restatement above). The **bound** is not quoted here at all: it lives in
+ * `A3_TOURNAMENT_EVIDENCE` / `DEFAULT_TOURNAMENT_BUDGET_MS`, which is the one place it changes.
  *
- * - **`time pnpm verify` = `real 0m57.320s`** on a quiet machine (vitest's own share 19.6 s),
- *   against 104 s before it — 12.7 s inside the 70 s target and 33 s inside A5's 90 s bound;
- * - `real 1m0.655s` for a second run taken while another workspace's suite was running
- *   (`loadavg` 2.62, six of its test processes live), with vitest's own share 21.1 s — so the
- *   headroom survives a busy machine, which is the point of having any.
+ * - `real 0m57.320s` for fast `pnpm verify` **as measured when this tier was drawn** (M7b, quiet
+ *   machine, vitest's own share 19.6 s), against `104 s` before it — 12.7 s inside the 70 s target
+ *   and 33 s inside A5's 90 s bound;
+ * - `real 1m0.655s` for a second run taken at the same time while another workspace's suite was
+ *   running (`loadavg` 2.62, six of its test processes live), with vitest's own share 21.1 s — so
+ *   the headroom survived a busy machine, which is the point of having any.
  *
  * Two things this config deliberately does **not** do. It does not exclude files (the header
  * above), and it does not shrink the *work* — the expensive experiments that are evidence
@@ -95,7 +101,26 @@ const resolvePath = (p: string): string => fileURLToPath(new URL(p, import.meta.
  * The same rule applied to the *full* tier, where the twenty-seed sixty-turn tournament in
  * `packages/sim/test/tournament.test.ts` measured 417 s — 85 % of that tier's 489 s — against a
  * comment claiming ~100 s: it is a four-seed smoke run now (9.2 s), and the twenty seeds are the
- * evidence script's job. That tier now measures `real 2m58.085s`.
+ * evidence script's job.
+ *
+ * **`real 2m58.085s` was quoted here for that tier, unlabelled, and it is not what the tier costs.**
+ * Re-measured while landing H1, solo and with no other job of this workspace running, on the shared
+ * box (`/home/box/Harness`, `loadavg` 5.7-9.9 from the machine's own long-lived processes):
+ * `real 1m37.342s` (1913 tests passing, vitest's own share 96.6 s) and `real 1m41.303s` on a second
+ * run. Both are **readings from 2026-09-13**, kept as such rather than as a current figure: the fast
+ * tier is the gate on every commit and the one the ≤ 70 s bound is aimed at, so the full tier is
+ * measured when the tier boundary moves, not restated as a standing number. The old figure is left
+ * in this sentence instead of deleted because the 1.8× gap between it and the two runs above is
+ * exactly the drift an unlabelled number invites, and the next reader deserves to see it named.
+ *
+ * **H2 re-took both bounds while verifying H1** (2026-09-13, same box and the same long-lived load
+ * from the machine's own processes, no other job of this workspace running, each run starting with
+ * `loadavg` 4.2-6.0 on eight cores): `real 0m53.062s` for fast `pnpm verify` — 17 s inside the 70 s
+ * bound — and `real 2m5.756s` for `pnpm verify:full`, 7.9 minutes inside the 10 minute one. Those
+ * runs collect **1914 tests** rather than the 1913 above, because H2 added one test to
+ * `sim-cli.test.ts` (the phase-less planner record, a branch nothing else drove): the two counts are
+ * readings from two runs, not a drift, and neither figure is a claim about what the tier costs next
+ * week.
  *
  * ## Why the alias map is exported
  *

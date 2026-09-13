@@ -46,6 +46,7 @@ import {
   DEFAULT_TOURNAMENT_BUDGET_MS,
   smartPolicy,
   type DiagnosedPolicy,
+  type PlannerFailure,
 } from '@civts/sim';
 import { describe, expect, it } from 'vitest';
 // The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
@@ -1682,10 +1683,13 @@ describe('the CLI says out loud when a planner threw, and fails the run', () => 
     expect(output.stdout).toContain('the board is unreadable');
     // The verdict's own last line, printed whether or not anybody reads the banner: a reader must
     // not have to notice an *absence* to know the AI played the whole game. The counts are the
-    // report's, not the renderer's.
-    expect(output.stdout).toContain('1 planner failure in 1 of 1 game');
+    // report's, not the renderer's — and the count is two, because both seats of this one-game
+    // tournament threw in the same pass: one entry per (seat, pass) per game, not one per game
+    // (H1/G2-1 re-decided this from `1`: a record frozen per pass collapsed the two seats into one
+    // line and silently dropped the other seat's throw).
+    expect(output.stdout).toContain('2 planner failures in 1 of 1 game');
     expect(output.stdout).toContain('not measurements of the AI');
-    expect(output.stdout).toContain('planners    1 planner failure in 1 of 1 game');
+    expect(output.stdout).toContain('planners    2 planner failures in 1 of 1 game');
     expect(output.exitCode).toBe(1);
   });
 
@@ -1705,21 +1709,31 @@ describe('the CLI says out loud when a planner threw, and fails the run', () => 
     const failures = parsedJson(output)['plannerFailures'];
     expect(Array.isArray(failures)).toBe(true);
     if (!Array.isArray(failures)) throw new Error('the report carries no planner failures');
-    // **Re-decided with F2-1: these two expectations were both `1`.**
+    // **Re-decided twice, and both are recorded rather than deleted.**
     //
-    // They pinned a *silent pass*. The batch hands every seat of every run the same instance, and
+    // F2-1 re-decided the *absence*: the batch hands every seat of every run the same instance, and
     // this planner throws on every turn of both games of the two-seed batch, but the runner used to
     // baseline the policy's failure log on record *identity* while `PolicyReport` keeps only the
     // first failure per pass for the life of the instance — so the second game re-threw in a pass
     // the first had already recorded, got the same record object back, and reported nothing. One
     // game was named; the other was reported as clean although its AI threw throughout. A path
-    // where a thrown planner looks clean is the silent-pass shape M7d exists to close, so the
-    // runner now baselines on the monotone `PolicyReport.failureCount`, and each game reports its
-    // own throw: two records, in two games. Still one entry per game rather than one per turn,
-    // which is why each of the four-turn games contributes one.
-    expect(failures.length).toBe(2);
+    // where a thrown planner looks clean is the silent-pass shape M7d exists to close, so the runner
+    // baselines on the monotone `PolicyReport.failureCount`, and each game reports its own throw.
+    //
+    // H1/G2-1 re-decided the *number*, from `2` to `4` and from `[1, 1]` to `[2, 2]`. One entry per
+    // game was not a property of the seam: both seats of each game share this instance and both
+    // threw, in the same pass, so a record frozen per pass collapsed them into one line and the run
+    // reported one seat's throw while silently dropping the other's. Two seats that both stopped
+    // playing are two throws, and each is now named. It is still not one entry per turn — each game
+    // contributes two, not eight, though its planner threw on all four turns for both seats.
+    expect(failures.length).toBe(4);
     expect(output.report?.totals.plannerFailingRuns).toBe(2);
-    expect(output.report?.runs.map((run) => run.plannerFailures.length)).toStrictEqual([1, 1]);
+    expect(output.report?.runs.map((run) => run.plannerFailures.length)).toStrictEqual([2, 2]);
+    // And each run's entries are its own two seats — not one seat twice, and not the other game's.
+    for (const run of output.report?.runs ?? []) {
+      expect(run.plannerFailures.map((failure) => failure.playerId)).toStrictEqual([0, 1]);
+      for (const failure of run.plannerFailures) expect(failure.seed).toBe(run.seed);
+    }
     expect(output.stdout).not.toContain('WARNING');
 
     const text = okOrThrow(
@@ -1779,5 +1793,72 @@ describe('the CLI says out loud when a planner threw, and fails the run', () => 
     expect(
       okOrThrow(runSimCommand([...SMALL, '--policy', 'smart', '--json'])).stdout,
     ).not.toContain('WARNING');
+  });
+
+  it('says LESS for a record that cannot say where its throw happened, and invents no pass', () => {
+    // `PlannerFailure.phase` and `.detail` are optional because a `PolicyReport` written
+    // *elsewhere* may not know them; the shipped planner always does (it tracks its own pass as it
+    // plans), so this shape is reachable only through the `policyOverrides` seam. That is exactly
+    // why it is driven here rather than assumed: the branch that renders it — and the branch that
+    // keeps the two keys out of the canonical `--json` — is otherwise executed by no test, and a
+    // renderer nobody drives is a renderer nobody keeps honest.
+    const mute = (): DiagnosedPolicy => {
+      let count = 0;
+      const records: PlannerFailure[] = [];
+      return {
+        name: 'mute',
+        // An empty turn: the run is about the record and nothing else.
+        chooseCommands: (ctx) => {
+          count += 1;
+          records.push({
+            policy: 'mute',
+            turn: ctx.state.turn,
+            playerId: Number(ctx.playerId),
+            error: 'Error: this reporter cannot say where it was',
+          });
+          return [];
+        },
+        // A fresh array per call, the same objects — the shape `PolicyReport` promises, with a
+        // count that moves on every throw and no pass recorded on any of them.
+        report: () => ({
+          failures: records.slice(0, 1),
+          latestFailures: [...records],
+          failureCount: count,
+        }),
+      };
+    };
+
+    const text = okOrThrow(
+      runTournamentCommand(['--seeds', '1', '--turns', '1', '--seats', 'smart,smart'], {
+        policyOverrides: new Map([['smart', mute()]]),
+      }),
+    );
+    // The pass clause shrinks to what is known rather than borrowing a pass name: a placeholder
+    // such as "unknown pass" would read like a pass the engine has, which is the plausible-looking
+    // claim about the AI this project treats as the worst outcome here.
+    expect(text.stdout).toContain('at an unrecorded point in the turn');
+    expect(text.stdout).not.toContain('undefined');
+    expect(text.exitCode).toBe(1);
+
+    const json = okOrThrow(
+      runTournamentCommand(['--seeds', '1', '--turns', '1', '--seats', 'smart,smart', '--json'], {
+        policyOverrides: new Map([['smart', mute()]]),
+      }),
+    );
+    const parsed = parsedJson(json);
+    const failures = parsed['plannerFailures'];
+    expect(Array.isArray(failures)).toBe(true);
+    if (!Array.isArray(failures) || !isRecord(failures[0])) {
+      throw new Error('the report carries no planner failures');
+    }
+    const first = failures[0];
+    // Omitted, never written holding `undefined`: `canonicalize` refuses that outright, and the
+    // unhashable spelling is a mistake this project has paid for three times. What the record
+    // cannot say is what it does not carry.
+    expect(Object.keys(first)).not.toContain('phase');
+    expect(Object.keys(first)).not.toContain('detail');
+    expect(first['error']).toContain('cannot say where it was');
+    // Canonical JSON, still — the two absent keys are absent rather than out of order.
+    expectSortedKeys(parsed, '$');
   });
 });

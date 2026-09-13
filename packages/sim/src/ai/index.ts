@@ -42,13 +42,25 @@ export type { SmartWeightGroup, SmartWeights, SmartWeightsPatch } from './weight
 // A policy that cannot throw and cannot say it went wrong reports a game it did not play.
 // `plannerFailuresOf` and `describePlannerFailures` are how a runner or a CLI asks: they
 // work on any `Policy` (`[]` and `[]` for one that cannot report), so wiring them costs a
-// call and no knowledge of this module.
+// call and no knowledge of this module. `plannerReportOf` is the same question asked for the
+// whole report — the two lists and the monotone count — and it is on this surface because a
+// consumer that wants the **count** (the only monotone thing a policy hands out, and the thing
+// the runner baselines on) otherwise has no public path to it: `describing`/`listing` drop it,
+// so `@civts/sim`'s own runner reached for the module path instead. Exported beside its two
+// narrower readers so the seam has one name on the surface, not three.
 
 export {
   describePlannerFailures,
   plannerFailuresOf,
+  plannerReportOf,
   SMART_POLICY,
   SMART_POLICY_NAME,
   smartPolicy,
 } from './smart.js';
-export type { DiagnosedPolicy, PlannerFailure, PlannerPhase, PolicyReport } from './smart.js';
+export type {
+  DiagnosedPolicy,
+  PlannerFailure,
+  PlannerFailureDraft,
+  PlannerPhase,
+  PolicyReport,
+} from './smart.js';

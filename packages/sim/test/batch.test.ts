@@ -316,27 +316,35 @@ describe('BatchResult — what it does not claim', () => {
     const broken = boardBlindBatchPolicy();
     const batch = batchOf([31, 32], 3, [broken, broken]);
 
-    // **Re-decided in M7d's follow-up (F2-1): this expectation was `[true, false]`.**
+    // **Re-decided twice, and both decisions are recorded rather than deleted.**
     //
-    // It pinned a *silent pass*. The fixture hands ONE policy instance to both runs, and the
-    // planner throws on every turn of both: the runner used to baseline the policy's failure log
-    // on record *identity*, while `PolicyReport.failures` keeps only the first failure per pass
-    // for the life of the instance — so run 2 re-threw in a pass run 1 had already recorded, was
-    // handed the same record object, and reported *nothing*. A path where a thrown planner looks
-    // clean is the same silent-pass shape M7d exists to close, so the runner now baselines on the
-    // monotone `PolicyReport.failureCount` (`runner.ts`, "Carrying a planner failure") and the
-    // second run reports its own throw. The old value is recorded here rather than deleted: the
-    // change is auditable, and this is a *corrected* expectation, not a loosened one.
+    // M7e's follow-up (F2-1) re-decided this from `[true, false]`. That pinned a *silent pass*: the
+    // fixture hands ONE policy instance to both runs, and the planner throws on every turn of both,
+    // while the runner then baselined the log on record *identity* — and `PolicyReport.failures`
+    // keeps only the first failure per pass for the life of the instance, so run 2 re-threw in a
+    // pass run 1 had already recorded, was handed the same record object, and reported *nothing*.
+    // The count is now the baseline, so the second run reports its own throw.
+    //
+    // H1/G2-1 re-decided the **number** from `[1, 1]` to `[2, 2]`. One entry per run was not a
+    // property of the seam: it was an artefact of the record the runner read. Both seats share this
+    // instance and **both** threw, on every turn of every run, and the pass they threw in is the
+    // same for both (`research` — the map is the first thing the city pass reads, so a board that
+    // cannot be read at all fails there). A record frozen per pass therefore collapsed two seats
+    // into one line, and the run reported one seat's throw while silently dropping the other's.
+    // What a run reports is now one entry per (seat, pass) it saw throw, so two seats are two
+    // entries — and the count is still not one per turn: both threw on all three turns of both
+    // runs and each run carries two, not twelve.
     //
     // Still true, and deliberately: the record is attributed to the run that produced it (run 1
-    // is not handed run 2's), a re-throw inside one run is counted once rather than nagged once
-    // per turn — each run carries exactly one entry even though both threw on all three turns of
-    // two seats — and a game is never accused of a failure it did not cause.
-    expect(batch.runs.map((run) => run.plannerFailures.length)).toEqual([1, 1]);
-    expect(batch.runs.map((run) => run.plannerFailures[0]?.error)).toEqual([
-      'Error: the board is unreadable',
-      'Error: the board is unreadable',
+    // is not handed run 2's), a re-throw inside one run is not nagged once per turn, and a game is
+    // never accused of a failure it did not cause.
+    expect(batch.runs.map((run) => run.plannerFailures.length)).toEqual([2, 2]);
+    expect(batch.runs.map((run) => run.plannerFailures.map((failure) => failure.error))).toEqual([
+      ['Error: the board is unreadable', 'Error: the board is unreadable'],
+      ['Error: the board is unreadable', 'Error: the board is unreadable'],
     ]);
+    // Two seats, so the two entries of one run are two players' throws and not one throw twice.
+    expect(batch.runs[0]?.plannerFailures.map((failure) => failure.playerId)).toEqual([0, 1]);
     // Nothing the invariants saw was wrong, and nothing stopped early.
     expect(batch.runs.every((run) => run.violations.length === 0)).toBe(true);
     expect(batch.runs.every((run) => run.turnsPlayed === 3)).toBe(true);

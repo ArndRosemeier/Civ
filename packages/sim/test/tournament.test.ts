@@ -627,6 +627,11 @@ describe('a planner failure is a pass/fail condition (M7d)', () => {
       expect(failure.policy).toBe(broken.name);
       expect(failure.turn).toBeGreaterThanOrEqual(1);
       expect(failure.error).toContain('the board is unreadable');
+      // Optional on the type, always present from a planner that knows where it was — guarded for
+      // the same reason the record above is: a missing detail must fail, not pass quietly.
+      if (failure.detail === undefined) {
+        throw new Error(`seed ${String(game.seed)} lost the detail of the pass`);
+      }
       expect(failure.detail.length).toBeGreaterThan(0);
     }
     // The tournament's flat list is exactly the games' own records, in game order — the same
@@ -636,7 +641,7 @@ describe('a planner failure is a pass/fail condition (M7d)', () => {
     );
   });
 
-  it('attributes a failure to each game that suffered it, once per game', () => {
+  it('attributes a failure to each game that suffered it, per seat and not per turn', () => {
     // The record lives on the *policy instance* and `PolicyReport` keeps the first failure of each
     // pass, so this test is about the two rules meeting: the pass record is the policy's (one per
     // pass, for the life of the instance), while **whether a game threw at all** is the runner's,
@@ -651,17 +656,26 @@ describe('a planner failure is a pass/fail condition (M7d)', () => {
     // failures instead of the records says what actually happened, and the old value is kept here
     // so the change is auditable rather than a quietly loosened assertion.
     //
-    // What must stay true is asserted too: each game carries its own failure (one entry, not one
-    // per turn — a policy that throws on every turn of a hundred-turn game must not nag a hundred
-    // times), and no game is accused of a failure it did not cause.
+    // What must stay true is asserted too: each game carries its own failures rather than one per
+    // turn — a policy that throws on every turn of a hundred-turn game must not nag a hundred
+    // times — and no game is accused of a failure it did not cause.
     const broken = boardBlindPolicy();
     const result = tournamentOf({ seeds: [5, 6, 7], policies: [broken, broken], maxTurns: 3 });
     const verdict = tournamentVerdict(result);
 
     expect(result.games).toHaveLength(3);
     expect(verdict.gamesWithPlannerFailures).toBe(3);
-    // Every game threw, and each says so exactly once — never once per turn per seat.
-    expect(result.games.map((game) => game.plannerFailures.length)).toStrictEqual([1, 1, 1]);
+    // Every game threw, and each says so **once per seat** — never once per turn. The two entries
+    // are the two seats' own throws: both seats share `broken` and both stopped playing, in the same
+    // pass (`research`, where the planner first reads the board), and one entry per run would have
+    // reported one seat while silently dropping the other's (H1/G2-1 re-decided this from `[1, 1, 1]`
+    // for exactly that reason — the old number was an artefact of a record frozen per pass, not a
+    // property of the seam). Both threw on all three turns of all three games, so two per game is
+    // still a bound rather than a count of turns.
+    expect(result.games.map((game) => game.plannerFailures.length)).toStrictEqual([2, 2, 2]);
+    for (const game of result.games) {
+      expect(game.plannerFailures.map((failure) => failure.playerId)).toStrictEqual([0, 1]);
+    }
     // The tournament's flat list is still exactly the games' own records, in game order.
     expect(result.plannerFailures).toStrictEqual(
       result.games.flatMap((game) => game.plannerFailures),
