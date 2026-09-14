@@ -184,33 +184,32 @@ main {
 }
 
 /*
- * The map region: a square, and the largest one the column can hold.
+ * The map region fills the whole column: the map takes every pixel the sidebar does not.
  *
- * `container-type: size` is what makes this expressible without JavaScript. It gives the region a
- * definite, content-independent size, which both (a) stops the canvas from being able to influence
- * the box it is sized against — the feedback loop that makes "largest square that fits" awkward in
- * CSS — and (b) makes the container units below mean "this region's own height".
+ * There is no square and no `aspect-ratio` here. The owner's first design made the map a square, but
+ * that wasted the slack whenever the column was wider than tall — a tall window left real map area
+ * unused. The design that replaced it: the map should fill all available space not used by the
+ * sidebar. The canvas is `100% × 100%` of the region, so the region and the map are the same
+ * rectangle, and `padding: 0` removes the panel's usual inset for the same reason.
  *
- * The canvas's side is then `min(100%, 100cqh)`: its full width, or its full height, whichever is
- * smaller. That is the largest square that fits, in one expression. `aspect-ratio` keeps it square
- * rather than letting the two axes disagree, and `overflow: hidden` guarantees the region can never
- * be grown by a child that overshoots.
+ * `overflow: hidden` guarantees the region can never be grown by a child that overshoots. The canvas
+ * is sized by the layout and read back by `main.ts`'s `measureCanvas`; a non-square box is fine
+ * there, because the camera clamp, the renderer and the hit-test each take a width and a height and
+ * none of them ever assumed the two were equal.
  */
 [data-panel='map'] {
   flex: 1 1 auto;
   min-height: 0;
-  container-type: size;
-  display: grid;
-  place-items: center;
   overflow: hidden;
+  padding: 0;
   border: 1px solid #2b333d;
   background: #0d1116;
   line-height: 0;
 }
 
 [data-panel='map'] canvas {
-  width: min(100%, 100cqh);
-  aspect-ratio: 1 / 1;
+  width: 100%;
+  height: 100%;
   cursor: crosshair;
 }
 

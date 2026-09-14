@@ -375,11 +375,18 @@ test('rendering: the sampled colour changes when the map pans and zooms, so the 
   const box = await canvasBox(page);
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   const camera = await cameraOf(page);
-  const local = { x: point.x - box.x, y: point.y - box.y };
-  const tileUnder = pagePointToTile(state, camera, local);
+  const rawLocal = { x: point.x - box.x, y: point.y - box.y };
+  const tileUnder = pagePointToTile(state, camera, rawLocal);
   expect(tileUnder, 'the centre of the canvas is not over a tile').toBeDefined();
   if (tileUnder === undefined) return;
 
+  // Sample the CENTRE of that tile, not the canvas centre. The canvas centre is an arbitrary pixel
+  // of the layout and can fall exactly on a grid line, whose colour (GRID_COLOUR) is the same for
+  // every terrain — so a pan that swaps the terrain beneath it would not change the pixel, and the
+  // one falsifier this test has would be measuring where the canvas centre happened to land rather
+  // than the renderer. The tile centre is interior by construction, so the sample is always terrain.
+  // This used to work only because the old square canvas put the centre just inside a tile.
+  const local = tileCentre(camera, tileUnder.x, tileUnder.y);
   const before = await sampleCanvasPixel(page, local);
 
   // Pan so that a tile of a DIFFERENT terrain sits under the same page point. The
@@ -531,8 +538,8 @@ test('hit-testing: a click opens the tile the same projection says is under the 
  * to be read. Three things have to hold at every window size, and each fails for a different
  * mistake:
  *
- *   1. it is square,
- *   2. it is the largest square the region can hold, and
+ *   1. it fills the region in both dimensions — no square, no slack,
+ *   2. it still fills it after a resize, and
  *   3. a pointer at its centre resolves to the tile the projection says is under that point.
  *
  * (3) is the load-bearing one. A fluid box can break the inverse mapping in two ways that nothing
@@ -540,31 +547,38 @@ test('hit-testing: a click opens the tile the same projection says is under the 
  * ground past the map's edge), and a hit-test still dividing by a size the renderer no longer used.
  * Both leave every other test passing, because every other test runs at one window size.
  */
-test('the map is a fluid square, and the click still lands where the renderer drew after a resize', async ({
+test('the map fills the region the sidebar leaves, and the click still lands where the renderer drew after a resize', async ({
   page,
 }) => {
   await openApp(page);
   await seedApp(page, SEED);
 
-  /** The canvas box, the region's content box, and what the two should be equal to. */
+  /** The canvas box, and the region's content box it must equal in both dimensions. */
   const measure = async (): Promise<{
     readonly width: number;
     readonly height: number;
-    readonly contentSide: number;
+    readonly contentWidth: number;
+    readonly contentHeight: number;
   }> => {
     const box = await canvasBox(page);
-    // The region's box model is read from the browser rather than restated here: the paddings and
-    // borders that decide how much room the canvas has are the stylesheet's business, and a test
-    // that hardcoded them would pass while the canvas sat in a box of a different shape.
-    const contentSide = await page.locator("[data-panel='map']").evaluate((region) => {
+    // The region's box model is read from the browser rather than restated here: the padding and
+    // border that decide how much room the canvas has are the stylesheet's business, and a test that
+    // hardcoded them would pass while the canvas sat in a box of a different shape.
+    const content = await page.locator("[data-panel='map']").evaluate((region) => {
       const style = getComputedStyle(region);
       const inset = (a: string, b: string): number =>
         parseFloat(style.getPropertyValue(a)) + parseFloat(style.getPropertyValue(b));
-      const width = region.clientWidth - inset('padding-left', 'padding-right');
-      const height = region.clientHeight - inset('padding-top', 'padding-bottom');
-      return Math.min(width, height);
+      return {
+        width: region.clientWidth - inset('padding-left', 'padding-right'),
+        height: region.clientHeight - inset('padding-top', 'padding-bottom'),
+      };
     });
-    return { width: box.width, height: box.height, contentSide };
+    return {
+      width: box.width,
+      height: box.height,
+      contentWidth: content.width,
+      contentHeight: content.height,
+    };
   };
 
   /**
@@ -598,26 +612,52 @@ test('the map is a fluid square, and the click still lands where the renderer dr
       .poll(
         async () => {
           const m = await measure();
-          return Math.abs(m.width - m.contentSide) <= 1;
+          return (
+            Math.abs(m.width - m.contentWidth) <= 1 && Math.abs(m.height - m.contentHeight) <= 1
+          );
         },
         { message: `the map never filled its region at ${at}`, timeout: 5000 },
       )
       .toBe(true);
 
     const m = await measure();
-    expect(
-      Math.abs(m.width - m.height),
-      `at ${at} the map is ${String(m.width)}x${String(m.height)}, which is not a square`,
-    ).toBeLessThanOrEqual(1);
     // Restated rather than assumed from the poll, so the failure names the number that was wrong.
     expect(
-      Math.abs(m.width - m.contentSide),
+      Math.abs(m.width - m.contentWidth),
       `at ${at} the map is ${String(m.width)}px across but the region can hold ` +
-        `${String(m.contentSide)}px, so it is not using the room it has`,
+        `${String(m.contentWidth)}px, so it is not using the width it has`,
+    ).toBeLessThanOrEqual(1);
+    expect(
+      Math.abs(m.height - m.contentHeight),
+      `at ${at} the map is ${String(m.height)}px tall but the region can hold ` +
+        `${String(m.contentHeight)}px, so it is not using the height it has`,
     ).toBeLessThanOrEqual(1);
 
-    // The inverse mapping, at this size, against the camera the app is actually using.
+    // The fill assertions above are about the BOX, and the box is laid out by CSS the moment the
+    // window changes. The CAMERA is re-clamped by the ResizeObserver one rendering update later, so a
+    // stale camera can still point past the map's edge here and put the canvas centre off the map.
+    // Poll until the centre is over a tile before the hit-test — the same reason the clamp section
+    // below polls on the clamp rather than on a size that is already correct. This surfaced as a
+    // flake only when the canvas stopped being square and the clamp bounds changed.
     const state = await readState(page);
+    await expect
+      .poll(
+        async () => {
+          const cam = await cameraOf(page);
+          const b = await canvasBox(page);
+          return (
+            screenToTile(
+              cam,
+              { width: state.map.width, height: state.map.height },
+              { x: b.width / 2, y: b.height / 2 },
+            ) !== undefined
+          );
+        },
+        { message: `at ${at} the canvas centre never came to rest over a tile`, timeout: 5000 },
+      )
+      .toBe(true);
+
+    // The inverse mapping, at this size, against the camera the app is actually using.
     const camera = await cameraOf(page);
     const box = await canvasBox(page);
     const centre = { x: box.width / 2, y: box.height / 2 };
@@ -639,9 +679,8 @@ test('the map is a fluid square, and the click still lands where the renderer dr
   }
 
   // The control that makes this a test about a FLUID map. Everything above also passes for a canvas
-  // hardcoded to a square small enough to fit the smallest window — square, and the largest square
-  // when the region happens to be that size. What cannot pass is a size that never moves, so the
-  // size moving is asserted rather than assumed.
+  // hardcoded to some box small enough to fit the smallest window. What cannot pass is a size that
+  // never moves, so the size moving is asserted rather than assumed.
   expect(
     new Set(sides).size,
     `the map measured ${JSON.stringify(sides)} at three window sizes, so it is not following the layout`,
