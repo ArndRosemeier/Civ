@@ -175,10 +175,12 @@ const noRoute = (from: number, to: number): string =>
  * there is no route.
  *
  * Fails with the same `GameError` members `planMove` uses for the questions they
- * share — an unknown unit, an absent player, a non-integer or off-map index — and
- * with `invalid-argument` (the engine's member for "this argument is not
- * acceptable") when the destination is a real tile that simply cannot be reached.
- * A unit already standing on `to` is `ok` with no steps.
+ * share — an unknown unit, an absent player, a non-integer or off-map index — with
+ * **`planMove`'s own refusal for the destination when that is what is wrong** (a
+ * mountain is `impassable`, a rival's tile is `occupied-by-enemy`), and with
+ * `invalid-argument` (the engine's member for "this argument is not acceptable")
+ * only when the destination is a tile the unit may stand on and simply cannot
+ * reach. A unit already standing on `to` is `ok` with no steps.
  *
  * Asking about a unit the state does not hold is an error rather than an empty
  * route, unlike `unitActions`' empty list: "nothing can happen" and "there is no
@@ -246,7 +248,8 @@ export const planRoute = (
   });
 
   /**
-   * The **destination's own** enterability, asked before the search starts.
+   * The **destination's own** enterability, asked before the search starts — and the
+   * engine's own refusal for it is what the caller gets.
    *
    * Every other node in the search is checked when it is discovered — the step onto it
    * is the thing being tested — but the destination is the search's *root*, and a root
@@ -257,17 +260,30 @@ export const planRoute = (
    * every returned step through `applyCommand` and was refused at the last one
    * (`occupied-by-enemy`, tile 31).
    *
+   * The failure is **`planMove`'s own error, not a route-shaped one**, whenever the
+   * destination is the problem: `impassable` for a mountain, `occupied-by-enemy` for a
+   * rival's tile, `not-enough-movement` for ground no unit of this type can ever afford.
+   * A player clicking a mountain should read "tile 12 cannot be entered", not "no route
+   * from tile 24 to tile 12" — the specific reason exists and the generic one would be
+   * this module throwing it away. `noRoute` is therefore for the other case only: a
+   * destination the unit *may* stand on, with no way to get there.
+   *
    * Asked from a neighbour, because the answer does not depend on which one asks (see
    * the module note on enterability being a property of the destination tile); a tile
-   * with no neighbours at all cannot be entered.
+   * with no neighbours at all cannot be entered, and then there is no step onto it.
    */
   const neighbourOfDestination = neighbors8(map, destination)[0];
-  if (
-    neighbourOfDestination === undefined ||
-    !planMove(probe(neighbourOfDestination), ruleset, unit.owner, unit.id, destination).ok
-  ) {
+  if (neighbourOfDestination === undefined) {
     return err({ kind: 'invalid-argument', detail: noRoute(unit.tile, destination) });
   }
+  const ontoDestination = planMove(
+    probe(neighbourOfDestination),
+    ruleset,
+    unit.owner,
+    unit.id,
+    destination,
+  );
+  if (!ontoDestination.ok) return err(ontoDestination.error);
 
   const distance = new Int32Array(size).fill(UNSET);
 

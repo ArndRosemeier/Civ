@@ -499,7 +499,15 @@ describe('planRoute: every clause of the movement rule is the engine declaring i
     // (4,1) is mountains — the wall, one row above the gap. The engine refuses it, and
     // so must the query, while its neighbour (4,2) is enterable for the settler. A
     // query that read neither `impassable` nor a cost would walk straight onto it.
-    expect(refusal(BASE, RULESET, SETTLER_ID, tile(4, 1)).kind).toBe('invalid-argument');
+    //
+    // The refusal is `planMove`'s own member and not a route-shaped `invalid-argument`:
+    // when the destination itself is the problem, the specific reason is the useful
+    // answer, and a mountain is `impassable` rather than "no route to it".
+    expect(refusal(BASE, RULESET, SETTLER_ID, tile(4, 1))).toStrictEqual({
+      kind: 'impassable',
+      unitId: SETTLER_ID,
+      to: tile(4, 1),
+    });
     expect(planRoute(BASE, RULESET, SETTLER_ID, GAP).ok).toBe(true);
     expect(stepsTo(BASE, RULESET, SETTLER_ID, GAP).length).toBe(4);
   });
