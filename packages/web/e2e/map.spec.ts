@@ -69,7 +69,13 @@ import {
 } from '@civts/core';
 import { humanSeatOf } from '../src/testapi.js';
 import { FOG_COLOUR, CITY_COLOUR, terrainColour } from '../src/render.js';
-import { BASE_TILE_PX, clampCamera, screenToTilePoint, tileScreenPx } from '../src/view.js';
+import {
+  BASE_TILE_PX,
+  clampCamera,
+  screenToTile,
+  screenToTilePoint,
+  tileScreenPx,
+} from '../src/view.js';
 
 /** A fixed seed, so every claim below is reproducible. */
 const SEED = 4242;
@@ -496,6 +502,192 @@ test('hit-testing: a click opens the tile the same projection says is under the 
     cityDialog(page, city.name),
     'a click one tile away opened the city screen, so the hit-test is snapping or offset',
   ).toBeHidden();
+});
+
+/**
+ * The map's box is the layout's, and everything that depends on it follows.
+ *
+ * The canvas used to be a fixed 720×540 for a stated reason: the viewport the camera is clamped
+ * against, the rectangle the renderer walks, and the box the hit-test inverts must be one number.
+ * This test exists because that reason survived the change and the *guarantee* did not — the size is
+ * now measured from the layout, so "one number" is a property to be checked rather than a constant
+ * to be read. Three things have to hold at every window size, and each fails for a different
+ * mistake:
+ *
+ *   1. it is square,
+ *   2. it is the largest square the region can hold, and
+ *   3. a pointer at its centre resolves to the tile the projection says is under that point.
+ *
+ * (3) is the load-bearing one. A fluid box can break the inverse mapping in two ways that nothing
+ * else in this suite would catch: a camera not re-clamped against the new viewport (so it shows
+ * ground past the map's edge), and a hit-test still dividing by a size the renderer no longer used.
+ * Both leave every other test passing, because every other test runs at one window size.
+ */
+test('the map is a fluid square, and the click still lands where the renderer drew after a resize', async ({
+  page,
+}) => {
+  await openApp(page);
+  await seedApp(page, SEED);
+
+  /** The canvas box, the region's content box, and what the two should be equal to. */
+  const measure = async (): Promise<{
+    readonly width: number;
+    readonly height: number;
+    readonly contentSide: number;
+  }> => {
+    const box = await canvasBox(page);
+    // The region's box model is read from the browser rather than restated here: the paddings and
+    // borders that decide how much room the canvas has are the stylesheet's business, and a test
+    // that hardcoded them would pass while the canvas sat in a box of a different shape.
+    const contentSide = await page.locator("[data-panel='map']").evaluate((region) => {
+      const style = getComputedStyle(region);
+      const inset = (a: string, b: string): number =>
+        parseFloat(style.getPropertyValue(a)) + parseFloat(style.getPropertyValue(b));
+      const width = region.clientWidth - inset('padding-left', 'padding-right');
+      const height = region.clientHeight - inset('padding-top', 'padding-bottom');
+      return Math.min(width, height);
+    });
+    return { width: box.width, height: box.height, contentSide };
+  };
+
+  /**
+   * The viewport the app itself clamps against: the measured box, *rounded*.
+   *
+   * Not a detail. The canvas's laid-out box is fractional (`596.703125` at 1600×700), and
+   * `measureCanvas` rounds it before handing it to the camera clamp, the renderer and the hit-test —
+   * which is what keeps those three on one number. Comparing a camera against a clamp taken over the
+   * unrounded box therefore asks a question the app never answers, and the two answers differ in the
+   * second decimal. The rounding is read here rather than duplicated by accident.
+   */
+  const viewportOf = async (): Promise<{ readonly width: number; readonly height: number }> => {
+    const box = await canvasBox(page);
+    return { width: Math.round(box.width), height: Math.round(box.height) };
+  };
+
+  const sizes = [
+    { width: 1280, height: 900 },
+    { width: 900, height: 1000 },
+    { width: 1600, height: 700 },
+  ] as const;
+  const sides: number[] = [];
+
+  for (const size of sizes) {
+    await page.setViewportSize(size);
+    const at = `${String(size.width)}x${String(size.height)}`;
+    // Settled before measured: the canvas is sized *by* the region it sits in, and a reading taken
+    // mid-reflow would be of the previous arrangement — which is the failure mode this poll turns
+    // into a wait instead of a race.
+    await expect
+      .poll(
+        async () => {
+          const m = await measure();
+          return Math.abs(m.width - m.contentSide) <= 1;
+        },
+        { message: `the map never filled its region at ${at}`, timeout: 5000 },
+      )
+      .toBe(true);
+
+    const m = await measure();
+    expect(
+      Math.abs(m.width - m.height),
+      `at ${at} the map is ${String(m.width)}x${String(m.height)}, which is not a square`,
+    ).toBeLessThanOrEqual(1);
+    // Restated rather than assumed from the poll, so the failure names the number that was wrong.
+    expect(
+      Math.abs(m.width - m.contentSide),
+      `at ${at} the map is ${String(m.width)}px across but the region can hold ` +
+        `${String(m.contentSide)}px, so it is not using the room it has`,
+    ).toBeLessThanOrEqual(1);
+
+    // The inverse mapping, at this size, against the camera the app is actually using.
+    const state = await readState(page);
+    const camera = await cameraOf(page);
+    const box = await canvasBox(page);
+    const centre = { x: box.width / 2, y: box.height / 2 };
+    const expected = screenToTile(
+      camera,
+      { width: state.map.width, height: state.map.height },
+      centre,
+    );
+    expect(expected, `at ${at} the centre of the canvas is not over any tile`).toBeDefined();
+
+    await page.mouse.move(box.x + centre.x, box.y + centre.y);
+    await expect
+      .poll(async () => mapDescription(page), {
+        message: `at ${at} the app never named a tile under the centre of the canvas`,
+      })
+      .toMatch(new RegExp(`${String(expected?.x)}\\s*,\\s*${String(expected?.y)}\\b`));
+
+    sides.push(Math.round(m.width));
+  }
+
+  // The control that makes this a test about a FLUID map. Everything above also passes for a canvas
+  // hardcoded to a square small enough to fit the smallest window — square, and the largest square
+  // when the region happens to be that size. What cannot pass is a size that never moves, so the
+  // size moving is asserted rather than assumed.
+  expect(
+    new Set(sides).size,
+    `the map measured ${JSON.stringify(sides)} at three window sizes, so it is not following the layout`,
+  ).toBeGreaterThan(1);
+
+  /*
+   * The camera has to be re-clamped, and this is the case that shows it.
+   *
+   * Assertion (3) above cannot catch a missing re-clamp, and it is worth being precise about why: it
+   * compares the app's behaviour against the app's *own* camera, so a camera that is wrong is still
+   * inverted consistently — every click lands where a wrong view drew. The failure is instead that
+   * the view shows ground past the map's edge, and the way to see it is to compare the camera
+   * against the clamp directly.
+   *
+   * A camera only becomes invalid when the viewport GROWS, so the test has to arrange that rather
+   * than hope for it: the view is driven hard against the map's corner at a narrow window (where
+   * `clampCamera` allows the largest pan), and the window is then made much wider, which claims
+   * more tiles than exist past that corner. Without the re-clamp the camera is left pointing off
+   * the map; `clampCamera` is idempotent, so asking whether the app's camera is one the clamp would
+   * have produced is exactly the question.
+   */
+  await page.setViewportSize({ width: 900, height: 1000 });
+  await dragMap(page, -4000, -4000);
+  await page.setViewportSize({ width: 1600, height: 700 });
+
+  // Polled on the property itself rather than on the canvas box, because the box is laid out by CSS
+  // the moment the window changes while the camera is re-clamped by the observer a beat later: a
+  // test that waited for the box would read the camera before the thing under test had run, and
+  // would pass on a build that never re-clamped at all. That mistake was made here first, and it is
+  // the reason this waits on the clamp rather than on a size that is already correct.
+  await expect
+    .poll(
+      async () => {
+        const c = await cameraOf(page);
+        const s = await readState(page);
+        const legal = clampCamera(
+          c,
+          { width: s.map.width, height: s.map.height },
+          await viewportOf(),
+        );
+        return Math.abs(legal.x - c.x) < 1e-9 && Math.abs(legal.y - c.y) < 1e-9;
+      },
+      {
+        message:
+          'the widening resize left the camera un-clamped: the view then shows ground past the ' +
+          'map’s edge, and the click inverse goes on faithfully reporting tiles that are not there',
+        timeout: 5000,
+      },
+    )
+    .toBe(true);
+
+  // Stated again as a plain reading, so that the number is in the record rather than only in a poll
+  // that happened to succeed.
+  const settled = await cameraOf(page);
+  const settledState = await readState(page);
+  expect(
+    clampCamera(
+      settled,
+      { width: settledState.map.width, height: settledState.map.height },
+      await viewportOf(),
+    ),
+    'the camera the app settled on is not one the clamp would produce',
+  ).toEqual(settled);
 });
 
 test('refusals: a click the engine would refuse leaves the state exactly as it was', async ({

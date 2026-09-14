@@ -84,6 +84,7 @@ import { hashValue } from '@civts/testing';
 
 import {
   centreOnTile,
+  clampCamera,
   defaultCamera,
   panCamera,
   screenToTile,
@@ -112,14 +113,25 @@ import { tileNamedBy } from './ui/schema.js';
 const DEFAULT_SEED = 1;
 
 /**
- * The canvas's CSS size. Fixed rather than fluid on purpose: the viewport the camera is clamped
- * against, the rectangle the renderer walks, and the box the hit-test inverts must be one number,
- * and a layout that resized the canvas mid-test would make "which tile did I click?" depend on
- * when the question was asked. Large enough to show a good part of a `tiny` map at the default
- * zoom, and comfortably inside the e2e suite's own 1280×900 viewport.
+ * The map's CSS size is **measured, not declared**.
+ *
+ * It used to be a fixed 720×540 box, and the argument for fixing it was sound: the viewport the
+ * camera is clamped against, the rectangle the renderer walks, and the box the hit-test inverts must
+ * be *one* number, or "which tile did I click?" stops agreeing with "which tile did I draw?". That
+ * argument is kept — the change is only *who owns the number*. It is now the layout (a square that
+ * takes the room the sidebar leaves), read in exactly one place and handed to all three consumers
+ * through `viewport()`.
+ *
+ * What the fixed box was protecting against is real and is why nothing else may read the layout: if
+ * the size could change between asking the question and answering it, the answer would depend on
+ * *when* it was asked. So the size changes only when the measured box genuinely differs, and every
+ * change re-clamps the camera against the new size before the next frame.
+ *
+ * The fallback is used only before the canvas has been laid out — `getBoundingClientRect` on an
+ * unmounted element is zero, and clamping a camera against a viewport of nothing would put it
+ * nowhere. `tests` never see it: by the time a page is interactive the box is real.
  */
-const CANVAS_WIDTH_PX = 720;
-const CANVAS_HEIGHT_PX = 540;
+const CANVAS_FALLBACK_PX = 540;
 
 /** One wheel notch of zoom, in zoom levels. */
 const WHEEL_STEP = 1;
@@ -433,10 +445,13 @@ const buildShell = (doc: Document): Shell => {
   mapRegion.dataset['panel'] = 'map';
 
   const canvas = doc.createElement('canvas');
-  canvas.width = CANVAS_WIDTH_PX;
-  canvas.height = CANVAS_HEIGHT_PX;
-  canvas.style.width = `${String(CANVAS_WIDTH_PX)}px`;
-  canvas.style.height = `${String(CANVAS_HEIGHT_PX)}px`;
+  // The backing store is resized by `draw` from the measured CSS box and the device pixel ratio;
+  // these initial numbers only have to be non-zero so the first frame has something to scale onto.
+  canvas.width = CANVAS_FALLBACK_PX;
+  canvas.height = CANVAS_FALLBACK_PX;
+  // The CSS box itself is the layout's business, not this file's — see `styles.css`, where the
+  // canvas is the largest square the map region can hold. Setting a pixel width here would be a
+  // second, competing statement of the size, which is the defect this whole file is arranged around.
   canvas.style.display = 'block';
   // The map's non-pixel interface: it names the visible map dimensions and the tile under the
   // cursor, which is what lets "which tile is under the pointer" be asserted without a colour.
@@ -497,7 +512,33 @@ const start = async (): Promise<void> => {
     return started.value;
   };
 
-  const viewport = (): ViewportSize => ({ width: CANVAS_WIDTH_PX, height: CANVAS_HEIGHT_PX });
+  /**
+   * The one number: the map's laid-out CSS size, shared by the camera clamp, the renderer and the
+   * click hit-test. See `CANVAS_FALLBACK_PX` for why this is one number owned by the layout.
+   */
+  let mapSizePx: ViewportSize = { width: CANVAS_FALLBACK_PX, height: CANVAS_FALLBACK_PX };
+
+  /**
+   * Read the canvas's laid-out box into `mapSizePx`. Returns whether it *changed*.
+   *
+   * Rounded, deliberately: `getBoundingClientRect` reports fractional CSS pixels, and every consumer
+   * walks whole ones. A fractional viewport would make the renderer's tile walk and the hit-test's
+   * inverse disagree in the last pixel column — which is exactly the drift this file is arranged to
+   * prevent, and the kind that shows up as "the click landed next door" rather than as an error.
+   */
+  const measureCanvas = (): boolean => {
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    // Zero means "not laid out yet" — an unmounted or hidden canvas. Taking it would clamp the
+    // camera against a viewport of nothing and put the view nowhere, so the previous size stands.
+    if (width <= 0 || height <= 0) return false;
+    if (width === mapSizePx.width && height === mapSizePx.height) return false;
+    mapSizePx = { width, height };
+    return true;
+  };
+
+  const viewport = (): ViewportSize => mapSizePx;
   const extent = (): ViewportSize => ({ width: state.map.width, height: state.map.height });
 
   state = startGame(initialSettings());
@@ -505,6 +546,11 @@ const start = async (): Promise<void> => {
   /* -------------------------------- drawing ------------------------------ */
 
   const draw = (): FrameTrace => {
+    // Measured at the top of the only function that paints, so the rectangle the renderer walks and
+    // the box the hit-test inverts come from one layout read. A size cached at start would be stale
+    // after the first resize, and a size measured separately by each consumer could differ *between*
+    // them, which is the drift this whole arrangement exists to make impossible.
+    measureCanvas();
     const size = viewport();
     const ratio = window_?.devicePixelRatio ?? 1;
     const backingWidth = Math.round(size.width * ratio);
@@ -784,12 +830,13 @@ const start = async (): Promise<void> => {
 
   const localPoint = (event: MouseEvent): ScreenPoint => {
     const rect = canvas.getBoundingClientRect();
-    // The canvas is never stretched (its CSS size is set to its own pixel size), but the scale is
-    // taken from the rect anyway: a page-wide zoom or a stylesheet that resized it would otherwise
-    // shift every hit-test by the difference, and this is the one place that arithmetic lives.
-    const scaleX = rect.width === 0 ? 1 : CANVAS_WIDTH_PX / rect.width;
-    const scaleY = rect.height === 0 ? 1 : CANVAS_HEIGHT_PX / rect.height;
-    return { x: (event.clientX - rect.left) * scaleX, y: (event.clientY - rect.top) * scaleY };
+    // No scale factor, and that is a real simplification rather than an omission. `draw` paints in
+    // the CSS pixels of the measured box (`viewport()`), so a client point minus the box's origin is
+    // *already* in the coordinate space the tiles were projected into. The old
+    // `CANVAS_WIDTH_PX / rect.width` factor existed to undo a stylesheet that stretched a canvas
+    // whose CSS size was its own pixel size; the layout owns the CSS size now, so there is nothing
+    // to undo — and any factor here would be a second opinion about the size the renderer used.
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   };
 
   const tileAt = (point: ScreenPoint): { readonly x: number; readonly y: number } | undefined =>
@@ -1075,6 +1122,48 @@ const start = async (): Promise<void> => {
   panels.refresh();
   refreshAbilities();
   redraw();
+
+  /* ------------------------------ resizing ------------------------------- */
+
+  /**
+   * Re-clamp the camera and repaint when the map's box changes.
+   *
+   * A fluid map can shrink *under* a camera that was clamped for a larger one, and `clampCamera` is
+   * what stops the view walking off the map's edge. Without this, resizing the window would leave
+   * the camera pointing at empty space beyond the map — and the hit-test would then faithfully
+   * invert a camera aimed at nothing, so every click would resolve to a tile that is not shown. The
+   * clamp is the fix; the repaint is only so the player sees it.
+   *
+   * `ResizeObserver` rather than a window listener, because the box can change without the window
+   * changing: the dock grows as the event log fills, which moves the map's bottom edge. The window
+   * listener stays as the fallback for a browser without the observer, and is harmless where both
+   * exist — `measureCanvas` returns `false` when nothing moved, so the second caller does nothing.
+   *
+   * Wired *after* the first `redraw`, so the initial size is established by the normal paint path.
+   *
+   * **Unconditional, and that is the whole point of the function.** The obvious version skips the
+   * work when `measureCanvas` reports the size did not change — and that version is broken, which
+   * was measured rather than reasoned about. `draw` calls `measureCanvas` too, so any repaint
+   * between the layout change and this callback (the pointer events of a drag are enough) consumes
+   * the change first; this handler then sees "nothing changed", returns early, and the camera is
+   * *never* clamped. Measured: at 900×1000 the camera sat at 52.97, widening the window to 1600×700
+   * made 50.67 the legal limit, and the camera stayed at 52.97 indefinitely — while a later resize
+   * with no intervening repaint clamped correctly, so the defect showed up intermittently and would
+   * have read as a flake. `clampCamera` is idempotent, so calling it unconditionally is both correct
+   * and immune to that coupling.
+   */
+  const onViewportChanged = (): void => {
+    // Keep the size current, then clamp against it. `measureCanvas` leaves the previous size in
+    // place when the canvas is not laid out (a zero box), so this cannot clamp against nothing.
+    measureCanvas();
+    camera = clampCamera(camera, extent(), viewport());
+    redraw();
+  };
+
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(onViewportChanged).observe(canvas);
+  }
+  window_?.addEventListener('resize', onViewportChanged);
 };
 
 /** A `ViewportSize` from any state's map — the extent `clampCamera` and friends take. */

@@ -665,7 +665,7 @@ The owner's design reorders these. Phase 0 is unchanged and still first — it i
 button deletion safe.
 
 0. **Schema + `driveScript` map path.** Invisible. Unchanged from §5.
-1. **The map becomes square and fluid.** New priority, because it is the enabler.
+1. **The map becomes square and fluid.** New priority, because it is the enabler. — **landed**, see §9.
 2. **The click contract, and the popup.** Merge the shell's `Abilities for unit <id>` group and the
    panel's `Actions for unit <id>` group into **one** popup with the frozen name — today they are
    two independent lists, which is also two independent labellers (§3, idea 12).
@@ -882,6 +882,73 @@ That is a claim about behaviour, and the new test is the first thing in the suit
 it fails and names the tiles. **Its result is therefore evidence about §7.3, not merely a regression
 check**, and §7.3 should be read as unconfirmed until it reports.
 
-## Phase 1 — the fog leak, in progress
+## The fog leak (scope item 1) — landed, `3c99193`
 
-Delegated. See §7.8 for the defect and the rule.
+Landed and independently verified. The rule, the measurement and the three mutations are in §7.8;
+see also `docs/KNOWN-ISSUES.md` §3.13, which records the city half as a consistency choice rather
+than something the leak forced, and the `exploreRanker` finding as a reading that was deliberately
+not acted on.
+
+## Phase 0 — landed, `6708c3a`
+
+The schema, the enum-per-context correction, and the two test-side seams are all in. §7.3's premise
+was settled by the new map-only sweep, and one half of it was wrong — see §7.3, which is now
+corrected in place: friendly **unit** tiles were already clickable, friendly **city** tiles are not.
+
+## Phase 1 — the square, fluid map — landed
+
+**What changed.** The canvas was a fixed 720×540, and the argument for fixing it was sound — the
+viewport the camera is clamped against, the rectangle the renderer walks, and the box the hit-test
+inverts must be one number. That argument is kept; only its owner changed. The layout now decides
+the size (a square that takes the room the sidebar leaves), `measureCanvas` reads it, and
+`viewport()` hands the same number to all three consumers. `localPoint` lost its scale factor
+outright: with nothing stretching the canvas, a client point minus the box origin is already in the
+coordinate space the tiles were projected into.
+
+**Measured, at three window sizes** (region is the map region's border box; "content" is what is
+left after its 1px border and 8/10px padding):
+
+| viewport | region | content box | canvas | largest square that fits |
+| --- | --- | --- | --- | --- |
+| 1280×900 | 852×815 | 830×797 | **797×797** | 797 |
+| 900×1000 | 472×915 | 450×897 | **450×450** | 450 |
+| 1600×700 | 1172×615 | 1150×597 | **597×597** | 597 |
+
+Square at every size, and exactly the largest square available rather than merely *a* square. The
+sidebar became a fixed 380px strip (`flex: 0 1 380px`) so the map takes what remains, and the dock
+gave up its claim on the column's height (`flex: 0 1 auto; max-height: 40%`) so the map has first
+claim on it. No JavaScript sizes the canvas: `container-type: size` plus
+`width: min(100%, 100cqh)` expresses "the largest square that fits" in one declaration.
+
+**A defect in the first version of this phase, found by its own test.** The resize handler skipped
+its work when `measureCanvas` reported the size unchanged — and that is wrong, because `draw` calls
+`measureCanvas` too. Any repaint between the layout change and the observer callback (the pointer
+events of a drag are enough) consumed the change first, so the handler saw "nothing changed",
+returned early, and the camera was **never** re-clamped. It appeared intermittently: a later resize
+with no intervening repaint clamped correctly. Measured before the fix — at 900×1000 the camera sat
+at 52.97, widening to 1600×700 made 50.67 the legal limit, and the camera stayed at 52.97 for as
+long as it was watched. The fix is to clamp unconditionally, which `clampCamera`'s idempotence
+makes free. **This is the failure the fixed 720×540 box used to make impossible, and it is exactly
+why the phase needed its own measurement rather than a stylesheet edit.**
+
+**The test** (`map.spec.ts`, "the map is a fluid square…") asserts four things at three window
+sizes: that the canvas is square; that it fills its region's content box; that a pointer at its
+centre resolves to the tile the projection says is under that point; and — the control, since a
+hardcoded square passes the first two — that the size actually moved between windows. It then
+settles the camera question that the third assertion provably cannot: a pointer test compares the
+app against the app's *own* camera, so a camera showing ground past the map's edge inverts
+consistently and every click still lands where the wrong view drew. That is checked by driving the
+view hard into the map's corner at a narrow window and then widening it, which makes the held
+camera illegal; the assertion is that the app's camera is one `clampCamera` would produce.
+
+Mutation-checked three ways, each RED with a message naming the failure, each restored
+byte-identical: removing the re-clamp ("the widening resize left the camera un-clamped…"), freezing
+the canvas to a 450px square ("the map never filled its region at 1280x900"), and restoring a stale
+scale factor in the hit-test ("the app never named a tile under the centre of the canvas").
+
+**Not done in this phase, and not claimed.** The dock still sits under the map — Phase 3 is what
+re-partitions it, and the 40% cap is a holding position rather than a design. A narrow, tall window
+(900×1000) leaves the square limited by width and a good deal of unused height beneath it; that dead
+space closes when the dock's contents move to the sidebar. The sidebar's 380px is the current
+number, not an answer to §7.7.5, which is still open for the owner. And no keyboard or focus
+contract exists yet — that is Phase 5 and was not touched here.

@@ -99,21 +99,44 @@ main {
 
 /* The map and the dock share one column, so a docked panel sits under the map. */
 [data-layout='map-column'] {
-  flex: 0 0 auto;
+  /* The map takes the room the sidebar leaves. It used to be `0 0 auto`, sized by its contents —
+     a fixed 720 px canvas. Now the layout owns the width and the canvas fits itself inside it. */
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
   min-height: 0;
 }
 
+/*
+ * The map region: a square, and the largest one the column can hold.
+ *
+ * `container-type: size` is what makes this expressible without JavaScript. It gives the region a
+ * definite, content-independent size, which both (a) stops the canvas from being able to influence
+ * the box it is sized against — the feedback loop that makes "largest square that fits" awkward in
+ * CSS — and (b) makes the container units below mean "this region's own height".
+ *
+ * The canvas's side is then `min(100%, 100cqh)`: its full width, or its full height, whichever is
+ * smaller. That is the largest square that fits, in one expression. `aspect-ratio` keeps it square
+ * rather than letting the two axes disagree, and `overflow: hidden` guarantees the region can never
+ * be grown by a child that overshoots.
+ */
 [data-panel='map'] {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  container-type: size;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
   border: 1px solid #2b333d;
   background: #0d1116;
   line-height: 0;
 }
 
 [data-panel='map'] canvas {
+  width: min(100%, 100cqh);
+  aspect-ratio: 1 / 1;
   cursor: crosshair;
 }
 
@@ -132,7 +155,13 @@ main {
  * one, which is what `dialog`'s `overflow: auto` above provides.
  */
 [data-layout='dock'] {
-  flex: 1 1 auto;
+  /* The map has first claim on the column's height now that it is fluid, so the dock takes what its
+     content needs and no more — capped, because a docked event log would otherwise grow until the
+     map was a postage stamp. Past the cap it scrolls inside itself, which is what `overflow` was
+     already doing. The share of the column it may take is deliberately a small one: this is a
+     map-centric layout, and Phase 3 re-partitions the dock's contents into the sidebar anyway. */
+  flex: 0 1 auto;
+  max-height: 40%;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -142,7 +171,12 @@ main {
 }
 
 main > section[aria-label='Panels'] {
-  flex: 1 1 380px;
+  /* A strip, not a competitor. `1 1 380px` let the sidebar grow alongside the map and the two
+     split the leftover; the owner's design is a square map covering the left and the sidebar
+     hosting everything that is not a direct unit action, so the sidebar states its width and the
+     map takes what remains. It may still shrink to `min-width` on a narrow window rather than
+     pushing the map off-screen. */
+  flex: 0 1 380px;
   min-width: 340px;
   min-height: 0;
   overflow-y: auto;
