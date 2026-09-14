@@ -44,6 +44,17 @@ fresh clone needs. The install is non-interactive: `pnpm-workspace.yaml` declare
 
 ## Play the game
 
+### On Windows, without touching a terminal
+
+Double-click **`start-windows.bat`** in this folder. It checks for Node 24 and pnpm,
+asks before installing either if they are missing, installs the dependencies, starts
+the game server and opens `http://127.0.0.1:4174/` in your browser. It needs no
+administrator rights and changes nothing outside this folder and your user-level
+Node/pnpm install. The game runs in the separate `CivTS server` window; close that
+window to stop it.
+
+`start-windows.bat verify` runs the project's own checks first as well.
+
 ### In a browser (the way a human plays)
 
 ```bash
