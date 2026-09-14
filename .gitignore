@@ -13,3 +13,7 @@ settings.local.json
 # Playwright artifacts (screenshots are evidence, not source)
 artifacts/
 test-results/
+
+# Deploy credentials (never committed)
+.ftp.env.local
+ftp.env

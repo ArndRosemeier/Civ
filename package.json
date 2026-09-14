@@ -23,7 +23,8 @@
     "play": "tsx packages/headless/src/cli.ts play",
     "tournament:evidence": "tsx scripts/tournament-evidence.ts",
     "verify": "pnpm check:static && pnpm test",
-    "verify:full": "pnpm check:static:full && pnpm test:full"
+    "verify:full": "pnpm check:static:full && pnpm test:full",
+    "deploy:sync": "bash deploy-sync.sh"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",
