@@ -28,7 +28,7 @@ const resolvePath = (relative: string): string => fileURLToPath(new URL(relative
  * Deploy CI passes `CIV_BASE=/Civ/` so built asset URLs resolve under https://futuremagic.de/Civ/.
  */
 function resolveBase(): string {
-  const fromEnv = process.env.CIV_BASE?.trim();
+  const fromEnv = process.env['CIV_BASE']?.trim();
   if (fromEnv === undefined || fromEnv.length === 0) {
     return '/';
   }

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # CivTS - incremental FTP sync to futuremagic.de
 #
-# Adapted from Campaigner's deploy-sync.sh (the Linux counterpart of its deploy-sync.ps1).
-# What changed, and why, is listed in the header comment of `deploy-ftp.py` and below.
+# Linux twin of deploy-sync.ps1. What changed, and why, is listed in the header
+# comment of `deploy-ftp.py` and below.
 #
 # Builds `@civts/web` with the subdirectory Vite base, uploads only new/changed files (by size),
 # and removes remote files that are no longer in the build.
 #
 # Usage (from the repo root):
 #   ./deploy-sync.sh
+#   ./deploy-sync.ps1          (Windows; see deploy-sync.ps1)
 #   pnpm run deploy:sync
 #
 # Password: $FTP_PASSWORD, or ~/.config/civ/ftp.env, or ./.ftp.env.local (each mode 600, never

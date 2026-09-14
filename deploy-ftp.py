@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Incremental FTP sync for CivTS (Linux counterpart of Campaigner's deploy-sync.ps1).
+"""Incremental FTP sync for CivTS.
 
 Reads the FTP password only from os.environ['FTP_PASSWORD']. Never prints,
-logs, or writes the password. Invoked by deploy-sync.sh after a local build.
+logs, or writes the password. Invoked by deploy-sync.sh or deploy-sync.ps1
+after a local build.
 """
 
 from __future__ import annotations

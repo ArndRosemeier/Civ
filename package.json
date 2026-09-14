@@ -13,8 +13,8 @@
     "lint:full": "eslint .",
     "format:check": "prettier --check . --cache --cache-location .cache/prettier.cache",
     "format:check:full": "prettier --check .",
-    "check:static": "pnpm typecheck & t=$!; pnpm lint & l=$!; pnpm format:check & f=$!; s=0; wait $t || s=1; wait $l || s=1; wait $f || s=1; exit $s",
-    "check:static:full": "pnpm typecheck & t=$!; pnpm lint:full & l=$!; pnpm format:check:full & f=$!; s=0; wait $t || s=1; wait $l || s=1; wait $f || s=1; exit $s",
+    "check:static": "node scripts/run-check-static.mjs",
+    "check:static:full": "node scripts/run-check-static.mjs --full",
     "test": "vitest run",
     "test:full": "CIVTS_TEST_TIER=full vitest run",
     "mutation:check": "CIVTS_MUTATION_CHECK=1 vitest run packages/testing/test/m9-m10-adversarial.test.ts --no-file-parallelism",
@@ -24,7 +24,7 @@
     "tournament:evidence": "tsx scripts/tournament-evidence.ts",
     "verify": "pnpm check:static && pnpm test",
     "verify:full": "pnpm check:static:full && pnpm test:full",
-    "deploy:sync": "bash deploy-sync.sh"
+    "deploy:sync": "node scripts/run-deploy-sync.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",

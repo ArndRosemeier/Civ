@@ -1,0 +1,6 @@
+# Keep the working tree on LF so Windows checkouts match Prettier's endOfLine
+# and the Linux gate. core.autocrlf=true would otherwise turn every text file
+# into CRLF and fail `pnpm format:check`.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
