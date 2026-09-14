@@ -81,10 +81,12 @@ const recordingContext = (): { readonly ctx: Canvas2D; readonly fills: Fill[] } 
       paint.stroke = value;
     },
     lineWidth: 1,
+    imageSmoothingEnabled: false,
     fillRect(x, y, width, height): void {
       fills.push({ colour: paint.fill, x, y, width, height });
     },
     strokeRect(): void {},
+    drawImage(): void {},
     beginPath(): void {},
     moveTo(): void {},
     lineTo(): void {},
@@ -94,6 +96,8 @@ const recordingContext = (): { readonly ctx: Canvas2D; readonly fills: Fill[] } 
     arc(): void {},
     save(): void {},
     restore(): void {},
+    translate(): void {},
+    scale(): void {},
     setTransform(): void {},
     clearRect(): void {},
   };

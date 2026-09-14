@@ -5,11 +5,11 @@
  * ## What this module decides, and what it refuses to decide
  *
  * It decides **presentation**: which rectangle a tile occupies (`view.ts`'s projection, called,
- * never re-derived), which colour a terrain id is painted in, where a unit marker sits, and how
- * a tile nobody has explored is dimmed. It decides **nothing** about the game: it never asks
- * whether a move is legal, never computes a cost, a yield or an outcome, and never reads the
- * RNG. The two facts it takes from the state — each tile's terrain id and the exploring player's
- * `explored` row — are copied verbatim into the frame, and the visible-tile walk is the
+ * never re-derived), which colour or sprite a terrain id is painted with, where a unit marker
+ * sits, and how a tile nobody has explored is dimmed. It decides **nothing** about the game: it
+ * never asks whether a move is legal, never computes a cost, a yield or an outcome, and never
+ * reads the RNG. The two facts it takes from the state — each tile's terrain id and the exploring
+ * player's `explored` row — are copied verbatim into the frame, and the visible-tile walk is the
  * projection's own `visibleTileBounds`, so a tile outside the viewport is never drawn and a tile
  * inside it always is.
  *
@@ -18,9 +18,10 @@
  * `TERRAIN_COLOURS` is exported as a plain record of `#rrggbb` strings, which is what the e2e
  * suite's palette probe reads (`e2e/helpers.ts`' `paletteOf`, source 2): a pixel sample is then
  * checked against the colour the **renderer** documents, rather than against a swatch the test
- * invented. The six ids are the shipped ruleset's own terrain catalog; `FALLBACK_TERRAIN_COLOUR`
- * covers a ruleset that ships a row this build has never heard of, so the renderer stays total
- * (a tile with an unknown terrain is painted, not skipped) without pretending to know it.
+ * invented. Textured tiles keep that same centre colour. The six ids are the shipped ruleset's
+ * own terrain catalog; `FALLBACK_TERRAIN_COLOUR` covers a ruleset that ships a row this build has
+ * never heard of, so the renderer stays total (a tile with an unknown terrain is painted, not
+ * skipped) without pretending to know it.
  *
  * That default is deliberately a colour no shipped terrain uses: an unknown row is visible as
  * "something this build does not paint", which is the honest reading, rather than a plausible
@@ -174,8 +175,16 @@ export interface Canvas2D {
   fillStyle: string;
   strokeStyle: string;
   lineWidth: number;
+  imageSmoothingEnabled: boolean;
   fillRect(x: number, y: number, width: number, height: number): void;
   strokeRect(x: number, y: number, width: number, height: number): void;
+  drawImage(
+    image: CanvasImageSource,
+    dx: number,
+    dy: number,
+    dw: number,
+    dh: number,
+  ): void;
   beginPath(): void;
   moveTo(x: number, y: number): void;
   lineTo(x: number, y: number): void;
@@ -185,19 +194,24 @@ export interface Canvas2D {
   arc(x: number, y: number, radius: number, start: number, end: number): void;
   save(): void;
   restore(): void;
+  translate(x: number, y: number): void;
+  scale(x: number, y: number): void;
   setTransform(a: number, b: number, c: number, d: number, e: number, f: number): void;
   clearRect(x: number, y: number, width: number, height: number): void;
 }
 
 /**
- * A unit marker's shape, from the engine's own numbers: its tile, and whose it is.
+ * A unit marker's shape, from the engine's own numbers: its tile, type, and whose it is.
  *
  * The renderer is handed the *identity* of what stands on a tile rather than deriving it, so
- * "is this mine?" is a comparison of two ids and not a game question.
+ * "is this mine?" is a comparison of two ids and not a game question. The type id selects the
+ * sprite; the colour is the owner badge (and the triangle fallback).
  */
 export interface UnitMarker {
   readonly id: UnitId;
   readonly tile: TileIndex;
+  /** Engine unit type id — used to look up a sprite when `unitSprites` is supplied. */
+  readonly type: string;
   readonly colour: string;
   readonly selected: boolean;
 }
@@ -218,6 +232,16 @@ export interface CityMarker {
  */
 export type OwnerColour = (owner: number) => string;
 
+/**
+ * Optional terrain textures keyed by terrain id. When present, an explored tile is painted with
+ * `drawImage` instead of a flat fill; the documented `TERRAIN_COLOURS` remain the centre-sample
+ * contract for tests. Missing ids (and all unexplored tiles) still use the flat palette.
+ */
+export type TerrainSpriteMap = Readonly<Partial<Record<string, CanvasImageSource>>>;
+
+/** Optional unit sprites keyed by unit type id. */
+export type UnitSpriteMap = Readonly<Partial<Record<string, CanvasImageSource>>>;
+
 /** Everything a frame needs, all of it copied from the state or from presentation state. */
 export interface FrameInput {
   readonly state: GameState;
@@ -230,6 +254,10 @@ export interface FrameInput {
   /** The colour per player, for the territory tint (M9) — see `OwnerColour`. */
   readonly ownerColour: OwnerColour;
   readonly cursor: { readonly x: number; readonly y: number } | null;
+  /** Preloaded terrain sprites from `tiles.ts`; omit in unit tests that only assert borders. */
+  readonly sprites?: TerrainSpriteMap;
+  /** Preloaded unit sprites from `units.ts`; omit to keep the triangle fallback. */
+  readonly unitSprites?: UnitSpriteMap;
 }
 
 /** The `#rrggbb` colour parsed into three 0-255 channels. */
@@ -281,6 +309,30 @@ const borderEdges = (state: GameState, x: number, y: number, owner: number): Bor
   down: ownerOn(state, x, y + 1) !== owner,
 });
 
+/**
+ * Deterministic mirror of a terrain sprite from the tile's coordinates, so adjacent tiles of the
+ * same terrain do not look rubber-stamped. Presentation only — same `(x, y)` always flips the
+ * same way; no RNG. Uses `translate`/`scale` so the caller's DPR transform stays intact.
+ */
+const paintTerrainSprite = (
+  ctx: Canvas2D,
+  sprite: CanvasImageSource,
+  x: number,
+  y: number,
+  rect: { readonly x: number; readonly y: number; readonly width: number; readonly height: number },
+  size: number,
+): void => {
+  const flip = (x * 3 + y * 5) & 3;
+  const mirrorX = (flip & 1) === 1;
+  const mirrorY = (flip & 2) === 2;
+  ctx.imageSmoothingEnabled = size >= 16;
+  ctx.save();
+  ctx.translate(rect.x + (mirrorX ? rect.width : 0), rect.y + (mirrorY ? rect.height : 0));
+  ctx.scale(mirrorX ? -1 : 1, mirrorY ? -1 : 1);
+  ctx.drawImage(sprite, 0, 0, rect.width, rect.height);
+  ctx.restore();
+};
+
 /** One owned tile's pending tint: where it is, in whose colour, and on which of its edges. */
 interface Territory {
   readonly x: number;
@@ -301,7 +353,8 @@ interface Territory {
  * Draw order is terrain, then territory, then cities, then units: a border band is drawn along the
  * tiles' outer edges and both kinds of marker are corner-anchored, so a marker drawn last is never
  * swallowed by a band — which is what keeps "the colour at a tile's centre" a claim about terrain
- * rather than about who owns the tile.
+ * rather than about who owns the tile. Terrain itself is a texture when `sprites` is supplied,
+ * otherwise the documented flat palette — same centre colour either way.
  */
 export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   const { state, camera, viewport } = input;
@@ -313,6 +366,7 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   // 32 px and the band is 4, so it is visible at a glance and still leaves the tile's centre —
   // where the pixel tests sample terrain — untouched.
   const band = Math.max(2, Math.round(size / 8));
+  const sprites = input.sprites;
 
   ctx.fillStyle = rgbCss(FOG_COLOUR);
   ctx.fillRect(0, 0, viewport.width, viewport.height);
@@ -332,8 +386,13 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
       const rect = tileRect(camera, x, y);
       const explored = exploredRow?.[tile] === true;
       const owner = ownerOn(state, x, y);
-      ctx.fillStyle = rgbCss(explored ? terrainColour(terrainId) : FOG_COLOUR);
-      ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+      const sprite = explored ? sprites?.[terrainId] : undefined;
+      if (sprite !== undefined) {
+        paintTerrainSprite(ctx, sprite, x, y, rect, size);
+      } else {
+        ctx.fillStyle = rgbCss(explored ? terrainColour(terrainId) : FOG_COLOUR);
+        ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+      }
       // A one-pixel grid line, drawn inside the tile so neighbouring fills never land on a
       // sampled centre. It is presentation and it is cheap; it makes the tile grid readable at
       // every zoom level, which the screenshots are reviewed for.
@@ -397,15 +456,20 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   for (const unit of input.units) {
     const rect = tileRect(camera, indexToX(state.map, unit.tile), indexToY(state.map, unit.tile));
     if (!onScreen(rect.x, rect.y, viewport)) continue;
-    const inset = Math.max(1, size / 8);
-    const half = size / 2;
-    ctx.fillStyle = rgbCss(unit.colour);
-    ctx.beginPath();
-    ctx.moveTo(rect.x + inset, rect.y + size - inset);
-    ctx.lineTo(rect.x + half, rect.y + inset);
-    ctx.lineTo(rect.x + size - inset, rect.y + size - inset);
-    ctx.closePath();
-    ctx.fill();
+    const sprite = input.unitSprites?.[unit.type];
+    if (sprite !== undefined) {
+      paintUnitSprite(ctx, sprite, unit.colour, rect, size);
+    } else {
+      const inset = Math.max(1, size / 8);
+      const half = size / 2;
+      ctx.fillStyle = rgbCss(unit.colour);
+      ctx.beginPath();
+      ctx.moveTo(rect.x + inset, rect.y + size - inset);
+      ctx.lineTo(rect.x + half, rect.y + inset);
+      ctx.lineTo(rect.x + size - inset, rect.y + size - inset);
+      ctx.closePath();
+      ctx.fill();
+    }
     if (unit.selected) {
       ctx.strokeStyle = rgbCss(SELECTION_COLOUR);
       ctx.lineWidth = 2;
@@ -414,6 +478,33 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   }
 
   return { tiles, cursor: input.cursor };
+};
+
+/**
+ * Paint a unit sprite in the lower portion of the tile, with a small owner-colour badge at the
+ * bottom-left so ownership stays readable without tinting the art. Anchored away from the exact
+ * tile centre so terrain centre samples on clear tiles stay meaningful.
+ */
+const paintUnitSprite = (
+  ctx: Canvas2D,
+  sprite: CanvasImageSource,
+  ownerColour: string,
+  rect: { readonly x: number; readonly y: number; readonly width: number; readonly height: number },
+  size: number,
+): void => {
+  const spriteSize = Math.max(8, Math.round((size * 3) / 4));
+  const dx = rect.x + Math.round((size - spriteSize) / 2);
+  const dy = rect.y + size - spriteSize - Math.max(1, Math.round(size / 16));
+  ctx.imageSmoothingEnabled = size >= 16;
+  ctx.drawImage(sprite, dx, dy, spriteSize, spriteSize);
+  const badge = Math.max(3, Math.round(size / 6));
+  const bx = rect.x + Math.max(1, Math.round(size / 16));
+  const by = rect.y + size - badge - Math.max(1, Math.round(size / 16));
+  ctx.fillStyle = rgbCss(ownerColour);
+  ctx.fillRect(bx, by, badge, badge);
+  ctx.strokeStyle = rgbCss(GRID_COLOUR);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx + 0.5, by + 0.5, badge - 1, badge - 1);
 };
 
 /** Is this tile's top-left corner inside the canvas (with one tile of slack for the edges)? */

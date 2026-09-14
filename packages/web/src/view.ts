@@ -51,8 +51,8 @@ export interface ZoomLevel {
 /**
  * The zoom levels the UI steps through, outermost to innermost. Each is an exact
  * dyadic ratio (see the module note), and `ZOOM_DEFAULT_INDEX` names the level a
- * fresh game starts at — a level at which a 60×60 `tiny` map is readable but not
- * larger than the viewport.
+ * fresh game starts at — 2× so painted terrain textures read clearly while a
+ * starting scout of a `tiny` map still fits the canvas.
  */
 export const ZOOM_LEVELS: readonly ZoomLevel[] = [
   { numerator: 1, denominator: 4 },
@@ -62,8 +62,8 @@ export const ZOOM_LEVELS: readonly ZoomLevel[] = [
   { numerator: 4, denominator: 1 },
 ];
 
-/** Index into `ZOOM_LEVELS` of the default level. */
-export const ZOOM_DEFAULT_INDEX = 2;
+/** Index into `ZOOM_LEVELS` of the default level — 2× so textured tiles read clearly. */
+export const ZOOM_DEFAULT_INDEX = 3;
 
 /**
  * The camera: which map coordinate sits at the canvas's top-left corner, and how

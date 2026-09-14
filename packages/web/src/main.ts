@@ -98,6 +98,8 @@ import {
   type FrameTrace,
   type UnitMarker,
 } from './render.js';
+import { loadTerrainSprites, type TerrainSprites } from './tiles.js';
+import { loadUnitSprites, type UnitSprites } from './units.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
 import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
@@ -180,6 +182,7 @@ const unitMarkers = (state: GameState, selected: UnitId | undefined): readonly U
   state.units.map((unit) => ({
     id: unit.id,
     tile: unit.tile,
+    type: unit.type,
     colour: colourOfPlayer(state, unit.owner),
     selected: unit.id === selected,
   }));
@@ -420,9 +423,10 @@ const buildShell = (doc: Document): Shell => {
  *
  * The order is strict, because each step depends on the last: the shell's DOM exists before the
  * panels are mounted into it, the panels exist before the first `refresh()`, and the ruleset is
- * validated before any game is created from it.
+ * validated before any game is created from it. Terrain sprites are decoded before the first
+ * frame so `ready` means "painted with the real art", not a flat-colour flash.
  */
-const start = (): void => {
+const start = async (): Promise<void> => {
   const doc = document;
   const ruleset = validatedRuleset();
   const shell = buildShell(doc);
@@ -430,6 +434,8 @@ const start = (): void => {
   const context = canvas.getContext('2d');
   if (context === null) throw new Error('this browser gave the map canvas no 2d context');
   const window_ = doc.defaultView;
+  const sprites: TerrainSprites = await loadTerrainSprites();
+  const unitSprites: UnitSprites = await loadUnitSprites();
 
   /* -------------------------------- state -------------------------------- */
 
@@ -483,6 +489,8 @@ const start = (): void => {
       // tint the renderer draws: a player is one colour all over the canvas (M9's borders).
       ownerColour: (owner) => colourOfPlayer(state, owner),
       cursor,
+      sprites,
+      unitSprites,
     });
     trace = frame;
     frames += 1;
@@ -1019,6 +1027,7 @@ const start = (): void => {
 
   // The first frame, and then `ready` — the contract's `ready` means "the first frame is drawn",
   // so it is set by the draw itself rather than by a timer or by a load event.
+  camera = openingCamera(state);
   panels.refresh();
   refreshAbilities();
   redraw();
@@ -1030,4 +1039,4 @@ const extentOf = (state: GameState): ViewportSize => ({
   height: state.map.height,
 });
 
-start();
+void start();
