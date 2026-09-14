@@ -230,6 +230,18 @@ Known trap this exists to prevent: a widely-linked "city growth mechanics" threa
 that yields `20 + 2·pop` is **Civ IV**, not Civ III. Cite the game as well as the
 number. `docs/GDD.md` carries the full provenance table.
 
+## Art provenance
+
+The sixteen map sprites are the one kind of content the provenance tooling cannot
+count, so their origin is recorded in prose: **all sixteen were freshly generated
+with Grok 4.6 (xAI) for this project** — not cropped, traced or derived from existing
+artwork, and carrying no PNG metadata that could corroborate it independently.
+`packages/web/assets/PROVENANCE.md` has the statement, the catalog cross-check, what
+the two `process_*.py` scripts actually do, and what is still open.
+
+The repository has **no `LICENSE` file**; the terms the code and the art are offered
+under are an open decision, not a settled one.
+
 ## Determinism
 
 Same seed + same commands ⇒ same state, on a pinned `(engine version, Node major)`.

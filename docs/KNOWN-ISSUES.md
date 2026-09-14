@@ -389,6 +389,54 @@ is exactly the class of defect this document exists to catch.
   final hashes. The millisecond figures are readings of the box, not properties of the
   engine, which is why every one of them is quoted with a load average.
 
+### 3.12 Textured tiles broke a contract they claimed to keep — three e2e tests fail, open
+
+The sprite commit (`2376dd5`) added sixteen generated PNGs and painted the map with
+them. All sixteen are correct and complete against the catalog
+(`packages/web/assets/PROVENANCE.md`), but three end-to-end tests fail on this tree,
+and the commit's own central claim is measurably false:
+
+> "Keeps owner badges, selection outlines, and the documented terrain centre colours
+> so the existing render contracts still hold."
+
+**It does not keep the documented terrain centre colours.** `lock_centre()` in
+`assets/tiles/process_tiles.py` writes the palette colour into the exact centre pixel
+of the *source* PNG, but the e2e samples the *painted canvas* after the texture has
+been scaled into the tile rect — where one pixel is a blend of its neighbours and the
+locked value is gone. Measured, not inferred:
+
+```
+grassland  painted rgb(84, 143, 52)  documented #4a9d4a  differs by 28
+coast      painted rgb(76, 207, 210) documented #3aa0c8  differs by 51
+```
+
+`map.spec.ts:167` allows a difference of 24 and `m8-adversarial.spec.ts:1410`
+compares against the palette outright, so both fail. The lock is applied at the wrong
+layer: it is a property of the file, and the tests are a property of the pixels.
+
+**`map.spec.ts:273` fails for an unrelated reason.** `ZOOM_DEFAULT_INDEX` went `2 → 3`
+in the same commit, so the test's *opening* `zoomTo(page, 1, 1)` now lands on the
+maximum level (128 px per tile) and the later zoom has nowhere left to go:
+`128 == 128`. This is deterministic, not load flake — it reproduces on an idle box.
+
+**Why these are recorded rather than fixed.** Both are questions about which art is
+canonical, and neither is a mechanic's call:
+
+- either the tiles are re-graded so the *painted* centre lands on the documented
+  palette (which means the lock has to be verified through the renderer, not in the
+  file), or the palette in `render.ts` and those two tests adopt the art;
+- either the test's opening zoom changes, or the default zoom goes back to `2`.
+
+Two further tests that the same commit broke — `determinism.spec.ts:156` and
+`panels.spec.ts:64`, both failing with "the M8 test seam is missing" — were **races,
+not contract changes**, and are fixed. `start()` became `async` and now decodes the
+sprites before publishing `window.__CIVTS__`, so a spec that reloads and seeds
+immediately was racing the decode; `seedApp` now waits for the seam the way `openApp`
+always did. The same commit also shipped with the fast gate red (`render.ts` was not
+prettier-clean) and turned a failed boot into a blank page — `void start()` with no
+`catch` — which now reports on the page instead. Suite state: **58 passed / 5 failed
+before, 60 passed / 3 failed after.**
+
 ---
 
 ## 4. UI limits
