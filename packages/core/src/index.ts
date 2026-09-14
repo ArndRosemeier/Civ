@@ -73,6 +73,11 @@ export * from './units.js';
 // call it, never the other way round.
 export * from './combat.js';
 export * from './commands.js';
+// The route query — `docs/UI-OVERHAUL.md` §7.4's shape (b): a route query in the engine, the
+// destination held as UI intent. It sits AFTER `commands.js` because every answer it gives is
+// `planMove`'s: it states no movement rule of its own, it asks the one this package already has,
+// once per destination tile. See the module note for the defect class that avoids.
+export * from './route.js';
 /**
  * **M11's save, load and replay**, in reading order: the one serializer, then the thing that
  * re-runs a recorded game through the same applier.
