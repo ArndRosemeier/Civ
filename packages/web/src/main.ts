@@ -45,10 +45,12 @@ import {
   DEFAULT_SETTINGS,
   MAP_SIZES,
   applyCommand,
+  asPlayerId,
   asTileIndex,
   asUnitId,
   indexToX,
   indexToY,
+  isExplored,
   isGameOver,
   neighbors8,
   mergeSettings,
@@ -58,6 +60,7 @@ import {
   planAttackUnit,
   planFortifyUnit,
   unitActions,
+  visibleTiles,
   type Command,
   type GameEvent,
   type GameState,
@@ -173,22 +176,54 @@ const colourOfPlayer = (state: GameState, owner: number): string =>
   state.players.find((player) => player.id === owner)?.color ?? '#d0d0d0';
 
 /**
- * One marker per unit, with the acting player's own units drawn in their owner's colour and
- * everyone else's in a single warning colour, so "mine" and "not mine" are distinguishable at a
- * glance without the viewer having to know the palette. Which units are marked is the state's
- * list, verbatim: this file does not decide what is visible.
+ * One marker per unit the viewing player can **see right now**, each in its owner's colour, so
+ * "mine" and "not mine" are distinguishable at a glance without the viewer having to know the
+ * palette.
+ *
+ * **This file decides what is visible, by asking the engine.** `render.ts` is a pure function of
+ * `(state, camera, viewport, markers)` and reads no fog of its own, so the filtering has to happen
+ * where the markers are built — and it is a *question*, not a decision of this file's own: the
+ * engine exports both notions of "known" and they answer different questions (`fog.ts`).
+ * `visibleTiles` is current sight, derived from the viewing player's own units, and it is the one
+ * a unit marker needs: a marker is a claim about what the player can see *this instant*, so a
+ * rival that walks out of range must stop being drawn. `isExplored` is memory — the right function
+ * for terrain, for the border tint, and for the city markers below — and using it here would leak,
+ * because a rival on ground the player once saw but cannot see now would still be painted.
+ *
+ * This comment used to say "this file does not decide what is visible". It was true of this
+ * function and false of the app: every unit of every player was marked, the renderer filtered only
+ * by viewport, and an unexplored tile was painted flat fog with the enemy drawn on top of it
+ * (measured in docs/UI-OVERHAUL.md §7.8; recorded in docs/KNOWN-ISSUES.md).
  */
-const unitMarkers = (state: GameState, selected: UnitId | undefined): readonly UnitMarker[] =>
-  state.units.map((unit) => ({
-    id: unit.id,
-    tile: unit.tile,
-    type: unit.type,
-    colour: colourOfPlayer(state, unit.owner),
-    selected: unit.id === selected,
-  }));
+const unitMarkers = (
+  state: GameState,
+  selected: UnitId | undefined,
+  viewer: PlayerId,
+): readonly UnitMarker[] => {
+  const visible = new Set<number>(visibleTiles(state, viewer).map((tile) => Number(tile)));
+  return state.units
+    .filter((unit) => visible.has(Number(unit.tile)))
+    .map((unit) => ({
+      id: unit.id,
+      tile: unit.tile,
+      type: unit.type,
+      colour: colourOfPlayer(state, unit.owner),
+      selected: unit.id === selected,
+    }));
+};
 
-const cityMarkers = (state: GameState): readonly CityMarker[] =>
-  state.cities.map((city) => ({ tile: city.tile, colour: colourOfPlayer(state, city.owner) }));
+/**
+ * One marker per city the viewing player **remembers**, which is `isExplored` and deliberately not
+ * `visibleTiles`: you keep a city you have seen on the map after it leaves your sight, which is the
+ * genre convention and what this codebase already does one layer down — `render.ts` says "a border
+ * is drawn only on an explored tile", for the same reason (revealing through the marker exactly
+ * what the flat fog colour refuses to reveal through the terrain). So cities are the stated
+ * exception to the units rule above, and the two rules differ on purpose rather than by oversight.
+ */
+const cityMarkers = (state: GameState, viewer: PlayerId): readonly CityMarker[] =>
+  state.cities
+    .filter((city) => isExplored(state, viewer, city.tile))
+    .map((city) => ({ tile: city.tile, colour: colourOfPlayer(state, city.owner) }));
 
 /* ------------------------------------------------------------------ *
  * The queried commands: fortify, and the attacks the engine accepts
@@ -478,13 +513,18 @@ const start = async (): Promise<void> => {
     // rectangle `tileToScreen` returns is the rectangle that lands on screen — and a pixel sample
     // taken at `tileCentre` reads that tile's colour on a hidpi page as well as an ordinary one.
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    // The acting player, read once: the frame's fog layer, the unit markers and the city markers
+    // must all be answers about the SAME viewer, and three separate calls could disagree the day
+    // one of them grows a fallback. Seat 0 when the state names no civilization is the same
+    // fallback `viewer` had, said in the engine's own type rather than in a bare `0`.
+    const viewer = humanSeatOf(state) ?? asPlayerId(0);
     const frame = drawFrame(context as unknown as Canvas2D, {
       state,
-      viewer: humanSeatOf(state) ?? 0,
+      viewer,
       camera,
       viewport: size,
-      units: unitMarkers(state, panels.selection().unitId),
-      cities: cityMarkers(state),
+      units: unitMarkers(state, panels.selection().unitId, viewer),
+      cities: cityMarkers(state, viewer),
       // The ONE colour lookup for a player, shared with the markers above and with the territory
       // tint the renderer draws: a player is one colour all over the canvas (M9's borders).
       ownerColour: (owner) => colourOfPlayer(state, owner),

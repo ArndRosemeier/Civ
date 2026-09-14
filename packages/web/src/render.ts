@@ -262,7 +262,16 @@ export interface FrameInput {
   readonly viewer: number;
   readonly camera: Camera;
   readonly viewport: ViewportPx;
+  /**
+   * The markers to draw. **The caller decides which ones those are, and this module never
+   * filters them**: `main.ts` builds them from the engine's own answer — `visibleTiles` for a unit
+   * (current sight, so a rival that walks out of range stops being drawn) and `isExplored` for a
+   * city (`fog.ts`'s memory, so a city you have seen stays on the map). Handing this module the
+   * whole state's unit list is what drew every unit of every player through the fog
+   * (docs/KNOWN-ISSUES.md §3.13).
+   */
   readonly units: readonly UnitMarker[];
+  /** The city markers to draw, already chosen by the caller — see `units` above. */
   readonly cities: readonly CityMarker[];
   /** The colour per player, for the territory tint (M9) — see `OwnerColour`. */
   readonly ownerColour: OwnerColour;

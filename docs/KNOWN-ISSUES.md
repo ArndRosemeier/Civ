@@ -516,6 +516,93 @@ adopted.**
 
 ---
 
+### 3.13 Every unit of every player was drawn through the fog — **closed, with the mutations that prove it** (2026-09-14)
+
+Found by reading `main.ts` and confirmed by measurement, not by a failing test — the suite had no
+test that could see it, which is why it survived to this pass. Recorded in the plan as
+`docs/UI-OVERHAUL.md` §7.8.
+
+**The defect.** `unitMarkers` was `state.units.map(…)` — every unit of every player, with a comment
+claiming "this file does not decide what is visible". True of that function, and false of the app:
+nothing downstream decided either. `render.ts` filters markers by **viewport** only
+(`if (!onScreen(rect.x, rect.y, viewport)) continue`), and fog is applied to *terrain* alone (an
+unexplored tile is filled flat `FOG_COLOUR`), so the frame painted an unexplored tile as unknown and
+then painted the enemy standing on it.
+
+**The measurement.** At game start on a `small` map with 4 civilizations (seeds 1, 7, 75, 4242),
+**all 6 foreign units stood on never-explored ground, and all 6 were drawn.** Reading the canvas
+rather than the map at a hidden unit's tile centre gave `rgb(82, 67, 47)` — a unit sprite — where
+the fog colour is `#31394a`; the same tile carried **81** pixels of that unit's owner colour (the
+marker's badge) inside ground the player had never seen. The same numbers appear in the mutation
+output below, which is what makes the test evidence rather than decoration.
+
+**The rule, which is now written where the markers are built** (`packages/web/src/main.ts:199`,
+`:224`). `fog.ts` exports two different notions and they must not be conflated:
+
+- **units → `visibleTiles`** (current sight, derived from the viewing player's own units). A marker
+  is a claim about what the player can see *this instant*, so a rival that walks out of range stops
+  being drawn.
+- **cities → `isExplored`** (memory). You keep a city you have seen on the map after it leaves your
+  sight, which is the genre convention and what this codebase already does one layer down — the
+  border tint is drawn only on an explored tile. **This half is an owner-level decision, taken for
+  consistency rather than derived from the leak**, and it is stated here so it can be overridden:
+  swap it to `visibleTiles` and cities will vanish when they leave sight.
+
+The renderer stays a pure function of `(state, camera, viewport, markers)`; the app asks the engine
+which markers to hand it.
+
+**What the test now proves** (`packages/web/e2e/map.spec.ts:619`, "fog: a rival the player cannot see
+is not painted, one it can see is, and one that walks out of sight stops being painted"). It plays a
+`duel` / 2-civ game to turn 23 (seed 12), reads the **app's own state through its own save path** so
+that the engine's `visibleTiles` and `isExplored` can be asked about the browser's game rather than
+about a copy of the rule, and asserts four things, each with its premise asserted too so that none
+can quietly vanish:
+
+1. a rival on never-explored ground: the tile centre is exactly `FOG_COLOUR` **and** no pixel of the
+   tile is that unit's owner colour;
+2. **the control** — a rival in the player's sight *is* painted (> 0 pixels of its owner's colour);
+   without this, a build that painted no units at all would pass (1);
+3. founding the settler's city (one player action, consuming the sight that unit contributed) takes
+   a rival out of sight while its tile stays **explored** — and its marker is gone while the tile
+   is still painted as remembered terrain. This is the assertion that distinguishes the two rules;
+4. cities, both directions: the player's own city marker is painted, and a rival city on
+   never-explored ground is not.
+
+The instrument is `countTilePixels` (`packages/web/e2e/helpers.ts:1008`), which counts pixels of a
+tile's own rectangle that are exactly a colour. A centre sample cannot make claim (2): "the centre is
+not fog" is also true of an app that paints no units at all.
+
+**Falsified three ways, each RED, `main.ts` restored byte-identical**
+(`sha256 6adf302069fe1e5e2a6448e34632688ae60a6a381aadd7f12d8483b7b240cd12`, checked with
+`sha256sum -c` after each):
+
+| mutation | result | first failure |
+|---|---|---|
+| unit filter forced always-true (the pre-fix behaviour) | RED | `rival worker (tile 1166) stands on ground the player has NEVER explored, … its centre reads rgb(82, 67, 47) instead of #31394a` |
+| unit filter `isExplored` instead of `visibleTiles` | RED | `rival galley (tile 578) left the player's sight but its tile is still EXPLORED, and it is still painted: 81 of the tile's pixels are its owner's colour (#2f6fd1)`, expected 0, received 81 |
+| city filter forced always-true | RED | `a rival city (tile 1366) stands on ground the player has never explored and its marker is painted: 318 of its tile's pixels are the city colour #f2e6c8` |
+
+The second row is the one worth keeping: a build that swapped current sight for memory would pass
+every other test in the repository and fails only here.
+
+**The related leak that is NOT fixed (engine side, recorded rather than touched).** The shipped AI
+policy reads fogged world data when it chooses where to walk: `exploreRanker`
+(`packages/sim/src/policies.ts:~375`) ranks a candidate step by `hutAt(state, tile)` — the existence
+of a goody hut on the *destination* tile — and by `yieldsAt` on that tile, with no `isExplored`
+guard, so a rival scout can prefer an unseen hut to an unseen empty tile. (`revealCount` beside it
+*is* guarded: it asks `isExplored`.) `inContact` reads enemy units and cities on the eight adjacent
+tiles only, which are inside a unit's own sight radius, so it is not a leak in practice. This is a
+reading, not a measurement, and it is left alone deliberately: the policy is the measurement
+instrument every balance number in this repository was taken against, and changing what it can see
+would invalidate them.
+
+**Also recorded:** `FOE_COLOUR` (`render.ts:133`) is exported and used by nothing — markers take the
+*owner's own* colour from the state, for the player's units and everyone else's alike. The comment on
+`unitMarkers` used to claim foreign units were drawn "in a single warning colour", which was never
+true; the claim is gone.
+
+---
+
 ## 4. UI limits
 
 ### 4.1 The city screen scrolls inside its own panel at 900 px

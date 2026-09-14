@@ -44,6 +44,7 @@ import {
   asUnitId,
   asUnitTypeId,
   DEFAULT_SETTINGS,
+  deserialize,
   newGame,
   parseSettings,
   type Command,
@@ -59,11 +60,13 @@ import { hashValue } from '@civts/testing';
 
 import {
   screenToTile,
+  tileRect,
   tileScreenPx,
   tileToScreen,
   visibleTileBounds,
   type Camera,
 } from '../src/view.js';
+import { SAVE_KEY, webCodec } from '../src/panels/save.js';
 
 /* ------------------------------------------------------------------ *
  * The frozen test seam
@@ -359,6 +362,31 @@ export const stateHash = (page: Page): Promise<string> =>
     if (api === undefined) throw new Error('the M8 test seam is missing');
     return api.stateHash();
   });
+
+/**
+ * The authoritative `GameState`, taken through the app's OWN save path.
+ *
+ * `readState` above is the narrow view most specs want: plain fields, validated one by one, safe
+ * to assert against. This is for the other kind of question — one that has to be asked of an
+ * ENGINE function (`visibleTiles`, `isExplored`, `unitActions`) about the browser's own game
+ * rather than about a copy of it. Those functions take a `GameState`, and `window.__CIVTS__.state()`
+ * hands the object back through Playwright's serialiser, which is not a faithful transport for its
+ * typed arrays and branded ids. The save payload is JSON the **engine itself wrote**, read back by
+ * the engine's own `deserialize` and the codec the save panel writes with, so what comes back is
+ * the state the app is really playing.
+ *
+ * `Save game` dispatches nothing and changes nothing, so a spec may take this reading at any point
+ * in a game without perturbing what it is measuring. (Proven in `e2e/t2-probe.ts`, which reads the
+ * authoritative state this way to compare the browser's opponent against `@civts/sim`'s policy.)
+ */
+export const authoritativeState = async (page: Page): Promise<GameState> => {
+  await saveButton(page).click();
+  const text = await page.evaluate((key: string) => window.localStorage.getItem(key), SAVE_KEY);
+  if (text === null) throw new Error(`the app wrote no save under ${SAVE_KEY}`);
+  const loaded = deserialize(text, webCodec());
+  if (!loaded.ok) throw new Error(`the app's own save does not load: ${loaded.error.kind}`);
+  return loaded.value;
+};
 
 /** Dispatch through the real applier. `'refused'` is an answer, never an exception. */
 export const dispatch = (page: Page, action: unknown): Promise<'ok' | 'refused'> =>
@@ -946,6 +974,105 @@ export const sampleTileColour = async (
   y: number,
 ): Promise<Rgb> => sampleCanvasPixel(page, tileCentre(camera, x, y));
 
+/** How many pixels of one tile's own rectangle are exactly `colour`, out of how many were read. */
+export interface TilePixelCount {
+  /** Pixels inside the tile's rectangle that are exactly `colour`. */
+  readonly matching: number;
+  /** Pixels read, so "none matched" is distinguishable from "nothing was read at all". */
+  readonly total: number;
+}
+
+/**
+ * Count the pixels of a tile's rectangle that are exactly `colour`.
+ *
+ * `sampleTileColour` answers "what is at this tile's centre", which is a *terrain* reading. This
+ * answers the question a centre sample cannot answer on its own: **is a unit marker painted on
+ * this tile at all?** A unit's marker carries a solid block of its owner's colour — the badge
+ * `render.ts`' `paintUnitSprite` fills, or the triangle a build with no sprite for the type falls
+ * back to — and no other layer paints a solid block of a player's colour *inside* a tile: M9's
+ * territory tint is a band along the tile's edges, which is why the read is inset
+ * (`TILE_READ_INSET_PX`) by more than a band's worth of the boundary while a marker stays wholly
+ * inside the inset. So a count of zero is evidence that no marker is painted here and a count above
+ * zero is evidence that one is.
+ *
+ * Both directions matter to a fog test, and neither is available from a centre sample alone: "the
+ * centre is not fog" is also true of an app that paints no units at all, and "the centre is fog" is
+ * what an unexplored tile reads as whatever is standing on it — which was the defect
+ * `docs/UI-OVERHAUL.md` §7.8 records.
+ *
+ * The rectangle is the tile's own `tileRect`, through the app's projection, so a caller cannot read
+ * a neighbouring tile by accident. `total` is reported so a caller can refuse to conclude anything
+ * from a rectangle that fell off the canvas, and the backing store's `devicePixelRatio` scaling is
+ * honoured exactly as `sampleCanvasPixel` honours it.
+ */
+export const countTilePixels = async (
+  page: Page,
+  camera: Camera,
+  x: number,
+  y: number,
+  colour: string,
+): Promise<TilePixelCount> => {
+  const rect = tileRect(camera, x, y);
+  const wanted = parseHexColour(colour);
+  return (await mapCanvas(page)).evaluate(
+    (element, input) => {
+      if (!(element instanceof HTMLCanvasElement)) {
+        throw new Error('the map viewport contains no <canvas> to count pixels in');
+      }
+      const box = element.getBoundingClientRect();
+      const context = element.getContext('2d');
+      if (context === null) throw new Error('the map canvas has no 2d context');
+      const scaleX = element.width / box.width;
+      const scaleY = element.height / box.height;
+      const left = Math.max(0, Math.round((input.x + input.inset) * scaleX));
+      const top = Math.max(0, Math.round((input.y + input.inset) * scaleY));
+      const right = Math.min(
+        element.width,
+        Math.round((input.x + input.size - input.inset) * scaleX),
+      );
+      const bottom = Math.min(
+        element.height,
+        Math.round((input.y + input.size - input.inset) * scaleY),
+      );
+      const width = right - left;
+      const height = bottom - top;
+      if (width <= 0 || height <= 0) return { matching: 0, total: 0 };
+      const data = context.getImageData(left, top, width, height).data;
+      let matching = 0;
+      for (let index = 0; index < data.length; index += 4) {
+        if (data[index] === input.r && data[index + 1] === input.g && data[index + 2] === input.b) {
+          matching += 1;
+        }
+      }
+      return { matching, total: width * height };
+    },
+    {
+      x: rect.x,
+      y: rect.y,
+      size: rect.size,
+      inset: TILE_READ_INSET_PX,
+      r: wanted.r,
+      g: wanted.g,
+      b: wanted.b,
+    },
+  );
+};
+
+/**
+ * How far inside a tile's rectangle `countTilePixels` reads.
+ *
+ * Two pixels, and both reasons are measured rather than guessed. The tile's own one-pixel grid
+ * line is stroked *inside* the rectangle (`render.ts`' `strokeRect(rect.x + 0.5, …)`), so an inset
+ * keeps the grid out of the count for every colour a caller might ask about rather than only for a
+ * colour the grid does not use; and M9's territory tint is a band along the tile's edges
+ * (`max(2, round(size / 8))`), so the inset also keeps most of a rival's border out of a count that
+ * is meant to be evidence of a *marker*. A unit's marker is drawn at least
+ * `max(1, round(size / 16))` = 4 px inside the tile at the default 64 px tile, so it survives the
+ * inset — checked against the painted canvas rather than argued: a rival marker measured 81 badge
+ * pixels inside this rectangle, and 0 after the marker is suppressed.
+ */
+export const TILE_READ_INSET_PX = 2;
+
 export const colourDistance = (a: Rgb, b: Rgb): number =>
   Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
 
@@ -1274,7 +1401,20 @@ export const visibleTiles = (
 export const isExplored = (state: UiState, playerId: number, tile: number): boolean =>
   state.explored[playerId]?.[tile] === true;
 
-/** Does anything else occupy this tile, so a terrain sample would read it instead? */
+/**
+ * Does this tile carry no unit and no city in the state, so a terrain sample of its centre is
+ * reading this tile's terrain and nothing else?
+ *
+ * The screen is deliberately **stricter than the renderer**, and that is the point of it being
+ * here. `render.ts` paints a unit marker only for a unit the viewing player can see *right now*
+ * and a city marker only for a city it has explored, so a tile carrying a hidden rival — or a city
+ * on ground the player has never explored — is in fact painted as plain fog or terrain, and could
+ * be sampled. Deciding that *here* would mean re-deriving `visibleTiles` inside the test suite: a
+ * second statement of what "visible" means, which is exactly the class of defect the fog leak of
+ * `docs/UI-OVERHAUL.md` §7.8 was made of. The safe direction is to leave such a tile out of a
+ * terrain sample and lose nothing; what this must never do is let a tile a marker *is* painted on
+ * into a terrain sample, and that is what the state-level test guarantees.
+ */
 export const tileIsClear = (state: UiState, tile: number): boolean =>
   unitAt(state, tile) === undefined && cityAt(state, tile) === undefined;
 

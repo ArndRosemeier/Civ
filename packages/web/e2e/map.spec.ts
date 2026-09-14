@@ -22,12 +22,16 @@ import {
   foundCity,
   canvasBox,
   clickTile,
+  clickUnitAction,
   colourDistance,
+  countTilePixels,
   describeColour,
   dispatchLog,
   dragMap,
   drawTraceOf,
+  endTurns,
   humanPlayerId,
+  authoritativeState,
   mapDescription,
   openApp,
   pagePointToTile,
@@ -38,6 +42,7 @@ import {
   sampleCanvasPixel,
   sampleTileColour,
   seedApp,
+  selectUnit,
   stateHash,
   terrainAtTile,
   TERRAIN_CENTRE_TOLERANCE,
@@ -53,6 +58,17 @@ import {
   zoomTo,
   type Rgb,
 } from './helpers.js';
+import {
+  isExplored,
+  // The ENGINE's `visibleTiles` — what a player can see — is a different function from this
+  // suite's `visibleTiles` (which tiles the VIEWPORT covers). They are named apart here on
+  // purpose: conflating "in sight" with "on screen" is the mistake `render.ts` records for the
+  // renderer, and conflating "in sight" with "explored" is the one the fog leak was made of.
+  visibleTiles as tilesInSight,
+  type Unit,
+} from '@civts/core';
+import { humanSeatOf } from '../src/testapi.js';
+import { FOG_COLOUR, CITY_COLOUR, terrainColour } from '../src/render.js';
 import { BASE_TILE_PX, clampCamera, screenToTilePoint, tileScreenPx } from '../src/view.js';
 
 /** A fixed seed, so every claim below is reproducible. */
@@ -574,4 +590,318 @@ test('A4 map render: the camera and the drawn tiles agree with the projection at
 
   // Four zoom steps moved through distinct projections rather than sitting still.
   expect(new Set(seen).size).toBeGreaterThan(1);
+});
+
+/* ------------------------------------------------------------------ *
+ * Fog: what the player can see, told apart from what it remembers
+ * ------------------------------------------------------------------ */
+
+/**
+ * The seed and the turn this file's fog test plays to.
+ *
+ * Not arbitrary, and not a needle either. The scene it needs is one where **founding the settler's
+ * own city takes a rival unit out of the player's sight while its tile stays explored** — the one
+ * configuration in which `visibleTiles` (current sight) and `isExplored` (memory) give different
+ * answers about a unit, and therefore the only one that can tell the two rules apart from the
+ * outside. It was found by asking the engine, not by looking at the canvas: a headless mirror of
+ * the app's own turn loop (the human seat ends its turn, `SMART_POLICY` plays the rival) over seeds
+ * 1..30 on a `duel` map with 2 civilizations produced that configuration on **28 of 30 seeds**;
+ * seed 12 reaches it at turn 23 and holds it for five turns, so the scene is a property of ordinary
+ * play rather than a coincidence of one seed. `docs/UI-OVERHAUL.md` §7.8 records the measurement.
+ *
+ * `endTurns` clicks `End turn` `FOG_TURNS` times, which leaves the app's own counter at
+ * `FOG_TURNS + 1` turns played — the assertion below states the turn it actually landed on rather
+ * than assuming the convention.
+ */
+const FOG_SEED = 12;
+const FOG_TURNS = 22;
+
+test('fog: a rival the player cannot see is not painted, one it can see is, and one that walks out of sight stops being painted', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await openApp(page);
+  await seedApp(page, FOG_SEED, { mapSize: 'duel', civCount: 2 });
+  await endTurns(page, FOG_TURNS);
+
+  // The app's OWN state, through its own save path: the engine's `visibleTiles` and `isExplored`
+  // take a `GameState`, and asking them about the browser's game is the whole point — a mirrored
+  // copy of the rule in this file is the second notion of "visible" that produced the leak.
+  const before = await authoritativeState(page);
+  const seat = humanSeatOf(before);
+  expect(seat, 'the state names no civilization to play as').toBeDefined();
+  if (seat === undefined) return;
+  expect(before.turn, 'the game is not at the turn this scene was measured at').toBe(FOG_TURNS + 1);
+
+  const ui = await readState(page);
+  const inSight = new Set<number>(tilesInSight(before, seat).map((tile) => Number(tile)));
+  const rivals = before.units.filter((unit) => unit.owner !== seat);
+  expect(rivals.length, 'the game has no rival units to look at').toBeGreaterThan(0);
+
+  /** The colour the app paints this unit's owner in (the markers' own `colourOfPlayer` read). */
+  const ownerColourOf = (owner: number): string => {
+    const player = before.players.find((candidate) => candidate.id === owner);
+    if (player === undefined) throw new Error(`the state has no player ${String(owner)}`);
+    return player.color;
+  };
+
+  /** Pan so this tile's centre is on the canvas — a sample taken off the canvas reads nothing. */
+  const centreOnCanvas = async (tile: number): Promise<boolean> => {
+    await bringTileToCentre(page, ui, tile);
+    const camera = await cameraOf(page);
+    const box = await canvasBox(page);
+    const local = tileCentre(camera, tileX(ui, tile), tileY(ui, tile));
+    return local.x >= 0 && local.y >= 0 && local.x < box.width && local.y < box.height;
+  };
+
+  /**
+   * What one tile reads as: the colour at its centre, and how many of its pixels are exactly
+   * `colour`. The two together are the whole instrument — see `countTilePixels` for why a centre
+   * sample alone cannot say whether a unit marker is painted.
+   */
+  const readTile = async (
+    tile: number,
+    colour: string,
+  ): Promise<{ centre: Rgb; matching: number; total: number }> => {
+    const camera = await cameraOf(page);
+    const x = tileX(ui, tile);
+    const y = tileY(ui, tile);
+    const centre = await sampleTileColour(page, camera, x, y);
+    const counted = await countTilePixels(page, camera, x, y, colour);
+    return { centre, matching: counted.matching, total: counted.total };
+  };
+
+  /**
+   * The first of these tiles the camera can actually put on the canvas, so a candidate near the
+   * map's edge (a pan the clamp refuses) cannot be mistaken for a failure of the rule under test.
+   * `undefined` when none of them can be brought into view.
+   */
+  const reachableTile = async (tiles: readonly number[]): Promise<number | undefined> => {
+    for (const tile of tiles) {
+      if (await centreOnCanvas(tile)) return tile;
+    }
+    return undefined;
+  };
+
+  /** The same choice, for a list of units: the first whose tile can be panned into view. */
+  const reachable = async (units: readonly Unit[]): Promise<Unit | undefined> => {
+    const tile = await reachableTile(units.map((unit) => Number(unit.tile)));
+    return tile === undefined ? undefined : units.find((unit) => Number(unit.tile) === tile);
+  };
+
+  /* ------------------- (1) never explored: not painted ------------------- */
+
+  // The defect `docs/UI-OVERHAUL.md` §7.8 records: every unit of every player was marked, the
+  // renderer filtered only by viewport, and an unexplored tile was painted flat fog with the enemy
+  // drawn on top of it. Measured at game start on every seed tried, all six foreign units of a
+  // `small` 4-civ game stood on never-explored ground and all six were drawn.
+  const hidden = rivals.filter(
+    (unit) => !inSight.has(Number(unit.tile)) && !isExplored(before, seat, unit.tile),
+  );
+  expect(
+    hidden.length,
+    'no rival unit was standing on ground the player has never explored at this turn, so this ' +
+      'test could not observe the leak it exists for — re-measure the seed and the turn',
+  ).toBeGreaterThan(0);
+
+  const hiddenUnit = await reachable(hidden);
+  expect(
+    hiddenUnit,
+    'none of the rivals on never-explored ground could be panned onto the canvas, so nothing ' +
+      'about the fog the player sees could be sampled',
+  ).toBeDefined();
+  if (hiddenUnit === undefined) return;
+  const hiddenTile = Number(hiddenUnit.tile);
+
+  const hiddenRead = await readTile(hiddenTile, ownerColourOf(hiddenUnit.owner));
+  expect(
+    hiddenRead.total,
+    `nothing was read from tile ${String(hiddenTile)}, so "no marker there" would be vacuous`,
+  ).toBeGreaterThan(0);
+  expect(
+    hiddenRead.centre,
+    `rival ${hiddenUnit.type} (tile ${String(hiddenTile)}) stands on ground the player has NEVER ` +
+      `explored, which must be painted flat fog, and its centre reads ` +
+      `${describeColour(hiddenRead.centre)} instead of ${FOG_COLOUR}`,
+  ).toEqual(parseHexColour(FOG_COLOUR));
+  expect(
+    hiddenRead.matching,
+    `rival ${hiddenUnit.type} (tile ${String(hiddenTile)}) is painted on a tile the player has ` +
+      `never explored: ${String(hiddenRead.matching)} of the tile's pixels are its owner's own ` +
+      `colour (${ownerColourOf(hiddenUnit.owner)}), which only a unit marker paints`,
+  ).toBe(0);
+
+  /* ------------- (2) in sight: painted — the inverse control ------------- */
+
+  // Without this half the test would also pass in a build that painted no units at all: "the centre
+  // of a fogged tile is fog" says nothing about whether markers are drawn anywhere. So a rival the
+  // player can see RIGHT NOW must be demonstrably painted.
+  const seenRivals = rivals.filter((unit) => inSight.has(Number(unit.tile)));
+  expect(
+    seenRivals.length,
+    'no rival unit was in the player’s sight at this turn, so the control half of this test is ' +
+      'missing and "the enemy is not painted" would be unfalsifiable',
+  ).toBeGreaterThan(0);
+
+  const seenUnit = await reachable(seenRivals.filter((unit) => Number(unit.tile) !== hiddenTile));
+  expect(
+    seenUnit,
+    'no rival unit in the player’s sight could be panned onto the canvas, so the control half of ' +
+      'this test could not be taken',
+  ).toBeDefined();
+  if (seenUnit === undefined) return;
+  const seenTile = Number(seenUnit.tile);
+  const seenColour = ownerColourOf(seenUnit.owner);
+
+  // The instrument's own precondition, stated: the marker's colour is nowhere near the fog colour,
+  // so counting it cannot be confused with the fog a leak would have painted over.
+  expect(
+    colourDistance(parseHexColour(seenColour), parseHexColour(FOG_COLOUR)),
+    `the rival's own colour ${seenColour} is too close to the fog colour ${FOG_COLOUR} for this ` +
+      'test to tell a painted marker from an unpainted tile',
+  ).toBeGreaterThan(24);
+
+  const paintedRead = await readTile(seenTile, seenColour);
+  expect(
+    paintedRead.total,
+    `nothing was read from tile ${String(seenTile)}, so "a marker is painted" would be vacuous`,
+  ).toBeGreaterThan(0);
+  expect(
+    paintedRead.matching,
+    `rival ${seenUnit.type} (tile ${String(seenTile)}) is in the player's sight and is not ` +
+      `painted: none of the tile's pixels are its owner's colour (${seenColour})`,
+  ).toBeGreaterThan(0);
+  expect(
+    paintedRead.centre,
+    `tile ${String(seenTile)} is in the player's sight and was painted as unexplored fog`,
+  ).not.toEqual(parseHexColour(FOG_COLOUR));
+
+  /* -------- (3) remembered but out of sight: the marker must go away ------- */
+
+  // The case that tells the engine's two notions apart. Found a city with the settler — the
+  // player's own control, one `FoundCity`, the engine's own command — which consumes the settler
+  // and with it the sight that unit contributed. A rival on a tile that is still EXPLORED (memory)
+  // must stop being painted if the rule is current sight, and must stay painted if the rule is
+  // memory. This is the assertion that fails for an `isExplored` filter.
+  const settler = before.units.find((unit) => unit.owner === seat && unit.type.includes('settler'));
+  expect(
+    settler,
+    'the human seat has no settler, so its sight cannot be shrunk in one order',
+  ).toBeDefined();
+  if (settler === undefined) return;
+  await selectUnit(page, ui, await cameraOf(page), Number(settler.id));
+  await clickUnitAction(page, Number(settler.id), /found city/i);
+
+  const after = await authoritativeState(page);
+  const inSightAfter = new Set<number>(tilesInSight(after, seat).map((tile) => Number(tile)));
+  const droppedOut = after.units.filter(
+    (unit) =>
+      unit.owner !== seat &&
+      inSight.has(Number(unit.tile)) &&
+      !inSightAfter.has(Number(unit.tile)) &&
+      isExplored(after, seat, unit.tile),
+  );
+  expect(
+    droppedOut.length,
+    'founding the settler’s city did not take any rival unit out of the player’s sight while ' +
+      'leaving its tile explored, so the rule this test exists for was not exercised — the scene ' +
+      'premise (seed 12, turn 23) has moved',
+  ).toBeGreaterThan(0);
+
+  const gone = await reachable(droppedOut);
+  expect(
+    gone,
+    'no rival that left the player’s sight could be panned onto the canvas, so the rule this ' +
+      'test exists for could not be sampled',
+  ).toBeDefined();
+  if (gone === undefined) return;
+  const goneTile = Number(gone.tile);
+  const goneColour = ownerColourOf(gone.owner);
+  const uiAfter = await readState(page);
+
+  const goneRead = await readTile(goneTile, goneColour);
+  expect(
+    goneRead.matching,
+    `rival ${gone.type} (tile ${String(goneTile)}) left the player's sight but its tile is still ` +
+      `EXPLORED, and it is still painted: ${String(goneRead.matching)} of the tile's pixels are ` +
+      `its owner's colour (${goneColour}) — an enemy that has walked out of range is drawn, which ` +
+      'is what using the fog layer’s MEMORY (`isExplored`) for units would do',
+  ).toBe(0);
+  // ...and the tile itself is still painted as ground the player remembers: the marker went away
+  // because the UNIT went away, not because the tile was fogged over. Without this the assertion
+  // above would also pass in a build that painted the whole tile flat fog.
+  expect(
+    colourDistance(goneRead.centre, parseHexColour(FOG_COLOUR)),
+    `tile ${String(goneTile)} is explored and must still be painted as terrain, but its centre ` +
+      `reads ${describeColour(goneRead.centre)}, which is the fog colour`,
+  ).toBeGreaterThan(24);
+  expect(
+    colourDistance(
+      goneRead.centre,
+      parseHexColour(terrainColour(terrainAtTile(uiAfter, goneTile))),
+    ),
+    `tile ${String(goneTile)} is explored and remembers ${terrainAtTile(
+      uiAfter,
+      goneTile,
+    )}, but its centre reads ${describeColour(
+      goneRead.centre,
+    )} rather than that terrain's documented colour (${terrainColour(
+      terrainAtTile(uiAfter, goneTile),
+    )})`,
+  ).toBeLessThanOrEqual(TERRAIN_CENTRE_TOLERANCE);
+
+  /* ---- (4) cities: the rule is MEMORY, and it still paints something ---- */
+
+  // Cities are the deliberate exception to (1)-(3), and the two directions are asserted together
+  // because a build that simply stopped painting city markers would satisfy the negative half
+  // alone. A city the player has explored is remembered and stays on the map (`isExplored`); a
+  // rival city on ground the player has never explored is not drawn at all — the same memory rule
+  // `render.ts` already states for the border tint ("a border is drawn only on an explored tile").
+  const ownCity = after.cities.find((city) => city.owner === seat);
+  expect(
+    ownCity,
+    'the seat founded no city, so "an explored city is painted" could not be checked',
+  ).toBeDefined();
+  if (ownCity === undefined) return;
+  expect(
+    isExplored(after, seat, ownCity.tile),
+    'the player’s own city is not on an explored tile, so it could not be sampled as a remembered city',
+  ).toBe(true);
+  expect(
+    await centreOnCanvas(Number(ownCity.tile)),
+    'the own city could not be panned onto the canvas',
+  ).toBe(true);
+  const ownCityRead = await readTile(Number(ownCity.tile), CITY_COLOUR);
+  expect(
+    ownCityRead.matching,
+    `the player's own city (tile ${String(ownCity.tile)}) is on an explored tile and its marker is ` +
+      `not painted: no pixel of its tile is the city colour ${CITY_COLOUR}`,
+  ).toBeGreaterThan(0);
+
+  const unknownCities = after.cities.filter(
+    (city) => city.owner !== seat && !isExplored(after, seat, city.tile),
+  );
+  expect(
+    unknownCities.length,
+    'no rival city stood on ground the player has never explored at this turn, so "a city the ' +
+      'player has not explored is not painted" could not be checked — re-measure the seed and turn',
+  ).toBeGreaterThan(0);
+  const unknownTile = await reachableTile(unknownCities.map((city) => Number(city.tile)));
+  expect(
+    unknownTile,
+    'no rival city on never-explored ground could be panned onto the canvas, so nothing about it ' +
+      'could be sampled',
+  ).toBeDefined();
+  if (unknownTile === undefined) return;
+  const unknownRead = await readTile(unknownTile, CITY_COLOUR);
+  expect(
+    unknownRead.total,
+    `nothing was read from tile ${String(unknownTile)}, so "no city marker there" would be vacuous`,
+  ).toBeGreaterThan(0);
+  expect(
+    unknownRead.matching,
+    `a rival city (tile ${String(unknownTile)}) stands on ground the player has never explored ` +
+      `and its marker is painted: ${String(unknownRead.matching)} of its tile's pixels are the ` +
+      `city colour ${CITY_COLOUR}`,
+  ).toBe(0);
 });
