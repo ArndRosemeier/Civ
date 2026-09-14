@@ -205,9 +205,34 @@ status=$?
 set -e
 unset FTP_PASSWORD _CIVTS_FTP_PASSWORD
 
-if [[ "$status" -eq 0 ]]; then
-  echo "${C_CYAN}App should now work at: ${PUBLIC_URL}${C_RESET}"
-  echo "${C_YELLOW}[SKIP] Windows Register-FuturemagicApp.ps1 helper (Linux deploy does not run it)${C_RESET}"
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
 fi
 
-exit "$status"
+echo "${C_CYAN}App should now work at: ${PUBLIC_URL}${C_RESET}"
+
+# **Registration: the step Campaigner's Linux script skips.** That script prints
+# "[SKIP] Windows Register-FuturemagicApp.ps1 helper", so on Linux this app would upload and stay
+# invisible on the landing page, which reads `/apps.json` at the web root. `register-app.py` is that
+# helper for this platform: it upserts our one entry and leaves the other apps' entries alone.
+#
+# It runs *after* a successful upload, because registering an app whose files are not there would put
+# a broken tile on the landing page. `SKIP_REGISTER=1` bypasses it for a re-upload that has not
+# changed the app's identity.
+if [[ "${SKIP_REGISTER:-}" == "1" ]]; then
+  echo "${C_YELLOW}Skipping registration (SKIP_REGISTER=1)${C_RESET}"
+else
+  echo "${C_YELLOW}Registering in the site's app registry...${C_RESET}"
+  FTP_PASSWORD="$_CIVTS_FTP_PASSWORD" python3 "$SCRIPT_DIR/register-app.py" \
+    --server "$FTP_SERVER" \
+    --user "$FTP_USER" \
+    --slug "Civ" \
+    --title "CivTS" \
+    --path "$BASE_PATH" \
+    --manifesto "$SCRIPT_DIR/packages/web/public/futuremagic.json" \
+    --backup-dir "$SCRIPT_DIR" || \
+    echo "${C_YELLOW}Registration failed; the app is uploaded but may not be listed.${C_RESET}" >&2
+fi
+unset FTP_PASSWORD _CIVTS_FTP_PASSWORD
+
+exit 0
