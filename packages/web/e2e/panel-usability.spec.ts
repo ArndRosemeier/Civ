@@ -678,6 +678,179 @@ test('X1 sidebar: at 1280×900 the strip holds every panel and the whole scorebo
  * 2. THE RATES
  * ------------------------------------------------------------------ */
 
+/**
+ * The panel at the fold, measured rather than described — the visual review's third finding.
+ *
+ * `docs/KNOWN-ISSUES.md` §4.6 recorded it as unexplained: *"the scoreboard body appears empty in the
+ * help-panel screenshot while populated in the other two."* It is not empty and it is not squeezed.
+ * Measured at 1280×900 with the keyboard help open: the desktop is unchanged in the DOM — the
+ * scoreboard panel still measures 106 px tall and its table 74 px, `scrollHeight === clientHeight` on
+ * both — while the **panel stack** shrinks to the 40 % a dialog leaves it (`61..523`, 669 px of
+ * content in 462 px of box) and the scoreboard happens to sit across that edge: its heading is above
+ * the fold and its whole body is below it. A panel cut by a scroll container's edge is §4.1's
+ * documented behaviour; what made it read as a defect is that this browser paints no scrollbar at
+ * rest, so a list that continues below the fold looks exactly like a panel with nothing in it.
+ *
+ * The assertions therefore pin the *cause*, so a future change that really does squeeze the table to
+ * nothing fails here and this explanation cannot rot into a wrong claim.
+ */
+test('X1 fold: with a dialog open the scoreboard’s body is below the stack’s fold, and nothing was squeezed to make it fit', async ({
+  page,
+}) => {
+  await openApp(page);
+  await seedApp(page, SEED, OPPONENT_OFF);
+
+  const boxes = async (): Promise<{
+    readonly stack: Box;
+    readonly heading: Box;
+    readonly table: Box;
+    readonly tableScrolls: boolean;
+    readonly panelScrolls: boolean;
+  }> =>
+    page.evaluate(() => {
+      const rectOf = (node: Element | null): Box => {
+        if (node === null) throw new Error('the element the fold test measures is not in the DOM');
+        const rect = node.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      };
+      const stack = document.querySelector("[data-layout='panel-stack']");
+      const panel = document.querySelector("[data-panel='scoreboard']");
+      const table = document.querySelector("[data-panel='scoreboard'] table");
+      const heading = document.querySelector("[data-panel='scoreboard'] h2");
+      return {
+        stack: rectOf(stack),
+        heading: rectOf(heading),
+        table: rectOf(table),
+        tableScrolls: table !== null && table.scrollHeight > table.clientHeight,
+        panelScrolls: panel !== null && panel.scrollHeight > panel.clientHeight,
+      };
+    });
+
+  const before = await boxes();
+  expect(
+    before.table.height,
+    'the scoreboard table has no height with nothing open, so this test cannot see it squeezed',
+  ).toBeGreaterThan(20);
+
+  const help = page.getByRole('button', { name: 'Keyboard' });
+  await help.click();
+  await expect(page.getByRole('dialog', { name: 'Keyboard' })).toBeVisible();
+  const after = await boxes();
+
+  const stackBottom = after.stack.y + after.stack.height;
+  expect(
+    stackBottom,
+    'the panel stack did not shrink, so the docked dialog is not competing for the strip and this ' +
+      'test is not measuring the arrangement it describes',
+  ).toBeLessThan(before.stack.y + before.stack.height);
+  expect(
+    after.table.height,
+    'the scoreboard table lost its height when the dialog opened — that is a squeeze, not the fold',
+  ).toBeCloseTo(before.table.height, 0);
+  expect(after.tableScrolls, 'the table scrolls inside itself, so its own body is not whole').toBe(
+    false,
+  );
+  expect(
+    after.panelScrolls,
+    'the scoreboard panel scrolls inside itself, so its own body is not whole',
+  ).toBe(false);
+  expect(
+    after.heading.y + after.heading.height,
+    'the scoreboard’s heading is not above the stack’s fold, so the panel that reads as empty is ' +
+      'not the panel this test is about',
+  ).toBeLessThanOrEqual(stackBottom);
+  expect(
+    Math.min(after.table.y + after.table.height, stackBottom) -
+      Math.max(after.table.y, after.stack.y),
+    `the scoreboard's body is not below the fold: the table is at y=${String(
+      Math.round(after.table.y),
+    )}..${String(Math.round(after.table.y + after.table.height))} and the stack ends at ` +
+      String(Math.round(stackBottom)),
+  ).toBeLessThanOrEqual(2);
+
+  // The other half of phase 5's arrangement, and the reason it is asserted here: the first visual
+  // review found the body's last visible row *jammed against the `Close` control*, because the
+  // control was the last thing in the dialog and the body's cut edge sat directly above it.
+  const close = page
+    .getByRole('dialog', { name: 'Keyboard' })
+    .getByRole('button', { name: 'Close' });
+  const closeBox = await close.boundingBox();
+  const keysBox = await page.locator("[data-panel='keyboard'] [data-role='keys']").boundingBox();
+  expect(closeBox, 'the Keyboard panel has no Close control').not.toBeNull();
+  expect(keysBox, 'the Keyboard panel has no bindings body').not.toBeNull();
+  if (closeBox === null || keysBox === null) return;
+  expect(
+    closeBox.y + closeBox.height,
+    'the Close control is below the scrolling body, so the row the body cuts in half is the one ' +
+      'sitting against the way out of the panel',
+  ).toBeLessThanOrEqual(keysBox.y + 1);
+});
+
+/**
+ * The scoreboard's name column, clear of the first figure.
+ *
+ * The first visual review read the longest row as `Barbarians0`. Measured before the repair, the
+ * label's cell ended at x 955 and the first value's cell began at 955, with the 2 px cell padding the
+ * only separation there was — a gap that reads as one word in the one column whose content is a
+ * *name* rather than a figure. The repair widens that column's right padding to 8 px and pays for it
+ * out of the panel's own side padding (the table measured `scrollWidth / clientWidth` of 362/362, so
+ * there was nothing else to spend), which is why the second assertion here is that the table still
+ * fits: a gap bought by overflowing the strip would be a worse defect than the one it fixed.
+ */
+test('X1 scoreboard: the name column is clear of its first figure, and the table still fits the strip', async ({
+  page,
+}) => {
+  await openApp(page);
+  await seedApp(page, SEED, OPPONENT_OFF);
+
+  const measured = await page.evaluate(() => {
+    const table = document.querySelector("[data-panel='scoreboard'] table");
+    if (table === null) throw new Error('the scoreboard table is not in the DOM');
+    const rows = [...table.querySelectorAll('tbody tr')];
+    const last = rows[rows.length - 1];
+    const cells = last === undefined ? [] : [...last.children];
+    const value = cells[1]?.getBoundingClientRect();
+    // The *text*, not the cell box: this column's padding lives inside the cell, so a cell boundary
+    // says nothing about how far the word is from the figure beside it.
+    const name = last?.firstElementChild?.firstChild ?? null;
+    const range = document.createRange();
+    let textRight: number | null = null;
+    if (name !== null) {
+      range.selectNodeContents(name.parentNode ?? table);
+      const box = range.getBoundingClientRect();
+      textRight = box.width === 0 ? null : box.right;
+    }
+    return {
+      value: value === undefined ? null : { left: value.left, right: value.right },
+      textRight,
+      scrollWidth: table.scrollWidth,
+      clientWidth: table.clientWidth,
+      rows: rows.length,
+      longest: last?.textContent ?? '',
+    };
+  });
+
+  expect(measured.rows, 'the scoreboard has no rows to measure').toBeGreaterThan(0);
+  expect(measured.value, 'the scoreboard has no second column').not.toBeNull();
+  expect(
+    measured.textRight,
+    'the longest name has no text box, so the gap below would be measured from nothing',
+  ).not.toBeNull();
+  if (measured.value === null || measured.textRight === null) return;
+  const gap = measured.value.left - measured.textRight;
+  expect(
+    gap,
+    `the name column is not clear of its first figure: the row "${measured.longest}" ends its name ` +
+      `at x=${String(Math.round(measured.textRight))} and begins its first value at x=${String(
+        Math.round(measured.value.left),
+      )}, a gap of ${String(Math.round(gap))} px — which is what made it read as "Barbarians0"`,
+  ).toBeGreaterThanOrEqual(6);
+  expect(
+    measured.scrollWidth,
+    'the scoreboard table overflows its panel, so the columns would be clipped or scrolled',
+  ).toBeLessThanOrEqual(measured.clientWidth + 1);
+});
+
 test('X1 rates: setting the rates through the status strip moves the ENGINE’s own rates, and the strip follows', async ({
   page,
 }) => {

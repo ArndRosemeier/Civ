@@ -824,9 +824,7 @@ would otherwise have to infer from the code.
   `off` for that reason. A structured `aria-describedby` version would be an accessibility
   improvement nobody has measured the need for.
 
-### 4.6 The orders popup does not follow the map — found by looking, not by measuring (2026-09-14)
-
-**Open. Nothing in the suite can see it, and a fix was attempted and withdrawn.**
+### 4.6 The orders popup does not follow the map — found by looking, not by measuring (2026-09-14) — **CLOSED, and the obvious fix was not the fix**
 
 Every phase of this overhaul was verified by measurement and mutation, and six phases in, nobody had
 looked at the result. The first visual review — a vision-capable model reading three screenshots,
@@ -836,50 +834,85 @@ because every agent on this work ran on a text-only route — found this immedia
 > though the selected unit moved one tile up-left… So in this frame the popup is *not* beside the
 > selected unit.
 
-**Cause.** `placeUnitActions` (`main.ts`) is called when the *selection* changes and never when the
-*camera* does. The popup's coordinates are the selected unit's screen position, so any pan, zoom or
-resize leaves it behind. The hover readout added in phase 6 gets this right — `redraw` rebuilds it
+**Cause.** `placeUnitActions` (`main.ts`) was called when the *selection* changed and never when the
+*camera* did. The popup's coordinates are the selected unit's screen position, so any pan, zoom or
+resize left it behind. The hover readout added in phase 6 got this right — `redraw` rebuilds it
 precisely "because what it describes can change while the pointer stands still: a move, a new turn, a
 key that pans the map" — and the popup three hundred lines above it did not.
 
 **The obvious fix was tried and is wrong.** Adding `placeUnitActions()` to `redraw()` makes the popup
-follow correctly, and turns **three** green tests red (measured, same box, same command):
+follow correctly, and turned **three** green tests red (measured, same box, same command):
 
 | test | failure |
 |---|---|
-| `m8-adversarial.spec.ts` reachable | `clicking tile 885 for unit 1 did not issue a MoveUnit; dispatched [{"type":"StartWork","unitId":1,"kind":"irrigation"}]` — the click was taken by one of the popup's own buttons |
+| `m8-adversarial.spec.ts` reachable | `clicking tile 885 for unit 1 did not issue a MoveUnit; dispatched [{"type":"StartWork","unitId":1,"kind":"irrigation"}]` |
 | `map.spec.ts` fog | `no rival unit in the player's sight could be panned onto the canvas, so the control half of this test could not be taken` |
 | `map.spec.ts` hover (phase 6) | `the priced tile could not be hovered a second time` |
 
-Reverting the one line returns all three to green in 1m24s. So the defect and its fix are not
-separable by a one-liner: **a popup that follows the map sweeps its buttons across tiles as the map
-moves**, and can come to rest over the very tile a click is aimed at. Phase 2 accepted that collision
-as inherent ("the popup is unavoidably larger than one tile, and no placement avoids every neighbour")
-and mitigated it with `pointer-events: none` and a `clickTile` that clicks any unobstructed point
-*inside* the target tile — but both assume the popup holds still between the hit-test and the click,
-which following breaks. Resolving it is a design decision, not a patch: either the popup yields while
-the camera moves (hidden during a drag and re-placed after), or the map keeps a click-priority rule
-over the popup's buttons, or the popup is placed in the map region's margin where it covers no tiles.
-Whichever is chosen must be measured against the three tests above.
+**What the three failures actually were, re-measured rather than inferred.** The note above blamed
+"the button can arrive under the pointer after the helper has chosen its point". That is **not** what
+the traces show. Instrumenting `placeUnitActions`, the map's `pointerdown`, the document's `click` and
+`clickTile` itself found two different mechanisms, and neither is the popup moving between a hit test
+and a press:
 
-**Three more findings from the same review, also open, also invisible to the suite:**
+1. **A dragged gesture that starts on the menu does not pan the map at all.** `dragOnce` plants its
+   pointer **12 px inside the canvas edge** — and where a popup that follows the map sits is a function
+   of the map, so when the selected unit is off screen the popup is *clamped to that corner*. Traced:
+   `pointerdown at 836,78 target BUTTON:Fortify`, the camera never moved, and `bringTileToCentre` gave
+   up — which is why the fog and hover tests failed on their *fixture's premise* rather than on their
+   own assertion. A popup that follows the map refuses a drag, and a player meets it the same way.
+2. **The hit test and the press are asked in different coordinate spaces.** `elementFromPoint` takes
+   the fractional point it is handed; a press is delivered at the integer device pixel it lands in.
+   Traced: a `clickTile` candidate at **(457.99, 520.65)** reported `CANVAS` with no button's rectangle
+   containing it, and the press at that same point — rounded by the browser to (458, 521) — landed
+   0.35 px lower, on `Start work: Irrigation`. That is the keystone failure above, and it is a defect
+   of the *helper*: it asks one question and then performs another.
 
-1. **A scoreboard label collides with its first value.** The longest row reads `Barbarians0` with
-   about 4 px of clearance. §4.1's work fixed the table's *horizontal overflow*; this is the cell
-   padding being too tight for the one data-driven column.
-2. **The keyboard help panel clips its last visible row.** `← pan the map one tile left` is sliced
-   along the baseline and jammed against the `Close` button, with `SAVE` and `DEBUG` pushed out of
-   view. Phase 5 measured the panel's body as scrolling by 159 px with `Close` at y 851–879 — inside
-   the window — which is true and is not the same claim as "the panel looks finished".
-3. **The scoreboard body is empty in the help-panel screenshot** while it is populated in the other
-   two. Unexplained; possibly the panel is being squeezed by the help panel beside it. Not
-   investigated.
+**The fix, and it is three rules rather than one** (`docs/UI-OVERHAUL.md`, phase 7, has the design
+essay, the rejected alternatives and the mutations): the popup is re-placed from `redraw`; a press on
+it arms the same pan a press on the canvas does, with a control acting only if the pointer did not
+travel (`DRAG_CLICK_TOLERANCE_PX`); and the placement puts the popup on the other side of the unit's
+tile when the preferred side would come to rest under a pointer that is aiming at the map — the
+hazard the fix itself creates. `clickTile` now rounds its candidate to whole pixels before the hit
+test and offers the browser the *whole* tile rather than seven points within a quarter of it, which is
+what its own comment had always claimed. All three originally-red tests are green with the fix
+(`m8-adversarial` reachable in 1.2 min, fog 5.0 s, hover 2.1 s), and each rule fails loudly when it is
+removed — the mutations are tabulated in `docs/UI-OVERHAUL.md`, phase 7.
+
+**Three more findings from the same review — two closed, one explained:**
+
+1. **A scoreboard label collides with its first value — CLOSED.** Measured: the longest row's name
+   ended at x 950 and its first figure began at x 952, a 2 px cell padding that reads as one word in
+   the one column whose content is a name (`Barbarians0`). The column carries 8 px now, paid for out of
+   the panel's own side padding, because the table measured `scrollWidth / clientWidth = 362 / 362`
+   and there was no slack to spend. Asserted at ≥ 6 px, with the overflow guard beside it.
+2. **The keyboard help panel clips its last visible row — CLOSED as far as the panel can close it.**
+   Measured: the body's box ended at y 851 and the `← pan the map one tile left` row spanned 836–856,
+   so the row was cut through its glyphs with the `Close` button beginning at 851 — its top border was
+   the cut. `Close` now sits under the heading, where every other dialog puts it (asserted), and the
+   body's last 16 px fade, so the cut reads as "more below". Nine bindings still do not fit the share
+   a docked panel gets (454 px of content in a 295 px box); making them fit is a typography or a
+   share decision, not a bug fix, and §4.4 records it.
+3. **The scoreboard body appears empty in the help-panel screenshot — EXPLAINED, and asserted.**
+   It is neither empty nor squeezed: with the help open the scoreboard panel still measures **106 px
+   and its table 74 px, `scrollHeight === clientHeight` on both**, while the **panel stack** shrinks
+   to the share a dialog leaves it (**669 px of content in a 462 px box**) and the scoreboard sits
+   across that edge — heading above the fold, whole body below it. That is §4.1's documented fold; the
+   reason it reads as a defect is that this browser paints no scrollbar at rest, so a panel that
+   continues below the fold looks exactly like a panel with nothing in it. The same fold is why `SAVE`
+   and `DEBUG` are not visible in that frame. `panel-usability.spec.ts` now asserts the cause (panel
+   and table heights unchanged, no internal scrolling, heading above the fold, body below it) so the
+   explanation cannot rot into a wrong claim.
 
 **The lesson, recorded because it is the whole point:** a suite that measures geometry, text and
 engine agreement can be green for six phases while the thing it describes looks wrong. Screenshots
 are cheap; the reason they were not taken earlier is that every model on this work was text-only and
 the vision route (`deepseek-v4-flash-vision-exp`, the only catalog entry declaring
 `inputModalities: ["text","image"]`) was never tried. It works, and it should be part of the loop.
+**The second lesson is about the first one's write-up:** the review's reading of *why* the one-line fix
+was wrong was itself wrong — it was an inference from a failure message, and the instrumentation that
+replaced it found an instrument defect (a fractional hit test against an integer press) that no amount
+of reasoning about the popup would have found.
 
 ### 4.7 Other UI limits
 

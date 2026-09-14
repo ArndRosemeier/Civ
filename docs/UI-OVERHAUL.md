@@ -1524,7 +1524,7 @@ board** and compares `hashValue` and `state.rng` before and after).
 What it is *not* is the chance of winning the whole battle. That is a multi-round quantity, no engine
 function returns it, and the AI's own model for it (`battleWinPctOf`) is private to `packages/sim`.
 The readout therefore says **"percent per round of combat"**, because that is what the engine
-computed, and it does not multiply it by anything. `docs/KNOWN-ISSUES.md` §4.6 records the gap and
+computed, and it does not multiply it by anything. `docs/KNOWN-ISSUES.md` §4.5 records the gap and
 what closing it would take: an exported odds query in the engine (or an exported `CombatContext`
 builder), not arithmetic in the UI.
 
@@ -1619,7 +1619,7 @@ this suite's geometry assertions are load-bearing, not decoration.
 ### Not done in this phase, and not claimed
 
 - **No whole-battle odds.** The engine has no such function and this phase did not invent one; see
-  above and `docs/KNOWN-ISSUES.md` §4.6.
+  above and `docs/KNOWN-ISSUES.md` §4.5.
 - **No e2e assertion sees a percentage.** The odds figure is pinned by `test/ui/hover.test.ts` against
   the engine's own `CombatResolved` event, and the e2e proves the *combat field* is wired (it reports
   the engine's refusal for a unit that cannot attack, and names a rival it can see). Reaching an
@@ -1634,3 +1634,164 @@ this suite's geometry assertions are load-bearing, not decoration.
   anything.
 - **Nobody with working eyes has reviewed it.** The sentence is asserted by text and by engine
   equality; how it reads at a glance, and whether 12 px is the right size, is not measured.
+
+---
+
+## Phase 7 — the visual review: the popup follows the map, and three things looking at it found — landed
+
+**This phase exists because every agent before it was text-only.** Six phases were verified by
+measurement and mutation, and nobody had opened a screenshot. The first visual review (a
+vision-capable model reading three frames) found the defect `docs/KNOWN-ISSUES.md` §4.6 records, and
+three smaller ones beside it. This phase fixes the defect, fixes two of the three, and measures the
+third into an explanation.
+
+### The defect: the orders popup did not follow the map
+
+`placeUnitActions` computed the popup's screen position from the selected unit's tile and was called
+when the *selection* changed — never when the camera did. Measured on the frames this phase captured
+for its own before/after pair, with the map panned exactly one tile (64 px) between them:
+
+| frame | selected tile | orders popup |
+|---|---|---|
+| before, before the pan | x 306–368, y 336–399 | x 377–554, y 337–381 |
+| before, after a one-tile pan | x 370–432, y 336–399 | **x 377–554, y 337–381 — unmoved** |
+| after, after the same pan | x 370–432, y 336–399 | x 441–618, y 337–381 |
+
+So the popup held the coordinates it was given while the map slid out from under it, and it came to
+rest **over the tile it belongs to**. The four corners of that reading are the phase's evidence: the
+before pair is byte-identical in the popup and 64 px apart in the tile, and the after pair is 64 px
+apart in both.
+
+### The design, and the two alternatives it rejects
+
+The obvious repair — call `placeUnitActions()` from `redraw()` — is correct and **not sufficient**,
+and the reason is measured rather than argued. Two rules go with it, and each was found by breaking
+the build and watching a green test go red:
+
+1. **The popup is re-placed on every frame** (`redraw`), like the hover readout beside it. Removing
+   this one call makes the new `map.spec.ts` test fail with *"the popup did not move when the camera
+   did: it is still holding the coordinates it was given"*.
+2. **A gesture that starts on the popup and travels is a map gesture.** A press on the popup arms the
+   same pan a press on the canvas does, and a control acts only if the pointer did not travel past
+   the map's own `DRAG_CLICK_TOLERANCE_PX`. Without it, `map.spec.ts`'s own new test reads *"a drag
+   that started on the popup did not pan the map by the distance dragged"* — the camera does not move
+   at all. **And without it the two tests the review's write-up named go red with its own messages**,
+   on the app fix alone: *"no rival unit in the player's sight could be panned onto the canvas, so the
+   control half of this test could not be taken"* and *"the priced tile could not be hovered a second
+   time"*. Both of those tests pan by dragging a point 12 px inside the canvas edge, and a popup that
+   follows the map can be sitting exactly there — which is Phase 2's accepted collision, seen from the
+   side nobody had looked at: not "the menu covers a tile" but "the menu refuses a drag".
+3. **The popup does not come to rest under a pointer that is aiming at the map.** The placement checks
+   the pointer's own last position over the map and puts the popup on the other side of the unit's
+   tile when the preferred side would land on it. This is the hazard the *fix* creates: a pan, a
+   wheel, a key or the unit's own move can slide the menu's **buttons** under a stationary pointer
+   that is looking at a tile. Measured without this rule (the mutation): *"the popup came to rest
+   under the pointer: its box is 256,473 181x46 and the pointer is at 312,496"*.
+
+**Rejected: hiding the popup while the camera moves and showing it again when it settles.** It sounds
+like the cheapest of the three, and it does not fix the measured failure: the pointer is already on
+the map when the camera stops, and what moves under it is the popup, not the pointer. It also cannot
+be tested honestly — a "hidden while moving" rule has no observable that a screenshot or a hit test
+can distinguish from "placed correctly", and `Locator.click`'s actionability check would deadlock on a
+control that only becomes interactive on the next pointer move.
+
+**Rejected: giving the map click priority over a popup button.** A press on a button is the one
+gesture whose meaning is unambiguous — the player can see the control under their pointer — and a
+rule that sometimes overrode it would break the menu for the case that actually matters (pressing a
+button). What is ambiguous is a *travelling* gesture, which is what rule 2 decides, and a *button
+that arrived*, which is what rule 3 decides.
+
+**Rejected, and measured: placing the popup where it covers no tile.** The map region has no margin to
+place it in — the canvas fills it — and a worker's popup measures **256×115 px against 64 px tiles**,
+so it is four tiles wide and two tall. It cannot avoid the ring of tiles a unit can act on, which is
+where Phase 2 left this question and this phase does not reopen it.
+
+### The helper had to change too, and that is the interesting part
+
+The review's write-up proposed that the popup *arrives* under a pointer between `clickTile`'s hit test
+and its press. **That is not what was measured.** Two different mechanisms were, and neither is about
+the popup moving:
+
+- **The hit test and the press are asked in different coordinate spaces.** `elementFromPoint` takes
+  the fractional point it is handed; a press is delivered at the integer device pixel it lands in.
+  Traced: a candidate at **(457.99, 520.65)** reported `CANVAS` with no button's rectangle containing
+  it, and the press at the same point — which the browser rounds to (458, 521) — landed 0.35 px lower,
+  on `Start work: Irrigation`. That is the brief's own message: *"clicking tile 885 for unit 1 did not
+  issue a MoveUnit; dispatched `[{"type":"StartWork","unitId":1,"kind":"irrigation"}]`"*, reproduced
+  with the app fix in place and the original helper restored. The candidates are now rounded to whole
+  pixels before the hit test, so the point that is hit-tested is the point that is pressed.
+- **Seven sample points is not enough room for a menu four tiles wide.** `clickTile`'s comment has
+  always said *any* unobstructed point inside the target tile, and its implementation sampled seven
+  points within a quarter tile of the centre. With the popup where it belongs, all seven fell inside
+  it — *"every point inside tile (45, 14) is covered by something other than the map"* — while the
+  tile's own left 6 px belonged to the map the whole time. The whole tile is now offered to the
+  browser, inset from its edges and stepped, and the free point nearest the centre wins.
+
+Both are repairs to the *instrument*, and both were made only after the app-side fix was in place and
+the test still failed: neither is a way of passing the test without fixing the app.
+
+### The three smaller findings
+
+1. **`Barbarians0`** — the name column had the same 2 px cell padding as every other cell, which is
+   right for a figure and wrong for the one column whose content is a name. Measured before: the
+   label's text ended at x 950 and its first value began at x 952. The column now carries 8 px, paid
+   for out of the panel's own side padding (8 px → 5 px), because the table measured
+   `scrollWidth / clientWidth = 362 / 362` — there was no slack anywhere else. After: 368 / 368, a gap
+   of 8 px, and still no overflow.
+2. **The keyboard help panel clipped its last visible row against its own `Close` control.** Measured
+   at 1280×900: the body's box ended at y 851 and the `← pan the map one tile left` row spanned
+   836–856, so the row was cut through its glyphs with the `Close` button starting at 851 — its top
+   border *was* the cut. Two changes: `Close` now sits under the heading, where every other dialog
+   puts it (asserted: the control's bottom is above the body's top), and the body's last 16 px fade
+   out, so the cut reads as "there is more below" rather than as a rendering mistake. The fade is the
+   honest affordance here: this browser paints **no** classic scrollbar — measured `offsetWidth /
+   clientWidth = 362 / 362` for the body, and thirty lines of `::-webkit-scrollbar` styling painted
+   nothing and reserved nothing — and `scrollbar-gutter: stable` reserves 8 px that stay blank at
+   rest. All three of those were tried and measured before the fade was written.
+3. **The empty-looking scoreboard** is neither empty nor squeezed, and `panel-usability.spec.ts` now
+   asserts the cause: with the help panel open the desktop does not change at all (the scoreboard
+   panel still measures 106 px and its table 74 px, with `scrollHeight === clientHeight` on both),
+   while the **panel stack** shrinks to the share a dialog leaves it (669 px of content in a 462 px
+   box) and the scoreboard sits across that edge — heading above it, whole body below it. That is
+   §4.1's documented fold; what made it read as a defect is that the fold is invisible on this
+   browser. The `SAVE` and `DEBUG` panels are below the same fold, for the same reason.
+
+### Mutation-checked, each restored byte-identical
+
+| mutation | result | the failure it produced |
+|---|---|---|
+| `placeUnitActions()` removed from `redraw` | RED | *"the popup did not move when the camera did: it is still holding the coordinates it was given"* |
+| the popup's `pointerdown` (the pan) removed | RED | *"a drag that started on the popup did not pan the map by the distance dragged"* — camera delta **0** where 120 px was dragged — and, on the same build, the review's two named tests fail with its own messages |
+| the dodge branch removed | RED | *"the popup came to rest under the pointer: its box is 256,473 181x46 and the pointer is at 312,496"* |
+| the name column's `padding-right: 8px` removed | RED | *"the name column is not clear of its first figure … a gap of 2 px — which is what made it read as `Barbarians0`"* |
+| `Close` moved back below the body | RED | *"the Close control is below the scrolling body, so the row the body cuts in half is the one sitting against the way out of the panel"* — measured at y 879 against a body ending at 556 |
+| `clickTile` reverted to its seven fractional candidates | RED | the brief's own message, verbatim: *"clicking tile 885 for unit 1 did not issue a MoveUnit; dispatched `[{"type":"StartWork","unitId":1,"kind":"irrigation"}]`"* |
+
+Every file was restored byte-identical and checked with `sha256sum -c` before the next mutation.
+
+### Not done in this phase, and not claimed
+
+- **The popup still covers tiles.** It is four tiles wide at the default zoom and no placement avoids
+  the ring; Phase 2 accepted that and rule 2 is what keeps it from *blocking* the map. Clicking a tile
+  the menu's background covers works because the background is transparent to the pointer; clicking a
+  tile a *button* covers does not, and cannot.
+- **The dodge is horizontal only.** The alternative placement is the other side of the unit's tile, so
+  a popup that arrives under the pointer by a *vertical* move is not dodged. Measured as a limit, not
+  fixed: the popup's vertical anchor is the tile's own top, and moving it below the tile would trade
+  this hazard for covering the tile below.
+- **The fade is a presentation change with no assertion.** Its effect is visible in the before/after
+  pair and was read by the vision model (*"a gradient fade rather than a hard cut"*), but nothing
+  asserts a gradient: an assertion over `mask-image` would be a restatement of the stylesheet, which
+  is the kind of test this project calls decoration.
+- **Nine bindings still do not fit the share a docked panel gets.** The content measures 454 px in a
+  295 px box; making it fit means either a smaller type or a larger share of the strip, and the 40/60
+  split between the stack and the dock is the owner's decision (§4.4).
+- **The scoreboard header row is still cramped**, which is the vision model's own closing observation:
+  the header words are wider than the figures under them, so `Population / Treasury / Techs / Beakers`
+  are separated by 3–5 px. Its further claim — that the header labels do not line up with the figures
+  beneath them — is **not** corroborated: the header and body cells share a column box and both are
+  `text-align: left`, measured `Cities: 991–1023` above `0: 991–1023`.
+- **Nothing was done about the sidebar's invisibly-scrolling stack.** The 8 px a visible scrollbar
+  would need is not available: the panels are 380 px wide around a scoreboard table that measures
+  362/362, so the table would overflow its panel and clip the `Score` column that §4.1's work exists
+  to protect.

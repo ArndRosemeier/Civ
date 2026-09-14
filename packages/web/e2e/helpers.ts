@@ -850,21 +850,50 @@ export const clickTile = async (
   // tile, so no placement of it avoids every neighbour). Clicking the centre blindly then presses a
   // menu button instead of the map, and the order silently never happens.
   //
-  // The candidates stay within a quarter of a tile of the centre, so they cannot spill into a
-  // neighbouring tile and address the wrong one; the first candidate the map actually owns is used.
-  // If none of them is the map's, the click is not attempted and the failure says so, rather than
-  // reporting a missing order that was never asked for.
+  // So the whole tile is offered to the browser and **the free point nearest the centre wins**. That
+  // is the rule the comment above has always stated — *any* unobstructed point inside the target
+  // tile — and it is what the implementation has to be, because the first version of it sampled only
+  // seven points within a quarter of a tile of the centre and that is not enough room for a menu
+  // that is four tiles wide. Measured with the orders popup following the map (the fix this file's
+  // `clickTile` was repaired for): the worker's popup stood at `448,473 256x115` and tile 885's
+  // candidates all fell inside it — `every point inside tile (45, 14) is covered by something other
+  // than the map, so the order cannot be issued by clicking it` — while the tile's own left 6 px
+  // (`442..448`) belonged to the map the whole time. The sampled grid is inset from the tile's edges
+  // so a candidate cannot land on the boundary the app's inverse projection rounds the other way, and
+  // it is stepped rather than exhaustive so one tile costs one round trip.
+  //
+  // **The candidates are rounded to whole client pixels before the hit test, and that is not
+  // tidiness.** The hit test and the press are two different questions asked of two different
+  // coordinate spaces: `elementFromPoint` takes the fractional point it is handed, while a press is
+  // delivered at the integer coordinates of the device pixel it lands in (`event.clientX`). One pixel
+  // apart is the whole width of a menu's row gap, and it was measured doing exactly that: a candidate
+  // at (457.99, 520.65) reported `CANVAS` with no button's rectangle containing it, and the press at
+  // the same point — which the browser rounds to (458, 521) — landed 0.35 px lower, on `Start work:
+  // Irrigation`. The keystone sweep read that as `clicking tile 885 for unit 1 did not issue a
+  // MoveUnit; dispatched [{"type":"StartWork",...}]`. Rounding first makes the point that is
+  // hit-tested the point that is pressed, so "the point the map owns" is a statement about the click
+  // that is about to happen rather than about its neighbourhood.
   const size = tileScreenPx(camera);
-  const quarter = size / 4;
-  const candidates = [
-    point,
-    { x: point.x, y: point.y + quarter },
-    { x: point.x, y: point.y - quarter },
-    { x: point.x + quarter, y: point.y + quarter },
-    { x: point.x - quarter, y: point.y + quarter },
-    { x: point.x + quarter, y: point.y - quarter },
-    { x: point.x - quarter, y: point.y - quarter },
-  ];
+  const inset = Math.max(1, Math.min(3, Math.floor(size / 8)));
+  const step = Math.max(1, Math.round((size - 2 * inset) / 12));
+  const candidates: { x: number; y: number }[] = [];
+  for (let dy = inset; dy <= size - inset; dy += step) {
+    for (let dx = inset; dx <= size - inset; dx += step) {
+      candidates.push({
+        x: Math.round(point.x - size / 2 + dx),
+        y: Math.round(point.y - size / 2 + dy),
+      });
+    }
+  }
+  // Nearest the centre first: the tile a test means is the tile it names, and the point inside it is
+  // then as close to the one it would have clicked as the menu allows.
+  const centre = { x: Math.round(point.x), y: Math.round(point.y) };
+  candidates.sort(
+    (one, two) =>
+      (one.x - centre.x) ** 2 +
+      (one.y - centre.y) ** 2 -
+      ((two.x - centre.x) ** 2 + (two.y - centre.y) ** 2),
+  );
   const reachable = await page.evaluate(
     (points) =>
       points.map((at) => {
@@ -877,7 +906,9 @@ export const clickTile = async (
   if (chosen === undefined) {
     throw new Error(
       `every point inside tile (${String(x)}, ${String(y)}) is covered by something other than the ` +
-        `map, so the order cannot be issued by clicking it`,
+        `map, so the order cannot be issued by clicking it ` +
+        `(${String(candidates.length)} points sampled across the tile, all of them owned by ` +
+        `something else)`,
     );
   }
   await page.mouse.click(chosen.x, chosen.y);

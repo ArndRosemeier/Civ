@@ -344,9 +344,28 @@ main {
   overflow: hidden;
 }
 
+/*
+ * The body scrolls, and **its bottom edge says so**.
+ *
+ * The measurement behind this rule: nine bindings and their two notes are 454 px in the 295 px box
+ * a docked panel gets at 1280×900, so the panel cannot show them all and the body is a scroll
+ * container. What the first visual review saw was not the scrolling, it was the *cut*: a row sliced
+ * along its baseline flush against the panel's own edge, which reads as a rendering mistake rather
+ * than as "there is more below". The browser does not help — measured on this element, an
+ * `overflow: auto` box reports `offsetWidth / clientWidth = 362 / 362`, an overlay scrollbar laid
+ * out as nothing, and thirty lines of `::-webkit-scrollbar` styling painted no bar and reserved no
+ * space either (both measured, both reverted rather than left in as decoration). `scrollbar-gutter:
+ * stable` does reserve 8 px, but this browser still paints no bar into it at rest, so it buys
+ * nothing a player can see and costs the sentences 8 px of width.
+ *
+ * So the cue is drawn: the last 16 px fade out, which is the one affordance that does not depend on
+ * a scrollbar being painted. It marks the cut whether or not the list is at its end, and that is the
+ * direction to err in for a help panel whose purpose is to be read to the end.
+ */
 [data-panel='keyboard'] [data-role='keys'] {
   overflow-y: auto;
   min-height: 0;
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent 100%);
 }
 
 [data-panel='keyboard'] dl {
@@ -808,6 +827,18 @@ td {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /*
+   * 8 px of side padding becomes 5 px, and **the 6 px it frees is the gap the label column needs.**
+   * The first visual review read the longest row as `Barbarians0`: measured, the label's cell ends
+   * at x 955 and the first value's cell begins at 955, with the 2 px cell padding the only thing
+   * between them. Widening that gap means widening the first column, and the table has *no* slack
+   * to widen into — measured `scrollWidth / clientWidth = 362 / 362`, because every other column is
+   * as wide as its own header word (`Population` is the widest) with `white-space: nowrap`. So the
+   * space comes from the panel's decoration rather than from the columns' rhythm, which is the one
+   * place in this panel where a pixel is not doing work.
+   */
+  padding-left: 5px;
+  padding-right: 5px;
 }
 
 [data-panel='scoreboard'] table {
@@ -821,10 +852,16 @@ td {
   font-size: 10px;
 }
 
+/*
+ * The label column: as wide as its own longest name (`Barbarians`), and 8 px clear of the first
+ * value rather than the 2 px every other cell carries. It is the one column whose content is text
+ * rather than a figure, so it is the one column where a tight gap reads as one word (`Barbarians0`).
+ */
 [data-panel='scoreboard'] th:first-child,
 [data-panel='scoreboard'] td:first-child {
   white-space: normal;
   overflow-wrap: anywhere;
+  padding-right: 8px;
 }
 
 /* The table's accessible name is its caption's text, and the caption is a second visible

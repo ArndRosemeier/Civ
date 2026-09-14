@@ -478,6 +478,15 @@ const buildKeyboardHelp = (doc: Document): Shell['keyboard'] => {
   // panel gets, so a panel that scrolled as a whole put its own Close button below the fold — which
   // is the defect `styles.css` records for the *other* direction and is just as bad this way round.
   // The body scrolls; the way out stays put.
+  //
+  // **And it stays put at the top, under the heading, which is where every other dialog's is.** The
+  // first visual review of this app found what the geometry could not: at 1280×900 the body's last
+  // *visible* row is a binding sliced along its baseline, and with `Close` last that sliced row was
+  // jammed straight into the control (measured: the keys box ends at y 851, the `← pan the map one
+  // tile left` row is at 836–856, and the Close button was at 851–879). The body still scrolls —
+  // nine bindings do not fit in the share a docked panel gets, and `styles.css` says so — but the
+  // cut is now at the panel's own edge, where the stylesheet fades it out, rather than against a
+  // control a player is trying to press.
   const body = el(doc, 'div');
   body.dataset['role'] = 'keys';
   for (const section of KEY_HELP) {
@@ -489,7 +498,7 @@ const buildKeyboardHelp = (doc: Document): Shell['keyboard'] => {
     group.append(el(doc, 'h3', section.where), el(doc, 'p', section.note), rows);
     body.append(group);
   }
-  dialog.append(heading, body, close);
+  dialog.append(heading, close, body);
 
   const open = el(doc, 'button', 'Keyboard');
   open.type = 'button';
@@ -753,6 +762,11 @@ const start = async (): Promise<void> => {
     // load or a new game re-opens it and the button can never be out of step with the state.
     shell.endTurn.disabled = isGameOver(state, ruleset);
     draw();
+    // The unit's orders popup is re-placed here for the same reason the readout is rebuilt here, and
+    // it is the defect §4.6 records: what it is anchored to is a *tile*, and which screen pixels
+    // that tile owns changes whenever the camera does. Called on the selection change alone, it kept
+    // the coordinates it was given and floated over whatever tile had since moved under it.
+    placeUnitActions();
     // The hover readout is rebuilt here rather than only on `pointermove`, because what it describes
     // can change while the pointer stands still: a move, a new turn, a key that pans the map. See
     // `updateReadout` — it reads the engine and changes nothing.
@@ -901,6 +915,24 @@ const start = async (): Promise<void> => {
    * The size is read *after* the panel has rebuilt the buttons, so the flip and the clamp use the
    * popup's real width rather than a guess; a control that runs off the map is an order the player
    * cannot give.
+   *
+   * **It is called on every frame, and that is the defect this function was fixed for.** It used to
+   * be called only when the *selection* changed, so a pan, a wheel zoom, a keyboard pan or a resize
+   * left the popup holding the coordinates it was given while the map slid out from under it: at
+   * 1280×900 a one-tile pan moved the selection outline from x 337–378 to x 290–330 and left the
+   * popup at **x 387–500, y 356–384 in both frames** (`docs/KNOWN-ISSUES.md` §4.6, measured). The
+   * hover readout beside it has been rebuilt from `redraw` since it was added, for exactly this
+   * reason; the popup is now rebuilt there too.
+   *
+   * **And it is placed, when it can be, so that it does not come to rest under the pointer.** A menu
+   * that follows the map can *arrive* under a pointer that is standing still — a pan, a wheel, a
+   * key, the unit's own move — and the player's next press, aimed at the tile they were looking at,
+   * is then taken by a button that slid there. `pointerAt` is the pointer's own last position over
+   * the map (null when it is not over the canvas at all), so this is one comparison against two
+   * candidate placements rather than a rule about time. The other side of the unit's tile is the
+   * alternative, and when both sides cover the pointer the clamp wins: the popup still covers a
+   * neighbouring tile, which is Phase 2's accepted cost, and a press that travels is a map gesture
+   * whatever it started on (see the map region's `pointerdown`).
    */
   const placeUnitActions = (): void => {
     const popup = panels.elements.unitActions;
@@ -924,10 +956,25 @@ const start = async (): Promise<void> => {
 
     // Right of the tile by preference, then left, then clamped: the flip keeps the popup off the
     // tile it belongs to at the map's right edge, and the clamp keeps it on screen everywhere else.
-    let left = box.left + at.x + size + gap;
-    if (left + width > box.right) left = box.left + at.x - width - gap;
+    const clampX = (candidate: number): number =>
+      Math.max(box.left, Math.min(candidate, box.right - width));
+    const rightOf = box.left + at.x + size + gap;
+    const leftOf = box.left + at.x - width - gap;
+    const flipped = rightOf + width > box.right;
+    const preferred = flipped ? leftOf : rightOf;
+    const other = flipped ? rightOf : leftOf;
+    // Does this candidate come to rest under the pointer? Only the *interactive* part matters — the
+    // popup's own background is transparent to the pointer (`styles.css`) — but a button is
+    // somewhere in the box at every point of it worth worrying about, so the box is the test.
+    const covers = (candidate: number, where: number): boolean =>
+      pointerAt !== null &&
+      pointerAt.clientX >= candidate &&
+      pointerAt.clientX <= candidate + width &&
+      pointerAt.clientY >= where &&
+      pointerAt.clientY <= where + height;
+    let left = clampX(preferred);
     let top = box.top + at.y;
-    left = Math.max(box.left, Math.min(left, box.right - width));
+    if (covers(left, top) && !covers(clampX(other), top)) left = clampX(other);
     top = Math.max(box.top, Math.min(top, box.bottom - height));
     popup.style.left = `${String(left)}px`;
     popup.style.top = `${String(top)}px`;
@@ -968,20 +1015,59 @@ const start = async (): Promise<void> => {
   /**
    * Put the readout beside the pointer: right and below by preference, flipped at the map's edge,
    * then clamped inside the canvas so it can never leave the map's own box. Presentation only.
+   *
+   * **And clear of the unit's orders popup, when a side of the pointer is clear of it.** The two
+   * boxes are anchored to the same neighbourhood — the popup sits in the ring around the selected
+   * unit, and the destinations a player hovers are exactly the tiles in that ring — so a readout
+   * drawn under the menu is a price the player has to move the pointer to read, and the popup's
+   * `z-index` is above the readout's. It was found by measurement rather than by looking: `map.spec`
+   * asserts that the point at the middle of the readout belongs to the map, and with the popup
+   * following the camera that assertion went red on a *hit test* — `BUTTON` where `CANVAS` was
+   * expected — which is the readout being drawn *under* its own unit's menu. The four corners around
+   * the pointer are tried in the order the preference states, the first that clears the popup wins,
+   * and a pointer the popup surrounds from every side keeps the plain preference: the readout is a
+   * tooltip, and a tooltip that will not fit beside the pointer is still worth drawing.
    */
   const placeReadout = (): void => {
     if (pointerAt === null || shell.tileReadout.hidden) return;
     const box = canvas.getBoundingClientRect();
     const width = shell.tileReadout.offsetWidth;
     const height = shell.tileReadout.offsetHeight;
-    let left = pointerAt.clientX + READOUT_GAP_X_PX;
-    if (left + width > box.right) left = pointerAt.clientX - width - READOUT_GAP_X_PX;
-    let top = pointerAt.clientY + READOUT_GAP_Y_PX;
-    if (top + height > box.bottom) top = pointerAt.clientY - height - READOUT_GAP_Y_PX;
-    left = Math.max(box.left, Math.min(left, box.right - width));
-    top = Math.max(box.top, Math.min(top, box.bottom - height));
-    shell.tileReadout.style.left = `${String(left)}px`;
-    shell.tileReadout.style.top = `${String(top)}px`;
+    const clampX = (candidate: number): number =>
+      Math.max(box.left, Math.min(candidate, box.right - width));
+    const clampY = (candidate: number): number =>
+      Math.max(box.top, Math.min(candidate, box.bottom - height));
+    // The placement the readout has always had is kept as the **first** candidate: right and below by
+    // preference, flipped to the other side of the pointer when that would leave the canvas — rather
+    // than clamped onto the pointer, which would hide the tile the readout is about — and then
+    // clamped so it can never leave the map's own box.
+    const rightOf = pointerAt.clientX + READOUT_GAP_X_PX;
+    const leftOf = pointerAt.clientX - width - READOUT_GAP_X_PX;
+    const flipX = rightOf + width > box.right;
+    const belowOf = pointerAt.clientY + READOUT_GAP_Y_PX;
+    const aboveOf = pointerAt.clientY - height - READOUT_GAP_Y_PX;
+    const flipY = belowOf + height > box.bottom;
+    const preferredX = clampX(flipX ? leftOf : rightOf);
+    const otherX = clampX(flipX ? rightOf : leftOf);
+    const preferredY = clampY(flipY ? aboveOf : belowOf);
+    const otherY = clampY(flipY ? belowOf : aboveOf);
+    const popup = panels.elements.unitActions;
+    const menu = popup.hidden ? null : popup.getBoundingClientRect();
+    const clear = (x: number, y: number): boolean =>
+      menu === null ||
+      x + width <= menu.left ||
+      menu.right <= x ||
+      y + height <= menu.top ||
+      menu.bottom <= y;
+    const candidates: readonly (readonly [number, number])[] = [
+      [preferredX, preferredY],
+      [preferredX, otherY],
+      [otherX, preferredY],
+      [otherX, otherY],
+    ];
+    const [x, y] = candidates.find(([atX, atY]) => clear(atX, atY)) ?? [preferredX, preferredY];
+    shell.tileReadout.style.left = `${String(x)}px`;
+    shell.tileReadout.style.top = `${String(y)}px`;
   };
 
   /**
@@ -1274,6 +1360,10 @@ const start = async (): Promise<void> => {
    *   travel through it — which is what stops a button press from also ordering the unit onto
    *   whatever tile happens to lie beneath the menu. The DOM gives that guard for free, which is why
    *   there is no "was this click inside the popup?" test in the handler below.
+   * - **except that the popup carries its own `pointerdown`**, which arms a pan and nothing else:
+   *   the press still never reaches the canvas's click handler, so no order can be issued by it, and
+   *   a press that moves is a pan rather than a button press. The reason is measured and is stated
+   *   at the listener itself.
    * - everything else belongs to the **region**: the wheel, the pointer move, the release and the
    *   leave. Bound to the canvas, each goes dark the moment the pointer crosses the popup, and that
    *   was measured rather than reasoned about. With the wheel still on the canvas, a wheel over the
@@ -1291,6 +1381,49 @@ const start = async (): Promise<void> => {
     lastX = event.clientX;
     lastY = event.clientY;
   });
+
+  /**
+   * **A gesture that starts on the menu and travels is a map gesture.**
+   *
+   * The popup floats over the map and is bigger than one tile, so a press that begins on it is
+   * ambiguous — and Phase 2 resolved the ambiguity the only way that was available to it then, by
+   * giving the buttons the pointer and leaving the popup's background transparent to it. That is
+   * right for a *press* and wrong for a *drag*: a pan that starts on the menu did not work at all,
+   * and the position the popup holds is a function of the map, so it can be sitting over the one
+   * place a player habitually starts a drag from. Measured with the popup following the map, in a
+   * build whose popup was clamped to the canvas's own corner: `bringTileToCentre` — which plants its
+   * pointer 12 px inside the canvas edge, the way `dragMap` does — put its press on `Fortify`, the
+   * camera never moved, and two green tests (`map.spec.ts`'s fog and hover cases) failed on the
+   * *fixture's* premise rather than on their own assertion: *"no rival unit in the player's sight
+   * could be panned onto the canvas"*.
+   *
+   * So a press on the popup arms the same pan a press on the canvas does, and the button acts only
+   * if the pointer did not travel — the very threshold the map itself uses to tell a click from a
+   * pan, in the one place where the two are the same gesture. A drag that starts on a button and
+   * ends on one suppresses the button's own `click`, because the browser fires that click on the
+   * nearest common ancestor and a press and a release inside the same control would otherwise both
+   * pan the map *and* take the order.
+   */
+  panels.elements.unitActions.addEventListener('pointerdown', (event) => {
+    dragging = true;
+    travelled = 0;
+    lastX = event.clientX;
+    lastY = event.clientY;
+  });
+
+  panels.elements.unitActions.addEventListener(
+    'click',
+    (event) => {
+      if (travelled <= DRAG_CLICK_TOLERANCE_PX) return;
+      // The gesture was a pan, not a press on this control. `stopPropagation` in the capture phase
+      // keeps the button's own listener from seeing it; the distance is reset here so the next press
+      // on a button is judged on its own travel.
+      travelled = 0;
+      event.stopPropagation();
+      event.preventDefault();
+    },
+    true,
+  );
 
   shell.mapRegion.addEventListener('pointermove', (event) => {
     // The hover layer follows the pointer, and **only while the pointer is over the canvas**. The

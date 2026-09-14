@@ -33,6 +33,7 @@ import {
   humanPlayerId,
   authoritativeState,
   mapDescription,
+  mapViewport,
   openApp,
   OPPONENT_OFF,
   pagePointToTile,
@@ -85,6 +86,12 @@ import {
   screenToTilePoint,
   tileScreenPx,
 } from '../src/view.js';
+
+/** The command a record carries, for a claim about *which* order was issued. */
+const actionTypeOf = (action: unknown): string =>
+  typeof action === 'object' && action !== null && 'type' in action
+    ? String((action as { readonly type: unknown }).type)
+    : 'unreadable';
 
 /** A fixed seed, so every claim below is reproducible. */
 const SEED = 4242;
@@ -778,6 +785,357 @@ test('the unit popup is the only surface for a unit’s orders, holds no tile-na
     onTop,
     'the popup is between the pointer and the map, so the tiles under it cannot be clicked',
   ).toBe('CANVAS');
+});
+
+/**
+ * The orders popup is anchored to a **tile**, so it is a function of the camera.
+ *
+ * `docs/KNOWN-ISSUES.md` §4.6 is the defect, and it was found by looking at two screenshots rather
+ * than by a test: `placeUnitActions` was called when the *selection* changed and never when the
+ * camera did, so the popup held the coordinates it was given while the map slid out from under it.
+ * Measured in those frames at 1280×900: the map moved one tile, the selection outline went from
+ * x 337–378 to x 290–330, and the popup stayed at **x 387–500, y 356–384 in both** — the same
+ * screen position, over whatever tile had moved beneath it.
+ *
+ * The instrument is the offset between the popup's own box and the unit's tile box, which is what
+ * "anchored" means: a **pan** moves both by the same pixels, so the offset is invariant, while a
+ * popup that kept its coordinates would change it by exactly the pan. The two other camera changes
+ * are asserted separately because their geometry is a different claim: a **zoom** changes how many
+ * pixels a tile covers (so a correct popup has to move by more than the tile did), and a **resize**
+ * moves the canvas under it.
+ *
+ * The premises are asserted at every step — the tile really moved on screen, the popup really moved
+ * — because a frozen popup and a correct one are indistinguishable in a frame where nothing moved.
+ */
+test('the orders popup follows the camera: a pan, a zoom and a resize all leave it beside its unit', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await openApp(page);
+  const state = await seedApp(page, SEED, OPPONENT_OFF);
+  const owner = humanPlayerId(state);
+  const settler = state.units.find((one) => one.owner === owner);
+  expect(settler, 'the human seat owns no unit to select').toBeDefined();
+  if (settler === undefined) return;
+  await selectUnit(page, state, await cameraOf(page), settler.id);
+
+  const popupBox = async (): Promise<Box> => {
+    const box = await page.locator("[data-floating='unit-actions']").boundingBox();
+    if (box === null) throw new Error('the unit action popup has no box (is it hidden?)');
+    return box;
+  };
+  /** The unit's own tile, in page coordinates, through the app's projection. */
+  const tileBox = async (): Promise<Box> => {
+    const camera = await cameraOf(page);
+    const box = await canvasBox(page);
+    const size = tileScreenPx(camera);
+    const at = tileCentre(camera, tileX(state, settler.tile), tileY(state, settler.tile));
+    return { x: box.x + at.x - size / 2, y: box.y + at.y - size / 2, width: size, height: size };
+  };
+  /** What "anchored to the tile" means, as one comparable number. */
+  const offset = async (): Promise<{ dx: number; dy: number }> => {
+    const [popup, tile] = [await popupBox(), await tileBox()];
+    return { dx: popup.x - tile.x, dy: popup.y - tile.y };
+  };
+
+  const anchored = async (where: string): Promise<void> => {
+    const [popup, tile] = [await popupBox(), await tileBox()];
+    expect(
+      popup.x >= tile.x + tile.width - 1 || popup.x + popup.width <= tile.x + 1,
+      `${where}: the popup (${String(Math.round(popup.x))}..${String(
+        Math.round(popup.x + popup.width),
+      )}) is over the unit's own tile (${String(Math.round(tile.x))}..${String(
+        Math.round(tile.x + tile.width),
+      )}), so the player cannot see what they are ordering`,
+    ).toBe(true);
+    expect(
+      Math.abs(popup.y - tile.y) <= 1 || popup.y + popup.height <= tile.y + 1,
+      `${where}: the popup's top (${String(Math.round(popup.y))}) is neither the unit's tile top ` +
+        `(${String(Math.round(tile.y))}) nor clear above it`,
+    ).toBe(true);
+    expect(
+      Math.min(Math.abs(popup.x - (tile.x + tile.width)), Math.abs(popup.x + popup.width - tile.x)),
+      `${where}: the popup is more than one tile away from the unit's tile, so it is not beside it`,
+    ).toBeLessThanOrEqual(tile.width + 1);
+  };
+
+  const atStart = await offset();
+  await anchored('at the start');
+
+  /* ------------------------------- a pan -------------------------------- */
+
+  // A drag pans the camera by pixels the test chooses, so the popup's own movement is exact: a
+  // popup that follows the map moves with it, and the *offset* from the tile cannot change.
+  const tileBeforePan = await tileBox();
+  await dragMap(page, 96, 48);
+  const tileAfterPan = await tileBox();
+  expect(
+    { x: tileAfterPan.x, y: tileAfterPan.y },
+    'the pan did not move the unit’s tile on screen, so this step could not observe anything',
+  ).not.toEqual({ x: tileBeforePan.x, y: tileBeforePan.y });
+  const popupAfterPan = await popupBox();
+  expect(
+    { x: popupAfterPan.x, y: popupAfterPan.y },
+    'the popup did not move when the camera did: it is still holding the coordinates it was ' +
+      'given, which is the defect (docs/KNOWN-ISSUES.md §4.6)',
+  ).not.toEqual({ x: tileBeforePan.x + atStart.dx, y: tileBeforePan.y + atStart.dy });
+  const atPan = await offset();
+  expect(
+    {
+      dx: Math.round((atPan.dx - atStart.dx) * 100) / 100,
+      dy: Math.round((atPan.dy - atStart.dy) * 100) / 100,
+    },
+    'a pan moved the popup by a different amount than the tile it belongs to, so it is not ' +
+      'anchored to that tile',
+  ).toEqual({ dx: 0, dy: 0 });
+  await anchored('after a pan');
+
+  /* ------------------------------ a zoom -------------------------------- */
+
+  const tileBeforeZoom = await tileBox();
+  const zoomed = await zoomTo(page, -1, 1);
+  const tileAfterZoom = await tileBox();
+  expect(
+    tileScreenPx(zoomed),
+    'the wheel did not change the zoom, so this step could not observe anything',
+  ).not.toBe(tileBeforeZoom.width);
+  expect(
+    Math.round(tileAfterZoom.width),
+    'the tile did not change size on screen, so the zoom is not a new projection',
+  ).not.toBe(Math.round(tileBeforeZoom.width));
+  await anchored('after a zoom');
+
+  /* ----------------------------- a resize ------------------------------- */
+
+  // **A resize is the one camera change that can honestly move nothing**, and this step says so
+  // rather than failing when it does: the canvas is anchored at the map region's own top-left, so a
+  // smaller window leaves every tile's screen position exactly where it was until the camera's clamp
+  // bites — which it does not, since a smaller view has a *wider* legal range. So the step's premise
+  // is the canvas really changing (asserted below, through the observer, which is asynchronous), and
+  // its claim is the same anchor as everywhere else: whatever the window does, the popup is still
+  // beside the tile it belongs to and still inside the map it floats over.
+  const canvasBeforeResize = await canvasBox(page);
+  await page.setViewportSize({ width: 1100, height: 820 });
+  await expect
+    .poll(async () => (await canvasBox(page)).width, {
+      message: 'the canvas never took the smaller window, so the resize was never observed',
+    })
+    .not.toBe(canvasBeforeResize.width);
+  await anchored('after a resize');
+  const afterResize = await popupBox();
+  const canvasAfterResize = await canvasBox(page);
+  expect(
+    afterResize.x >= canvasAfterResize.x - 1 &&
+      afterResize.y >= canvasAfterResize.y - 1 &&
+      afterResize.x + afterResize.width <= canvasAfterResize.x + canvasAfterResize.width + 1 &&
+      afterResize.y + afterResize.height <= canvasAfterResize.y + canvasAfterResize.height + 1,
+    `the popup was left outside the map by the resize: its box is ${String(
+      Math.round(afterResize.x),
+    )},${String(Math.round(afterResize.y))} ${String(Math.round(afterResize.width))}x${String(
+      Math.round(afterResize.height),
+    )} and the canvas is now ${String(Math.round(canvasAfterResize.x))},${String(
+      Math.round(canvasAfterResize.y),
+    )} ${String(Math.round(canvasAfterResize.width))}x${String(Math.round(canvasAfterResize.height))}`,
+  ).toBe(true);
+});
+
+/**
+ * A gesture that starts on the menu and travels is a map gesture.
+ *
+ * The popup floats over the map and is wider than a tile, so it is unavoidably over tiles the
+ * player wants to click and over tiles they want to drag. Phase 2 gave its *buttons* the pointer
+ * and left its background transparent, which decides what a **press** means; it left the **drag**
+ * meaning nothing at all, and that is only harmless while the popup holds still — see §4.6. It is
+ * not harmless once the popup follows the map, because where it sits is then a function of the map
+ * it is covering: measured on the fixed build with the popup clamped to the canvas's own corner,
+ * `bringTileToCentre` (which plants its pointer 12 px inside the canvas edge) put its press on
+ * `Fortify`, the camera never moved, and two green tests failed on their *fixture's* premise.
+ *
+ * So the assertion is the one a player would make: press on a control of the menu, drag, and the
+ * map pans — by the distance dragged, and without the control acting.
+ */
+test('a drag that starts on the orders popup pans the map, and the control it started on does nothing', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await openApp(page);
+  const state = await seedApp(page, SEED, OPPONENT_OFF);
+  expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
+  const owner = humanPlayerId(state);
+  const settler = state.units.find((one) => one.owner === owner);
+  expect(settler, 'the human seat owns no unit to select').toBeDefined();
+  if (settler === undefined) return;
+  await selectUnit(page, state, await cameraOf(page), settler.id);
+
+  const button = unitActionButtons(page, settler.id).first();
+  await expect(button, 'the popup offers no control to press').toBeVisible();
+  const buttonBox = await button.boundingBox();
+  if (buttonBox === null) throw new Error('the popup’s first control has no box');
+  const from = { x: buttonBox.x + buttonBox.width / 2, y: buttonBox.y + buttonBox.height / 2 };
+  expect(
+    await page.evaluate((at) => document.elementFromPoint(at.x, at.y)?.tagName ?? 'nothing', from),
+    'the press does not start on the control this test is about',
+  ).toBe('BUTTON');
+
+  const before = await cameraOf(page);
+  const travelled = 120;
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  for (let step = 1; step <= 4; step += 1) {
+    await page.mouse.move(from.x - (travelled * step) / 4, from.y);
+    await page.waitForTimeout(16);
+  }
+  await page.mouse.up();
+
+  const after = await cameraOf(page);
+  const size = tileScreenPx(after);
+  // The projection's own convention (`panCamera`): dragging the pointer left by `travelled` moves
+  // the camera one `travelled / tileSize` further along +x. The test computes it rather than
+  // guessing, so a pan of the wrong size fails here rather than in a later assertion.
+  expect(
+    (after.x - before.x) * size,
+    'a drag that started on the popup did not pan the map by the distance dragged, so the menu ' +
+      'blocked the gesture',
+  ).toBeCloseTo(travelled, 0);
+  expect(
+    (await dispatchLog(page)).map((entry) => JSON.stringify(entry.action)),
+    'the control the drag started on acted as well as the map panning',
+  ).toEqual([]);
+});
+
+/**
+ * A menu that arrives under a pointer that was aiming at the map does not take the pointer.
+ *
+ * This is the hazard the fix creates and this file's other tests cannot see: the popup follows the
+ * camera, so a pan can slide its *buttons* under a pointer that is standing still over a tile — the
+ * player is looking at the tile, presses, and a menu button that moved there takes the order. The
+ * placement therefore checks the pointer's own last position over the map (`pointerAt`) and puts the
+ * popup on the other side of the unit's tile when the preferred side would come to rest under it.
+ *
+ * The arrangement has to be built, and every step of it is asserted, because the claim is about a
+ * *transition*: with the pointer parked out of the way, a four-tile pan is measured to learn where
+ * the popup goes; the pan is undone; a point **inside** that position is confirmed to belong to the
+ * map; the pointer is parked on it; and the pan is taken again. What must be true then is that the
+ * popup did not come to rest under the pointer — and the press that follows, taken without moving
+ * the pointer first, must dispatch nothing.
+ */
+test('a menu that a pan slides under a pointer aiming at the map does not take the press', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await openApp(page);
+  const state = await seedApp(page, SEED, OPPONENT_OFF);
+  expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
+  const owner = humanPlayerId(state);
+  const settler = state.units.find((one) => one.owner === owner);
+  expect(settler, 'the human seat owns no unit to select').toBeDefined();
+  if (settler === undefined) return;
+  await selectUnit(page, state, await cameraOf(page), settler.id);
+
+  const popupBox = async (): Promise<Box> => {
+    const box = await page.locator("[data-floating='unit-actions']").boundingBox();
+    if (box === null) throw new Error('the unit action popup has no box (is it hidden?)');
+    return box;
+  };
+  const underPointer = async (at: { x: number; y: number }): Promise<string> =>
+    page.evaluate((point) => {
+      const element = document.elementFromPoint(point.x, point.y);
+      if (element === null) return 'nothing';
+      const label = element.textContent.trim().slice(0, 24);
+      return element.tagName === 'CANVAS' ? 'CANVAS' : `${element.tagName}:${label}`;
+    }, at);
+  const contains = (box: Box, at: { x: number; y: number }): boolean =>
+    at.x >= box.x && at.x <= box.x + box.width && at.y >= box.y && at.y <= box.y + box.height;
+
+  const map = mapViewport(page);
+  const pan = async (times: number, key: 'ArrowLeft' | 'ArrowRight'): Promise<void> => {
+    await map.focus();
+    for (let press = 0; press < times; press += 1) await page.keyboard.press(key);
+  };
+
+  // (1) Where the popup goes on a four-tile pan, with the pointer out of the way.
+  await page.mouse.move(2, 2);
+  const before = await cameraOf(page);
+  await pan(4, 'ArrowRight');
+  const panned = await cameraOf(page);
+  expect(
+    panned.x - before.x,
+    'the keyboard pan did not move the camera four tiles (ArrowRight pans by +1 tile per press)',
+  ).toBeCloseTo(4, 5);
+
+  // (2) A point inside where it arrived, and over one of its own controls — the hazard has to be a
+  //     button, because the popup's background is transparent to the pointer already.
+  const hazard = await page.evaluate(() => {
+    const buttons = [...document.querySelectorAll("[data-floating='unit-actions'] button")];
+    const first = buttons[0];
+    if (first === undefined) return null;
+    const box = first.getBoundingClientRect();
+    return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+  });
+  expect(hazard, 'the popup offered no control to slide under the pointer').not.toBeNull();
+  if (hazard === null) return;
+  expect(
+    await underPointer(hazard),
+    'the point chosen for the pointer is not over a control of the popup, so nothing could be taken',
+  ).toContain('BUTTON');
+
+  // (3) Undo the pan and check the arrangement: that point belongs to the map right now, which is
+  //     what makes the pointer's aim a claim about the map rather than about the menu.
+  await pan(4, 'ArrowLeft');
+  expect((await cameraOf(page)).x, 'the pan back did not restore the camera').toBeCloseTo(
+    before.x,
+    5,
+  );
+  expect(
+    await underPointer(hazard),
+    'the point the pointer is about to be parked on is not the map’s in the state before the pan',
+  ).toBe('CANVAS');
+
+  // (4) Park the pointer there — a real pointer move, so the app's `pointerAt` is this point — and
+  //     take the same pan again.
+  await page.mouse.move(hazard.x, hazard.y);
+  expect(
+    await underPointer(hazard),
+    'the pointer is not over the map after being parked, so `pointerAt` would not describe it',
+  ).toBe('CANVAS');
+  const pointer = { x: hazard.x, y: hazard.y };
+  await pan(4, 'ArrowRight');
+  expect((await cameraOf(page)).x, 'the second pan did not move the camera').toBeCloseTo(
+    panned.x,
+    5,
+  );
+  const settled = await popupBox();
+  expect(
+    contains(settled, pointer),
+    `the popup came to rest under the pointer: its box is ${String(Math.round(settled.x))},${String(
+      Math.round(settled.y),
+    )} ${String(Math.round(settled.width))}x${String(Math.round(settled.height))} and the pointer ` +
+      `is at ${String(Math.round(pointer.x))},${String(Math.round(pointer.y))} — the press that ` +
+      'follows is aimed at the tile the pointer is over',
+  ).toBe(false);
+
+  // (5) And the press itself, without moving the pointer first. The map is entitled to the click —
+  //     a `MoveUnit` is what clicking a tile means, and this test does not care whether the engine
+  //     accepts it — while the menu is not: a stolen press would dispatch a control of the popup
+  //     (`FoundCity` or `FortifyUnit` for this settler), and the popup holds no tile-named control
+  //     for a `MoveUnit` to have come from (map.spec.ts asserts that separately).
+  const pressed = hazard;
+  expect(
+    await underPointer(pressed),
+    'the point the press is about to land on does not belong to the map',
+  ).toBe('CANVAS');
+  await page.mouse.down();
+  await page.mouse.up();
+  const types = (await dispatchLog(page))
+    .map((entry) => actionTypeOf(entry.action))
+    .filter((type) => type !== 'MoveUnit');
+  expect(
+    types,
+    `a press at ${String(Math.round(pressed.x))},${String(
+      Math.round(pressed.y),
+    )} was taken by the menu that slid under the pointer, so the player ordered something they ` +
+      'did not aim at',
+  ).toEqual([]);
 });
 
 test('refusals: a click the engine would refuse leaves the state exactly as it was', async ({
