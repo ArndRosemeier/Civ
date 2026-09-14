@@ -619,6 +619,43 @@ true; the claim is gone.
 
 ---
 
+### 3.14 A city screen outlived the world it belonged to, offering orders the engine refused — **closed, with the mutation that proves it** (2026-09-14)
+
+Found by **`m8-adversarial.spec.ts`**, and found *because* phase 5 added two controls to the header:
+that spec's page-wide pass clicks every enabled button in **DOM order** and judges each dispatch
+against the engine, so inserting two buttons shifted which control it reached when — and it began
+reaching the `New game` dialog **before** the city screen's controls. Twelve findings, all of the
+same shape:
+
+```
+seed 1337 page button 17 "Build Scout (unit) (1 shields)" dispatched
+  {"type":"SetProduction","cityId":0,"item":{"kind":"unit","id":"scout"}} and the engine refused it
+```
+
+**The defect, reproduced directly.** Start a game, found a city, open its screen, then use the app's
+own two clicks — `New game` → `Start new game`. The new world has **0 cities**; the `City City 1`
+dialog is **still open**, and its `Build …` controls still dispatch `SetProduction` for city 0. The
+order channel says what the engine said: `the engine refused it (unknown-city)`. `Load game` is the
+same door, because it replaces the state the same way.
+
+**Why it happened, in one line.** `panels/city.ts` keeps the open city in its own memory and
+re-renders from the state on every `refresh`; when the city was no longer in the state it took an
+early return — so the dialog kept its last rendering instead of closing.
+
+**The fix** closes the screen and forgets the city (`panels/city.ts`), which is the rule the other
+panels already follow in spirit: a panel is a view of a state, and a view of a state that no longer
+exists is a control offering an order the engine refuses — the keystone invariant's *offered*
+direction, which `docs/INTERFACES.md:1848-1850` makes binding.
+
+**Verified by breaking it.** Reverting the branch to the early return turns the new
+`city.spec.ts` test red with *"a panel survived the world it belonged to: a new game replaced the
+state and left a screen up"*; `panels/city.ts` was restored byte-identical (`5563d31f…`). Both
+keystone sweeps (`adversarial keystone — offered` and `— reachable`) are green with the fix, and the
+new test states the rule directly so a future reordering of the button tree cannot make the defect
+invisible again. This one is recorded rather than merely fixed because of how it was found: **the
+sweep that carries the invariant is itself order-dependent**, which the file says in its own words,
+and this is the second time a layout change has moved its boundary.
+
 ## 4. UI limits
 
 ### 4.1 A side screen is 380 px wide now, and the strip scrolls on a short window

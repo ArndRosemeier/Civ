@@ -363,7 +363,21 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
 
     const cityId = openCityId;
     const city = cityId === undefined ? undefined : cityById(state, cityId);
-    if (cityId === undefined || city === undefined) return;
+    if (cityId === undefined) return;
+    if (city === undefined) {
+      // **The world this screen belonged to is gone, so the screen goes with it.** This used to
+      // return early and leave the dialog up, which left its controls offering orders for a city the
+      // engine no longer has: a `Build …` control dispatched `SetProduction` for city 0 in a state
+      // with no cities at all, and `applyCommand` refused it as `unknown-city`. That is the keystone
+      // invariant's offered direction broken in two clicks a player can make on purpose —
+      // `New game` → `Start new game` (and the same through `Load game`, which replaces the state
+      // the same way). Found by `e2e/m8-adversarial.spec.ts`, whose page-wide sweep reordered when
+      // phase 5 added two controls to the header: the sweep reached the new-game dialog before the
+      // city screen's controls and reported twelve refusals. Recorded in `docs/KNOWN-ISSUES.md`.
+      openCityId = undefined;
+      dialog.close();
+      return;
+    }
 
     // M10: once the engine has ended the game it refuses every command, so the tile checkboxes and
     // the production buttons below are rendered disabled — closed, not hidden, because "what this

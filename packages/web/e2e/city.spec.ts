@@ -21,11 +21,14 @@ import {
   dispatch,
   dispatchLog,
   foundCity,
+  loadButton,
+  OPPONENT_OFF,
   openApp,
   openCity,
   readState,
   recordDispatches,
   RULESET,
+  saveButton,
   seedApp,
   tileIndexOf,
   type UiCity,
@@ -278,3 +281,84 @@ const itemName = (item: { readonly kind: string; readonly id: string }): string 
     item.kind === 'unit' ? RULESET.units : RULESET.buildings;
   return defs.find((def) => def.id === item.id)?.name ?? item.id;
 };
+
+/**
+ * **A screen belongs to a world, and this one used to outlive it.** The city panel keeps the open
+ * city in its own memory (`panels/city.ts`) and re-renders from the state on every `refresh`; when
+ * the city was no longer in the state it returned early and left the dialog — and its controls — on
+ * screen. Those controls then offered orders for a city that does not exist: a `Build …` control
+ * dispatched `SetProduction` for city 0 in a state with no cities at all, and `applyCommand` refused
+ * it as `unknown-city`. That is the keystone invariant's *offered* direction broken in two clicks a
+ * player can make on purpose.
+ *
+ * It was found by `m8-adversarial.spec.ts`, whose page-wide sweep clicks every enabled button in
+ * DOM order and reports what the engine refused: phase 5 added two controls to the header, the
+ * sweep's order shifted, and it began reaching the `New game` dialog *before* the city screen's
+ * controls — twelve refusals, all `SetProduction` for a city that had been replaced. The sweep is
+ * the instrument; this test is the direct statement of the rule, so the next reordering cannot make
+ * the defect invisible again.
+ */
+test('A4 city screen — a screen does not outlive its world: a new game and a load both close it', async ({
+  page,
+}) => {
+  await openApp(page);
+  await seedApp(page, SEED, OPPONENT_OFF);
+
+  const city = await foundCity(page);
+  await openCity(page, await readState(page), await cameraOf(page), city);
+  const dialog = cityDialog(page, city.name);
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByRole('button', { name: /^Build / }).first(),
+    'the city screen offers nothing to build, so this case has no control to leave behind',
+  ).toBeVisible();
+
+  /* ------------------ (1) a NEW GAME through the controls ------------------ */
+
+  // Exactly the two clicks a player makes. The world that follows has no cities in it, which is the
+  // vacuity guard: this case is about a city that is *gone*, and it says so if the new game happened
+  // to contain one.
+  await page.getByRole('button', { name: 'New game', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Start new game' }).click();
+  const fresh = await readState(page);
+  expect(
+    fresh.cities.length,
+    'the new game still holds the old city, so "the screen outlived its world" was not the case here',
+  ).toBe(0);
+  await expect(
+    page.getByRole('dialog'),
+    'a panel survived the world it belonged to: a new game replaced the state and left a screen up',
+  ).toHaveCount(0);
+  await expect(
+    dialog,
+    'the city screen for a city that no longer exists is still on screen',
+  ).toBeHidden();
+  expect(
+    await page.locator("[data-role='order']").innerText(),
+    'the engine refused something while a new game was started, which means a stale control was pressed',
+  ).toBe('');
+
+  /* -------------------- (2) and a LOAD replaces it too --------------------- */
+
+  // The same rule through the other door. The save is taken from the cityless game above, so
+  // loading it while a city screen is open is the case that matters: the city the screen is about is
+  // not in the world that arrives.
+  await saveButton(page).click();
+  await foundCity(page);
+  const second = (await readState(page)).cities[0];
+  expect(second, 'the second game founded no city to open a screen for').toBeDefined();
+  if (second === undefined) return;
+  await openCity(page, await readState(page), await cameraOf(page), second);
+  await expect(cityDialog(page, second.name)).toBeVisible();
+
+  await loadButton(page).click();
+  const loaded = await readState(page);
+  expect(
+    loaded.cities.length,
+    'the save that was loaded still holds a city, so the case below is not about one that is gone',
+  ).toBe(0);
+  await expect(
+    page.getByRole('dialog'),
+    'loading a game left a screen from the previous world up, offering orders for a city that is not there',
+  ).toHaveCount(0);
+});

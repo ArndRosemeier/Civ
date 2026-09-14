@@ -1454,6 +1454,18 @@ Note the pair in that table: mutating the *session handler away* leaves the defe
 flow tests green. Neither test alone can show the contract works; the two together are what pin it —
 which is why both are in the file.
 
+### A defect the phase's own sweep found, in a screen it does not own
+
+Both phases add controls to the header, and `m8-adversarial.spec.ts` clicks every enabled button in
+**DOM order** — so its traversal moved, and it began reaching the `New game` dialog *before* the city
+screen's controls. That turned up a real defect that had nothing to do with the hover layer: starting
+a new game (or loading one) closed the world but **left the city screen open**, its `Build …`
+controls still dispatching `SetProduction` for a city the engine no longer had — twelve refusals, all
+`unknown-city`. Fixed in `panels/city.ts` (a screen whose city is gone now closes), with its own test
+in `city.spec.ts` and its own mutation; recorded in `docs/KNOWN-ISSUES.md` §3.14, including the
+measurement that found it. It is the second time a layout change has moved that sweep's boundary,
+which is what §4.1c predicted a redesign would do.
+
 ### Not done in this phase, and not claimed
 
 - **No auto-advance** (§6.2 stays open), and **no order on a key** (only navigation, the turn, and
