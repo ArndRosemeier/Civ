@@ -207,10 +207,13 @@ export const playerScore = (state: GameState, ruleset: RulesetView, playerId: Pl
  *
  * Ties are broken by **lowest player id**, explicitly, and this is the one place that
  * choice is written: the contract fixes the same tie-break for contested tiles
- * ("ties go to the LOWER city id — never to iteration order") and gives no rule here,
+ * ("ties go to the LOWER **city** id — never to iteration order") and gives no rule here,
  * so the same principle is applied rather than leaving the winner to whichever player
- * the array happened to list first. `undefined` for a state with no civilization at
- * all, which is the honest answer rather than a fabricated winner.
+ * the array happened to list first. **The player id is the one that decides** — this
+ * sentence used to say "city id", which is the tile rule's id and not this one's, and a
+ * reader following it would have looked for a city where the choice is made. `undefined`
+ * for a state with no civilization at all, which is the honest answer rather than a
+ * fabricated winner.
  *
  * **Barbarians are never a candidate** — the contract's "barbarians never win, never
  * score". The filter is `kind === 'civ'`, the same read `civPlayers` gives, and

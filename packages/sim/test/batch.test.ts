@@ -42,10 +42,12 @@ import { describe, expect, it } from 'vitest';
 import { FULL_TIER } from '@civts/testing';
 
 import {
+  CORE_INVARIANTS,
   DO_NOTHING_POLICY,
   MEASURED_METRIC_FIELDS,
   SIMPLE_POLICY,
   aggregateRuns,
+  applyOverrides,
   playerMetrics,
   runBatch,
   smartPolicy,
@@ -93,6 +95,40 @@ const batchOf = (
     ruleset: RULESET,
     policies,
     maxTurns,
+  });
+
+/**
+ * The shipped catalog with the score condition's horizon moved to turn 1.
+ *
+ * The real applier (`applyOverrides`) plus validation, exactly as a sweep would do it: the
+ * engine's own rule with one catalog number changed, rather than a second rule. It is what makes
+ * a **decided** batch affordable in the fast tier — the score condition is the only one that
+ * fires on a horizon of a couple of turns.
+ */
+const DECIDED_RULESET: Ruleset = (() => {
+  const validated = validateRuleset(
+    applyOverrides(CATALOG, { victory: { scoreVictoryTurn: 1 } }),
+    'tuned',
+  );
+  if (!validated.ok) {
+    throw new Error(
+      `the patched catalog does not validate: ${validated.error.map((issue) => issue.kind).join(', ')}`,
+    );
+  }
+  return validated.value;
+})();
+
+/** A batch whose games really end — see `DECIDED_RULESET`. */
+const decidedBatchOf = (
+  seeds: readonly number[],
+  policies: BatchOptions['policies'],
+): BatchResult =>
+  runBatch({
+    seeds,
+    settings: settingsFor(1),
+    ruleset: DECIDED_RULESET,
+    policies,
+    maxTurns: 3,
   });
 
 const NO_EVENTS: readonly GameEvent[] = [];
@@ -274,11 +310,14 @@ describe('aggregateRuns — the arithmetic, checked against its own rows', () =>
  * ------------------------------------------------------------------ */
 
 describe('BatchResult — what it does not claim', () => {
-  it('omits wins, because the engine has no victory condition to count', () => {
+  it('omits wins when no game in the batch ended', () => {
     const batch = batchOf([15, 16], 3);
 
     // Omitted, never a key holding `undefined` — and not `wins: []` either, which would
-    // claim victories were counted and that none happened.
+    // claim victories were counted and that none happened. The name of this test used to say
+    // "because the engine has no victory condition to count", which stopped being true at M10:
+    // what is asserted is the *absence of endings* in this batch, not the absence of the rule
+    // (`decidedBatchOf` below is the same command with a batch that does end).
     expect('wins' in batch).toBe(false);
     expect(Object.keys(batch).sort()).toEqual(['aggregates', 'runs']);
   });
@@ -294,6 +333,89 @@ describe('BatchResult — what it does not claim', () => {
         expect(Object.values(row).some((value) => value === undefined)).toBe(false);
       }
     }
+  });
+
+  it('counts a decided batch by condition, and names every player that won one', () => {
+    // **The wins list was never tested with a win in it** — this test exists because a fold that
+    // only ever returned `[]` (or was omitted) looked identical to one that worked. The fixture is
+    // the shipped catalog with the score condition's horizon moved to turn 1 through the real
+    // applier: one seat founds a city and the other does nothing, so the score condition decides
+    // every game at the first turn it is evaluated.
+    //
+    // A batch does **not** rotate its policies (that is the tournament's job), so the same player
+    // wins every game here — which is exactly why the row must count wins *per player* rather than
+    // keep one: the old field kept the first winner and dropped the rest, so a row could read
+    // `count: 5, winner: 0` while three of those games were won by player 1.
+    const batch = decidedBatchOf([1, 2], [SIMPLE_POLICY, DO_NOTHING_POLICY]);
+
+    expect(batch.runs.map((run) => run.outcome?.condition)).toStrictEqual(['score', 'score']);
+    expect(batch.wins).toStrictEqual([
+      { outcome: 'score', count: 2, byPlayer: [{ playerId: 0, wins: 2 }], draws: 0 },
+    ]);
+    // The identities the row carries: the count is the winners plus the drawn games, and the
+    // winners are exactly the runs' own outcomes rather than a second count of them.
+    for (const win of batch.wins ?? []) {
+      const won = win.byPlayer.reduce((total, row) => total + row.wins, 0);
+      expect(win.count).toBe(won + win.draws);
+      expect(win.count).toBe(
+        batch.runs.filter((run) => run.outcome?.condition === win.outcome).length,
+      );
+    }
+  });
+
+  it('carries a counted check total per run, and sampling does not thin it out (Q1/F2)', () => {
+    // **A run's `invariantChecks` is a count of the predicate invocations, not a function of
+    // anything else in the row.** Two properties are asserted together because either alone
+    // would be weak: the metric sample can be thinned by `sampleEvery` (so the aggregates really
+    // do shrink — a fixture where they did not would make the second half vacuous), while the
+    // registry runs on every **turn**, sampled or not. A figure tied to sampled rows, or derived
+    // from the horizon by a reader, would fail here.
+    const dense = batchOf([1, 2], 4);
+    const sparse = runBatch({
+      seeds: [1, 2],
+      settings: settingsFor(1),
+      ruleset: RULESET,
+      policies: [SIMPLE_POLICY, SIMPLE_POLICY],
+      maxTurns: 4,
+      sampleEvery: 4,
+    });
+
+    const turns = [4, 4]; // four turns each, nothing decided at this horizon
+    expect(dense.runs.map((run) => run.turnsPlayed)).toStrictEqual(turns);
+    expect(sparse.runs.map((run) => run.turnsPlayed)).toStrictEqual(turns);
+
+    // Non-vacuity: sampling really did thin the rows the aggregates fold.
+    const denseRows = dense.aggregates.find((row) => row.metric === 'treasury')?.count ?? 0;
+    const sparseRows = sparse.aggregates.find((row) => row.metric === 'treasury')?.count ?? 0;
+    expect(denseRows).toBeGreaterThan(sparseRows);
+    expect(sparseRows).toBeGreaterThan(0);
+
+    // ...and every run of both, decided or not, sampled or not, reports one check per turn per
+    // registry entry — the number the batch report sums. A run whose deciding turn was skipped
+    // would report `turnsPlayed - 1` here.
+    for (const run of [...dense.runs, ...sparse.runs]) {
+      expect(run.invariantChecks).toBe(run.turnsPlayed * CORE_INVARIANTS.length);
+    }
+    // The decided fixture too, since that is the case F2 was about.
+    const decided = decidedBatchOf([1, 2], [SIMPLE_POLICY, DO_NOTHING_POLICY]);
+    expect(decided.runs.map((run) => run.outcome?.condition)).toStrictEqual(['score', 'score']);
+    for (const run of decided.runs) {
+      expect(run.invariantChecks).toBe(run.turnsPlayed * CORE_INVARIANTS.length);
+    }
+  });
+
+  it('orders the wins by condition id, whatever order the seeds arrived in', () => {
+    // Two conditions in one batch is not reachable on this catalog at a test's horizon, so the
+    // ordering rule is checked on the one row a batch can produce plus the *seed permutation*
+    // property the whole file is built on: the same games in a different order give the same
+    // wins, field for field.
+    const forwards = decidedBatchOf([1, 2, 3], [SIMPLE_POLICY, DO_NOTHING_POLICY]);
+    const backwards = decidedBatchOf([3, 2, 1], [SIMPLE_POLICY, DO_NOTHING_POLICY]);
+
+    expect(backwards.wins).toStrictEqual(forwards.wins);
+    expect(forwards.wins?.map((win) => win.outcome)).toStrictEqual(['score']);
+    expect(forwards.wins?.[0]?.count).toBe(3);
+    expect(forwards.wins?.[0]?.byPlayer).toStrictEqual([{ playerId: 0, wins: 3 }]);
   });
 
   it('reports a batch of runs that commanded nothing as no-commands, per run', () => {

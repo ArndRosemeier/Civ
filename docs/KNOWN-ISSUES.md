@@ -58,11 +58,14 @@ no dead flags, no placeholder screens:
 
 ---
 
-## 3. Open defects measured in this session (2026-09-13)
+## 3. Defects measured in this session (2026-09-13) — open, or closed with its evidence
 
 These were found by running shipped commands, not by reading code. They are recorded
 here because a documentation pass that reports only the flattering facts is worse than
-no documentation.
+no documentation. Each entry says which it is: **open** with the measurement that still
+reproduces, or **closed** with the command that shows the fix working. A closed entry is
+kept rather than deleted, because the defect is what the next reader needs to recognise
+if it comes back.
 
 ### 3.1 A real invariant violation, reachable from shipped content
 
@@ -124,18 +127,24 @@ own rule — one serializer, in `packages/core/src/serialize.ts`, never
 
 ### 3.4 The e2e suite is load-sensitive
 
-Measured twice in one session:
+Measured three times in one session, on the same box:
 
 | run | load average at start | result | wall |
 |---|---|---|---|
 | full Playwright suite | 9.37 | **57 passed, 4 failed** | 249.1 s |
 | those same 4 specs re-run alone | 13.13 | **9 passed, 0 failed** | 87.2 s |
+| full suite again (the alpha audit's run) | 2.3–3.5 | **63 passed, 0 failed, 0 flaky, 0 retries** | 3.9 min |
 
 The four failures were all "the app never reported `ready === true`" inside the
 15 s readiness budget — a cold Vite dev server plus a busy box, not a code path the
-re-run exercises differently. It is reported rather than explained away, and it is a
-real hazard for anyone using this suite as a gate: a verdict that flips on machine
-noise is not a criterion.
+re-run exercises differently. The suite count also moved from 57 to 63 as specs
+landed, so the two readings are not the same test list; what is comparable is the
+*failure mode*, and it is load, not code.
+
+It is reported rather than explained away, and it is a real hazard:
+**nobody should promise a green UI suite on a busy box.** The whole-suite figure is
+only reproducible on a quiet one; a verdict that flips on machine noise is not a
+criterion, which is why the e2e suite is not part of `pnpm verify` or `pnpm verify:full`.
 
 ### 3.5 The fast tier's headroom is thin
 
@@ -157,6 +166,18 @@ So the honest statement is: the parts are fast, the composed command was not mea
 with M11's files, and 64.0 s is a reading of the **previous** script that must not be
 quoted as the current gate.
 
+The gap that note left is now closed by measurement rather than by assumption. The
+verifier measured the composed command **green** on the landed tree — **31.414 s** warm
+(load 2.11 → 4.89) and **56.153 s** cold (`.cache` deleted first, load 2.87 → 6.16),
+both EXIT 0 — and this pass re-measured it green as well: **32 s** raw wall for
+`pnpm verify`, EXIT 0, `64 files / 2112 passed / 56 skipped of 2168`, taken at load
+**5.78 → 7.95**, i.e. on a box that was *busy* rather than quiet. The cold figure is the
+honest one for a fresh checkout and it is the tighter of the two: **56.2 s against the
+70 s target leaves 13.8 s (20 %)**. The tier is inside its bound even at load ≈ 8, and
+the bound is not generous; a checkout that has never run the gate should be read as
+~56 s, not ~32 s.
+
+
 ### 3.6 The mutation check cannot run inside the shared suite
 
 `pnpm mutation:check` deliberately breaks two source files on disk
@@ -170,6 +191,203 @@ and both tiers print it as **skipped** by name.
 **It was not run in this session** — it mutates source files on disk for ~3 seconds,
 and other agents were working in the same tree at the time. Unmeasured, not assumed
 green.
+
+### 3.7 Two of the four victory conditions have never ended an AI-played game
+
+This is the project's largest honest gap, and it is a **shortfall, not a dead rule**.
+Measured with the shipped catalog, the real AI (`smart`) in both seats, 20 seeds on
+`tiny`, seats rotated:
+
+| condition | ever ended a real AI-played game? | evidence |
+|---|---|---|
+| `cultural` | **yes, in self-play — it is the AI's whole game** | 13 of 20 at 150 turns, 18 of 20 at 200 turns |
+| `score` | **yes, in self-play**, at the catalog's own horizon | 2 of 20 at 200 turns (seeds 3 and 7) |
+| `conquest` | **only with the AI in ONE seat** — never in self-play | **0 of 100** self-play games; 6 of 6 against the do-nothing control |
+| `domination` | **never, anywhere** | **0 of 100** AI-played games |
+
+```bash
+# 13 of 20 end at 150 turns, every one by `cultural`; 0 violations, 0 planner failures
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 150 --json
+
+# 20 of 20 end at 200 turns: cultural 18, score 2
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 200 --json
+
+# conquest, AI vs a do-nothing control: 6 of 6, at turns 35-42
+npx tsx scripts/probes/outcome-aggregate-probe.ts
+```
+
+The 100 self-play games are P1's three horizons (20 each: 100, 150, 200 turns) plus
+two further 20-game runs by the verifier P2; `conquest` and `domination` are **0** in
+every one of them. `domination` is demonstrated only on **hand-built boards with
+patched thresholds** — a city added by hand with `dominationLandPct: 1,
+dominationPopPct: 50` — in `packages/testing/test/m9-m10-adversarial.test.ts:590–681`
+and `:1314–1338`. It is boundary-tested at each of its two thresholds there, so the
+rule holds; what has never happened is a *policy* playing its way to it. At the
+shipped magnitudes (60% of the **map's** land, 40% of the world's citizens) the AI
+neither takes nor grows that far inside 200 turns.
+
+The `conquest` demonstration is weaker than its row makes it look: the do-nothing
+control never founds a second city, so "the AI conquers" there means "the AI takes an
+undefended capital", not "two AIs fight a war".
+
+**A3's own wording** — *"at least one victory condition demonstrated ending a real
+game"* — is **met**, by `cultural` and `score`. The M9+M10 acceptance line that asks
+*each* condition to be "demonstrated ENDING A REAL GAME" is **not** met for `conquest`
+or `domination`, and **"the victory system works" / "every victory condition works in
+practice" would be an overstatement.** `docs/GDD.md` §5.1 and `docs/BALANCE.md` §8
+carry the same table with their censuses.
+
+### 3.8 The `checks` denominator was derived and the deciding turn was never checked — **fixed in this wave**
+
+This was the verifier's **F2**, and it was two defects wearing one number.
+
+*The defect, as measured.* Both `civts sim` and `civts tournament` reported
+`invariants.checks` as `Σ turnsPlayed × invariantCount` (two derivations in
+`packages/headless/src/sim-cli.ts`, at lines 1640 and 3037 as the file stood before the
+repair), while the runner checked the game-over condition **before** it ran the invariant
+registry and `break`ed on the turn that ended the game (`packages/sim/src/runner.ts`, the
+game-over break at line 736 and the registry at line 746, again as the file stood before
+the repair). So the **turn the game was decided on was handed to no predicate at all**,
+and the reported figure was larger than the number of checks really run:
+
+| run (before the fix) | reported `checks` | really run | over-reported |
+|---|---|---|---|
+| 20 seeds × 150 turns | 86,975 | 86,520 | 455 (0.52 %) |
+| 20 seeds × 200 turns | 93,730 | 93,030 | 700 (0.75 %) |
+
+Measured, not argued, by a probe that installs a one-invariant registry recording every
+turn it is really given:
+
+```bash
+npx tsx scripts/probes/invariant-check-count-probe.ts
+# before the fix:  turnsPlayed 35, checks really run 34, skipped 1
+# after the fix:   turnsPlayed 35, checks really run 35, skipped 0
+```
+
+Two consequences, both stated rather than only the flattering one. (1) The **verdict was
+unaffected**: 0 violations is 0 violations, and the reported count was the *larger* of
+the two, so nothing was hidden by it. (2) The **coverage claim was overstated**, and the
+gap was not academic — the skipped turn is the one on which a capture or a completion
+happens, and `captured-city-consistent` (the invariant that really does fire on this
+engine, §3.1) is a capture invariant. Had that capture also been the decisive one, the
+run would have reported no violation at all. The suite could not catch it either:
+`packages/headless/test/sim-cli.test.ts` **pinned the derived identity**
+`checks === count × turnsPlayed` on a fixture whose runs do not end (line 500 as it stood
+before the repair; the pin belongs to the defect and was rewritten with it).
+
+*The repair, and how it is verified.* The runner now counts checks **where they happen**
+— the registry it is handed is the caller's own entries with each `check` wrapped in a
+counter, and `SimulationResult.invariantChecks` (required, never `undefined`) carries the
+total — and it runs the registry **before** the game-over break, so the deciding turn is
+checked like any other and no turn is double-checked or skipped. A violation still
+outranks an ending when both land on the same turn, because a broken state is an engine
+defect and has to be reported as one.
+
+Re-measured after the repair, on this tree:
+
+```bash
+npx tsx scripts/probes/invariant-check-count-probe.ts     # skipped 0, on both arms
+npx tsx packages/headless/src/cli.ts sim --seeds 1..2 --turns 200 --policy none \
+  --map-size duel --json                                  # 199 turns → invariantChecks 6965 = 199 × 35
+```
+
+So the A3 figures (`86,975` and `93,730` at 150 and 200 turns) are **unchanged in value
+and now true** rather than derived, and the coverage claim they carry is the one the
+runner actually made. This is the repair's own acceptance evidence, and it is a
+different thing from "the number looked right".
+
+The lesson is the one this project keeps re-learning: **a denominator computed from the
+loop's arithmetic is a claim about the loop, and a claim about a loop goes stale the
+moment the loop has an early exit.** It is now counted where it happens.
+
+### 3.9 The draw arm of the outcome report had no coverage — **closed in this wave**
+
+**The finding (P2's mutation B′).** The verifier mutated the `winner === null` branch of
+`gameOutcomeReport` (`packages/headless/src/sim-cli.ts`, line 2926 at the revision it
+tested — search for the branch rather than trusting the number) to name the wrong
+condition, and **the whole `sim-cli` suite stayed green**. No shipped condition reaches a
+draw in a tournament, so the mutation was vacuous rather than the assertions being absent;
+but the honest reading was that the draw path was **not covered**, and that a mutation
+applied there proved nothing. The draw is a real outcome the frozen `GameOutcome` shape
+exists for (`winner: null`, a score tie), so it was a coverage hole rather than a dead
+branch.
+
+**What closed it.** `packages/headless/test/sim-cli.test.ts` now has a fixture that
+really reaches the arm — `'reports a drawn ending, and the counted checks rather than a
+product'` — and asserts, on a drawn run, `kind === 'draw'`, `condition === 'score'`,
+`turn === scoreHorizon(...)`, that the `winner` key is **absent** (not present-and-
+undefined, which `canonicalize` refuses) and that the rendered text prints the draw
+label. The `condition` and `kind` assertions are exactly what P2's mutation B′ flips, so
+the mutation is no longer vacuous; the test's own comment names the mutation and the
+report section it came from.
+
+*Not independently re-run here:* this pass read the fixture and its assertions rather
+than re-applying the mutation to another workstream's file. The claim is therefore "the
+arm is now reached and its condition is asserted", which is what makes the mutation
+visible — not "the mutation was re-executed and turned red".
+
+### 3.10 The seat question: no effect supported at n = 20
+
+Both seats run the **same policy** with the seats rotated, so a per-seat win total is a
+measurement of the *position* and mixes no strategy. Counted from the per-game records
+of the runs in §3.7:
+
+| sample | endings | seat 1 wins | seat 0 wins | one-sided binomial p (fair coin) |
+|---|---|---|---|---|
+| 150 turns, 20 seeds | 13 | 10 | 3 | 4.61 % |
+| 200 turns, 20 seeds | 20 | 12 | 8 | 25.17 % |
+| 200 turns, the 15 games **not** on a plains start | 15 | 8 | 7 | **50.0 %** |
+| 200 turns, the 5 plains-start games only | 5 | **5** | 0 | 3.13 % |
+| the three horizons pooled — nested, double-counted | 38 | 27 | 11 | 0.69 % — *do not read this row* |
+
+**No seat effect is supported at n = 20.** The auditor's "seat 1 won 5 of 5" was the
+whole 100-turn sample, and 5 of 5 is p ≈ 3.1 % — the p-value of a coincidence — and it
+is **not** a pure start-terrain artefact, because seeds 18 and 19 are grassland starts
+that seat 1 also won. At the largest sample seat 1 wins 12 of 20 (60 %, p = 25 %).
+The residue that is left lives in the **starting position**, which is measurably
+asymmetric:
+
+```bash
+npx tsx scripts/probes/starting-position-probe.ts
+# seat 0: grassland in all 20 seeds.
+# seat 1: plains in exactly 5 — seeds 3, 8, 12, 16, 20 — in every configuration,
+#         because map generation is deterministic.
+```
+
+Seat 1 won all 5 of those plains-start games at 200 turns and lost the other 15 by
+**8–7** — dead even. P2's conclusion is the one recorded here: a plains-only effect,
+5 of 5 twice over in two independent runs, is a **map-generation** finding (a systematic
+start asymmetry worth its own look), not a seat effect, and it is not alpha-blocking.
+To be convincing at this sample size a one-sided result would need **≥ 15 of 20**
+(p = 2.07 %; 14 of 20 is 5.77 % and does not clear 5 %), at a horizon chosen before
+looking, with the excess still present in the 15 non-plains-start games. No
+wrong-player crediting was found: the winner every game reports is the seat the engine's
+`gameOutcomeOf` names, checked against an independent read of the board.
+
+The pooled row is printed only to show the trap: pooling *nested* horizons counts the
+same game twice and manufactures a "significant" result. (Its p-value is **0.69 %**, not
+the 0.9 % an earlier draft of `docs/BALANCE.md` printed — see §3.11.)
+
+### 3.11 Figures that did not reproduce, and readings that move
+
+Recorded here rather than quietly corrected, because a figure a reader cannot reproduce
+is exactly the class of defect this document exists to catch.
+
+- `docs/BALANCE.md:331` printed the pooled double-counted row's p-value as **0.9 %**. The
+  counts in that same row (27 seat-1 wins of 38 endings) give
+  `P(X ≥ 27 | n = 38, p = ½) = 0.69 %`; no neighbouring count gives 0.9 %. Fixed in this
+  pass, and the arithmetic is quoted there so it can be re-checked. The other five
+  p-values in that table (3.1 %, 4.6 %, 25.2 %, 50.0 %, 2.07 %, 5.77 %) were recomputed
+  and reproduce exactly.
+- The README's **64.0 s** fast-gate reading and the note that the composed `pnpm verify`
+  "was not measured green" were true when written and are no longer the current gate;
+  both are now superseded by a measured green run (§3.5), with the raw time and the load
+  average beside it.
+- The tournament wall times are **load-sensitive** and move run to run: the 150-turn
+  configuration took 171.7 s, 173 s and 172.4 s across three runs, and the 200-turn one
+  187.8 s, 188 s and 192.8 s — the same deterministic games, the same counts, the same
+  final hashes. The millisecond figures are readings of the box, not properties of the
+  engine, which is why every one of them is quoted with a load average.
 
 ---
 

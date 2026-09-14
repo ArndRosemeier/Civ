@@ -11,10 +11,18 @@
  *    used only to *read* state, never to play. A criterion that says "a human can play it" is not
  *    evidenced by a test that plays it through a JavaScript API.
  * 2. **The page starts from a clean browser state** (`localStorage` cleared before the first
- *    navigation), so this is the game a first-time visitor gets — not a game a test seeded.
- * 3. **It measures the opponent seat.** A victory screen against a seat that never issues a command
- *    is a victory screen about a different claim than the one A1 makes, so the test records whether
- *    the rival civilization's board changed at all while the human played.
+ *    navigation), so this is the game a first-time visitor gets — not a game a test seeded. The one
+ *    thing this file changes about it, it changes through the visitor's own `New game` control: the
+ *    opponent is switched off (see item 3).
+ * 3. **The opponent is held still, and the reason is recorded here.** A1's own gate
+ *    (`s2-a1-conformance.spec.ts` §6) measures the live opponent; this audit measures something
+ *    else — that a human can click a game all the way to its ending screen — and with a real
+ *    policy playing the rival seat the audit's own game ends at turn 51 by a victory condition
+ *    instead of at the catalog's score horizon, which is a different claim, not a weaker one. So
+ *    the opponent is switched off through the app's `New game` control
+ *    (`startSameGameWithoutOpponent`), and the audit still records whether the rival
+ *    civilization's board changed while the human played — which, with the switch off, is the
+ *    evidence that the switch is the thing that holds it still.
  *
  * The adversarial half of A1 lives here too: after the ending, the file walks the page looking for a
  * state the UI cannot escape — a dialog that will not close, a control that stays enabled over a
@@ -126,6 +134,50 @@ const controlNames = async (page: Page): Promise<readonly string[]> => {
   return names;
 };
 
+/**
+ * Start the SAME game with the opponent switched off, by clicking the app's own New game surface.
+ *
+ * ## Why this audit holds the opponent still, and why it does it by clicking
+ *
+ * The app now plays a real policy for every non-human seat on each turn advance
+ * (`src/main.ts`'s `playOpponentSeats`: `SMART_POLICY`). This audit plays its game by clicking
+ * `End turn` and nothing else, so with the opponent live the rival plays a real game against a
+ * human who never moves a unit: measured on this very test, the game ends at **turn 51** by a
+ * victory condition rather than at the catalog's score horizon, and the assertion below — the one
+ * A1 needs, that the UI can play a game all the way to an ending screen — cannot hold. That ending
+ * is a legitimate result of a live opponent; it is simply a different claim from the one this file
+ * makes, and it is measured where it belongs: `s2-a1-conformance.spec.ts` §6, which plays a real
+ * game to its end against a live opponent, and `e2e/t2-probe.ts`. So the opponent is held still
+ * here — and it is held still **through the app's own control**, not by seeding a game through the
+ * test seam, because this file's second claim is that it plays the game a first-time visitor gets
+ * and not a game a test seeded (`window.__CIVTS__.seed` never touches this test).
+ *
+ * That control exists because A1 also asks for it: `PLAN.md` §16.1 A1 is *"a human can start a new
+ * game from the web UI, choose settings"*, and the setting this clicks is `ai.opponent` — the
+ * engine's own field (`packages/core/src/settings.ts`), carried in `state.settings` and therefore
+ * visible in the hashed state of the game that follows.
+ *
+ * It is deliberately the same game: the form is filled in with the seed the clean load is already
+ * playing, so the only thing that changes between the visitor's opening game and the audited one is
+ * the opponent. The seed equivalence is asserted by the caller rather than assumed here.
+ */
+const startSameGameWithoutOpponent = async (page: Page, seed: number): Promise<void> => {
+  await page.getByRole('button', { name: 'New game', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'New game' });
+  await expect(dialog, 'the New game control opened no New game dialog').toBeVisible();
+
+  const seedField = dialog.getByRole('spinbutton', { name: 'Seed' });
+  await seedField.fill(String(seed));
+  const opponent = dialog.getByRole('checkbox', { name: 'Opponent' });
+  await expect(
+    opponent,
+    'the New game dialog offers no Opponent control, so a player cannot hold the opponent still',
+  ).toBeVisible();
+  await opponent.uncheck();
+  await dialog.getByRole('button', { name: 'Start new game' }).click();
+  await expect(dialog).toBeHidden();
+};
+
 test('A1 audit: a clean browser session is played to an outcome screen by clicking, and the rival seat is measured', async ({
   page,
 }) => {
@@ -138,7 +190,17 @@ test('A1 audit: a clean browser session is played to an outcome screen by clicki
   });
   await openApp(page);
 
+  // The clean-load game, and then the same game with the opponent switched off — through the app's
+  // own New game control, because this file audits the game a player can actually start. See
+  // `startSameGameWithoutOpponent` for why the opponent is held still and what measures it instead.
+  const cleanLoad = await readState(page);
+  await startSameGameWithoutOpponent(page, cleanLoad.seed);
+
   const start = await readState(page);
+  expect(
+    start.seed,
+    'the audited game is not the clean load’s own game with the opponent switched off',
+  ).toBe(cleanLoad.seed);
   const human = humanPlayerId(start);
   const rival = start.players.find((candidate) => candidate.id !== human);
   const settings = await readSettings(page);

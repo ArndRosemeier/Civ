@@ -30,7 +30,7 @@ Two rules this report follows, because the alternative is a document that lies:
 | 5 | `npx tsx scripts/combat-balance-sweep.ts --knob walls-bonus` | `combat.wallsBonusPct` | ≈16 s | **flat, exposure 0 of 88 battles** — measurement limitation, not a finding |
 | 6 | `npx tsx scripts/combat-balance-sweep.ts --knob capture-divisor` | `capture.populationDivisor` | ≈16 s | near-flat: 1 column of 5 differs, by 2 population over 3 games |
 | 7 | `npx tsx scripts/combat-balance-sweep.ts --knob damage-per-round` | `combat.damagePerRound` | ≈16 s | **moves** strongly at 2; 3 and 4 identical |
-| 8 | `pnpm tournament:evidence` | A3's experiment (no knob) | 149.8 s | 20 games, 0 violations, 0 planner failures, **5 of 20 ended by a condition** |
+| 8 | `pnpm tournament:evidence` | A3's experiment (no knob) | 149.8 s | 20 games, 0 violations, 0 planner failures, **5 of 20 ended by a condition** — all `cultural`; `conquest` and `domination` have never fired (§8) |
 
 All seven sweeps are reproducible; none of them reads a clock, `Math.random` or any
 ambient input, so the tables are a function of the flags alone.
@@ -273,47 +273,213 @@ applier reports.
 
 ---
 
-## 8. A3's tournament — the outcome distribution, not a knob
+## 8. A3's tournament — each game's ending, and the census over the games (P1)
 
 ```
-pnpm tournament:evidence      # 149.8 s wall (the script's own bracket: 149,073.7 ms)
+# the three configurations measured below, one after another (nothing else running)
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 100 --json > ev-100.json
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 150 --json > ev-150.json
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 200 --json > ev-200.json
+
+# the same experiment as a human-readable report (this is the one below in full)
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 200
+
+# the report on its own, without the evidence wrapper
+npx tsx packages/headless/src/cli.ts tournament --seeds 1..20 --turns 200
 ```
 
-20 seeds × 100 turns, tiny, 2 civs, the real AI (`smart`) in both seats with the
-**seats rotated** so no policy is ever tested from one position only.
+20 seeds, tiny, 2 civs, the real AI (`smart`) in both seats with the **seats rotated**,
+so no policy is ever tested from one position only. Before P1 the report carried only
+`stoppedBecause`: `game-over` said a game had ended and never *which condition* ended it
+or *who won*, so a reader could not tell a cultural runaway from a conquest, and a
+suspicion such as "seat 1 won every ending" could not be checked from the report at all.
+The report now carries both — a per-game outcome (`condition`, `winner`, `seat`, `turn`)
+read from the engine's own `gameOutcomeOf`, and a census over the games
+(`Totals.outcomes`: counts by condition, the no-outcome count, **wins by seat** and the
+stop reasons). Both are produced once, in `@civts/sim`; the CLI and the evidence script
+only render the structured value (`TOURNAMENT_REPORT_VERSION` 2, `EVIDENCE_VERSION` 3).
 
-| measure | value |
-|---|---|
-| invariant checks | 66,395 across **35 named predicates** |
-| invariant violations | **0** |
-| planner failures | **0** (every turn of every game was decided by its policy) |
-| games ended by a condition | **5 of 20 (25%)** — the engine's own `game-over` stop reason |
-| games that hit the horizon | 15 of 20 (75%) — `max-turns`, no winner |
-| wall time | 149,073.7 ms (external bracket) / 149,840 ms for `time pnpm tournament:evidence` |
-| per game | 7,453.7 ms |
-| budget | 900,000 ms — `DEFAULT_TOURNAMENT_BUDGET_MS`, verdict `within budget` |
+| turns | games ended | no outcome | conquest | domination | cultural | score | wins seat 0 | wins seat 1 | wall (script) | wall (external) | per game |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 100 | 5 of 20 | 15 | 0 | 0 | **5** | 0 | 0 | **5** | 141,586.5 ms | 142,078 ms | 7,079.3 ms |
+| 150 | 13 of 20 | 7 | 0 | 0 | **13** | 0 | 3 | **10** | 176,563.1 ms | 177,166 ms | 8,828.2 ms |
+| 200 | **20 of 20** | **0** | 0 | 0 | **18** | 2 | 8 | 12 | 185,924.2 ms | 186,513 ms | 9,296.2 ms |
 
-The outcome distribution is the part that matters for alpha criterion A3: the
-victory conditions are **reachable in real games** (25% of games ended under one,
-with no winner declared in the rest because the catalog's own score horizon is turn
-200 and the experiment stops at 100). A tournament in which nothing ever ends would
-be evidence that the conditions do not work.
+Invariant checks 66,395 / 86,975 / 93,730 across **35 named predicates**, **0 violations**
+and **0 planner failures** in all three; every game's stop reason is `game-over` exactly
+when its outcome says a condition fired, and `max-turns` exactly when it does not.
+(Those three figures were **derived** as `turnsPlayed × 35` when P1 wrote them, and the
+derivation over-reported by one turn per decided game; the F2 repair counts checks where
+they run and hands the deciding turn to the registry, so the same three numbers are now
+what actually ran — `docs/KNOWN-ISSUES.md` §3.8. The 150- and 200-turn runs were repeated
+after the repair and reproduce them exactly.)
+Budget 900,000 ms (`DEFAULT_TOURNAMENT_BUDGET_MS`), verdict `within budget` in all three
+(the 200-turn run uses 21% of it). Raw load average, which is what a wall figure on a
+shared box has to be read against: **3.84 → 4.09** (100 turns), **4.09 → 3.31** (150),
+**3.31 → 4.07** (200), on 8 cores.
 
-**Recorded versus measured, printed by the script itself:**
+Two things follow for A3. **Some** conditions are reachable in real games: 38 of the 60
+games played above ended under one, each with a named winner, a seat and a turn — but
+every one of those 38 was `cultural` or `score`, and no game in any of the three
+configurations ended by `conquest` or `domination`. And the ending is a function of the
+horizon, not a coin flip — at 200 turns *nothing* is left unfinished, which is what makes
+a 200-turn tournament a measurement of the victory conditions rather than of the turn
+limit.
+
+**Reproduced independently, by the verifier and again by this pass.** All three
+configurations were re-run from separate processes and agree **game for game**: the same
+games ended on the same turns with byte-identical final hashes, and the censuses matched
+(`5 of 20` all cultural with seats 0/5; `13 of 20` all cultural with seats 3/10;
+`20 of 20`, cultural 18 + score 2, seats 8/12). The 100-turn row was derived by the
+verifier from the 150-turn run (the nested endings are the same games) and is now
+**measured directly** as well, in the row below. Our own re-runs, with the raw wall time
+and the load average beside each, because a wall figure on this box is not evidence
+without one:
+
+| turns | raw wall | load average before → after | harness elapsed | per game | ended |
+|---|---|---|---|---|---|
+| 100 | 131 s | 2.01 → 1.63 | 130,879.2 ms | 6,545.2 ms | 5 of 20, all cultural |
+| 150 | 173 s | 0.90 → 2.59 | 171,706.3 ms | 8,586.9 ms | 13 of 20, all cultural |
+| 200 | 188 s | 2.59 → 2.68 | 187,825.3 ms | 9,393.1 ms | 20 of 20 — cultural 18, score 2 |
+
+The **counts** are identical to P1's table above; the millisecond figures are readings.
+Run-to-run the wall moves with the box (the verifier measured 177.5 s and 188.8 s for the
+same two configurations at a different load, against 173 s and 188 s here), which is why
+they are quoted as readings and not as properties of the engine.
+
+The 150- and 200-turn configurations were run a **second time after the F2 repair** to the
+invariant-check count landed (`docs/KNOWN-ISSUES.md` §3.8): **172 s** at load 1.13 → 3.05
+and **193 s** at load 3.05 → 3.59, with the same 13-of-20 and 20-of-20 censuses, the same
+per-game conditions, seats and final hashes, and **0 violations / 0 planner failures** on
+both. Those runs are the ones whose reported `checks` (86,975 and 93,730) are *counted
+where the predicates ran* rather than derived from `turnsPlayed × 35` — and because the
+repair also hands the deciding turn to the registry, the two figures are unchanged in
+value and now true.
+
+**The conditions that have never ended an AI-played game.** The per-horizon counts are
+one run each; pooling the 60 games above with the verifier's 40 — two independent re-runs
+of the 150- and 200-turn configurations — gives **100 AI-played games** in total, and the
+zeros are the whole point of counting that many:
+
+| condition | count | verdict |
+|---|---|---|
+| `conquest` | **0 of 100** | **never fired in self-play** — the auditor's claim is reproduced |
+| `domination` | **0 of 100** | **never fired, anywhere, in any AI-played game** |
+| `cultural` | 5 of 20 / 13 of 20 / 18 of 20 at 100 / 150 / 200 turns | the AI's whole game at these horizons |
+| `score` | 2 of 20 at 200 turns (and 0 at 150) | fires only where the horizon reaches the catalog's turn-200 threshold |
+
+```bash
+# the two re-runnable censuses behind this table (≈3 min each, 20 games each)
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 150 --json
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 200 --json
+```
+
+`conquest` holds in the engine and is demonstrated in tests (`packages/sim/test/
+tournament.test.ts`, `runner.test.ts`) — conquest on a real board with the real AI against
+a do-nothing control (seed 1, turn 35, winner seat 0; seed 2, turn 38, winner seat 1), and
+a score tie credited to the lower player id. It is also reachable from a shipped command,
+which is the demonstration that costs a reader nothing:
+
+```
+npx tsx packages/headless/src/cli.ts sim --seeds 1..2 --turns 200 --policy none --map-size duel
+# ≈2 s, two games, both `game-over`, both decided by `score`, winner player 0:
+#   wins: score 2 (player 0 2)
+```
+
+But that demonstration is **weaker than it looks**, and the difference is the reason this
+section exists: the do-nothing control never founds a second city, so "the AI conquers"
+there means "the AI takes an undefended capital", not "two AIs fight a war". `conquest`
+has **never** ended a game in which both seats played.
+
+`domination` is worse off, and is not reachable from any shipped command at all. It holds
+in the engine, and it is boundary-tested at each of its two thresholds on **hand-built
+boards with patched thresholds** — a city added by hand with `dominationLandPct: 1,
+dominationPopPct: 50` — in `packages/testing/test/m9-m10-adversarial.test.ts:590–681` and
+`:1314–1338`. At the shipped magnitudes (60% of the **map's** land and 40% of the world's
+citizens) the AI neither takes nor grows that far inside 200 turns.
+
+So the honest statement is a **measured shortfall, not a dead rule**: two of the four
+conditions have never been reached by the shipping AI in 100 self-played games, and
+`score` only where the horizon is the catalog's own. A two-sided military ending is not
+reachable from `civts sim` at all (that command seats one policy in every chair — the
+rotation belongs to the tournament), which is why the conquest demonstration lives in the
+test suite. Whether the AI *should* fight is a policy question, and §9 says where such a
+sweep would go.
+
+**A3's literal wording is met, and "the victory system works" would be an overstatement.**
+A3 asks for *"at least one victory condition demonstrated ending a real game"* — that is
+`cultural` and `score`, which end real self-play games repeatedly and reproducibly. The
+M9+M10 acceptance line, which asks *each* condition to be demonstrated ENDING A REAL
+GAME, is **not** satisfied for `conquest` or `domination`. Both statements are true at
+once and only the second one is a weakness; a reader who takes the first as evidence for
+the second has been misled by the word "victory".
+
+**The seat effect: the auditor's suspicion, at two sample sizes.** The auditor saw seat 1
+win 5 of 5 endings and called it suspicious. At that horizon it *is* the whole sample —
+and 5 of 5 is p ≈ 3.1% under a fair coin, which is the p-value of a coincidence:
+
+| sample | endings | seat 1 wins | one-sided binomial p |
+|---|---|---|---|
+| 100 turns, 20 seeds | 5 | 5 | **3.1%** |
+| 150 turns, 20 seeds | 13 | 10 | 4.6% |
+| 200 turns, 20 seeds | 20 | 12 | **25.2%** |
+| 200 turns, the 15 games **not** on a plains start | 15 | 8 | **50.0%** |
+| 200 turns, the 5 plains-start games only | 5 | **5** | 3.1% |
+| the three pooled, **double-counted** (nested samples: a 100-turn ending is also a 150-turn ending) | 38 | 27 | **0.69%** — *do not read this row* |
+
+The pooled p-value is `P(X ≥ 27 | n = 38, p = ½)` computed exactly from the counts in
+that row: **0.69 %**, not the 0.9 % an earlier draft printed. A figure in this report
+that a reader cannot reproduce is the defect this document exists to catch, so the
+counts are quoted beside the number (and `docs/KNOWN-ISSUES.md` §3.11 records the
+correction).
+
+The larger sample is the honest one: **12 of 20 is 60%, p = 25% — no seat effect is
+detectable at n = 20**, and the 100-turn reading was the small-sample artefact the
+auditor suspected it might be. (The pooled row is printed only to show the trap: pooling
+nested horizons counts the same game twice and manufactures a "significant" result.) The
+cause was still chased down rather than assumed away, because a seat effect could be a
+real bug — wrong-player crediting, turn order, or an asymmetric start — and the starting
+position is measurably **not symmetric**: seat 0 started on grassland in all 20 seeds,
+while seat 1 started on plains (1 food / 2 shields instead of 2 food / 1 shield) in 5 of
+them. In the 200-turn run seat 1 won all 5 of those plains-start games and lost the other
+15 by 8–7 — a lead worth following up with a bigger sample, not a finding: n = 5 again. No wrong-player crediting was found: the winner every game reports is the seat the
+engine's `gameOutcomeOf` names, which the tests check against the board itself (a conquest
+winner's opponents hold 0 cities).
+
+The starting-position asymmetry is reproducible on its own, in under a second:
+
+```bash
+npx tsx scripts/probes/starting-position-probe.ts
+# seat 0: grassland ×20. seat 1: plains in exactly seeds 3, 8, 12, 16, 20.
+```
+
+**What would have to be true to be convincing.** At n = 20 endings a one-sided result
+needs **≥ 15 of 20** (p = 2.07 %); 14 of 20 is 5.77 % and does not clear 5 %. And because
+three nested horizons were examined, the chance that the *best* of three looks reaches
+p = 3.1 % under the null is about **9 %**. So the convincing shape is not "one horizon
+crosses 5 %": it is ≥ 15 of 20 endings at a horizon fixed before looking, with the excess
+still present in the 15 non-plains-start games. The recorded conclusion is therefore
+**no effect supported**, with the whole residue attributed to the map generator rather
+than to the seats.
+
+**Recorded versus measured** (printed by the *text* invocation of the recorded experiment —
+the `--json` form carries `wallMs`/`perGameMs` as fields instead, which is where the table's
+figures come from; the 150- and 200-turn invocations print `not comparable` rather than a
+ratio between different runs):
 
 ```
 recorded           5621.0ms per game over 20 games of 100 turns — 900000ms budget, 787579ms headroom (87.5%)
-this run           7453.7ms per game over 20 games of 100 turns
-drift              +32.6% per game
+this run           7079.3ms per game over 20 games of 100 turns
+drift              +25.9% per game
 ```
 
-The record is stored once, in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, and was taken
-at commit `8e9ea21` (M7b) under load average ~2.16–3.4. The +32.6 % drift is a
-*speed* reading on a shared box, not a behavioural change — but the record's 20 final
-hashes no longer match this run either (seed 1: recorded `49118125b0f5d85e`, measured
-`37a049dba29e940f`), because `SCHEMA_VERSION` has moved from 8 to 9 since the record
-was taken. **The timing record and the hash record are both stale and both say so in
-their own output; nothing in this repository treats either as a live claim.**
+The record is stored once, in `@civts/sim`'s `A3_TOURNAMENT_EVIDENCE`, and was taken at
+commit `8e9ea21` (M7b) under load average ~2.16–3.4. The +25.9 % drift is a *speed*
+reading on a shared box, not a behavioural change — but the record's 20 final hashes no
+longer match this run either (seed 1: recorded `49118125b0f5d85e`, measured
+`37a049dba29e940f`), because `SCHEMA_VERSION` has moved from 8 to 9 since the record was
+taken. **The timing record and the hash record are both stale and both say so in their own
+output; nothing in this repository treats either as a live claim.**
 
 ---
 

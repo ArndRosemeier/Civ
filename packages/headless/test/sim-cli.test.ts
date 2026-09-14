@@ -38,21 +38,34 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { type GameState, type Result } from '@civts/core';
-import { CATALOG } from '@civts/rules';
+import {
+  type GameState,
+  type PlayerState,
+  type Result,
+  DEFAULT_SETTINGS,
+  gameOutcomeOf,
+  scoreHorizon,
+} from '@civts/core';
+import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
 import {
   A3_TOURNAMENT_EVIDENCE,
   CORE_INVARIANTS,
   DEFAULT_TOURNAMENT_BUDGET_MS,
+  DO_NOTHING_POLICY,
+  runBatch,
   smartPolicy,
+  type BatchResult,
   type DiagnosedPolicy,
   type PlannerFailure,
+  type SimulationResult,
 } from '@civts/sim';
 import { describe, expect, it } from 'vitest';
 // The **test tier** predicate: this file's long sweeps are `it.skipIf(!FULL_TIER)` —
 // they run under `pnpm verify:full` and are reported as skipped by `pnpm verify`. The
 // boundary and its reasoning live in `@civts/testing`'s `tier.ts`, once.
-import { FULL_TIER } from '@civts/testing';
+// `hashValue` is imported for the same reason `gameOutcomeOf` is: the draw fixture's
+// `finalHash` is the hash of the state the engine really read, not a made-up string.
+import { FULL_TIER, hashValue } from '@civts/testing';
 
 import {
   A3_TOURNAMENT_SEED_SPEC,
@@ -69,6 +82,8 @@ import {
   parseTournamentArgs,
   plannerFailureWarning,
   readKnob,
+  buildSimReport,
+  renderSimReport,
   runSimCommand,
   runSweepCommand,
   runTournamentCommand,
@@ -112,6 +127,79 @@ const simReportOf = (args: readonly string[]): SimReport => {
   const output = okOrThrow(runSimCommand(args));
   if (output.report === undefined) throw new Error('the command produced no report');
   return output.report;
+};
+
+/** The real, validated content the CLI runs on — never a hand-made view. */
+const RULESET: Ruleset = (() => {
+  const validated = validateRuleset(CATALOG, 'tuned');
+  if (!validated.ok) {
+    throw new Error(
+      `the shipped catalog does not validate: ${validated.error.map((issue) => issue.kind).join(', ')}`,
+    );
+  }
+  return validated.value;
+})();
+
+/**
+ * **The engine's only draw, and the construction that reaches it.**
+ *
+ * `gameOutcomeOf` names a winner for every condition but one. The score condition returns
+ * `winner: null` when `highestScore` finds no civilization at all, and **only** then — a tied
+ * score does *not* draw, because the tie-break is the lowest player id. Both halves of that
+ * were measured rather than assumed: two do-nothing civilizations on `duel` at 200 turns tie at
+ * zero and the report credits **player 0** (`sim-cli.test.ts`'s decided-run test above pins
+ * exactly that), and `newGame` cannot build the civ-less world either — `civCount` is parsed
+ * with a minimum of 2, and the generator refuses 0 starts outright ("too few candidate start
+ * positions").
+ *
+ * So a draw is unreachable from a played game, which is why a mutation in the draw arm of
+ * `gameOutcomeReport` was GREEN under the previous suite (P2's B′, recorded in
+ * `P2-VERIFICATION.md` §B8): no shipped fixture ever reached the arm. The correct construction
+ * for *this* engine is therefore a hand-built world — every player's `kind` set to
+ * `'barbarian'`, at the catalog's own score horizon — with a run assembled around it from a
+ * real one. The `outcome` is **the engine's own read of that state** (`gameOutcomeOf`), never a
+ * literal, and the helper throws if the read is not a draw, so this fixture cannot drift from
+ * the rule it exercises.
+ *
+ * The drawn run also carries an `invariantChecks` that is **not** `turnsPlayed × count`
+ * (7 rather than 4 × 35): that is the second F2 face, and it is what pins the reported figure
+ * as a *count* of the runs rather than a product the report computes for itself.
+ */
+const barbarian = (player: PlayerState): PlayerState => ({ ...player, kind: 'barbarian' });
+
+const drawnBatch = (): BatchResult => {
+  const real = runBatch({
+    seeds: [1, 2],
+    settings: { ...DEFAULT_SETTINGS, seed: 1, civCount: 2 },
+    ruleset: RULESET,
+    policies: [DO_NOTHING_POLICY, DO_NOTHING_POLICY],
+    maxTurns: 4,
+  });
+  const first = real.runs[0];
+  if (first === undefined) throw new Error('the fixture batch produced no runs');
+
+  const horizon = scoreHorizon(RULESET);
+  const civless: GameState = {
+    ...first.finalState,
+    turn: horizon,
+    players: first.finalState.players.map(barbarian),
+  };
+  const ending = gameOutcomeOf(civless, RULESET);
+  if (ending === null || ending.winner !== null) {
+    throw new Error(
+      "the fixture state is not a draw: the engine's own draw construction has moved, so this " +
+        'test is no longer exercising the arm it names',
+    );
+  }
+
+  const drawn: SimulationResult = {
+    ...first,
+    finalState: civless,
+    finalHash: hashValue(civless),
+    outcome: { kind: 'draw', condition: ending.condition, winner: null, turn: civless.turn },
+    invariantChecks: 7,
+  };
+  return { ...real, runs: [drawn, ...real.runs.slice(1)] };
 };
 
 const sweepReportOf = (args: readonly string[], defaults: SweepCommandDefaults): SweepReport => {
@@ -497,14 +585,145 @@ describe('the sim report is one structured value, rendered', () => {
     // One row per civilization per sampled turn, and one whole-registry check per turn.
     expect(report.totals.metricRows).toBe(2 * 2 * 4);
     expect(report.invariants.count).toBe(report.invariants.names.length);
-    expect(report.invariants.checks).toBe(report.invariants.count * report.totals.turnsPlayed);
+    // **Counted, not `count × turnsPlayed`** (Q1/F2). The pin that used to stand here was
+    // `expect(report.invariants.checks).toBe(report.invariants.count * report.totals.turnsPlayed)`
+    // — the report's own arithmetic, restated as an assertion, which is true only while every
+    // played turn really reaches the registry. On *this* fixture (two four-turn runs, nothing
+    // decided) the old derived figure and the new counted one are **both 280 = 35 × 8**, so
+    // this batch can never tell the two apart; the assertion below that ties the total to the
+    // per-run counts is what makes it a reading of the runs rather than of the loop, and the
+    // fixture in the next block — whose runs really end, one of them in a draw — pins the
+    // difference on numbers that are not the product.
+    expect(report.invariants.checks).toBe(280);
+    expect(report.runs.map((run) => run.invariantChecks)).toStrictEqual([140, 140]);
+    expect(report.runs.reduce((total, run) => total + run.invariantChecks, 0)).toBe(
+      report.invariants.checks,
+    );
     expect(report.invariants.violations).toBe(0);
     expect(report.violations).toStrictEqual([]);
     expect(report.aggregates.map((aggregate) => aggregate.metric)).toContain('population');
     expect(report.horizonTotals.map((total) => total.metric)).toStrictEqual([...HORIZON_METRICS]);
-    // The engine has no victory condition, so the batch reports none — and the key is
-    // omitted rather than written as an empty list, which would claim wins were counted.
+    // No run in this batch reached a condition, so the report claims none — the key is omitted
+    // rather than written as an empty list, which would claim wins were counted.
     expect(report.wins).toBeUndefined();
+  });
+
+  it('names the condition and the winners when a run in the batch really ends', () => {
+    // A *decided* batch the fast tier can afford: `sim` seats ONE policy in every chair (that is
+    // the difference between a batch and a tournament), so a two-sided conquest is not reachable
+    // from this command. The score condition is: at the catalog's horizon of turn 200 the highest
+    // score wins, and a policy that does nothing still gets there in ~2 s for two games — the
+    // engine's own rule, reached at its own shipped threshold, with no override at all.
+    //
+    // The batch's `wins` list had no test with a win in it before P1, so a fold that always
+    // returned `[]` — or one that kept a single winner and dropped the rest — passed the suite.
+    const args: readonly string[] = [
+      '--seeds',
+      '1..2',
+      '--turns',
+      '200',
+      '--policy',
+      'none',
+      '--map-size',
+      'duel',
+    ];
+    const report = simReportOf(args);
+    const output = okOrThrow(runSimCommand(args));
+
+    // Each run carries its ending: the condition the engine read, not just the stop reason.
+    expect(
+      report.runs.map((run) => (run.outcome.ended ? run.outcome.condition : 'no outcome')),
+    ).toStrictEqual(['score', 'score']);
+    for (const run of report.runs) {
+      if (!run.outcome.ended) throw new Error('this fixture ends every run');
+      expect(run.outcome.turn).toBe(report.parameters.maxTurns);
+      // The policy is named by its **own** name (`do-nothing`), the way the tournament report's
+      // seats column names it, rather than by the flag spelling (`--policy none`) that selected it.
+      expect(run.outcome.winner).toStrictEqual({
+        playerId: 0,
+        seat: 0,
+        seatPolicy: 'do-nothing',
+      });
+      expect(run.outcome.text).toContain('player 0 won');
+    }
+    // The stop reason and the outcome are two fields that must agree: every run that ended by a
+    // condition left the loop with `game-over`, and every run that did not is `ended: false`.
+    for (const run of report.runs) {
+      expect(run.stoppedBecause).toBe(run.outcome.ended ? 'game-over' : run.stoppedBecause);
+    }
+    // **F2, on a fixture whose runs really end** — the case the old pin could not see. Both
+    // games stop at turn 200 having played 199 turns, so the counted checks are `199 × 35 =
+    // 6,965` per run and `13,930` for the batch. **The old and new figures, recorded:** before
+    // Q1 the loop read the game-over condition and broke *before* the registry, so the 199th
+    // turn of each run — the turn the game was decided on — was handed to no predicate, and
+    // the checks really run were `13,860 = 2 × 198 × 35`. The report said 13,930 then and says
+    // 13,930 now: the reported number never moved, and that is the point — it *was* the product
+    // `count × turnsPlayed`, which is the right answer only if the last turn is checked, and it
+    // was not. This assertion is the one that fails if the registry is ever moved back behind
+    // the break: it reads the runs' own counts, and they would drop to 6,930.
+    const invariantCount = report.invariants.count;
+    expect(report.totals.turnsPlayed).toBe(2 * 199);
+    expect(report.runs.map((run) => run.invariantChecks)).toStrictEqual([
+      199 * invariantCount,
+      199 * invariantCount,
+    ]);
+    expect(report.invariants.checks).toBe(2 * 199 * invariantCount);
+    expect(report.invariants.checks).toBe(
+      report.runs.reduce((total, run) => total + run.invariantChecks, 0),
+    );
+    // Both games end level at zero and the tie goes to the lower player id, which is the engine's
+    // stated tie-break rather than an ordering accident — so both wins are player 0's.
+    expect(report.wins).toStrictEqual([
+      { outcome: 'score', count: 2, byPlayer: [{ playerId: 0, wins: 2 }], draws: 0 },
+    ]);
+    // The renderer prints the figures the row carries, winners included — a figure the text
+    // prints and the structured value does not hold is the M2 provenance bug.
+    expect(output.stdout).toContain('wins: score 2 (player 0 2)');
+    // ...and the per-run ending is in the table, next to the stop reason it must agree with.
+    expect(output.stdout).toMatch(/score seat 0/);
+  });
+
+  it('reports a drawn ending, and the counted checks rather than a product', () => {
+    const reference = simReportOf(SMALL);
+    const batch = drawnBatch();
+    const report = buildSimReport({
+      batch,
+      parameters: reference.parameters,
+      ruleset: reference.ruleset,
+      invariantNames: reference.invariants.names,
+    });
+
+    const drawn = report.runs[0];
+    if (drawn === undefined) throw new Error('the report has no first run');
+    expect(drawn.outcome.ended).toBe(true);
+    if (!drawn.outcome.ended) throw new Error('the fixture run must end');
+
+    // **The draw arm of `gameOutcomeReport`**, reached for the first time: the condition held
+    // and named no winner. Before this test the whole `sim-cli` suite stayed green with that
+    // arm mutated (`P2-VERIFICATION.md` §B8, mutation B′), because no fixture ever got here.
+    expect(drawn.outcome.kind).toBe('draw');
+    expect(drawn.outcome.condition).toBe('score');
+    expect(drawn.outcome.turn).toBe(scoreHorizon(RULESET));
+    // The winner is **absent**, not `undefined`: a key holding `undefined` is not JSON, and
+    // `canonicalize` refuses it. Asserted on the key set because that is the difference.
+    expect(Object.keys(drawn.outcome)).not.toContain('winner');
+    expect(drawn.outcome.text).toContain('ended level');
+    expect(drawn.outcome.text).toContain('named no winner');
+
+    // ...and the renderer prints it, from its own draw label — the text report's drawn arm,
+    // which was uncovered for the same reason the structured one was.
+    const rendered = renderSimReport(report);
+    expect(rendered).toContain('score (level)');
+    expect(rendered).toContain(String(report.invariants.checks));
+
+    // **Counted, not derived (F2).** The drawn run reports 7 checks; the product the report
+    // used to compute is `count × turnsPlayed = 35 × 8 = 280`, so this assertion fails if the
+    // multiplication comes back — it is the pin that makes "counted" a property rather than a
+    // sentence in a doc comment.
+    const rest = batch.runs.slice(1).reduce((total, run) => total + run.invariantChecks, 0);
+    expect(report.invariants.checks).toBe(7 + rest);
+    expect(report.invariants.checks).not.toBe(report.invariants.count * report.totals.turnsPlayed);
+    expect(drawn.invariantChecks).toBe(7);
   });
 
   it('prints the registry the report was built from — its count, and every name', () => {
@@ -1403,6 +1622,35 @@ describe('the tournament report is one structured value, rendered', () => {
     for (const game of report.games) {
       expect(output.stdout).toContain(game.finalHash);
       expect(output.stdout).toContain(game.seats.join(', '));
+      // The per-game outcome is in the table, in both arms: this fixture's four turns end
+      // nothing, so every row reads "no outcome" beside the engine's own reason it stopped.
+      expect(output.stdout).toContain('no outcome');
+      expect(game.outcome.ended).toBe(false);
+    }
+    // The census the block is printed from, figure by figure: the totals are the report's own
+    // fields, and `noOutcomeGames` is asserted against the games list it was counted from.
+    expect(output.stdout).toContain(
+      `${String(report.totals.outcomes.endedGames)} of ` +
+        `${String(report.totals.outcomes.games)} games ended by a victory condition, ` +
+        `${String(report.totals.outcomes.noOutcomeGames)} with no outcome`,
+    );
+    expect(report.totals.outcomes.noOutcomeGames).toBe(report.games.length);
+    for (const row of report.totals.outcomes.conditions) {
+      expect(output.stdout).toMatch(
+        new RegExp(
+          `${row.condition} +${String(row.games)} +${String(row.wins)} +${String(row.draws)}`,
+        ),
+      );
+    }
+    for (const seat of report.totals.outcomes.seats) {
+      expect(output.stdout).toContain(
+        `seat ${String(seat.seat)} — ${String(seat.wins)} of ${String(seat.games)} `,
+      );
+    }
+    for (const reason of report.totals.outcomes.stopReasons) {
+      expect(output.stdout).toMatch(
+        new RegExp(`${reason.stoppedBecause} +${String(reason.games)}`),
+      );
     }
 
     // The budget, the check total and the verdict are fields, not recomputations.
@@ -1441,6 +1689,107 @@ describe('the tournament report is one structured value, rendered', () => {
     // a constant that happened to match.
     expect(typeof report.budget.elapsedMs).toBe('number');
     expect(report.budget.elapsedMs).toBeGreaterThan(0);
+  });
+});
+
+describe('the tournament report names the condition, the winner and the seat', () => {
+  /**
+   * Two games that **really end, by conquest, inside the gate's budget**.
+   *
+   * `smart` against the do-nothing control on a `duel` map: measured at 35 and 38 turns of
+   * conquest, both games in ~1.5 s. It is the real engine and the real AI in one seat and a
+   * policy that does nothing in the other, which is what makes an *ending* affordable in the fast
+   * tier at all — and it is how the audit's claim that conquest has "never ended a real game"
+   * gets an answer it can check.
+   */
+  const DECIDED: readonly string[] = [
+    '--seeds',
+    '1..2',
+    '--turns',
+    '80',
+    '--seats',
+    'smart,none',
+    '--map-size',
+    'duel',
+  ];
+
+  it('carries the condition, the winner, the seat and the policy that played it', () => {
+    const report = tournamentReportOf(DECIDED);
+
+    expect(report.verdict.passed).toBe(true);
+    expect(report.verdict.accepted).toBe(true);
+    for (const game of report.games) {
+      expect(game.outcome.ended).toBe(true);
+      if (!game.outcome.ended) throw new Error('the fixture must end its games');
+      expect(game.outcome.condition).toBe('conquest');
+      expect(game.outcome.kind).toBe('victory');
+      expect(game.outcome.turn).toBe(game.turnsPlayed);
+      const winner = game.outcome.winner;
+      if (winner === undefined) throw new Error('a conquest ending has a winner');
+      // The winner is a seat, and the report says which policy played it — the fact a seat total
+      // cannot carry.
+      expect(winner.seat).toBe(winner.playerId);
+      expect(game.seats[winner.seat]).toBe(winner.seatPolicy);
+      // ...and the seat really was the one that conquered: it is the only seat holding cities.
+      expect(winner.seatPolicy).toBe('smart');
+    }
+    // The rotation puts the winner in a different seat in each game, which is the property the
+    // wins-by-seat census is read against.
+    const seats = report.games.flatMap((game) =>
+      game.outcome.ended && game.outcome.winner !== undefined ? [game.outcome.winner.seat] : [],
+    );
+    expect(seats).toStrictEqual([0, 1]);
+
+    const outcomes = report.totals.outcomes;
+    expect(outcomes.games).toBe(2);
+    expect(outcomes.endedGames).toBe(2);
+    expect(outcomes.noOutcomeGames).toBe(0);
+    expect(outcomes.conditions.find((row) => row.condition === 'conquest')).toStrictEqual({
+      condition: 'conquest',
+      games: 2,
+      wins: 2,
+      draws: 0,
+    });
+    // Never fired in these games, printed as zeros rather than omitted — the form in which a
+    // condition that does not work is visible.
+    expect(outcomes.conditions.find((row) => row.condition === 'domination')?.games).toBe(0);
+    expect(outcomes.conditions.find((row) => row.condition === 'cultural')?.games).toBe(0);
+    expect(outcomes.conditions.find((row) => row.condition === 'score')?.games).toBe(0);
+    expect(outcomes.seats.map((seat) => seat.wins)).toStrictEqual([1, 1]);
+    expect(outcomes.stopReasons).toStrictEqual([{ stoppedBecause: 'game-over', games: 2 }]);
+  });
+
+  it('prints those figures, and the JSON carries the same value', () => {
+    const output = okOrThrow(runTournamentCommand([...DECIDED]));
+    const report = output.report;
+    if (report === undefined) throw new Error('the command produced no report');
+
+    // Every game's own ending is in the table, and the census block below it prints the counts —
+    // all of them reads of stored fields. The long sentence travels in `--json` (asserted below)
+    // rather than in the column, which is as wide as the widest label of this report.
+    expect(output.stdout).toMatch(/conquest seat 0/);
+    expect(output.stdout).toMatch(/conquest seat 1/);
+    expect(output.stdout).toMatch(/conquest +2 +2 +0/);
+    expect(output.stdout).toMatch(/domination +0 +0 +0/);
+    expect(output.stdout).toContain('wins by seat');
+    expect(output.stdout).toContain('seat 0 — 1 of 2 games won');
+    expect(output.stdout).toContain('seat 1 — 1 of 2 games won');
+
+    const json = okOrThrow(runTournamentCommand([...DECIDED, '--json']));
+    const parsed = parsedJson(json);
+    // The sentence a pipeline does not have to compose, and the fields it is composed from.
+    for (const game of report.games) {
+      expect(json.stdout).toContain(game.outcome.text);
+    }
+    // The games array carries the outcome, and the totals carry the census — asserted as the
+    // bytes a pipeline reads rather than as a parsed shape, because canonical JSON is the
+    // contract with a pipeline.
+    expect(json.stdout).toContain('"condition":"conquest"');
+    expect(json.stdout).toContain('"kind":"victory"');
+    expect(json.stdout).toContain('"seatPolicy":"smart"');
+    expect(json.stdout).toContain('"outcomes":{"conditions":[{"condition":"conquest","draws":0,');
+    expect(json.stdout).toContain('"endedGames":2,"games":2,"noOutcomeGames":0');
+    expect(parsed['kind']).toBe('civts-tournament-report');
   });
 });
 

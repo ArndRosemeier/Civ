@@ -124,23 +124,28 @@ export {
   A3_TOURNAMENT_EVIDENCE,
   DEFAULT_TOURNAMENT_BUDGET_MS,
   HOST_CLOCK,
+  outcomeDistributionOf,
   runTournament,
   seatPlan,
   tournamentEvidence,
   tournamentVerdict,
 } from './tournament.js';
 export type {
+  SeatWinCount,
+  StopReasonGames,
   TournamentClock,
   TournamentEvidence,
   TournamentEvidenceGame,
   TournamentEvidenceInput,
   TournamentHarness,
   TournamentOptions,
+  TournamentOutcomeDistribution,
   TournamentPolicyTotals,
   TournamentResult,
   TournamentSeatTotals,
   TournamentTotals,
   TournamentVerdict,
+  VictoryConditionGames,
 } from './tournament.js';
 
 export type {
@@ -152,6 +157,7 @@ export type {
   InvariantContext,
   MetricAggregate,
   OverrideSection,
+  PlayerWinCount,
   Policy,
   PolicyContext,
   ResourcePatch,

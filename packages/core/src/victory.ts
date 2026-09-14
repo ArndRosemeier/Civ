@@ -34,13 +34,23 @@
  * > - **cultural** — your total culture reaches `CULTURAL_VICTORY_CULTURE`;
  * > - **score** — at the turn limit, the highest score wins.
  *
+ * **The domination line above is quoted from the contract, and BOTH of its clauses are
+ * overruled.** The AMENDMENT at the end of `docs/INTERFACES.md` rules the implementation
+ * correct and that wording wrong: domination requires **both** shares, and the land share
+ * is over the **MAP's** land tiles, never the land "any city claims". `dominationWinner`
+ * below states the rule and the measurement that forced it; `@civts/rules`' `VictorySpec`
+ * and its `victory` section say the same thing in their own prose, so a reader of the
+ * engine and a reader of the catalog are told one rule.
+ *
  * Each is a predicate over one player (`conquestWinner`, `dominationWinner`,
  * `culturalWinner`, `scoreWinner`), and every threshold is a `placeholder(...)` row in
  * `@civts/rules` that `RulesetPatch.victory` moves. **None of them is a Civ 3 figure**:
- * Civ 3's domination requires a share of the *land* **and** a share of the *population*
- * together and its cultural victory counts culture accumulated in individual cities,
- * where this engine's is a player total and its domination is an OR — readings stated
- * here rather than presented as fidelity.
+ * Civ 3's cultural victory counts culture accumulated in individual cities where this
+ * engine's is a player total, and Civ 3's turn limit depends on map size and difficulty,
+ * where this engine's is one catalog number — readings stated here rather than presented
+ * as fidelity. Domination is the one condition whose *shape* this engine deliberately
+ * matches (both shares, held together); its two magnitudes are still our own, measured
+ * over the map's whole land.
  *
  * **Space race is deferred**, and the contract asks for it to be named rather than
  * silently absent: there is no `VictoryConditionId` for it and no catalog row, because
@@ -67,7 +77,7 @@
  * the RNG, a clock or the environment.
  */
 
-import { ownedLandCount } from './borders.js';
+import { ownedLandTiles } from './borders.js';
 import { playerCulture } from './culture.js';
 import type { PlayerId } from './ids.js';
 import { landTileCount, type RulesetView } from './map.js';
@@ -201,7 +211,14 @@ const citizensOf = (population: number): number =>
  * at all, and the game is over before anybody has played. A victory that fires on the opening
  * position is not a victory condition; it is a reading error with a green test attached.
  *
- * ## The two repairs
+ * ## The three repairs, which the contract's own amendment now confirms
+ *
+ * The **AMENDMENT at the end of `docs/INTERFACES.md`** rules for this implementation and
+ * against the frozen sentence: "Civ 3's domination victory requires both shares, so 'or'
+ * would have been the less faithful reading … and a land share measured against *claimed*
+ * land is a moving denominator that a player can lower by claiming less, which makes the
+ * condition easier the worse you play." The three repairs below are therefore the rule, not
+ * a deviation from it.
  *
  * 1. **The land denominator is the map's land**, not the land anybody claims — see
  *    `landTileCount`. A percentage of the world's ground is a number a player can plan toward
@@ -214,15 +231,31 @@ const citizensOf = (population: number): number =>
  *    requirement's third clause exists to prevent. Both are reachable together: the shipped
  *    land share is 60 % and the population share 40 %, and a player who holds most of the
  *    world's ground almost always holds most of its citizens.
+ * 3. **The land numerator counts LAND** (`ownedLandTiles`, `borders.ts`) — the third repair,
+ *    R1's. The first two left the two halves of the fraction counting different kinds of tile:
+ *    `computeTileOwner` claims a **geometric disc** with no terrain filter, so a coastal city
+ *    claims its bay as well as its fields, and the old numerator counted every claimed tile
+ *    while the denominator counted only land. Measured (`scripts/probes/land-numerator-probe.ts`,
+ *    re-runnable): on eight AI-played `tiny` games at 200 turns, **713 of 1,793 owned tiles —
+ *    40 % — were water**, so the two readings of the share differ by up to 1.5× on real boards
+ *    (tiny seed 42 player 0: 4.9 % of the map's land counting the bay, 3.4 % counting land).
+ *    What did **not** move is any outcome: the twenty-seed tournaments at 100, 150 and 200 turns
+ *    are identical game for game — census, winners, per-game final hashes, check totals — as are
+ *    the six goldens and every scenario, because no policy this engine ships has ever reached
+ *    even a fifth of the map's land. So the repair costs nothing observable and removes a rule
+ *    that stated a share of the world's ground while measuring a share of its ground *and sea*.
+ *    `packages/core/test/victory.test.ts` pins it on a board built so the two numerators
+ *    disagree and the verdict turns on which one is used.
  *
  * Neither share can be won in a world with no denominator: a map with no land, or a world
  * with no citizens, is a world with no domination victory — stated rather than left to the
  * arithmetic to decide by accident. The comparison is multiplied out into integers
  * (`owned * 100 >= pct * total`), so no division and no float enters.
  *
- * The land count is a function of the map and the ruleset alone, so it is computed once per
- * call and read by every player; the population denominator counts **barbarian cities too**,
- * because "the world population" is a fact about the world.
+ * The land denominator is a function of the map and the ruleset alone, so it is computed once
+ * per call and read by every player; the numerator is a read of the ownership layer, one pass
+ * over it per player. The population denominator counts **barbarian cities too**, because "the
+ * world population" is a fact about the world.
  */
 const dominationWinner = (
   state: GameState,
@@ -232,7 +265,8 @@ const dominationWinner = (
 ): boolean => {
   const land = landTileCount(state.map, ruleset);
   if (land <= 0) return false;
-  if (ownedLandCount(state, player.id) * 100 < rules.dominationLandPct * land) return false;
+  if (ownedLandTiles(state, ruleset, player.id) * 100 < rules.dominationLandPct * land)
+    return false;
 
   let world = 0;
   let own = 0;
@@ -266,11 +300,19 @@ const culturalWinner = (state: GameState, rules: VictoryRules, player: PlayerSta
  * `highestScore` owns both the maximum and the tie-break, so this function adds nothing
  * to it but the horizon test — one computation, one reading.
  *
- * A world whose civilizations all score the same (or a world with no civilization) is a
- * **draw**: `winner: null`, which is what the frozen shape's nullable winner is for. A
- * draw is a real outcome and not a failure — the alternative would be awarding the game
- * to whoever the array listed first, which is the iteration-order dependence M5's
- * review found in the AI and which this codebase refuses on principle.
+ * **A tie is not a draw, and this paragraph used to say it was.** The corrected sentence is
+ * the one above and the one `highestScore` implements: equal scores go to the **lowest player
+ * id**, and `winner: null` is reached only by a world with **no civilization at all** (every
+ * candidate is a barbarian, or the state lists none). The stale wording — "a world whose
+ * civilizations all score the same is a draw" — was not a harmless comment: it described a
+ * value this function cannot return, so a verifier's draw-arm mutation on a tied board looked
+ * vacuous when the literal reading of this comment said the board was a draw and the engine
+ * correctly named player 0. The engine's own answer is what the tests pin: Q3's B3 read
+ * `{"condition":"score","winner":0}` off two do-nothing civilizations level at zero, against
+ * `winner: null` for the same board with every player relabelled barbarian.
+ *
+ * A draw is a real outcome and not a failure — it says the world contains nobody who can win,
+ * which is a fact about the state rather than a failure to decide.
  */
 const scoreWinner = (
   state: GameState,

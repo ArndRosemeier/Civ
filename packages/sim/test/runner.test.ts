@@ -29,6 +29,7 @@ import {
   asPlayerId,
   asTileIndex,
   asUnitId,
+  gameOutcomeOf,
   newGame,
   nextBelow,
   nextUint32,
@@ -167,6 +168,29 @@ const ALWAYS_FAILS: Invariant = {
   check: () => ['this invariant always fails'],
 };
 
+/**
+ * A one-entry registry that **writes down every context it is handed**, and never fires.
+ *
+ * This is the instrument F2 was measured with (`scripts/probes/invariant-check-count-probe.ts`):
+ * a registry that records what it saw turns "every turn is checked" from a reading of the loop's
+ * source into a count a test can compare against. A run whose registry is never handed a turn
+ * gets an empty list here, which is the difference between "nothing broke" and "nothing ran".
+ */
+const turnRecorder = (): { readonly invariant: Invariant; readonly turns: number[] } => {
+  const turns: number[] = [];
+  return {
+    turns,
+    invariant: {
+      name: 'records-the-turn',
+      description: 'Records the turn of every context it is handed, and never fires.',
+      check: (ctx) => {
+        turns.push(ctx.turn);
+        return [];
+      },
+    },
+  };
+};
+
 /** An invariant that reports nothing until the state's turn reaches four. */
 const FAILS_ON_TURN_FOUR: Invariant = {
   name: 'fails-on-turn-four',
@@ -210,6 +234,11 @@ describe('runSimulation — determinism', () => {
 
     expect(defaulted.violations).toEqual([]);
     expect(defaulted.finalHash).toBe(explicit.finalHash);
+    // The defaulted run really ran the whole registry on every turn it played — **counted**,
+    // from the run's own `invariantChecks` (F2), not derived from the horizon. An earlier
+    // version of this file could not make that claim: the figure the reports printed was
+    // `turnsPlayed × count`, computed beside the loop rather than by it.
+    expect(defaulted.invariantChecks).toBe(50 * CORE_INVARIANTS.length);
 
     // ...and an explicitly empty registry really does run nothing: the option is
     // `??`-defaulted, so `[]` means "check nothing" rather than "use the default".
@@ -218,6 +247,7 @@ describe('runSimulation — determinism', () => {
     );
     expect(unchecked.violations).toEqual([]);
     expect(unchecked.turnsPlayed).toBe(3);
+    expect(unchecked.invariantChecks).toBe(0);
   });
 
   it('reports a policy that commands nothing as no-commands, over the full horizon', () => {
@@ -296,6 +326,55 @@ describe('runSimulation — a violation stops the run', () => {
       'always-fails',
     ]);
     expect(result.turnsPlayed).toBe(1);
+    // Two predicates were handed that one turn, and the count says so: the two assertions are
+    // one fact each — the turn count from the loop, the check count from the registry.
+    expect(result.invariantChecks).toBe(2);
+  });
+
+  it('hand the registry the turn that decides the game, and counts what it ran (F2)', () => {
+    // A decided game the fast tier can afford, with no override of any kind: two civilizations
+    // that command nothing, so nothing is founded, both scores stay at zero, and the catalog's
+    // own score condition holds at turn 200 — the tie going to the lowest player id, which is
+    // the engine's stated tie-break. (It is **not** a draw: `winner: null` needs a world with no
+    // civilization in it at all; `sim-cli.test.ts` carries the only construction that reaches it.)
+    const recorder = turnRecorder();
+    const result = runSimulation(
+      optionsFor(1, [DO_NOTHING_POLICY, DO_NOTHING_POLICY], 200, {
+        invariants: [recorder.invariant],
+      }),
+    );
+
+    expect(result.stoppedBecause).toBe('game-over');
+    expect(result.outcome?.condition).toBe('score');
+    // 199 turns played, and the state's own turn is 200 on the last of them (turn 1 of a game is
+    // `newGame`'s state, which nobody played).
+    expect(result.turnsPlayed).toBe(199);
+    expect(result.finalState.turn).toBe(200);
+
+    // **The claim F2 is about, made checkable.** The registry was handed *every* turn that was
+    // played — 199 contexts, turns 2 through 200, the deciding one included. Before the fix the
+    // loop read the game-over condition and broke *before* the registry, so this list held 198
+    // entries and the turn the game was decided on went to no predicate at all: the capture or
+    // completion turn, which is exactly what `captured-city-consistent` and the conservation
+    // checks exist to fire on.
+    expect(recorder.turns).toHaveLength(199);
+    expect(recorder.turns[0]).toBe(2);
+    expect(recorder.turns[recorder.turns.length - 1]).toBe(200);
+
+    // ...and `invariantChecks` is that many checks, not an arithmetic on the loop: the field
+    // and the instrument are the same number, which is the whole point of counting it.
+    expect(result.invariantChecks).toBe(199);
+    expect(result.invariantChecks).toBe(recorder.turns.length);
+
+    // The turn-limited control, so the identity is not a fact about decided runs only.
+    const limit = turnRecorder();
+    const bounded = runSimulation(
+      optionsFor(1, [DO_NOTHING_POLICY, DO_NOTHING_POLICY], 5, { invariants: [limit.invariant] }),
+    );
+    expect(bounded.stoppedBecause).toBe('no-commands');
+    expect(bounded.turnsPlayed).toBe(5);
+    expect(limit.turns).toStrictEqual([2, 3, 4, 5, 6]);
+    expect(bounded.invariantChecks).toBe(5);
   });
 });
 
@@ -1165,5 +1244,74 @@ describe('runSimulation — M7d: a planner failure is carried in the result', ()
     shared.arm([]);
     const third = runSimulation(optionsFor(22, [shared.policy, shared.policy], 1));
     expect(third.plannerFailures).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The ending a run reports
+ * ------------------------------------------------------------------ */
+
+/**
+ * **`outcome` is the engine's own read of the final board, and its absence is a fact too.**
+ *
+ * The report layer above this one (`@civts/sim`'s tournament totals, the CLI's games table) can
+ * only say *which condition ended a game* if the run itself carries the answer, and it must carry
+ * the engine's answer rather than a second accumulation: `gameOutcomeOf` is the one statement of
+ * the victory rule, and a run that counted endings as it went would be a second one.
+ *
+ * The absent case is asserted as a missing **key** rather than as `undefined`: this project's
+ * hashability rule forbids a key holding `undefined` (it survives `JSON.stringify` as a hole and
+ * breaks a content hash), and "no outcome" has to be readable from the value rather than inferred
+ * from a hole in it.
+ */
+describe('the outcome a run reports — decided, or honestly absent', () => {
+  it('omits the key entirely while the game is still in play', () => {
+    const unfinished = shipped(1, 3);
+
+    expect(unfinished.stoppedBecause).toBe('max-turns');
+    expect('outcome' in unfinished).toBe(false);
+    expect(Object.values(unfinished).some((value) => value === undefined)).toBe(false);
+    // And the engine agrees the game was not over: this is the same predicate the runner read.
+    expect(gameOutcomeOf(unfinished.finalState, VIEW)).toBeNull();
+  });
+
+  it('names the condition, the winner and the turn when a condition decides the game', () => {
+    // `smart` against the do-nothing control: conquest on seed 1 at turn 35, measured. The
+    // cheapest *decided* game a gate can afford, and a real one — the real engine, the real AI,
+    // one seat a policy that does nothing.
+    const decided = runSimulation(optionsFor(1, [smartPolicy(), DO_NOTHING_POLICY], 80));
+    const outcome = decided.outcome;
+    if (outcome === undefined) throw new Error('this fixture must decide its game');
+
+    expect(decided.stoppedBecause).toBe('game-over');
+    expect(outcome.condition).toBe('conquest');
+    // A run has no seat, so `kind` is the two readings a batch can honestly report: `victory`
+    // when a player won, `draw` when nobody did (`defeat` is a viewer's word — `outcomeFor`).
+    expect(outcome.kind).toBe('victory');
+    expect(Number(outcome.winner)).toBe(0);
+    expect(outcome.turn).toBe(decided.turnsPlayed);
+
+    // **Read, not recomputed**: applying the engine's own function to the state the run ended on
+    // gives the same condition and the same winner, and the turn is the final state's own turn.
+    const fromFinalState = gameOutcomeOf(decided.finalState, VIEW);
+    expect(fromFinalState).not.toBeNull();
+    expect(fromFinalState?.condition).toBe(outcome.condition);
+    expect(fromFinalState?.winner).toBe(outcome.winner);
+    expect(outcome.turn).toBe(decided.finalState.turn);
+
+    // The board agrees with the condition: the winner is the only civilization still holding a
+    // city, which is what conquest *means*.
+    const others = decided.finalState.cities.filter((city) => Number(city.owner) !== 0);
+    expect(others).toStrictEqual([]);
+  });
+
+  it('reports the same ending twice, and the same ending on a replay of the same seed', () => {
+    // Determinism applies to the ending like everything else: two runs of one seed report the
+    // same outcome object, field by field.
+    const first = runSimulation(optionsFor(2, [smartPolicy(), DO_NOTHING_POLICY], 80));
+    const second = runSimulation(optionsFor(2, [smartPolicy(), DO_NOTHING_POLICY], 80));
+
+    expect(second.outcome).toStrictEqual(first.outcome);
+    expect(second.finalHash).toBe(first.finalHash);
   });
 });

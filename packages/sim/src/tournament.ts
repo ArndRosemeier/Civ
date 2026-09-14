@@ -43,6 +43,17 @@
  * result, the way `batch.test.ts` and the M4b/M5 suites compare theirs, instead of picking
  * a field to compare.
  *
+ * ## The outcome census (P1)
+ *
+ * `TournamentTotals.outcomes` counts **what ended the games**: one row per victory condition in
+ * the catalog's order (zeros included), the count of games no condition ended, wins by seat, and
+ * the engine's own stop reasons. It exists because the result could say a game ended without
+ * being able to say *which condition* ended it or *who* won — the alpha audit raised a seat
+ * suspicion ("seat 1 won 5 of 5 endings") against a report that could not check it, and a
+ * criterion that requires "a victory condition demonstrated ending a real game" cannot accept
+ * evidence that cannot name the condition. It is counted from each run's own `outcome`
+ * (`runner.ts`'s read of `gameOutcomeOf`), never re-derived: see `outcomeDistributionOf`.
+ *
  * ## Violations are a PASS/FAIL condition, not a statistic
  *
  * `TournamentResult.violations` is the flat concatenation of every game's violations, in
@@ -115,7 +126,7 @@
  * `@civts/sim` exactly as it imports `BatchOptions`.
  */
 
-import type { Settings } from '@civts/core';
+import { VICTORY_CONDITIONS, type Settings, type VictoryConditionId } from '@civts/core';
 import type { Ruleset } from '@civts/rules';
 
 import { aggregateRuns } from './batch.js';
@@ -127,6 +138,7 @@ import type {
   MetricAggregate,
   Policy,
   SimulationResult,
+  StopReason,
   TurnMetrics,
   Violation,
 } from './types.js';
@@ -202,6 +214,21 @@ export interface TournamentTotals {
   readonly seats: readonly TournamentSeatTotals[];
   /** By ascending `policyIndex`. */
   readonly policies: readonly TournamentPolicyTotals[];
+  /**
+   * **What ended the games** — the outcome distribution, added by P1 because a tournament
+   * could previously say *that* games ended (`stoppedBecause: 'game-over'`) and never *which
+   * condition* ended them, nor who won, nor from which seat.
+   *
+   * It is a field of the totals rather than something a report counts for itself, for the rule
+   * this package applies everywhere: a figure a renderer computes is a second implementation of
+   * a rule, and the second implementation is the one that disagrees. `outcomeDistributionOf`
+   * below is the only place these counts exist.
+   *
+   * The metrics in `seats`/`policies` are *averages* over a game; this block is a **census** of
+   * how the games ended, which is the question a tournament of deciding games has to answer —
+   * and the question a tournament in which nothing ever ends answers with zeros.
+   */
+  readonly outcomes: TournamentOutcomeDistribution;
 }
 
 export interface TournamentResult {
@@ -909,6 +936,259 @@ export const runTournament = (
 };
 
 /* ------------------------------------------------------------------ *
+ * The outcome distribution — which condition ended which game, and from which seat
+ * ------------------------------------------------------------------ */
+
+/**
+ * One victory condition and what it ended.
+ *
+ * **Every condition of the catalog appears, whether it fired or not**, in
+ * `VICTORY_CONDITIONS`' canonical evaluation order. That is deliberate and it is the whole
+ * point of the block: a condition that never fired is the finding A3 needs ("a condition that
+ * has never fired is a condition that does not work"), and a list that omitted the zero rows
+ * would report that finding as an absence a reader has to notice.
+ *
+ * `games === wins + draws`: a `draw` is an outcome the frozen `GameOutcome` shape allows
+ * (`winner: null`), and it is counted here rather than derived by a reader, so a renderer prints
+ * it instead of subtracting. **How to read a zero `draws`:** every one of the four shipped
+ * conditions names a winner whenever it holds — the score condition's tie-break is the *lowest
+ * player id*, so its `winner: null` arm needs a world with no civilization in it, which a
+ * tournament cannot play (`core/victory.ts`). A zero column means "the rule always names a
+ * winner", not "the count was skipped", and `tournament.test.ts` measures it on a game whose
+ * scores tie at zero.
+ */
+export interface VictoryConditionGames {
+  readonly condition: VictoryConditionId;
+  /** Games this condition ended, draws included. */
+  readonly games: number;
+  /** Of those, games a civilization won. */
+  readonly wins: number;
+  /** Of those, games that ended level — the score condition's horizon with equal scores. */
+  readonly draws: number;
+}
+
+/**
+ * One seat's wins, and the policies that played it.
+ *
+ * **Wins by seat are the figure a seating advantage would show up in**, and they are reported
+ * for every seat of the rotation whether it won or not. The same policy list is seated
+ * everywhere by `seatPlan` — over enough games every policy plays every seat — so a seat total
+ * mixes whoever sat there, which is exactly what makes it a measurement *of the seat*. A seat
+ * effect is a claim about the position (turn order, starting tile, who moves first), and no
+ * per-policy total can speak to it.
+ *
+ * `players` — a barbarian never wins (`civPlayers` decides who may), so `wins` can only
+ * ever be credited to a civilization, and every civilization of a tournament is a seat.
+ */
+export interface SeatWinCount {
+  /** The seat itself — the `PlayerId`, which is the index into the players array. */
+  readonly seat: number;
+  /** Games this seat played: every game seats every policy, so this is the game count. */
+  readonly games: number;
+  /** Games won **from** this seat. */
+  readonly wins: number;
+  /** The policies that played this seat, by name, ascending and unique. */
+  readonly policies: readonly string[];
+}
+
+/** One engine stop reason and how many games ended with it. */
+export interface StopReasonGames {
+  readonly stoppedBecause: StopReason;
+  readonly games: number;
+}
+
+/**
+ * **How the games ended** — the census a tournament report has to carry.
+ *
+ * ## What it is for
+ *
+ * The harness could report `stoppedBecause` per game since M7, and `'game-over'` since M10, so
+ * a tournament could say *how many* games ended. It could not say **which condition** ended
+ * them, **who** won or **from which seat** — so a run in which every ending was the same
+ * condition, or in which one seat won all of them, read exactly like a healthy mix. The alpha
+ * audit raised both suspicions against a report that could not answer either; this block is the
+ * answer, computed once, in the engine-adjacent package, from each run's own `outcome` (which
+ * `runner.ts` reads from `gameOutcomeOf` — the one statement of the victory rule).
+ *
+ * ## Order independence
+ *
+ * Every row is a count over the games, and the rows are emitted in **canonical order** — the
+ * catalog's condition order, ascending seat, ascending reason name — never in the order the
+ * games happened to be played. Sums are integer additions of counts, so no total depends on
+ * iteration order, and `tournament.test.ts` asserts that a permuted seed list produces an
+ * identical distribution (as it does for the rest of the result).
+ *
+ * ## The identities, and why they are safe to carry
+ *
+ * `games === endedGames + noOutcomeGames`, and `endedGames` is the sum of the condition rows'
+ * `games`. Both are true by construction here and asserted by the tests, so the extra headline
+ * fields are a convenience for a renderer — which must print figures the value contains, never
+ * ones it derives — rather than a second opinion about the same count.
+ */
+export interface TournamentOutcomeDistribution {
+  /** Games played. */
+  readonly games: number;
+  /** Games a victory condition ended, draws included. */
+  readonly endedGames: number;
+  /**
+   * Games **no** condition ended: the game was still in play when the run stopped, which is the
+   * ordinary end of a turn-limited run and the honest "no outcome" a report must be able to say.
+   */
+  readonly noOutcomeGames: number;
+  /** One row per victory condition, in the catalog's order — zero rows included. */
+  readonly conditions: readonly VictoryConditionGames[];
+  /** Wins by seat, ascending by seat — every seat appears, zeros included. */
+  readonly seats: readonly SeatWinCount[];
+  /** Games by the engine's own stop reason, ascending by reason name. */
+  readonly stopReasons: readonly StopReasonGames[];
+}
+
+/** The mutable form of one condition's tally, before it becomes a readonly row. */
+interface ConditionTally {
+  games: number;
+  wins: number;
+  draws: number;
+}
+
+/**
+ * Count what ended each game, who won it and from which seat.
+ *
+ * **It reads `SimulationResult.outcome` and never re-derives it.** The outcome is the engine's
+ * (`gameOutcomeOf`, in `core/victory.ts`, through the runner's final-state read), and a second
+ * implementation of the victory rule here is exactly the disagreement this project keeps
+ * hunting: the report would be able to say a game ended in a condition the engine says it did
+ * not end in. So this function is a fold over a value the engine already computed.
+ *
+ * The plan and the policy list are taken because a win names a **seat**, and the useful fact
+ * about a seat in a rotating tournament is which policy played it — that is what turns
+ * "seat 1 won 7 of 20" into a claim about a position rather than about a strategy.
+ *
+ * A winner that is not a seat of the plan is a thrown internal error rather than a dropped win:
+ * the plan seats every policy of every game, and a count that silently lost a win would make the
+ * distribution disagree with the games it was counted from.
+ */
+export const outcomeDistributionOf = (
+  games: readonly SimulationResult[],
+  plan: readonly (readonly number[])[],
+  policies: readonly Policy[],
+): TournamentOutcomeDistribution => {
+  const tallies = new Map<VictoryConditionId, ConditionTally>(
+    VICTORY_CONDITIONS.map((condition) => [condition, { games: 0, wins: 0, draws: 0 }]),
+  );
+  const winsBySeat = new Map<number, number>();
+  const stopReasons = new Map<StopReason, number>();
+  let endedGames = 0;
+
+  // The policy names that played each seat, from the plan — the same read `totalsFor` makes for
+  // `TournamentSeatTotals.policies`, and sorted for the same reason: a set's iteration order is
+  // insertion order, and a report whose order depended on it would be the ordering bug this
+  // package has fixed twice.
+  const namesBySeat: Set<string>[] = policies.map(() => new Set<string>());
+  for (const seatsInGame of plan) {
+    for (let seat = 0; seat < seatsInGame.length; seat += 1) {
+      const policyIndex = seatsInGame[seat];
+      if (policyIndex === undefined) {
+        throw new Error(
+          `runTournament: internal — the seat plan has no seat ${String(seat)} in a game of ` +
+            `${String(seatsInGame.length)} seats`,
+        );
+      }
+      const names = namesBySeat[seat];
+      if (names === undefined) {
+        throw new Error(
+          `runTournament: internal — the seat plan names seat ${String(seat)}, which the ` +
+            `policy list of ${String(policies.length)} seats does not have`,
+        );
+      }
+      names.add(policyAt(policies, policyIndex).name);
+    }
+  }
+
+  for (let index = 0; index < games.length; index += 1) {
+    const game = games[index];
+    if (game === undefined) {
+      throw new Error(
+        `runTournament: internal — the game list has a hole at ${String(index)} of ` +
+          String(games.length),
+      );
+    }
+
+    stopReasons.set(game.stoppedBecause, (stopReasons.get(game.stoppedBecause) ?? 0) + 1);
+
+    const outcome = game.outcome;
+    if (outcome === undefined) continue;
+
+    const tally = tallies.get(outcome.condition);
+    if (tally === undefined) {
+      throw new Error(
+        `runTournament: internal — a game ended in condition "${outcome.condition}", which is ` +
+          "not one of the catalog's conditions, so the distribution cannot count it",
+      );
+    }
+
+    tally.games += 1;
+    endedGames += 1;
+
+    // `null` is the engine's own spelling of "the condition held and nobody won", which only the
+    // score condition produces (its tie-break is a draw rather than an invented winner).
+    if (outcome.winner === null) {
+      tally.draws += 1;
+      continue;
+    }
+    tally.wins += 1;
+
+    const seat = Number(outcome.winner);
+    const seatsInGame = plan[index];
+    if (seatsInGame === undefined || seatsInGame[seat] === undefined) {
+      throw new Error(
+        `runTournament: internal — game ${String(index)} reported winner ${String(seat)}, which ` +
+          `is not one of the ${String(seatsInGame?.length ?? 0)} seats the plan seats`,
+      );
+    }
+    winsBySeat.set(seat, (winsBySeat.get(seat) ?? 0) + 1);
+  }
+
+  const conditions: VictoryConditionGames[] = VICTORY_CONDITIONS.map((condition) => {
+    const tally = tallies.get(condition);
+    if (tally === undefined) {
+      // Unreachable: the map is built from `VICTORY_CONDITIONS` itself, one key per entry.
+      throw new Error(
+        `runTournament: internal — the distribution has no tally for condition "${condition}"`,
+      );
+    }
+    return {
+      condition,
+      games: tally.games,
+      wins: tally.wins,
+      draws: tally.draws,
+    };
+  });
+
+  const seats: SeatWinCount[] = [];
+  for (let seat = 0; seat < policies.length; seat += 1) {
+    seats.push({
+      seat,
+      games: games.length,
+      wins: winsBySeat.get(seat) ?? 0,
+      policies: [...(namesBySeat[seat] ?? new Set<string>())].sort(compareText),
+    });
+  }
+
+  const reasonRows: StopReasonGames[] = [...stopReasons.entries()]
+    .map(([stoppedBecause, count]) => ({ stoppedBecause, games: count }))
+    .sort((a, b) => compareText(a.stoppedBecause, b.stoppedBecause));
+
+  return {
+    games: games.length,
+    endedGames,
+    noOutcomeGames: games.length - endedGames,
+    conditions,
+    seats,
+    stopReasons: reasonRows,
+  };
+};
+
+/* ------------------------------------------------------------------ *
  * The aggregates
  * ------------------------------------------------------------------ */
 
@@ -1005,6 +1285,9 @@ const totalsFor = (
     metricRows,
     seats,
     policies: policyTotals,
+    // The census of how the games ended, counted from each run's own engine-computed `outcome`
+    // — see `outcomeDistributionOf`, which is the only place these counts exist.
+    outcomes: outcomeDistributionOf(games, plan, policies),
   };
 };
 

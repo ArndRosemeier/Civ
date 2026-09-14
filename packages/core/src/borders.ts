@@ -68,7 +68,7 @@
 
 import type { City } from './cities.js';
 import type { PlayerId, TileIndex } from './ids.js';
-import { inBounds, indexToX, indexToY, tileIndex, type RulesetView } from './map.js';
+import { inBounds, indexToX, indexToY, isLandAt, tileIndex, type RulesetView } from './map.js';
 import type { GameState } from './state.js';
 
 /**
@@ -390,26 +390,76 @@ export const foreignOwnerAt = (
   return owner === playerId ? undefined : owner;
 };
 
-/**
- * Every tile any city claims in this state, as a **count** — the denominator of the
- * domination victory's land share.
+/*
+ * **There used to be a `claimedLandCount` here, and it was deleted (Q3's F3 residue).**
  *
- * A count rather than a set, because the only thing the victory rule asks is "what
- * fraction of the claimed world do I hold?", and a count of a layer that is already
- * materialised is the cheapest honest answer: it counts the entries of `tileOwner`
- * that are not `UNOWNED`, which is by construction the union of every city's claim.
+ * It counted the entries of `tileOwner` that are not `UNOWNED` — the union of every city's
+ * claim — and its doc comment called that "the denominator of the domination victory's land
+ * share". Both halves were wrong for a reader: the domination rule divides by the **map's**
+ * land (`map.ts`' `landTileCount`, and the AMENDMENT at the end of `docs/INTERFACES.md` rules
+ * that the *map's* land is the correct denominator), and **nothing in the repository called
+ * the function at all** (`grep -rn "claimedLandCount" --include=*.ts .` matched only its own
+ * declaration). An exported helper with no reader whose comment states a rule the engine does
+ * not implement is a trap for the next reader — the cost of keeping it is a future agent
+ * "wiring it up" because it looks like the missing piece. It is deleted rather than reworded,
+ * and this note is what a `git log -S` would otherwise have to explain.
  *
- * A layer of the wrong length (a hand-built state) counts what is there rather than
- * throwing, and answers `0` for a layer that is absent — the total reading
- * `@civts/sim`'s invariants report properly.
+ * The numerator the rule does use is `ownedLandTiles` below, and it stays.
  */
-export const claimedLandCount = (state: GameState): number => {
+
+/**
+ * **How many tiles `playerId` owns** — every claimed tile, land and water alike.
+ *
+ * Read straight off the ownership layer: it counts the entries of `tileOwner` that name this
+ * player, and it is **not** filtered by terrain. A claim is a geometric disc
+ * (`computeTileOwner` above has no terrain filter), so a city on the coast claims its bay as
+ * well as its fields — measured on real AI-played games, water is not a rare corner case: it is
+ * about 40 % of every border in play (see `ownedLandTiles` below for the figures and the
+ * instrument).
+ *
+ * `repl.ts` reads it for the "your borders reach N tiles" line, which is a statement about the
+ * border rather than about the victory rule, and there the all-terrain reading is the right
+ * one. **The victory rule does not read it**: `ownedLandTiles` is the domination numerator, so
+ * the name of this function is the only thing about it that says "land".
+ */
+
+/**
+ * **How many of `playerId`'s owned tiles are LAND** — the numerator of the domination
+ * victory's land share, and the count that makes the numerator and the denominator the same
+ * *kind* of thing.
+ *
+ * `landTileCount(state.map, ruleset)` is the denominator: the map's land. Counting owned
+ * *water* in the numerator would compare two different quantities — a player could hold a third
+ * of the world's land and reach the threshold on the strength of the sea inside its borders —
+ * and every document, the AMENDMENT at the end of `docs/INTERFACES.md` included, states the
+ * rule as a share of the map's land. So this asks `isLandAt` (`map.ts`) of every owned tile:
+ * **one predicate**, the same one `landTileCount` counts with, so the numerator and the
+ * denominator cannot come to different views of what land is. It used to carry a private copy of
+ * that three-line rule (Q3's F5, R2's R2-F3); the copy is deleted and this is what replaced it.
+ *
+ * A layer of the wrong length (a hand-built state) counts what is there rather than throwing,
+ * and answers `0` for a layer that is absent — the total reading `@civts/sim`'s invariants
+ * report properly. `tileOwner` indices outside the map's terrain are not land, which is
+ * `isLandAt`'s own answer for a tile nobody can describe.
+ *
+ * **How much this differs from `ownedLandCount` is a measurement, not a guess**
+ * (`scripts/probes/land-numerator-probe.ts`): over eight AI-played `tiny` games at 200 turns,
+ * 713 of 1,793 owned tiles — 39.8 % — were water, so the two numbers are far apart in play even
+ * though the rule's *verdict* has never turned on the difference.
+ */
+export const ownedLandTiles = (
+  state: GameState,
+  ruleset: RulesetView,
+  playerId: PlayerId,
+): number => {
+  const id = Number(playerId);
   let total = 0;
-  for (const owner of state.tileOwner) if (owner !== UNOWNED) total += 1;
+  for (let index = 0; index < state.tileOwner.length; index += 1) {
+    if (state.tileOwner[index] !== id) continue;
+    if (isLandAt(state.map, ruleset, index)) total += 1;
+  }
   return total;
 };
-
-/** How many tiles of the claimed land `playerId` holds. */
 export const ownedLandCount = (state: GameState, playerId: PlayerId): number => {
   const id = Number(playerId);
   let total = 0;

@@ -2589,6 +2589,12 @@ const syntheticRun = (seed: number, treasuries: readonly number[]): SimulationRe
     finalState: state,
     metrics: rows,
     violations: [],
+    // Q1/F2: `invariantChecks` is required on `SimulationResult` now that the figure is a
+    // count rather than `turnsPlayed * registry.length`. **Zero is the honest value for this
+    // fixture**: no registry ever ran over these hand-written rows, and a synthetic run that
+    // claimed `turnsPlayed * CORE_INVARIANTS.length` checks would be asserting a check that
+    // never happened — the exact defect the field was added to make impossible.
+    invariantChecks: 0,
     // Required and always present since M7d: a synthetic run whose policies never threw carries
     // an empty list, and the empty list is what says so. Written out rather than defaulted,
     // because the field being *required* is the point — a consumer cannot forget to look.

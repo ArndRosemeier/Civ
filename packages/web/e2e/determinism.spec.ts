@@ -34,6 +34,7 @@ import {
   headlessNewGame,
   humanPlayerId,
   humanPlayer,
+  OPPONENT_OFF,
   openApp,
   readState,
   recordDispatches,
@@ -84,7 +85,14 @@ test('determinism at the UI layer: a scripted game through the UI hashes exactly
 }) => {
   test.setTimeout(180_000);
   await openApp(page);
-  const started = await seedApp(page, SEED);
+  // **The opponent is held still, on both sides of this comparison.** The headless half below is
+  // `newGame` + `applyCommand` in this process and plays no policy for the rival seat; the browser
+  // plays `SMART_POLICY` for every non-human seat whenever the turn advances (including the
+  // `End turn` clicks this script makes). Left on, the two runs are different games and the hash
+  // equality below would be comparing a game with an opponent against one without. The setting goes
+  // into the SEEDED settings, so `settingsFrom(started.settings, seed)` hands the headless engine
+  // the same object — settings are part of the hashed state. See `OPPONENT_OFF` in `helpers.ts`.
+  const started = await seedApp(page, SEED, OPPONENT_OFF);
   const seed = started.seed;
   const settings = settingsFrom(started.settings, seed);
 

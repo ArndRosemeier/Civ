@@ -69,6 +69,7 @@ import {
   humanPlayerId,
   isExplored,
   luxuryIndicator,
+  OPPONENT_OFF,
   openApp,
   openCity,
   openPanel,
@@ -338,7 +339,14 @@ test('adversarial keystone — offered: no control on the page dispatches a comm
 
   for (const seed of SEEDS) {
     await openApp(page);
-    await seedApp(page, seed);
+    // **The opponent is held still.** This sweep judges every command a control dispatches against
+    // the engine's own lists FOR THE HUMAN SEAT, and the sweep clicks `End turn`, which — with the
+    // opponent live — makes the app plan and dispatch the rival seat's commands too
+    // (`playOpponentSeats`). Those commands legitimately name the rival's units and cities, so they
+    // are not in the human's lists and would be reported as findings that are really the opponent
+    // working. Switching it off keeps this test measuring what it was written to measure: the
+    // controls the page offers for the seat that is playing. See `OPPONENT_OFF` in `helpers.ts`.
+    await seedApp(page, seed, OPPONENT_OFF);
     expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
 
     // A city first, so the sweep has a city screen, a production menu and a second unit type.
@@ -992,7 +1000,14 @@ test('the UI cannot diverge: after a command the panels, the log text and the dr
   const findings: string[] = [];
 
   await openApp(page);
-  await seedApp(page, MID_GAME_SEED);
+  // **The opponent is held still on both sides of this comparison.** The headless half below starts
+  // the same seed with `settingsFrom(await readSettings(page), …)` and plays no policy; the browser
+  // plays `SMART_POLICY` for the rival seat on every `End turn` click, and those commands land in
+  // the dispatch log this test replays. Replaying them as the human seat is refused by the engine
+  // (`not-your-unit`), and even if they were skipped the two states would differ. The setting is
+  // seeded here, so it is in `state.settings` and reaches the headless engine through
+  // `settingsFrom` — one settings object for both sides. See `OPPONENT_OFF` in `helpers.ts`.
+  await seedApp(page, MID_GAME_SEED, OPPONENT_OFF);
   expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
   await clearDispatchLog(page);
 
@@ -1200,7 +1215,14 @@ test('determinism: one seed and one script hash the same in two browser contexts
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     const page = await context.newPage();
     await openApp(page);
-    await seedApp(page, seed);
+    // **The opponent is held still, in both contexts and on the headless side.** BOTH contexts must
+    // play the same game (they are compared to each other first), and the headless replay below is
+    // `newGame` + `applyCommand` with no policy for the rival seat, replaying the script as the
+    // human seat — so a rival command in the script is refused (`not-your-unit`). Seeding the
+    // setting here puts it in `state.settings`, which `settingsFrom(first.settings, seed)` then
+    // hands to the headless engine, keeping the two sides on ONE settings object. See
+    // `OPPONENT_OFF` in `helpers.ts`.
+    await seedApp(page, seed, OPPONENT_OFF);
     expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
     await clearDispatchLog(page);
 

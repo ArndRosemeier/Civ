@@ -425,6 +425,46 @@ export const seedApp = async (page: Page, seed: number, options?: unknown): Prom
   return readState(page);
 };
 
+/**
+ * The patch that holds the opponent still — `ai.opponent: 'off'` laid over the settings the app is
+ * already playing with. Used as `seedApp(page, seed, OPPONENT_OFF)`.
+ *
+ * ## Why a test has to hold it still
+ *
+ * The app plays a real policy for every non-human seat while the turn advances
+ * (`src/main.ts`'s `playOpponentSeats`: `SMART_POLICY` over `policyRngFor(seed, playerId, turn)`).
+ * The headless half of every comparison in this suite — `newGame` + `applyCommand`, in this
+ * process — plays no policy for anybody. So a browser game and a headless game started from the
+ * same seed are no longer the same game: the rival founds cities, moves units and consumes world
+ * randomness in one, and stands still in the other. Every test that compares the two therefore has
+ * to switch the opponent off on BOTH sides, and so does every test whose subject is something else
+ * entirely (a panel, a button, an order, a placement probe) — those were written against a game in
+ * which no policy played a seat, and holding it still is what keeps them measuring what they were
+ * written to measure.
+ *
+ * ## Both sides must share ONE settings object
+ *
+ * `settings` is part of the hashed state, so the browser and the headless engine have to be handed
+ * the same value: seeding through `seedApp` with this patch leaves `ai.opponent: 'off'` inside
+ * `state.settings`, and `settingsFrom(await readSettings(page), seed)` — the suite's single route
+ * from the browser's settings to the headless engine's — carries it across. A headless game started
+ * from settings that lack the field takes the app's default (`'policy'`, see `DEFAULT_OPPONENT_MODE`
+ * in `packages/core/src/settings.ts`) and differs by that field alone.
+ *
+ * ## Why it is a partial patch and not a whole settings object
+ *
+ * `seed` merges options with the ENGINE's own layered merge (`mergeSettings`), which is the one
+ * statement of what merging settings means. A spread — `{ ...settings, ai: { opponent: 'off' } }` —
+ * would replace the whole `ai` object, drop `aggression` and `expandFast`, and be refused by the
+ * strict schema, so the intent would vanish without the test noticing (the note beside
+ * `mergeSettings` records that this project has already paid for that defect once).
+ *
+ * Holding it still here does not leave the live opponent unmeasured: `s2-a1-conformance.spec.ts`
+ * (under `CIVTS_A1_GATE=1`) and `e2e/t2-probe.ts` measure it directly — its accepted commands, its
+ * own RNG stream, and the browser-vs-headless hash equality WITH it playing.
+ */
+export const OPPONENT_OFF = { ai: { opponent: 'off' } } as const;
+
 /* ------------------------------------------------------------------ *
  * The accessibility contract, named once
  *

@@ -76,7 +76,7 @@ export interface SeamHost {
    * events for the command. This is the app's *engine call*; the seam's `dispatch` is the frozen
    * wrapper over it, and `tookEvents` is how the same single call also reaches the log.
    */
-  dispatch(command: Command): DispatchResult;
+  dispatch(command: Command, forSeat?: PlayerId): DispatchResult;
   /**
    * The events of the command that was applied most recently, and an empty list before the first
    * one. Read (not pushed) by the panel adapter after each dispatch, so there is exactly one
@@ -185,6 +185,28 @@ declare global {
  * `commandFrom` gives is discarded here rather than thrown away everywhere: `replay` is the
  * caller that needs it (it must say *which* recorded command a log could not read).
  */
+/**
+ * Split a dispatched action into the seat acting and the command itself.
+ *
+ * The opponent dispatches through this same seam, so that its commands appear in the dispatch log
+ * and "the rival really acted" is checkable rather than inferred from a counter that moved. The
+ * acting seat therefore rides on the action as an extra key, removed here before the command
+ * parser sees it.
+ *
+ * The human's controls carry no seat and are applied for the human seat, which is what stops a UI
+ * action from ever ordering a rival's unit. The seat is a test-and-opponent channel, not something
+ * the interface can express.
+ */
+export const splitSeat = (
+  action: unknown,
+): { readonly seat: PlayerId | undefined; readonly rest: unknown } => {
+  if (typeof action !== 'object' || action === null || Array.isArray(action)) {
+    return { seat: undefined, rest: action };
+  }
+  const { seat, ...rest } = action as Record<string, unknown>;
+  return { seat: typeof seat === 'number' ? asPlayerId(seat) : undefined, rest };
+};
+
 export const toCommand = (raw: unknown): Command | undefined => {
   const read = commandFrom(raw);
   return read.ok ? read.value : undefined;
@@ -201,9 +223,10 @@ export const toCommand = (raw: unknown): Command | undefined => {
 const seamOf = (host: SeamHost): InstalledTestApi => {
   /** One engine call per dispatched command, whichever caller asked for it. */
   const applyOnce = (action: unknown): DispatchResult => {
-    const command = toCommand(action);
+    const { seat, rest } = splitSeat(action);
+    const command = toCommand(rest);
     if (command === undefined) return { outcome: 'refused', events: [] };
-    const result = host.dispatch(command);
+    const result = host.dispatch(command, seat);
     // The host records the events of this call for the log; the seam still publishes only the
     // outcome, so a wrapper installed by a test keeps working unchanged.
     return result;

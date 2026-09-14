@@ -40,6 +40,7 @@ import {
   hashOf,
   headlessNewGame,
   humanPlayerId,
+  OPPONENT_OFF,
   openApp,
   readState,
   recordDispatches,
@@ -411,7 +412,14 @@ test('A4 unit orders — attack: an attack the engine offers is issued from the 
 
   // The settings the app plays with are the app's business; the search must use the same ones,
   // so they are read from a seeded game rather than assumed.
-  const probe = await seedApp(page, SEED);
+  // **The opponent is held still, on both sides.** The scene search below plays the engine
+  // headlessly (`newGame` + `applyCommand`) and no policy plays the rival there, while the browser
+  // plays `SMART_POLICY` for the rival seat on each `End turn` the driven script issues. With it
+  // left on, the browser walks a different board from the engine's and the per-step hash equality
+  // (and the attack's resolution) would be comparing two games. The setting is seeded here, so the
+  // probe's own `state.settings` carries it into `settingsFor` — one settings object for the
+  // search, the replay and the browser. See `OPPONENT_OFF` in `helpers.ts`.
+  const probe = await seedApp(page, SEED, OPPONENT_OFF);
   const settingsFor = (seed: number): ReturnType<typeof settingsFrom> =>
     settingsFrom(probe.settings, seed);
   const scene = findAttackScene(settingsFor);

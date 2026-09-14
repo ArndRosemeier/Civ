@@ -49,6 +49,7 @@ import {
   headlessNewGame,
   humanPlayer,
   humanPlayerId,
+  OPPONENT_OFF,
   openApp,
   openCity,
   openPanel,
@@ -228,7 +229,14 @@ test('X1 placement: an open panel covers neither the map nor the action buttons,
   page,
 }) => {
   await openApp(page);
-  await seedApp(page, SEED);
+  // **The opponent is held still.** This test is about the docked panels covering nothing — the map
+  // still takes the pointer, `End turn` still advances the game, and the settler's own control still
+  // founds the acting seat's city. With the opponent left on, the `End turn` click below also plays
+  // the rival seat, whose policy founds a city of its own first — and `foundCity` (which returns the
+  // engine's first city) then hands back the RIVAL's city, so this test fails about a foreign city
+  // instead of about panel placement. Nothing here is about the AI: switching it off keeps the
+  // measurement on the panels and the controls beside them. See `OPPONENT_OFF` in `helpers.ts`.
+  await seedApp(page, SEED, OPPONENT_OFF);
 
   // The debug panel is the one `debug.spec.ts` plays on through, so it is the one that must be
   // proven not to be in the way.

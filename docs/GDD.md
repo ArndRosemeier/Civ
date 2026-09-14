@@ -45,9 +45,14 @@ and several notes say where Civ 3 is known to differ:
 - the **unhappy ladder** is 7/12/18 citizens, deliberately re-runged from 3/6/10
   after it was measured to make a three-citizen city permanently unable to build
   the temple that would cure it,
-- Civ 3's **domination** needs a share of land *and* population together, its
-  **cultural** victory counts culture per city, and its **turn limit** depends on
-  map size and difficulty; none of that is reproduced.
+- Civ 3's **cultural** victory counts culture per city, and its **turn limit** depends
+  on map size and difficulty; neither is reproduced. Civ 3's **domination** victory
+  also needs two shares held *together* (two thirds of the land and of the population),
+  and this engine's domination is an AND of two shares for that reason — but over the
+  **map's** land with its own 60 %/40 % magnitudes, so the shape agrees and no number
+  does. The frozen contract's original wording ("land **or** population", against
+  "claimed land") was **wrong** and is overruled by the AMENDMENT at the end of
+  `docs/INTERFACES.md`; §5 states the rule the engine actually implements.
 
 The mechanical consequence: `fidelity: "cited-only"` makes the engine **refuse to
 start**. That refusal is the intended behaviour today.
@@ -353,15 +358,66 @@ board. A finished game refuses further commands with a typed error.
 | condition | rule | threshold (placeholder) |
 |---|---|---|
 | conquest | you are the last civilization holding a city | — |
-| domination | you own enough of the claimed land **or** of the world population | 60% land, 40% population |
+| domination | you hold **both** the land share **and** the population share, over the **map's** land | 60% of the map's land **and** 40% of the world's population |
 | cultural | your total culture reaches the threshold | 1,500 culture |
 | score | at the catalog's own horizon, the highest score wins | turn 200 |
+
+**Domination is an AND, and the land denominator is the map's land — the contract's
+original wording was wrong.** The frozen M9+M10 text said domination needs the land
+share **or** the population share, over "the land tiles that any city claims". The
+AMENDMENT at the end of `docs/INTERFACES.md` rules that wording **wrong** and the
+implementation right, on two measured grounds: with "or", domination fires on **turn 1**
+of an ordinary game (the first civilization to found a capital holds 100% of the claimed
+land *and* 100% of the world's citizens before anybody else has been polled), and a share
+of *claimed* land is a denominator a player **lowers** by claiming less, so the condition
+would get easier the worse they play. `packages/core/src/victory.ts`' `dominationWinner`
+is the rule; `packages/testing/test/m9-m10-adversarial.test.ts:590` pins both halves at
+their own thresholds and shows the land half is *necessary*.
 
 Bare civs never win, never score and never count toward another player's conquest.
 The score horizon (`scoreVictoryTurn = 200`) is **content**, deliberately separate
 from a simulation's `maxTurns`: a run that stops before the horizon reports
 "max-turns" with no winner rather than crowning one, because the experiment ended
 before the game did.
+
+### 5.1 Which conditions have actually ended a game — measured, not assumed
+
+"The four conditions are implemented" and "the victory system works in practice" are
+different claims, and only the first one is true. Measured on the shipped catalog with
+the real AI (`smart`) in both seats of a 20-seed `tiny` tournament, seats rotated:
+
+| condition | ended an AI-played game? | measured |
+|---|---|---|
+| cultural | **yes, in self-play** | 13 of 20 games at 150 turns, 18 of 20 at 200 turns |
+| score | **yes, in self-play** | 2 of 20 games at 200 turns (the catalog's own horizon) |
+| conquest | **only with the AI in ONE seat** | 0 of 100 self-play games; 6 of 6 when `smart` faces a do-nothing control |
+| domination | **never** | 0 of 100 AI-played games; demonstrated only on hand-built boards with patched thresholds |
+
+```bash
+# 150 turns: 13 of 20 games end, every one by `cultural`; 0 violations, 0 planner failures
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 150 --json
+
+# 200 turns: 20 of 20 games end — cultural 18, score 2
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 200 --json
+
+# the conquest demonstration: the AI in one seat against the do-nothing control,
+# conquest at turns 35-42 with the winner alternating 0/1 as the seats rotate
+npx tsx scripts/probes/outcome-aggregate-probe.ts
+```
+
+At the shipped magnitudes (60% of the **map's** land and 40% of the world's citizens)
+the AI neither takes nor grows that far inside 200 turns, so `domination` has never
+ended a game a policy played. The `conquest` demonstration is weaker than it looks: the
+do-nothing control never founds a second city, so "the AI conquers" there means "the AI
+takes an undefended capital", not "two AIs fight a war".
+
+A3's literal requirement — *"at least one victory condition demonstrated ending a real
+game"* — is **met**, by the cultural and score victories, which do end real self-play
+games. **"Every victory condition works in practice" would be an overstatement**, and
+the M9+M10 acceptance line that asks each condition to be "demonstrated ENDING A REAL
+GAME" is *not* satisfied for conquest or domination. `docs/BALANCE.md` §8 carries the
+same shortfall with its censuses; `docs/KNOWN-ISSUES.md` §3.7 records it as an open
+limit rather than a footnote.
 
 Score is one integer from five catalog weights, read by the engine and the UI from
 the same function:
@@ -433,6 +489,12 @@ npx tsx -e 'import {MAP_SIZES,MAP_DIMENSIONS,RATE_TOTAL,VISIBILITY_RADIUS,MIN_CI
 for(const s of MAP_SIZES) console.log(s, MAP_DIMENSIONS[s].width+"x"+MAP_DIMENSIONS[s].height, MAP_DIMENSIONS[s].maxCivs);
 console.log("RATE_TOTAL",RATE_TOTAL,"VISION",VISIBILITY_RADIUS,"MIN_CITY_DISTANCE",MIN_CITY_DISTANCE);
 console.log([1,2,3,4,5,6,7,8].map(p=>p+"->"+foodBoxSize(p)).join(" "));'
+
+# §5 and §5.1 — the victory rule and which conditions have really ended a game
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 150 --json   # 13 of 20, all cultural
+npx tsx scripts/tournament-evidence.ts --seeds 1..20 --turns 200 --json   # 20 of 20: cultural 18, score 2
+npx tsx scripts/probes/outcome-aggregate-probe.ts                        # conquest 6 of 6 vs a do-nothing control
+npx tsx scripts/probes/starting-position-probe.ts                        # seat 0 grassland ×20; seat 1 plains ×5
 
 # §3 — the pipeline order, as the code states it
 sed -n '1,40p' packages/core/src/turn.ts

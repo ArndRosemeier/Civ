@@ -65,15 +65,22 @@
  * than a fraction of a percent would mean the budget verdict was computed from a clock that is
  * not measuring the run.
  *
- * ## The third question: did any game actually END?
+ * ## The third question: did any game actually END, and how?
  *
- * The text report prints an **outcome distribution** beside the timings — one row per stop
- * reason the engine reported, the count of games that reached their horizon, and, when *every*
- * game reached it, the finding that says so out loud. It exists because the timings and the
- * verdicts above it cannot answer that question: a tournament in which nothing ever ends reports
- * zero violations, stays inside its budget and looks exactly like a healthy one. A victory
- * condition that has never fired is a condition that does not work, and the count of endings is
- * the only figure that shows it. See `outcomeDistribution`.
+ * The text report prints an **outcome distribution** beside the timings — counts by victory
+ * condition (zero rows included), the count of games no condition ended, **wins by seat**, and
+ * the engine's own stop reasons — plus, when *every* game reached its horizon, the finding that
+ * says so out loud. It exists because the timings and the verdicts above it cannot answer that
+ * question: a tournament in which nothing ever ends reports zero violations, stays inside its
+ * budget and looks exactly like a healthy one. A victory condition that has never fired is a
+ * condition that does not work, and the counts of endings are the only figures that show it.
+ *
+ * **Every one of those figures is a field of the report** (`report.totals.outcomes`, counted
+ * once in `@civts/sim` from each game's own engine-read outcome); this script renders them and
+ * counts nothing itself. It used to build its own histogram of stop reasons, which is how a
+ * report comes to disagree with the engine — and which also answered the wrong question, since
+ * "13 games ended with `game-over`" names no condition and no winner. See
+ * `renderOutcomeDistribution`.
  *
  * ## Determinism and provenance
  *
@@ -90,7 +97,11 @@
  */
 
 import { DEFAULT_SETTINGS } from '@civts/core';
-import { A3_TOURNAMENT_EVIDENCE, DEFAULT_TOURNAMENT_BUDGET_MS } from '@civts/sim';
+import {
+  A3_TOURNAMENT_EVIDENCE,
+  DEFAULT_TOURNAMENT_BUDGET_MS,
+  type TournamentOutcomeDistribution,
+} from '@civts/sim';
 import { canonicalize } from '@civts/testing';
 
 import { parseIntFlag } from '../packages/headless/src/repl.js';
@@ -99,7 +110,6 @@ import {
   A3_TOURNAMENT_TURNS,
   parseSeedSpec,
   runTournamentCommand,
-  type TournamentGameReport,
   type TournamentReport,
 } from '../packages/headless/src/sim-cli.js';
 
@@ -144,10 +154,14 @@ invariant registry and the same structured report:
 
   civts tournament --seeds ${A3_SEED_SPEC} --turns ${String(A3_TURNS)} --json
 
-The text report ends with an OUTCOME DISTRIBUTION: one row per stop reason the engine reported,
-how many games reached their turn limit, and — when every one of them did — the finding that no
-victory condition can be reached in this build. A tournament where nothing ever ends is evidence
-about the conditions, not a table of outcomes.
+The text report ends with an OUTCOME DISTRIBUTION: one row per victory condition (zeros
+included, because a condition that never fired is the finding), how many games no condition
+ended, WINS BY SEAT, and the engine's own stop reasons. Every figure is a field of the
+structured report (\`totals.outcomes\`), rendered here and never recounted. A tournament in
+which nothing ever ends is evidence about the conditions, not a table of outcomes — and a
+condition that ends every game is a reason to look at the balance, which is what the wins-by-
+seat rows are for: the same policy plays different seats across seeds, so a seat that wins
+disproportionately is a property of the position, not of the strategy.
 
 Exit codes: 0 = zero violations, zero planner failures, and within budget; 1 = a violation, a
 planner failure, or both (each is named loudly — the violation with its seed and turn, the planner
@@ -257,22 +271,20 @@ export interface TournamentEvidence {
   /** `|wallMs - harnessElapsedMs| / wallMs` as a percentage: do the two clocks agree? */
   readonly clockAgreementPct: number;
   /**
-   * **Why each game stopped** — the outcome distribution, counted from the report above.
+   * **How each game ended** — the report's own `totals.outcomes`, carried rather than recounted.
    *
    * A tournament's *timings* say how the AI is doing; its *outcomes* say whether the game can
-   * end at all. The two questions were conflated until this field existed: every A3 run
-   * reported "zero violations, within budget" while every one of its twenty games stopped at
-   * the horizon, and nothing in the output said so. A condition that has never fired is a
-   * condition that does not work, and the only way to tell that from a table of averages is to
-   * count the endings — so the count is a field, printed by `renderOutcomeDistribution`, and
-   * never a figure a renderer derives on its own.
-   *
-   * It is computed here rather than carried by the CLI because it is a *reading of* the
-   * report's own `games`, exactly like `perGameMs` is a reading of the wall time: the per-game
-   * stop reason is the engine's (`TournamentGameReport.stoppedBecause`), and this adds no
-   * vocabulary of its own to it.
+   * end at all, and *which condition* ends it. The two questions were conflated until this
+   * field existed: every A3 run reported "zero violations, within budget" while every one of
+   * its games stopped at the horizon, and nothing in the output said so. A condition that has
+   * never fired is a condition that does not work, and the only way to tell that from a table
+   * of averages is to count the endings — so the count is a field of the report
+   * (`@civts/sim`'s `outcomeDistributionOf`, counted from each game's own engine-read outcome),
+   * and this value hands that same object through rather than building a second one. That
+   * distinction is the whole of P1: a script that counted its own histogram could disagree with
+   * the report it printed above it, and the old block did exactly that.
    */
-  readonly outcomes: OutcomeDistribution;
+  readonly outcomes: TournamentOutcomeDistribution;
   /** The run itself, exactly as `civts tournament --json` would report it. */
   readonly report: TournamentReport;
 }
@@ -285,123 +297,95 @@ export interface TournamentEvidence {
  *   that reads this value wants to know whether the endings were counted at all: a version-1
  *   value's silence about outcomes is not the same fact as a version-2 value reporting that
  *   every game reached the horizon.
+ * - 3 — **the same field, carrying the report's value instead of a histogram of stop reasons.**
+ *   `outcomes` is now `@civts/sim`'s `TournamentOutcomeDistribution`: counts by victory
+ *   condition (zero rows included), the no-outcome count, **wins by seat**, and the stop
+ *   reasons. Bumped because the shape changed: a version-2 consumer reads `outcomes.counts`,
+ *   which no longer exists.
  */
-export const EVIDENCE_VERSION = 2;
+export const EVIDENCE_VERSION = 3;
 
 /* ------------------------------------------------------------------ *
- * The outcome distribution
+ * The outcome distribution — rendered, never counted here
  * ------------------------------------------------------------------ */
 
-/** One stop reason, and how many of the tournament's games ended with it. */
-export interface OutcomeCount {
-  /**
-   * The engine's own `StopReason` for the game — the union's spelling, never a name invented
-   * here, and typed from the report so a renamed reason is a compile error rather than a row
-   * that silently reads zero.
-   */
-  readonly stoppedBecause: TournamentGameReport['stoppedBecause'];
-  readonly count: number;
-}
-
 /**
- * Why a run's games stopped, counted by the engine's own reason.
+ * The outcome block: **what ended the games**, read straight out of the report's own
+ * `totals.outcomes`.
  *
- * **`games` and `turnLimitGames` are carried as fields rather than left to the reader**, for the
- * rule the whole report follows: a figure the text prints is a figure the structured value
- * contains. `turnLimitGames` is the one this block exists for — "how many hit the turn limit"
- * is the question A3's outcome line asks — and `earlyGames` is its complement, stated so that
- * no renderer has to subtract.
+ * ## Why this is a renderer and not a counter (P1)
  *
- * The rows are sorted by the reason's own name (code-unit order), never by count and never by
- * the order the games happened to be played in, so two runs of the same seeds print the same
- * block and a diff between two reports means the games changed.
+ * It used to count for itself: it walked `report.games[].stoppedBecause` and built its own
+ * histogram. That is the M2 provenance bug one layer along — a report that computes a figure
+ * its structured value does not carry is a report that can disagree with the engine — and it
+ * was also answering the wrong question: *why a run left the loop* is not *which condition
+ * ended the game*. `'game-over'` was thirteen games and named none of them, so a run whose
+ * every ending was one condition read exactly like a healthy mix, and A3's requirement ("at
+ * least one victory condition demonstrated ending a real game") could not be checked from the
+ * output at all.
+ *
+ * So the counting moved into `@civts/sim` (`outcomeDistributionOf`, where every game's own
+ * engine-read `outcome` is folded once — conditions with their zero rows, the no-outcome count,
+ * wins by seat, and the stop reasons), and this function prints the fields it is handed. Every
+ * figure below is a field; nothing here is added, subtracted or divided except the one share
+ * percentage, which is a presentation of `count / games`.
+ *
+ * ## The findings it is allowed to state
+ *
+ * One, and only when the data says it: **every** game reaching its horizon with no outcome is
+ * evidence that no victory condition can be reached in this configuration, and it is printed as
+ * a FINDING rather than left for a reader to notice. A run in which one game ended says nothing
+ * of the sort, and this renderer emits nothing of the sort — a line that always appeared would
+ * be claiming a finding it had not measured.
  */
-export interface OutcomeDistribution {
-  readonly games: number;
-  /** Games that reached their horizon — `stoppedBecause === 'max-turns'`. */
-  readonly turnLimitGames: number;
-  /** Games that ended before their horizon, for whatever engine reason. */
-  readonly earlyGames: number;
-  /** One row per reason that occurred, ascending by reason. */
-  readonly counts: readonly OutcomeCount[];
-}
-
-/**
- * Count the stop reasons of a report's games.
- *
- * `'max-turns'` is written here as the engine spells it, and it compiles only against
- * `TournamentGameReport['stoppedBecause']` — the single place that vocabulary is defined. That
- * is deliberate: a literal that matched a *string* rather than the union would turn a renamed
- * reason into "no game ever reached the horizon", which is the most misleading number this
- * block could print.
- */
-export const outcomeDistribution = (
-  games: readonly TournamentGameReport[],
-): OutcomeDistribution => {
-  const counts = new Map<TournamentGameReport['stoppedBecause'], number>();
-  for (const game of games) {
-    counts.set(game.stoppedBecause, (counts.get(game.stoppedBecause) ?? 0) + 1);
+export const renderOutcomeDistribution = (outcomes: TournamentOutcomeDistribution): string => {
+  if (outcomes.games === 0) {
+    return [
+      '',
+      "OUTCOME DISTRIBUTION (how each game ended — the engine's own outcome, counted once in",
+      "                     the report's totals.outcomes)",
+      '  (no games were played, so there are no endings to count)',
+    ].join('\n');
   }
 
-  const rows: OutcomeCount[] = [...counts.entries()]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([stoppedBecause, count]) => ({ stoppedBecause, count }));
-
-  const turnLimitGames = counts.get('max-turns') ?? 0;
-  return {
-    games: games.length,
-    turnLimitGames,
-    earlyGames: games.length - turnLimitGames,
-    counts: rows,
-  };
-};
-
-/**
- * The outcome block: how many games ended in which condition, and how many hit the turn limit.
- *
- * What each reason *means* is not restated here — `@civts/sim`'s `StopReason` names them, and a
- * second glossary would be a second place for them to drift — so the block prints the reason and
- * the count, and one interpretation that is only true when the data says so:
- *
- * - **every** game reaching its horizon is printed with the finding it is, because a tournament
- *   in which nothing ever ends is evidence that no victory condition can be reached, not a table
- *   of outcomes. The sentence is emitted **only** in that case; a run with one early ending says
- *   nothing about conditions being unreachable, and a report that always carried the line would
- *   be claiming a finding it had not measured.
- */
-export const renderOutcomeDistribution = (distribution: OutcomeDistribution): string => {
   const lines: string[] = [
     '',
-    `OUTCOME DISTRIBUTION (why each of the ${String(distribution.games)} games stopped — ` +
-      "the engine's own stop reasons, counted from the report above)",
+    "OUTCOME DISTRIBUTION (how each game ended — the engine's own outcome per game, counted",
+    "                     once in the report's totals.outcomes and rendered, not recomputed)",
+    `  ended by a condition  ${String(outcomes.endedGames)} of ${String(outcomes.games)} games`,
+    `  no outcome            ${String(outcomes.noOutcomeGames)} of ${String(outcomes.games)} games ` +
+      '(still in play when the run stopped)',
   ];
 
-  if (distribution.counts.length === 0) {
-    lines.push('  (no games were played, so there are no endings to count)');
-    return lines.join('\n');
-  }
-
-  for (const row of distribution.counts) {
-    const share =
-      distribution.games === 0 ? 0 : Math.round((row.count / distribution.games) * 1000) / 10;
+  for (const row of outcomes.conditions) {
     lines.push(
-      `  ${row.stoppedBecause.padEnd(18)}${String(row.count)} of ${String(
-        distribution.games,
-      )} games (${share.toFixed(1)}%)`,
+      `  ${row.condition.padEnd(20)}${String(row.games)} games, ${String(row.wins)} won, ` +
+        `${String(row.draws)} drawn`,
     );
   }
 
-  if (distribution.turnLimitGames === distribution.games) {
+  lines.push('  wins by seat:');
+  for (const seat of outcomes.seats) {
+    lines.push(
+      `    seat ${String(seat.seat)}              ${String(seat.wins)} of ${String(seat.games)} ` +
+        `games won (played by ${seat.policies.join(', ')})`,
+    );
+  }
+
+  lines.push("  why each game left the loop (the engine's own stop reasons):");
+  for (const reason of outcomes.stopReasons) {
+    const share = Math.round((reason.games / outcomes.games) * 1000) / 10;
+    lines.push(
+      `    ${reason.stoppedBecause.padEnd(18)}${String(reason.games)} of ` +
+        `${String(outcomes.games)} games (${share.toFixed(1)}%)`,
+    );
+  }
+
+  if (outcomes.noOutcomeGames === outcomes.games) {
     lines.push(
       '  FINDING            every game in this run reached its turn limit and no game ended by a',
-      '                     victory or a defeat, so this run is evidence that no victory condition',
-      '                     can be reached in this build — it is a finding, not a table of outcomes',
-    );
-  } else {
-    lines.push(
-      `  ${'ended early'.padEnd(18)}${String(distribution.earlyGames)} of ${String(
-        distribution.games,
-      )} games stopped before their horizon (see the reasons above)`,
+      '                     victory condition, so this run is evidence that no victory condition',
+      '                     can be reached here — it is a finding, not a table of outcomes',
     );
   }
 
@@ -560,7 +544,7 @@ if (typeof parsedArgs === 'string') {
         perGameMs: games === 0 ? 0 : roundTo1(wallMs / games),
         clockAgreementPct:
           wallMs === 0 ? 0 : roundTo2((Math.abs(wallMs - report.budget.elapsedMs) / wallMs) * 100),
-        outcomes: outcomeDistribution(report.games),
+        outcomes: report.totals.outcomes,
         report,
       };
 

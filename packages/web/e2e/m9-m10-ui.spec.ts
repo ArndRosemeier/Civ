@@ -57,6 +57,7 @@ import {
   hashOf,
   headlessNewGame,
   humanPlayerId,
+  OPPONENT_OFF,
   openApp,
   openCity,
   openPanel,
@@ -566,7 +567,14 @@ test('M10 victory screen: a real game played to its end shows the derived outcom
 }) => {
   test.setTimeout(300_000);
   await openApp(page);
-  await seedApp(page, SEED);
+  // **The opponent is held still, on both sides.** `replayHeadless` below reads the browser's own
+  // settings and replays this test's script through `newGame` + `applyCommand`, which plays no
+  // policy for the rival seat — while the app plays `SMART_POLICY` for it on the `End turn` clicks
+  // that end this game. Left on, the browser reached a different ending (a conquest at turn 51 in
+  // the audit's own measurement) and the hash equality below is between two different games. The
+  // setting is seeded, so `settingsFrom(await readSettings(page), SEED)` carries it to the headless
+  // engine: one settings object for both sides. See `OPPONENT_OFF` in `helpers.ts`.
+  await seedApp(page, SEED, OPPONENT_OFF);
   const owner = humanPlayerId(await readState(page));
   await foundCity(page);
   await closeDialogs(page);

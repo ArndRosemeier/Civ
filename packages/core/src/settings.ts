@@ -26,6 +26,32 @@ export type Difficulty = (typeof DIFFICULTIES)[number];
 export const FIDELITY_MODES = ['tuned', 'cited-only'] as const;
 export type Fidelity = (typeof FIDELITY_MODES)[number];
 
+/**
+ * Whether the non-human civilizations are played by a policy or left inert.
+ *
+ * A1 requires a human to play against opponents, and until this existed there was no way to say
+ * "the opponent is off" in the engine at all: the setting had no spelling, so a front end could
+ * only hardcode its choice and a test could not prove the choice did anything. `'policy'` is the
+ * default because a rival that never moves is solitaire, and a human who changes nothing should
+ * still get a game.
+ */
+export const OPPONENT_MODES = ['policy', 'off'] as const;
+export type OpponentMode = (typeof OPPONENT_MODES)[number];
+
+/**
+ * What an ABSENT `ai.opponent` means, stated once.
+ *
+ * The field is optional and not part of `DEFAULT_SETTINGS` (see the note at the schema field), so
+ * "the setting is not there" has to mean something. It means the default mode, and this is the
+ * only place that is said: every reader goes through `opponentModeOf`, so a front end cannot
+ * quietly decide that absent means inert and produce a game with no opponent.
+ */
+export const DEFAULT_OPPONENT_MODE: OpponentMode = 'policy';
+
+/** The opponent mode these settings describe, with the absent case resolved in one place. */
+export const opponentModeOf = (settings: Settings): OpponentMode =>
+  settings.ai.opponent ?? DEFAULT_OPPONENT_MODE;
+
 /** Map dimensions per size. PLACEHOLDER values (see PLAN.md 6.2), tuned by play. */
 export const MAP_DIMENSIONS: Record<
   MapSize,
@@ -48,6 +74,19 @@ const SettingsSchema = v.strictObject({
   ai: v.strictObject({
     aggression: v.pipe(v.number(), v.minValue(0), v.maxValue(1)),
     expandFast: v.boolean(),
+    /**
+     * See `OPPONENT_MODES`.
+     *
+     * **Optional, and deliberately absent from `DEFAULT_SETTINGS`.** `Settings` is hashed as part
+     * of `GameState`, so putting a field here changes the hash of every state in the repository —
+     * including every stored golden and every pinned hash in the adversarial suites — and it does
+     * so for a field no simulation reads. That is the one kind of change this project refuses: a
+     * hash must move because BEHAVIOUR moved, or it stops being evidence of anything. A file that
+     * omits the field therefore means the default, and `opponentModeOf` is the single place that
+     * default is stated; a player who chooses `'off'` gets the key written and hashed, which is
+     * what makes switching the opponent off visible in a save.
+     */
+    opponent: v.optional(v.picklist(OPPONENT_MODES)),
   }),
   debug: v.strictObject({
     cheats: v.boolean(),
@@ -76,7 +115,17 @@ export const DEFAULT_SETTINGS: Settings = {
 const isPlainObject = (x: unknown): x is Record<string, unknown> =>
   typeof x === 'object' && x !== null && !Array.isArray(x);
 
-const deepMerge = (
+/**
+ * Merge a patch into settings, one layer deep.
+ *
+ * Exported because a front end that patches settings field by field needs THIS merge and not a
+ * spread: `{...settings, ...{ai: {opponent: 'off'}}}` replaces the whole `ai` object, drops
+ * `aggression` and `expandFast`, and is then refused by the strict schema — so the caller's
+ * intent is silently discarded and the setting appears inert. That is a defect this project has
+ * already paid for once; the fix is to have one statement of what merging settings means, and
+ * this is it.
+ */
+export const mergeSettings = (
   base: Record<string, unknown>,
   patch: Record<string, unknown>,
 ): Record<string, unknown> => {
@@ -87,7 +136,7 @@ const deepMerge = (
     // canonical JSON, so a settings value carrying it cannot be hashed at all.
     if (value === undefined) continue;
     const prev = out[key];
-    out[key] = isPlainObject(prev) && isPlainObject(value) ? deepMerge(prev, value) : value;
+    out[key] = isPlainObject(prev) && isPlainObject(value) ? mergeSettings(prev, value) : value;
   }
   return out;
 };
@@ -102,7 +151,7 @@ const deepMerge = (
  * natural CLI wiring `loadSettings(config, { ruleset: flag.ruleset })` hits
  * this whenever the flag is absent, so the parsed output is normalized here.
  *
- * `ruleset` is the schema's only optional key; `deepMerge` above already drops
+ * `ruleset` is the schema's only optional key; `mergeSettings` above already drops
  * undefined-valued entries from every layer, and this is the second belt for
  * the direct-`parseSettings` path. If another optional key is ever added to
  * `SettingsSchema`, normalize it here too.
@@ -153,7 +202,7 @@ export const loadSettings = (
 ): Result<Settings, readonly SettingsIssue[]> => {
   let acc: Record<string, unknown> = { ...DEFAULT_SETTINGS };
   for (const layer of layers) {
-    if (layer !== undefined) acc = deepMerge(acc, layer);
+    if (layer !== undefined) acc = mergeSettings(acc, layer);
   }
   return parseSettings(acc);
 };

@@ -12,7 +12,10 @@
  * command it returns is applied through `applyCommand` (never by mutating state),
  * the world advances with `advanceTurn`, and **every invariant runs on every
  * turn** — checked in flight rather than only at the end, which is what makes a
- * violation be caught where it happened.
+ * violation be caught where it happened. "Every turn" includes the turn that ends the
+ * game: the registry runs **before** the game-over break, so a decided run is checked the
+ * same number of times as a turn-limited one, and `invariantChecks` counts what ran
+ * (F2 — the rule site states the choice and why a violation outranks an ending).
  *
  * ## The five decisions this file had to make, and why
  *
@@ -236,6 +239,8 @@ import { CORE_INVARIANTS, checkInvariants } from './invariants.js';
 import { sampleTurn } from './metrics.js';
 import type { PlannerFailure } from './ai/smart.js';
 import type {
+  Invariant,
+  InvariantContext,
   Policy,
   PolicyContext,
   SimulationOptions,
@@ -652,6 +657,28 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
   const stride = samplingStride(options.sampleEvery);
   const metrics: TurnMetrics[] = [];
   const violations: Violation[] = [];
+
+  // **The count of checks that really ran**, incremented by the check itself rather than
+  // computed from the turns played (F2). The registry used by the loop is the caller's own
+  // entries with each `check` wrapped in a counter, so the number in the result moves exactly
+  // when a predicate is invoked and cannot drift from what happened: a turn that is skipped,
+  // a check that is added, or a loop that breaks before the registry runs all show up here as
+  // a *different number* rather than as the same arithmetic reported twice. Every other
+  // reading of "how many checks" — `turnsPlayed * registry.length` above all — is a claim
+  // about the loop, and a claim about a loop is exactly the thing that goes stale.
+  //
+  // The wrappers preserve `name` and `description` (a violation built by `checkInvariants`
+  // names the invariant from the entry it ran), so wrapping changes nothing observable except
+  // the counter.
+  let invariantChecks = 0;
+  const countedInvariants: readonly Invariant[] = invariants.map((invariant) => ({
+    name: invariant.name,
+    description: invariant.description,
+    check: (ctx: InvariantContext): readonly string[] => {
+      invariantChecks += 1;
+      return invariant.check(ctx);
+    },
+  }));
   // Taken before the first turn — see the module note on the baseline.
   const plannerFailures = startPlannerFailureLog(options.policies);
 
@@ -732,17 +759,39 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
     //
     // Checked *after* the turn rather than before it, because the condition is evaluated
     // inside the pipeline: the turn that wins the game is a turn that was really played.
-    if (gameOutcomeOf(state, rulesetView) !== null) {
-      stopped = 'game-over';
-      break;
-    }
+    //
+    // The reading is taken here and **acted on below**, after the registry has run — see
+    // the note on the order of the two. It is one read of `gameOutcomeOf` for both uses,
+    // so the ending that stops the run and the ending reported in `outcome` cannot be two
+    // different answers to the same question.
+    const decided = gameOutcomeOf(state, rulesetView) !== null;
 
     // Sampled after the pipeline, so a row describes a fully settled turn: this
     // turn's income and upkeep ledger is in `events`, and the state is the one the
     // next turn begins from. The row's `turn` is the state's own turn, so the first
     // row of a run is turn 2 — turn 1 is `newGame`'s state and nobody played it.
-    if ((turnsPlayed - 1) % stride === 0) metrics.push(...sampleTurn(state, rulesetView, events));
+    //
+    // A deciding turn is **not** sampled, which is the sampling rule this loop has always
+    // had (`game-over` used to break before this line); the guard keeps the metric rows of
+    // every existing report byte-identical while the registry below gains the turn.
+    const sampleThisTurn = !decided && (turnsPlayed - 1) % stride === 0;
+    if (sampleThisTurn) metrics.push(...sampleTurn(state, rulesetView, events));
 
+    // **Every turn is checked, the deciding one included** (F2). The invariants are
+    // properties of *state*, and the state a deciding turn reaches is a state like any
+    // other — in fact it is the one that most needs checking: the capture or the
+    // completion that ends a game is exactly what `captured-city-consistent` and the
+    // conservation checks exist to fire on, and running them *after* the break meant the
+    // one turn a game is decided on was handed to no predicate at all. The registry
+    // therefore runs **before** the game-over break, on this turn's settled state, once:
+    // no turn is double-checked and none is skipped, which is what makes
+    // `SimulationResult.invariantChecks` equal to `turnsPlayed * registry.length` for a
+    // decided run as well as for a turn-limited one.
+    //
+    // A violation still outweighs an ending when both happen on the same turn: a broken
+    // state is a defect in the engine and has to be reported as one, and `stoppedBecause:
+    // 'violation'` is the more specific fact about the turn. The two are not in conflict —
+    // a state can end a game *and* break a property, and the property is the bug.
     const found = checkInvariants(
       {
         state,
@@ -752,11 +801,16 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
         events,
         turn: state.turn,
       },
-      invariants,
+      countedInvariants,
     );
     if (found.length > 0) {
       violations.push(...found);
       stopped = 'violation';
+      break;
+    }
+
+    if (decided) {
+      stopped = 'game-over';
       break;
     }
   }
@@ -782,6 +836,7 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
     finalState: state,
     metrics,
     violations,
+    invariantChecks,
     // A fresh array, and an empty one when nothing failed — required and always present,
     // the same discipline `violations` follows. The log's own array is handed over rather
     // than copied because the run is over and the log is local to it; nothing else holds a

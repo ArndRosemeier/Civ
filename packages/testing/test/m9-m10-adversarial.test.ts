@@ -588,7 +588,10 @@ describe('2. boundaries — every new threshold, at the value and one step below
   });
 
   it('domination needs BOTH shares, and each is tested at its own threshold', () => {
-    // The contract's prose says "land **and** pop". The implementation's note records why:
+    // The **AMENDMENT** at the end of `docs/INTERFACES.md` ("the domination condition was
+    // specified WRONG, and the implementation was right") is the document that says "land
+    // **and** pop": the frozen M9+M10 paragraph earlier in that same file says "or", the
+    // AMENDMENT overrules it, and the implementation's note in `victory.ts` records why —
     // with `or`, the condition fired on turn 1 of an ordinary game. This test states the
     // decision as a boundary rather than as an opinion — the population share is walked
     // across its edge exactly, and the land half is shown to be *necessary* rather than
@@ -611,8 +614,12 @@ describe('2. boundaries — every new threshold, at the value and one step below
       victory: { dominationLandPct: 1, dominationPopPct: 50 },
     });
     // The leading player's city is grown to radius 3 by culture; the rival's stays at radius
-    // 1. 37 owned tiles against a denominator of 1,368 land tiles is 2.7 %, comfortably over
-    // the minimum legal threshold of 1 % — which a radius-1 city is not.
+    // 1. **45 owned tiles** against a denominator of 1,368 land tiles is 3.3 %, comfortably
+    // over the minimum legal threshold of 1 % — which a radius-1 city's 5 tiles (0.37 %) are
+    // not. 45 is exactly the radius-3 disc (a 7×7 box minus its four corners) and every one of
+    // those tiles is land on this board, both figures re-measured by R1 with
+    // `scripts/probes/land-numerator-probe.ts`, which rebuilds this fixture field for field;
+    // this sentence said "37 owned tiles … 2.7 %" and no board this file builds produces that.
     const foundedState = founded(9, ruleset);
     const state = withCulture(foundedState, cityOf(foundedState).id, 2, ruleset);
     const me = playerOf(state, 0);

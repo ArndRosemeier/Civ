@@ -60,7 +60,10 @@
  *
  * Counted from each run's own `outcome`, which the runner derives from that run's final
  * state — so a win count here and the `outcome` on the run it came from are the same
- * fact, never two.
+ * fact, never two. **Each row names every player that won the condition** (`byPlayer`,
+ * ascending by player id) and how many games it ended level (`draws`): P1 replaced a single
+ * `winner` field that kept only the first winner it met, so a row could read `count: 5` while
+ * carrying the winner of one of those five games. See `countWins`.
  *
  * ## The planner-failure channel: carried verbatim, never summarised away (M7d)
  *
@@ -85,6 +88,8 @@
  * throw produces the same rows, the same aggregates and the same horizon as one whose
  * policies do not — with the failure visible beside them instead of hidden by them.
  */
+
+import type { PlayerId, VictoryConditionId } from '@civts/core';
 
 import { MEASURED_METRIC_FIELDS, type MeasuredMetricField } from './metrics.js';
 import { runSimulation } from './runner.js';
@@ -241,21 +246,52 @@ export const runBatch = (options: BatchOptions): BatchResult => {
  *
  * A `draw` is counted under its condition like any other ending — "the score condition
  * ended level" is a result a reader needs to see, and dropping it would make the counts
- * sum to fewer games than `stoppedBecause: 'game-over'` reports. `winner` is `null` for
- * those, and `null` is written rather than a placeholder id: the type says a draw has no
- * winner, and inventing seat 0 would be a lie about who won.
+ * sum to fewer games than `stoppedBecause: 'game-over'` reports — and it is counted as its own
+ * field rather than left out of a single winner.
+ *
+ * **Why `byPlayer` and not `winner` (P1).** Until P1 this fold kept the *first* winner it met and
+ * discarded the rest, so a batch in which five games ended culturally, three won by player 0 and
+ * two by player 1, reported `{ outcome: 'cultural', count: 5, winner: 0 }` — a count of five
+ * games, carrying the winner of one of them, which is exactly the "the report cannot say who won"
+ * defect the tournament report had one layer up. Wins are counted per player, ascending by player
+ * id so the row is independent of the order the seeds arrived in, and a game that ended level is
+ * counted as a draw rather than credited to anybody: inventing seat 0 for it would be a lie about
+ * who won.
  */
 const countWins = (runs: readonly SimulationResult[]): readonly WinCount[] => {
-  const counts = new Map<string, WinCount>();
+  const counts = new Map<
+    VictoryConditionId,
+    { count: number; draws: number; wins: Map<PlayerId, number> }
+  >();
+
   for (const run of runs) {
     const outcome = run.outcome;
     if (outcome === undefined) continue;
-    const existing = counts.get(outcome.condition);
-    counts.set(outcome.condition, {
-      outcome: outcome.condition,
-      count: (existing?.count ?? 0) + 1,
-      winner: existing === undefined ? outcome.winner : existing.winner,
-    });
+    const row = counts.get(outcome.condition) ?? {
+      count: 0,
+      draws: 0,
+      wins: new Map<PlayerId, number>(),
+    };
+    row.count += 1;
+    if (outcome.winner === null) {
+      row.draws += 1;
+    } else {
+      row.wins.set(outcome.winner, (row.wins.get(outcome.winner) ?? 0) + 1);
+    }
+    counts.set(outcome.condition, row);
   }
-  return [...counts.values()].sort((a, b) => (a.outcome < b.outcome ? -1 : 1));
+
+  return [...counts.entries()]
+    .map(([outcome, row]) => ({
+      outcome,
+      count: row.count,
+      draws: row.draws,
+      byPlayer: [...row.wins.entries()]
+        .map(([playerId, wins]) => ({ playerId, wins }))
+        // Ascending by player id, and sorted here rather than relying on the map's insertion
+        // order: a row whose order depended on the order the seeds were supplied in would be
+        // the ordering bug this package has fixed twice.
+        .sort((a, b) => Number(a.playerId) - Number(b.playerId)),
+    }))
+    .sort((a, b) => (a.outcome < b.outcome ? -1 : 1));
 };

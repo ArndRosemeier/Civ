@@ -81,13 +81,19 @@ export const VICTORY_CONDITION_ORDER: readonly VictoryConditionId[] = [
  *
  * Four numbers, each with one reader in `victory.ts`:
  *
- * - `dominationLandPct` — the share of the land *any city claims* that wins;
+ * - `dominationLandPct` — the share of the **map's land** a player must own that wins;
  * - `dominationPopPct` — the share of the *world's* citizens that wins;
  * - `culturalVictoryCulture` — the player's total culture that wins;
  * - `scoreVictoryTurn` — the turn at which the highest score wins.
+ *
+ * The first of those was documented for a whole milestone as "the share of the land *any city
+ * claims*", which is the wording the **AMENDMENT at the end of `docs/INTERFACES.md`** rules
+ * wrong: the denominator is the map's land (`map.ts`' `landTileCount`), never the land a city
+ * happens to claim. The DOMINATION condition is evaluated by `victory.ts`' `dominationWinner`,
+ * which states the rule and the measurement that forced it; this file only carries the number.
  */
 export interface VictoryRules {
-  /** Percent (`0..100`) of the land any city claims. */
+  /** Percent (`0..100`) of the **map's** land tiles the player must own. */
   readonly dominationLandPct: number;
   /** Percent (`0..100`) of the world's citizens. */
   readonly dominationPopPct: number;

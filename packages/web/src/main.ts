@@ -43,6 +43,7 @@
 
 import {
   DEFAULT_SETTINGS,
+  MAP_SIZES,
   applyCommand,
   asTileIndex,
   asUnitId,
@@ -50,7 +51,9 @@ import {
   indexToY,
   isGameOver,
   neighbors8,
+  mergeSettings,
   newGame,
+  opponentModeOf,
   parseSettings,
   planAttackUnit,
   planFortifyUnit,
@@ -63,7 +66,17 @@ import {
   type Settings,
   type UnitId,
 } from '@civts/core';
-import { CATALOG, validateRuleset } from '@civts/rules';
+import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
+/**
+ * The opponent, imported rather than written.
+ *
+ * A1 requires a human to play against opponents, and the sim package already owns the only
+ * decision-maker this project has: `SMART_POLICY`, the same policy the tournaments and the
+ * balance sweeps run. A browser-only second implementation would be a second opponent, free to
+ * disagree with the one every measurement in this repository was taken against — the
+ * command-versus-generator defect class this project has already found six times, at a new layer.
+ */
+import { SMART_POLICY, policyRngFor } from '@civts/sim';
 import { hashValue } from '@civts/testing';
 
 import {
@@ -87,7 +100,7 @@ import {
 } from './render.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
-import { humanSeatOf, installTestApi, seamDispatch, toCommand } from './testapi.js';
+import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
 
 /** The seed a page load starts on, when nothing has seeded it. */
 const DEFAULT_SEED = 1;
@@ -127,8 +140,15 @@ const el = <K extends keyof HTMLElementTagNameMap>(
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-/** The validated ruleset the whole session plays on — the same `tuned` catalog the goldens use. */
-const validatedRuleset = (): RulesetView => {
+/**
+ * The validated ruleset the whole session plays on — the same `tuned` catalog the goldens use.
+ *
+ * The type is the **content** ruleset, not the structural view: `validateRuleset` returns the
+ * content, and a policy needs the content (its `PolicyContext` is given the whole ruleset, since
+ * a decision may read a cost or a combat row that the engine's own view never needs). Annotating
+ * this as the view was harmless until the opponent arrived and then read it.
+ */
+const validatedRuleset = (): Ruleset => {
   const validated = validateRuleset(CATALOG, 'tuned');
   if (!validated.ok) {
     // A ruleset that does not validate cannot host a game. There is no honest way to keep going,
@@ -246,7 +266,101 @@ interface Shell {
   readonly panelsRoot: HTMLElement;
   /** Where an opened panel is docked — see `buildShell`. */
   readonly dock: HTMLElement;
+  readonly newGame: NewGameControls;
 }
+
+/**
+ * The new-game surface: A1's "start a new game from the web UI, **choose settings**".
+ *
+ * Before this existed the only way to choose a seed, a map size or a civilisation count was the
+ * test seam, so a human got whatever board the app happened to construct and could not start a
+ * second game at all. Each control carries its own accessible name because the accessibility
+ * contract targets by role and name, and **the engine does the validating**: the values are
+ * handed to `parseSettings`, and the refusal the player reads is the engine's own words. A check
+ * written here would be a second statement of what a legal game is, free to disagree with the
+ * one every other path uses.
+ */
+interface NewGameControls {
+  readonly dialog: HTMLDialogElement;
+  readonly open: HTMLButtonElement;
+  readonly seed: HTMLInputElement;
+  readonly mapSize: HTMLSelectElement;
+  readonly civCount: HTMLInputElement;
+  readonly opponent: HTMLInputElement;
+  readonly start: HTMLButtonElement;
+  readonly problem: HTMLElement;
+}
+
+const buildNewGame = (doc: Document): NewGameControls => {
+  const dialog = doc.createElement('dialog');
+  dialog.setAttribute('aria-label', 'New game');
+
+  const field = (label: string, control: HTMLElement): HTMLLabelElement => {
+    const wrapper = el(doc, 'label', `${label} `);
+    wrapper.append(control);
+    return wrapper;
+  };
+
+  const seed = doc.createElement('input');
+  seed.type = 'number';
+  seed.setAttribute('aria-label', 'Seed');
+  seed.value = String(DEFAULT_SETTINGS.seed);
+
+  const civCount = doc.createElement('input');
+  civCount.type = 'number';
+  civCount.setAttribute('aria-label', 'Civilisations');
+  // The bounds are rendered so the control is usable, but they are not the rule: an out-of-range
+  // value is still passed to the engine and refused by it, which is the path the test exercises.
+  civCount.min = '2';
+  civCount.max = '16';
+  civCount.value = String(DEFAULT_SETTINGS.civCount);
+
+  const mapSize = doc.createElement('select');
+  mapSize.setAttribute('aria-label', 'Map size');
+  for (const size of MAP_SIZES) {
+    const option = el(doc, 'option', size);
+    option.value = size;
+    if (size === DEFAULT_SETTINGS.mapSize) option.selected = true;
+    mapSize.append(option);
+  }
+
+  const opponent = doc.createElement('input');
+  opponent.type = 'checkbox';
+  opponent.setAttribute('aria-label', 'Opponent');
+  opponent.checked = DEFAULT_SETTINGS.ai.opponent === 'policy';
+
+  const problem = el(doc, 'p');
+  problem.setAttribute('role', 'status');
+  problem.setAttribute('aria-label', 'New game problem');
+
+  const start = el(doc, 'button', 'Start new game');
+  start.type = 'button';
+
+  const close = el(doc, 'button', 'Close new game');
+  close.type = 'button';
+  close.addEventListener('click', () => {
+    dialog.close();
+  });
+
+  const fields = el(doc, 'div');
+  fields.append(
+    field('Seed', seed),
+    field('Map size', mapSize),
+    field('Civilisations', civCount),
+    field('Opponent', opponent),
+    problem,
+    start,
+    close,
+  );
+
+  const heading = el(doc, 'h2', 'New game');
+  dialog.append(heading, fields);
+
+  const open = el(doc, 'button', 'New game');
+  open.type = 'button';
+
+  return { dialog, open, seed, mapSize, civCount, opponent, start, problem };
+};
 
 const buildShell = (doc: Document): Shell => {
   const root = el(doc, 'div');
@@ -257,7 +371,8 @@ const buildShell = (doc: Document): Shell => {
   const endTurn = el(doc, 'button', 'End turn');
   endTurn.type = 'button';
   endTurn.dataset['command'] = 'EndTurn';
-  header.append(title, endTurn);
+  const newGame = buildNewGame(doc);
+  header.append(title, newGame.open, endTurn);
 
   const main = el(doc, 'main');
 
@@ -296,7 +411,8 @@ const buildShell = (doc: Document): Shell => {
 
   root.append(header, main);
   doc.body.append(root);
-  return { root, canvas, endTurn, panelsRoot, dock };
+  dock.append(newGame.dialog);
+  return { root, canvas, endTurn, panelsRoot, dock, newGame };
 };
 
 /**
@@ -438,11 +554,20 @@ const start = (): void => {
    */
   let armDispatch: (action: unknown) => 'ok' | 'refused' = () => 'refused';
 
-  /** The app's own runner: validate into a `Command`, apply once, render, refresh. */
+  /**
+   * The app's own runner: split the acting seat off (`splitSeat`, the seam's own rule), validate
+   * into a `Command`, apply once for that seat, render.
+   *
+   * This and the installed seam's `applyOnce` are the same three steps in the same order, because
+   * an action must be applied identically whether a test wrapper is installed or not — the AI's
+   * commands go through both paths, and a wrapper that changed which seat they were applied for
+   * made the opponent silently vanish.
+   */
   const applyAction = (action: unknown): 'ok' | 'refused' => {
-    const command = toCommand(action);
+    const { seat, rest } = splitSeat(action);
+    const command = toCommand(rest);
     if (command === undefined) return 'refused';
-    return dispatchCommand(command).outcome;
+    return dispatchCommand(command, seat).outcome;
   };
 
   const panelsApi: PanelsApi = {
@@ -528,11 +653,14 @@ const start = (): void => {
    * `panels/index.ts`). A refusal changes nothing — no state, no events — and is reported as
    * `'refused'` rather than thrown, so a caller can prove the refusal was the engine's.
    */
-  function dispatchCommand(command: Command): {
+  function dispatchCommand(
+    command: Command,
+    forSeat?: PlayerId,
+  ): {
     readonly outcome: 'ok' | 'refused';
     readonly events: readonly GameEvent[];
   } {
-    const seat = humanSeatOf(state);
+    const seat = forSeat ?? humanSeatOf(state);
     if (seat === undefined) return { outcome: 'refused', events: [] };
 
     // Clear first: the buffer belongs to the call about to happen, so a refusal cannot leave the
@@ -580,11 +708,14 @@ const start = (): void => {
    * selection. Nothing is carried over, because a new game is a new game.
    */
   function reseed(seed: number, options?: unknown): void {
-    const merged = parseSettings({
-      ...state.settings,
-      ...(isRecord(options) ? options : {}),
-      seed,
-    });
+    // The ENGINE's layered merge, not a spread. `{...settings, ...{ai: {opponent: 'off'}}}`
+    // replaces the whole `ai` object, drops `aggression` and `expandFast`, and the strict schema
+    // then refuses the lot — so the caller's intent vanished and the setting looked inert while
+    // not being applied either. One statement of what merging settings means, and it is the
+    // engine's.
+    const merged = parseSettings(
+      mergeSettings(state.settings, mergeSettings(isRecord(options) ? options : {}, { seed })),
+    );
     if (!merged.ok) return;
     state = startGame(merged.value);
     camera = openingCamera(state);
@@ -772,8 +903,89 @@ const start = (): void => {
     });
   });
 
+  /**
+   * Let every civilization that is not the human's take its turn.
+   *
+   * This mirrors `runSimulation`'s ordering exactly — each policy seat asks its policy for
+   * commands, and every command goes through `applyCommand` — because the runner already states
+   * how a policy seat is played and a second statement of it here would be a second opponent.
+   * The policy draws from its OWN stream, derived from the game seed, and never from
+   * `state.rng`: if it consumed the world's stream then switching the opponent on would change
+   * the map and the battles, and the browser game could not be compared with the headless one.
+   *
+   * Called when the human ends their turn and BEFORE the turn advances, which is the runner's
+   * order: every seat acts, and only then does the turn move on. A policy's own `EndTurn` is
+   * skipped for the same reason the runner skips it — the turn boundary belongs to the engine.
+   */
+  function playOpponentSeats(): void {
+    if (opponentModeOf(state.settings) === 'off') return;
+    const human = humanSeatOf(state);
+    for (const player of state.players) {
+      if (player.kind !== 'civ' || player.id === human) continue;
+      const proposed = SMART_POLICY.chooseCommands({
+        state,
+        playerId: player.id,
+        ruleset,
+        rng: policyRngFor(state.settings.seed, player.id, state.turn),
+      });
+      for (const command of proposed) {
+        if (command.type === 'EndTurn') continue;
+        // Through the seam, carrying the acting seat. The dispatch log then shows the rival's
+        // commands as accepted commands naming its own units and cities — which is the only
+        // evidence that distinguishes an opponent from a counter that moved on its own.
+        armDispatch({ ...command, seat: player.id });
+      }
+    }
+    // The human must SEE what the rival did: the log is the engine's own story of the game, and an
+    // opponent that acts invisibly is indistinguishable from one that does nothing.
+    panels.refresh();
+    refreshAbilities();
+    redraw();
+  }
+
   shell.endTurn.addEventListener('click', () => {
+    playOpponentSeats();
     armDispatch({ type: 'EndTurn' });
+  });
+
+  /* --------------------------- the new-game surface ---------------------- */
+
+  /**
+   * The patch the new-game controls describe. It is an `unknown` on purpose: it goes to the
+   * engine's parser exactly as a settings file would, so nothing in this file claims to know what
+   * a legal game is.
+   */
+  const chosenSettings = (): Record<string, unknown> => ({
+    seed: Number(shell.newGame.seed.value),
+    mapSize: shell.newGame.mapSize.value,
+    civCount: Number(shell.newGame.civCount.value),
+    ai: {
+      ...state.settings.ai,
+      opponent: shell.newGame.opponent.checked ? 'policy' : 'off',
+    },
+  });
+
+  shell.newGame.open.addEventListener('click', () => {
+    shell.newGame.problem.textContent = '';
+    shell.newGame.dialog.show();
+  });
+
+  shell.newGame.start.addEventListener('click', () => {
+    // The ENGINE decides whether these are settings and the UI only reports its answer. A check
+    // written here would be a second statement of what a legal game is, and an empty or
+    // non-numeric field is refused by the same parser rather than by a guard beside it.
+    const patch = chosenSettings();
+    const merged = parseSettings({ ...state.settings, ...patch });
+    if (!merged.ok) {
+      const [first] = merged.error;
+      shell.newGame.problem.textContent = `the engine refused these settings: ${
+        first === undefined ? 'no reason given' : `${first.path} ${first.message}`
+      }`;
+      return;
+    }
+    shell.newGame.problem.textContent = '';
+    shell.newGame.dialog.close();
+    reseed(merged.value.seed, patch);
   });
 
   /* ------------------------------- the seam ------------------------------ */
@@ -782,7 +994,7 @@ const start = (): void => {
     state: () => state,
     playerId: () => humanSeatOf(state),
     ruleset,
-    dispatch: (command) => dispatchCommand(command),
+    dispatch: (command, forSeat) => dispatchCommand(command, forSeat),
     lastEvents: () => lastEvents,
     seed: (seed, options) => {
       reseed(seed, options);

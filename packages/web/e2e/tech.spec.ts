@@ -20,6 +20,7 @@ import {
   foundCity,
   hashOf,
   headlessNewGame,
+  OPPONENT_OFF,
   openApp,
   openPanel,
   readState,
@@ -149,7 +150,14 @@ test('A4 tech tree — known / available / locked: the three states match the en
 }) => {
   test.setTimeout(180_000);
   await openApp(page);
-  const probe = await seedApp(page, SEED);
+  // **The opponent is held still, on both sides.** `findKnownTechScene` searches headlessly
+  // (`newGame` + `applyCommand`) and no policy plays the rival seat there, while the browser plays
+  // `SMART_POLICY` for it on every `End turn` this test drives. Left on, the browser's game and the
+  // replayed one are different games, so the hash equality below — the proof that the tech rows are
+  // being compared against the right state — could not hold. The setting is seeded here, so the
+  // probe's `state.settings` carries it into `settingsFor`: one settings object for the search, the
+  // replay and the browser. See `OPPONENT_OFF` in `helpers.ts`.
+  const probe = await seedApp(page, SEED, OPPONENT_OFF);
   const settingsFor = (seed: number): Settings => settingsFrom(probe.settings, seed);
 
   let scene: KnownTechScene | undefined;

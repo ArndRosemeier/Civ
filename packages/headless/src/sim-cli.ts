@@ -90,6 +90,7 @@ import {
   err,
   loadSettings,
   ok,
+  type GameOutcome,
   type MapSize,
   type Provenance,
   type Result,
@@ -98,6 +99,7 @@ import {
   type Settings,
   type SettingsIssue,
   type UnitDomain,
+  type VictoryConditionId,
   terrainDefenseBonus,
 } from '@civts/core';
 import {
@@ -140,9 +142,11 @@ import {
   type TerrainPatch,
   type TournamentResult,
   type TournamentTotals,
+  type TournamentOutcomeDistribution,
   type TurnMetrics,
   type UnitPatch,
   type Violation,
+  type WinCount,
   type YieldsPatch,
 } from '@civts/sim';
 import { canonicalize, hashValue } from '@civts/testing';
@@ -1396,6 +1400,17 @@ export interface SimRunReport {
   readonly seed: number;
   readonly turnsPlayed: number;
   readonly stoppedBecause: StopReason;
+  /**
+   * **What ended this run, or that nothing did** — the engine's own outcome, read from
+   * `SimulationResult.outcome` (P1). Required and always present, in both arms of the union.
+   *
+   * A batch is a list of games like a tournament is, and its rows carried only `stoppedBecause`:
+   * `'game-over'` said a game had ended and never which condition ended it or who won, which is
+   * the same hole the tournament report had. The seat's policy name here is the batch's single
+   * `--policy` (`SimParameters.policy`), because a batch seats one policy in every chair — the
+   * rotation, and the reason a seat total is meaningful there, belongs to the tournament.
+   */
+  readonly outcome: GameOutcomeReport;
   readonly finalHash: string;
   readonly metricRows: number;
   /** The last turn sampled; 0 when a run produced no rows. */
@@ -1404,6 +1419,14 @@ export interface SimRunReport {
   readonly horizon: readonly MetricTotal[];
   /** The final sampled rows themselves, for a JSON consumer that wants every detail. */
   readonly final: readonly TurnMetrics[];
+  /**
+   * **Registry checks this run really ran**, read from `SimulationResult.invariantChecks`
+   * (F2) — the per-run term the batch total is summed from, carried so a reader can see
+   * *which* run contributed what rather than only the sum. A decided run contributes
+   * `turnsPlayed × count`, like any other, now that the registry is checked before the
+   * game-over break; it contributed one registry less while it was not.
+   */
+  readonly invariantChecks: number;
   readonly violations: readonly ReportedViolation[];
   /**
    * Planner failures this run reported — empty for a run the AI actually played.
@@ -1418,7 +1441,15 @@ export interface SimRunReport {
 export interface SimInvariantReport {
   readonly names: readonly string[];
   readonly count: number;
-  /** Whole-registry checks run: one per turn played, per run. */
+  /**
+   * **Whole-registry checks the runs really ran**, summed from each run's own
+   * `SimulationResult.invariantChecks` (F2). It is a count, not `turnsPlayed × count`:
+   * the product over-reports by one whole registry per decided game, because the runner
+   * used to break on the deciding turn *before* checking it. The field's own doc comment
+   * said "one per turn played" while the loop skipped the turn that ended the game —
+   * `sim-cli.test.ts` now pins the counted figure on a fixture whose runs really end, so
+   * the arithmetic and the claim cannot drift apart again.
+   */
   readonly checks: number;
   readonly violations: number;
 }
@@ -1476,11 +1507,43 @@ export interface SimReport {
    * summarising them: a batch's job is to fold metric rows, and this is not a row).
    */
   readonly plannerFailures: readonly ReportedPlannerFailure[];
-  /** The batch's win counts; the key is absent while the engine has no victory condition. */
-  readonly wins?: readonly { readonly outcome: string; readonly count: number }[];
+  /**
+   * The batch's win counts, **the engine's own `WinCount[]`** rather than a restatement of it:
+   * one row per victory condition a run reached, ordered by condition id, each naming every
+   * player that won it (`byPlayer`) and how many games ended level (`draws`). The key is absent
+   * — omitted, never `[]` — while no run in the batch ended, which is the honest report for a
+   * batch of games that all reached their horizon.
+   *
+   * Since P1 each row carries the winners rather than a single `winner`: the old field kept the
+   * first winner of the condition and dropped the rest, so a batch of five cultural wins split
+   * 3–2 read as `winner: 0` — a count that could not say who won, which is the same defect the
+   * tournament report had.
+   */
+  readonly wins?: readonly WinCount[];
 }
 
-export const SIM_REPORT_VERSION = 1;
+/**
+ * The version of the batch report's shape.
+ *
+ * - 1 — M7b/M7d: the parameters, the ruleset, the totals, the invariants, the aggregates, the
+ *   horizon totals, the runs, the violations, the planner failures and the win counts.
+ * - 2 — **P1: each run's own ending.** `runs[]` gains `outcome` (the condition, the winner, the
+ *   seat and the policy that played it, or an explicit "no outcome"), and `wins` rows now carry
+ *   every winner (`byPlayer`) instead of a single one. Bumped for the same reason the tournament
+ *   report's version was: a consumer parsing version 1 read a runs table in which "how did this
+ *   run end?" was unanswerable, and a version that did not move would let it do so silently.
+ *
+ * **Q1/F2 added `runs[].invariantChecks` without moving the version, and that is deliberate.**
+ * A field *added* to a shape breaks no reading of it: a version-2 consumer that never looks at
+ * the new key reads exactly what it read before, and one that wants the per-run check count can
+ * now find it instead of dividing the batch total. What did change meaning under the same name is
+ * `invariants.checks` — it is a **count** of the checks the runs ran rather than
+ * `Σ turnsPlayed × count` — and that is the repair itself, not a new shape: for every run whose
+ * deciding turn was already being checked the two agreed, and where they disagreed the old figure
+ * was the wrong one. Recorded here rather than in a version bump because a consumer cannot act on
+ * the difference: the numbers it would have compared are the numbers this report now states.
+ */
+export const SIM_REPORT_VERSION = 2;
 
 /** Exact integer totals for `metrics`, over `rows`, in the order given. */
 const metricTotals = (
@@ -1564,17 +1627,30 @@ export interface SimReportInput {
  * read as a formatting function and nothing else.
  */
 export const buildSimReport = (input: SimReportInput): SimReport => {
+  // A batch seats the same policy in every chair (`SimParameters.policy`), so the seat labels the
+  // shared outcome builder resolves are that name for every seat of the game. Built from the
+  // parameters rather than restated, so a run's winner is named with the policy that really
+  // played it.
+  const seatLabels = Array.from(
+    { length: input.parameters.civCount },
+    () => input.parameters.policy,
+  );
+  const seatIndices = Array.from({ length: input.parameters.civCount }, (_, seat) => seat);
+
   const runs: readonly SimRunReport[] = input.batch.runs.map((run) => {
     const rows = horizonRows(run);
     return {
       seed: run.seed,
       turnsPlayed: run.turnsPlayed,
       stoppedBecause: run.stoppedBecause,
+      // The engine's own outcome, with the winner's seat resolved to the policy in it.
+      outcome: gameOutcomeReport(run, seatIndices, seatLabels),
       finalHash: run.finalHash,
       metricRows: run.metrics.length,
       finalTurn: rows[0]?.turn ?? 0,
       horizon: metricTotals(rows, HORIZON_METRICS),
       final: rows,
+      invariantChecks: run.invariantChecks,
       violations: reportedViolations(run.seed, run.violations),
       plannerFailures: reportedPlannerFailures(run.seed, run.plannerFailures),
     };
@@ -1588,7 +1664,12 @@ export const buildSimReport = (input: SimReportInput): SimReport => {
   const turnsPlayed = runs.reduce((total, run) => total + run.turnsPlayed, 0);
   const metricRows = runs.reduce((total, run) => total + run.metricRows, 0);
   const invariantCount = input.invariantNames.length;
-  const checks = runs.reduce((total, run) => total + run.turnsPlayed * invariantCount, 0);
+  // **Counted, never derived** (F2): the figure comes from what each run's registry really
+  // did. The old `turnsPlayed * invariantCount` product was larger than the truth on any
+  // batch containing a decided game — by one whole registry per such game — so the
+  // denominator under "zero violations" was a claim about the loop rather than a reading of
+  // it. There is no multiplication here for that reason, not merely for elegance.
+  const checks = runs.reduce((total, run) => total + run.invariantChecks, 0);
   const horizonTurns = runs.map((run) => run.finalTurn).filter((turn) => turn > 0);
   const horizonTurnMin = horizonTurns.length === 0 ? 0 : Math.min(...horizonTurns);
   const horizonTurnMax = horizonTurns.length === 0 ? 0 : Math.max(...horizonTurns);
@@ -1817,24 +1898,31 @@ const horizonOf = (run: SimRunReport, metric: MeasuredMetricField): MetricTotal 
 const runTableLines = (runs: readonly SimRunReport[]): readonly string[] => {
   const column = 12;
   const stopWidth = 13;
+  // As wide as the widest ending label of this batch, so a long condition name cannot run into
+  // the metrics beside it. Layout, not data: the label is composed from `run.outcome`'s fields.
+  const outcomeWidth =
+    runs.reduce((width, run) => Math.max(width, outcomeLabel(run.outcome).length), 0) + 2;
   // Header and rows are built from one width list, so a column can never drift away
   // from the value under it.
   const row = (
     seed: string,
     turns: string,
     stop: string,
+    outcome: string,
     turn: string,
     cells: readonly string[],
     hash: string,
   ): string =>
     `  ${seed.padStart(6)} ${turns.padStart(5)}  ${padRight(stop, stopWidth)}` +
-    `${turn.padStart(4)}  ${cells.map((cell) => cell.padStart(column)).join('')}  ${hash}`;
+    `${padRight(outcome, outcomeWidth)}${turn.padStart(4)}  ` +
+    `${cells.map((cell) => cell.padStart(column)).join('')}  ${hash}`;
 
   const lines = [
     row(
       'seed',
       'turns',
       'stop',
+      'outcome',
       'turn',
       HORIZON_METRICS.map((metric) => metric),
       'final hash',
@@ -1852,6 +1940,7 @@ const runTableLines = (runs: readonly SimRunReport[]): readonly string[] => {
         String(run.seed),
         String(run.turnsPlayed),
         run.stoppedBecause,
+        outcomeLabel(run.outcome),
         String(run.finalTurn),
         cells,
         run.finalHash,
@@ -1957,9 +2046,18 @@ export const renderSimReport = (report: SimReport): string => {
     }`,
   );
 
+  // The batch's own census of endings, when any run reached a condition: one line per condition,
+  // printing the winners the row carries (P1) rather than a single one of them. A condition that
+  // ended game(s) level says so, and `batch.test.ts` asserts the two figures add up to the count.
   if (report.wins !== undefined) {
     for (const win of report.wins) {
-      lines.push(`  wins: ${win.outcome} ${String(win.count)}`);
+      const winners = win.byPlayer
+        .map((row) => `player ${String(row.playerId)} ${String(row.wins)}`)
+        .join(', ');
+      const drawn = win.draws === 0 ? '' : `, ${String(win.draws)} drawn`;
+      lines.push(
+        `  wins: ${win.outcome} ${String(win.count)}${winners === '' ? '' : ` (${winners})`}${drawn}`,
+      );
     }
   }
 
@@ -2550,6 +2648,80 @@ export interface TournamentParameters {
   readonly seeds: readonly number[];
 }
 
+/**
+ * Who won a game, and the seat — and the policy — they won it from.
+ *
+ * Carried by **both** reports the CLI produces: the tournament's games and the batch's runs
+ * (`civt` sim). The two differ in how a seat is filled — a tournament rotates a policy list
+ * across seats, a batch seats one policy in every chair — and not in what a winner is, so there
+ * is one type and one builder (`gameOutcomeReport`) rather than two that could disagree.
+ *
+ * **`playerId` and `seat` are the same number in this engine, and both are carried on
+ * purpose.** `PlayerId` *is* the index into `state.players` (the M3 invariant `explored` and
+ * every per-player array depend on), barbarians are appended after the civilizations, and
+ * `civPlayers` decides that only a civilization may win — so a winner's id is always a seat of
+ * the rotation. They are kept apart because "player 1 won" and "seat 1 won" are different
+ * claims to a reader of a tournament report: the rotation is indexed by seat, and a report that
+ * printed only the engine id would leave a reader to work out that the two coincide.
+ * `seatPolicy` is the fact the seat total cannot tell you — **which policy sat there in this
+ * game**, which is what makes "seat 1 won 8 of 20" a statement about a position rather than
+ * about a strategy.
+ */
+export interface GameWinnerReport {
+  /** The winning civilization's `PlayerId`. */
+  readonly playerId: number;
+  /** The seat that player was — its position in the rotation. */
+  readonly seat: number;
+  /** The policy that played that seat **in this game**, as the seats column labels it. */
+  readonly seatPolicy: string;
+}
+
+/**
+ * **How one game ended** — the field the tournament report was missing.
+ *
+ * The report carried `stoppedBecause` and nothing else, so a run could prove games *ended*
+ * (`'game-over'`) while being unable to name the condition that ended them or the winner. A3
+ * requires "at least one victory condition demonstrated ending a real game", and an ending
+ * nobody can name is not a demonstration — which is what the alpha audit measured.
+ *
+ * The shape is **derived from the engine's own `GameOutcome`** (`SimulationResult.outcome`,
+ * which `runner.ts` reads from `gameOutcomeOf`) and never recomputed here: `condition`, `kind`,
+ * `turn` and the winner are the engine's values, and the only work done here is resolving the
+ * winner's seat to the policy label the rotation put there. A second implementation of the
+ * victory rule in a *report* is exactly the disagreement this project keeps hunting.
+ *
+ * Absence is spelled as a union arm rather than as a `null`-holding key: `ended: false` is "no
+ * outcome — the run stopped before any condition held", which is the ordinary end of a
+ * turn-limited run, and the row still names the engine's stop reason beside it. `text` is a
+ * stored sentence so that no renderer has to compose one.
+ */
+export type GameOutcomeReport =
+  | {
+      readonly ended: true;
+      /**
+       * The engine's own reading: `victory` when a player won, `draw` when the game was level.
+       *
+       * Typed as the engine's `GameOutcome['kind']` rather than narrowed to the two the runner
+       * writes, because `defeat` is a **viewer's** word (`outcomeFor` answers it for a player who
+       * is watching, and a run has no seat) — so narrowing here would be a second statement of
+       * which values a run's outcome can take. `runner.ts` states that rule where it builds the
+       * value.
+       */
+      readonly kind: GameOutcome['kind'];
+      readonly condition: VictoryConditionId;
+      /** The turn the condition first held — the engine's `outcome.turn`. */
+      readonly turn: number;
+      /** The winner and their seat; **absent** for a draw, which has no winner. */
+      readonly winner?: GameWinnerReport;
+      /** One line naming the ending, for a text renderer and for `--json` readers alike. */
+      readonly text: string;
+    }
+  | {
+      readonly ended: false;
+      /** One line saying so, naming the stop reason and the horizon that was reached. */
+      readonly text: string;
+    };
+
 /** One game's summary, with the seating the rotation gave it. */
 export interface TournamentGameReport {
   readonly seed: number;
@@ -2557,6 +2729,13 @@ export interface TournamentGameReport {
   readonly seats: readonly string[];
   readonly turnsPlayed: number;
   readonly stoppedBecause: StopReason;
+  /**
+   * **What ended this game, or that nothing did** — read from the engine's own outcome.
+   *
+   * Required and always present, in both arms: a game in which no condition held carries
+   * `ended: false` and says so, rather than leaving a reader to infer it from a missing key.
+   */
+  readonly outcome: GameOutcomeReport;
   readonly finalHash: string;
   readonly metricRows: number;
   readonly violations: readonly ReportedViolation[];
@@ -2644,7 +2823,10 @@ export interface TournamentPolicyReport {
  *
  * `totals` is `@civts/sim`'s own `TournamentTotals`, embedded rather than restated: the
  * per-seat and per-policy aggregates in this report *are* the engine's, not a second
- * opinion about them.
+ * opinion about them. That includes **`totals.outcomes`** (P1) — the census of what ended
+ * each game, wins by seat included — which is counted once, in the engine-adjacent package,
+ * from each run's own engine-read outcome, so the text block below the games table and a
+ * `--json` consumer cannot disagree about it.
  */
 export interface TournamentReport {
   readonly kind: 'civts-tournament-report';
@@ -2679,7 +2861,19 @@ export interface TournamentReport {
   readonly plannerFailures: readonly ReportedPlannerFailure[];
 }
 
-export const TOURNAMENT_REPORT_VERSION = 1;
+/**
+ * The version of the tournament report's shape.
+ *
+ * - 1 — M7b/M7d: the parameters, the ruleset, the budget, the verdict, the totals, the seats,
+ *   the policies, the games, the violations and the planner failures.
+ * - 2 — **P1: the outcome census.** Each `games[]` row gains `outcome` (the condition, the
+ *   winner, the seat and the policy that played it, or an explicit "no outcome"), and
+ *   `totals.outcomes` gains the distribution — counts by condition with zeros included, the
+ *   no-outcome count, wins by seat and the engine's stop reasons. Bumped because a consumer
+ *   parsing version 1 would read a games table in which "how did this game end?" is
+ *   unanswerable, and a version number that did not move would let it do so silently.
+ */
+export const TOURNAMENT_REPORT_VERSION = 2;
 
 /**
  * What a tournament's unit of work is called in the violation banner.
@@ -2723,6 +2917,75 @@ export interface TournamentReportInput {
 }
 
 /**
+ * One game's outcome, read from the engine's own value.
+ *
+ * **This function decides nothing about victory.** `condition`, `kind`, `turn` and the winner
+ * are `SimulationResult.outcome` — the runner's read of `gameOutcomeOf`, which is the one
+ * statement of the victory rule (`core/victory.ts`). The only work done here is *naming*: the
+ * winner's seat, and the policy the rotation put in it, so a report can say "seat 1, smart #1"
+ * without a reader having to consult the seat plan, and one English sentence per game so that
+ * no renderer composes one.
+ *
+ * A game with no outcome is spelled `ended: false` and says which engine reason stopped it and
+ * after how many turns — the honest "no outcome, the run reached its horizon" that a
+ * turn-limited run must report rather than an inferred absence.
+ *
+ * An absent arm is impossible by construction: `seatPlan` seats every policy in every game, so
+ * a winner the plan does not seat is thrown as an internal error rather than printed as a game
+ * that somehow ended without a position to end it from.
+ */
+const gameOutcomeReport = (
+  game: SimulationResult,
+  seatsInGame: readonly number[],
+  labels: readonly string[],
+): GameOutcomeReport => {
+  const outcome = game.outcome;
+
+  if (outcome === undefined) {
+    return {
+      ended: false,
+      text:
+        `no outcome — the run stopped at ${game.stoppedBecause} after ` +
+        `${String(game.turnsPlayed)} ${plural(game.turnsPlayed, 'turn')} with the game still in play`,
+    };
+  }
+
+  const winnerSeat = outcome.winner;
+  if (winnerSeat === null) {
+    return {
+      ended: true,
+      kind: outcome.kind,
+      condition: outcome.condition,
+      turn: outcome.turn,
+      text:
+        `${outcome.condition} — the game ended level on turn ${String(outcome.turn)}: ` +
+        'the condition held and named no winner',
+    };
+  }
+
+  const playerId = Number(winnerSeat);
+  const policyIndex = seatsInGame[playerId];
+  if (policyIndex === undefined) {
+    throw new Error(
+      `internal: seed ${String(game.seed)} reported winner ${String(playerId)}, which is not one ` +
+        `of the ${String(seatsInGame.length)} seats the rotation seats`,
+    );
+  }
+  const seatPolicy = seatNameOf(labels, policyIndex);
+
+  return {
+    ended: true,
+    kind: outcome.kind,
+    condition: outcome.condition,
+    turn: outcome.turn,
+    winner: { playerId, seat: playerId, seatPolicy },
+    text:
+      `${outcome.condition} — player ${String(playerId)} won on turn ${String(outcome.turn)}, ` +
+      `from seat ${String(playerId)} (${seatPolicy})`,
+  };
+};
+
+/**
  * Turn a tournament result into the report. **Every figure the text prints is computed
  * here** (or is a field of the engine's result), and the renderer below only formats.
  *
@@ -2751,6 +3014,9 @@ export const buildTournamentReport = (input: TournamentReportInput): TournamentR
       seats: seatsInGame.map((policyIndex) => seatNameOf(labels, policyIndex)),
       turnsPlayed: game.turnsPlayed,
       stoppedBecause: game.stoppedBecause,
+      // The engine's own outcome, with the winner's seat resolved to the policy that played it.
+      // Read, never re-derived — see `gameOutcomeReport`.
+      outcome: gameOutcomeReport(game, seatsInGame, labels),
       finalHash: game.finalHash,
       metricRows: game.metrics.length,
       violations: reportedViolations(game.seed, game.violations),
@@ -2800,7 +3066,9 @@ export const buildTournamentReport = (input: TournamentReportInput): TournamentR
   const plannerFailures = games.flatMap((game) => game.plannerFailures);
   const verdict = tournamentVerdict(result);
   const invariantCount = input.invariantNames.length;
-  const checks = result.games.reduce((total, game) => total + game.turnsPlayed * invariantCount, 0);
+  // Counted, never derived — the same rule the batch report follows, and for the same reason:
+  // a tournament of decided games is where the old product was wrong by the most.
+  const checks = result.games.reduce((total, game) => total + game.invariantChecks, 0);
 
   const invariantSentence =
     verdict.violations === 0
@@ -2891,19 +3159,98 @@ const tournamentGameLines = (games: readonly TournamentGameReport[]): readonly s
     (width, game) => Math.max(width, game.seats.join(', ').length),
     0,
   );
+  // The outcome column is as wide as the widest label this report has, so a long condition name
+  // cannot run into the hash beside it. Layout, not data — the label itself is composed from
+  // fields of `game.outcome`.
+  const outcomeWidth =
+    games.reduce((width, game) => Math.max(width, outcomeLabel(game.outcome).length), 0) + 2;
   // Header and rows are built from one width list, so a column can never drift away from
   // the value under it.
   const header =
     `  ${padRight('seed', 6)}${padRight('seats', seatsWidth + 2)}${padRight('turns', 7)}` +
-    `${padRight('stop', 13)}${padRight('rows', 6)}final hash`;
+    `${padRight('stop', 13)}${padRight('outcome', outcomeWidth)}${padRight('rows', 6)}final hash`;
   const lines = [header];
   for (const game of games) {
     lines.push(
       `  ${padRight(String(game.seed), 6)}${padRight(game.seats.join(', '), seatsWidth + 2)}` +
         `${padRight(String(game.turnsPlayed), 7)}${padRight(game.stoppedBecause, 13)}` +
+        padRight(outcomeLabel(game.outcome), outcomeWidth) +
         `${padRight(String(game.metricRows), 6)}${game.finalHash}`,
     );
   }
+  return lines;
+};
+
+/**
+ * The short label the games table prints for one game's outcome.
+ *
+ * Composed from the stored fields (`condition`, the winner's `seat`) and nothing else — no
+ * figure here is derived, and the long sentence a reader wants is `outcome.text`, which travels
+ * verbatim in `--json`. A game that never ended says so in words rather than leaving a blank.
+ */
+const outcomeLabel = (outcome: GameOutcomeReport): string => {
+  if (!outcome.ended) return 'no outcome';
+  return outcome.winner === undefined
+    ? `${outcome.condition} (level)`
+    : `${outcome.condition} seat ${String(outcome.winner.seat)}`;
+};
+
+/**
+ * The outcome census, printed from the report's own field — every figure below is a counted
+ * value of `report.totals.outcomes`, and this function performs no arithmetic on any of them.
+ *
+ * It exists because the timings and the pass/fail verdict are both silent about *how* a
+ * tournament ended: a run in which all twenty games ended the same way, or in which one seat won
+ * every one of them, reads exactly like a healthy mix. The distribution is where those two
+ * questions — which conditions actually fire, and whether a seat is an advantage — are answered
+ * by counts rather than by impression, and the zeros are printed deliberately: a condition that
+ * never fired is a finding, not an absence.
+ */
+const tournamentOutcomeLines = (outcomes: TournamentOutcomeDistribution): readonly string[] => {
+  const lines: string[] = [
+    '',
+    `outcomes    ${String(outcomes.endedGames)} of ${String(outcomes.games)} ` +
+      `${plural(outcomes.games, 'game')} ended by a victory condition, ` +
+      `${String(outcomes.noOutcomeGames)} with no outcome; counted once, in @civts/sim's ` +
+      "totals.outcomes, from each game's own engine-read outcome:",
+    `  ${padRight('condition', 14)}${padRight('games', 7)}${padRight('wins', 6)}draws`,
+  ];
+
+  for (const row of outcomes.conditions) {
+    lines.push(
+      `  ${padRight(row.condition, 14)}${padRight(String(row.games), 7)}` +
+        `${padRight(String(row.wins), 6)}${String(row.draws)}`,
+    );
+  }
+  lines.push(
+    `  ${padRight('no outcome', 14)}${padRight(String(outcomes.noOutcomeGames), 7)}` +
+      `${padRight('0', 6)}0`,
+  );
+
+  lines.push('  wins by seat — the position, not the strategy:');
+  for (const seat of outcomes.seats) {
+    lines.push(
+      `    seat ${String(seat.seat)} — ${String(seat.wins)} of ${String(seat.games)} ` +
+        `${plural(seat.games, 'game')} won; played by ${seat.policies.join(', ')}`,
+    );
+  }
+
+  lines.push('  stop reasons — why each game left the loop:');
+  for (const reason of outcomes.stopReasons) {
+    lines.push(`    ${padRight(reason.stoppedBecause, 14)}${String(reason.games)}`);
+  }
+
+  // The sentence is emitted **only** when the data says it: a run with one ending says nothing
+  // about the conditions being unreachable, and a report that always carried the line would be
+  // claiming a finding it had not measured.
+  if (outcomes.games > 0 && outcomes.noOutcomeGames === outcomes.games) {
+    lines.push(
+      '  FINDING       every game in this run reached its horizon and none ended by a victory',
+      '                condition, so this run is evidence that no condition can be reached here',
+      '                (at this horizon and this catalog) — a finding, not a table of outcomes',
+    );
+  }
+
   return lines;
 };
 
@@ -3000,6 +3347,7 @@ export const renderTournamentReport = (report: TournamentReport): string => {
 
   lines.push('', 'games (ascending seed, with the policy each seat was played by):');
   lines.push(...tournamentGameLines(report.games));
+  lines.push(...tournamentOutcomeLines(report.totals.outcomes));
 
   lines.push(
     '',

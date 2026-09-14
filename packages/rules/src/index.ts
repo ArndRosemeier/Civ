@@ -869,7 +869,7 @@ export interface ScoreSpec {
  * | condition | threshold | field |
  * |---|---|---|
  * | conquest | last civilization standing | *(none — it is a structural rule)* |
- * | domination | land **or** population share | `dominationLandPct`, `dominationPopPct` |
+ * | domination | land **and** population share — **both** | `dominationLandPct`, `dominationPopPct` |
  * | cultural | accumulated player culture | `culturalVictoryCulture` |
  * | score | the turn limit | `scoreVictoryTurn` |
  *
@@ -877,6 +877,27 @@ export interface ScoreSpec {
  * cities" is `core/victory.ts`' `conquestWinner`, a shape of the board rather than a
  * magnitude. Nothing here can be turned to make conquest easier or harder, which is
  * worth stating so a sweep does not go looking for the knob.
+ *
+ * ## Domination is an AND, and the land share is over the MAP's land
+ *
+ * Two corrections to this document's own earlier wording, both ruled on by the
+ * **AMENDMENT at the end of `docs/INTERFACES.md`**, which holds that the M9+M10
+ * contract's sentence — "land **or** population", measured against "claimed land" — was
+ * **wrong and the implementation right**:
+ *
+ * 1. **Both shares must hold.** `dominationWinner` returns early when the land half
+ *    fails and only then tests the population half. The "or" reading was measured: with
+ *    it, domination fires on **turn 1** of an ordinary game, because the first
+ *    civilization to found a capital holds 100 % of both the claimed land and the world's
+ *    citizens before anybody else has been polled.
+ * 2. **The land denominator is `landTileCount` — every land tile on the map — not the
+ *    land any city claims.** A share of claimed land is a denominator a player *lowers*
+ *    by claiming less, which makes the condition easier the worse they play; a percentage
+ *    of the world's ground is a number that does not move while they make progress.
+ *
+ * The rule itself is stated once, in `core/victory.ts`' `dominationWinner`, and pinned at
+ * each threshold by `packages/testing/test/m9-m10-adversarial.test.ts` (which shows the
+ * land half is *necessary*, the half an "or" reading would have let through).
  *
  * ## The two percentages are compared with INTEGER arithmetic
  *
@@ -914,21 +935,32 @@ export interface ScoreSpec {
  */
 export interface VictorySpec {
   /**
-   * The share of the world's **claimed** land a player must hold to win by domination.
-   * Integer percentage, and the comparison is `>=`. `1..100`.
+   * The share of the **map's land** a player must hold to win by domination. Integer
+   * percentage, and the comparison is `>=`. `1..100`.
    *
-   * "Claimed" rather than "all": the denominator is the number of tiles any
-   * civilization's culture has claimed, because the map's size is an experiment's
-   * choice. A world where nothing is claimed cannot fire this condition, which is
-   * `victory.ts`' rule rather than a special case here.
+   * The denominator is `core/map.ts`' `landTileCount` — every land tile on the map —
+   * and **not** the land any city claims. The frozen M9+M10 contract said "claimed
+   * land"; the AMENDMENT at the end of `docs/INTERFACES.md` rules that wording wrong,
+   * because a share of claimed land is a moving denominator a player can lower by
+   * claiming less, which makes the condition easier the worse they play. On turn 1 the
+   * first capital owned 5 of the 5 claimed tiles — 100 % — and a 60 % threshold was met
+   * before anybody had played; `core/victory.ts` records that measurement.
+   *
+   * This half is **required**, not one alternative of two: `dominationWinner` returns
+   * early when this share fails and only then tests `dominationPopPct`.
    */
   readonly dominationLandPct: number;
   /**
-   * The share of the world's **civilian** population a player must hold to win by
-   * domination. Integer percentage, compared with `>=`. `1..100`.
+   * The share of the world's population a player must hold to win by domination.
+   * Integer percentage, compared with `>=`. `1..100`.
    *
-   * Barbarians have no population and no cities (`civPlayers()` decides what a
-   * civilization is), so they are not in the denominator and cannot win by this route.
+   * "The world's population" counts **every city's citizens, barbarian cities
+   * included** — it is a fact about the world, not about civilizations. Barbarians
+   * never *win* by this route (`civPlayers()` decides who is a candidate), so their
+   * citizens appear only in the denominator.
+   *
+   * Required together with `dominationLandPct`: domination is an AND over the two
+   * shares, and a world with no citizens is a world with no domination victory.
    */
   readonly dominationPopPct: number;
   /**
@@ -2246,15 +2278,22 @@ export const CATALOG: Catalog = {
    * | condition | threshold |
    * |---|---|
    * | conquest | *(none — last civilization with a city)* |
-   * | domination | 60% of claimed land **or** 40% of civilian population |
+   * | domination | **both** 60% of the map's land **and** 40% of the world's population |
    * | cultural | 1,500 accumulated culture |
    * | score | turn 200 |
    *
    * **The two shares are integers and are compared with `>=`**, which is what makes the
-   * boundary the value itself: a player holding exactly 60% of the claimed land wins.
-   * The land share is the stricter of the two because land is harder to take than
-   * population is to grow, and the population share is the one a tall, peaceful empire
-   * reaches — the pair exists so domination is not one strategy's condition.
+   * boundary the value itself: a player holding exactly 60% of the map's land tiles *and*
+   * exactly 40% of the world's citizens wins. **Domination requires both shares** — it is
+   * an AND, not an OR, and the land half is measured against the **map's** land rather
+   * than against the land any city claims. The frozen M9+M10 contract wrote "or" and
+   * "claimed land"; the AMENDMENT at the end of `docs/INTERFACES.md` rules that wording
+   * wrong and the implementation right, for two measured reasons: with "or", domination
+   * fired on turn 1 of an ordinary game (the first capital holds 100% of the claimed land
+   * and 100% of the world's citizens), and a share of *claimed* land is a denominator a
+   * player lowers by claiming less. `core/victory.ts`' `dominationWinner` is the rule;
+   * `packages/testing/test/m9-m10-adversarial.test.ts` pins each half at its own
+   * threshold and shows the land half is necessary.
    *
    * **1,500 culture is reachable and not automatic.** A city with a temple produces 1 per
    * turn; the shipped catalog's wonders and libraries add more; a four-city empire with

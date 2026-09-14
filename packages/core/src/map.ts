@@ -462,19 +462,37 @@ export const WATER_ROLES: readonly TerrainRole[] = ['ocean', 'coast'];
 export const isWaterRole = (role: TerrainRole): boolean => WATER_ROLES.includes(role);
 
 /**
+ * **Is the tile at `index` land?** — and the one statement of what ground counts as land.
+ *
+ * Read through the ruleset's terrain rows rather than guessed from an id or a role name, so a
+ * terrain a content pack adds counts as land unless its own row says it is water. A tile whose
+ * terrain the ruleset does not describe counts as **not** land — the map and the ruleset disagree
+ * about that tile, and calling it land would inflate a denominator with ground nobody can
+ * describe, which is the reading `landTileCount` and the domination numerator both take.
+ *
+ * It is exported because it had grown a second copy: `borders.ts` carried a private `isLandAt`
+ * (`Q3-VERIFICATION.md` §B4, R2's R2-F3) that re-derived exactly this three-line rule beside a doc
+ * comment naming `landTileCount` as its source. Two implementations of "is this ground land?" is
+ * the drift this project's one-statement discipline exists to prevent — the M2 lesson about two
+ * writers of one layer, applied to a predicate — so the copy is deleted and the readers call this.
+ */
+export const isLandAt = (map: GameMap, ruleset: RulesetView, index: number): boolean => {
+  const terrain = terrainAtIndex(map, index);
+  if (terrain === undefined) return false;
+  const def = ruleset.terrains.find((row) => row.id === terrain);
+  return def !== undefined && !isWaterRole(def.role);
+};
+
+/**
  * **How many tiles of this map are land** — the denominator M10's domination rule uses.
  *
- * Read through the ruleset's terrain rows rather than guessed from an id or a role name, so
- * a terrain a content pack adds counts as land unless it says it is water. A tile whose
- * terrain the ruleset does not describe counts as **not** land: the map and the ruleset
- * disagree about that tile, and inflating the denominator with ground nobody can occupy
- * would make domination strictly harder for a reason no catalog row states.
+ * One pass over the map's terrain, each tile decided by `isLandAt` — the single predicate, so
+ * this count and every other "is this tile land?" question in the engine cannot disagree.
  */
 export const landTileCount = (map: GameMap, ruleset: RulesetView): number => {
   let total = 0;
-  for (const id of map.terrain) {
-    const def = ruleset.terrains.find((terrain) => terrain.id === id);
-    if (def !== undefined && !isWaterRole(def.role)) total += 1;
+  for (let index = 0; index < map.terrain.length; index += 1) {
+    if (isLandAt(map, ruleset, index)) total += 1;
   }
   return total;
 };

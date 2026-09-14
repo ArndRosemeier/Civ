@@ -2047,8 +2047,11 @@ loop, before the turn increments) so there is one statement of the rule:
 - **conquest** — you own every other civilization's original capital... or simpler and more
   honest: you are the last civilization holding a city (if you own cities and every other
   civilization owns none, you win);
-- **domination** — you own at least `DOMINATION_LAND_PCT` of the land tiles that any city
-  claims, or at least `DOMINATION_POP_PCT` of the world population (placeholders);
+- **domination** — ~~you own at least `DOMINATION_LAND_PCT` of the land tiles that any city
+  claims, or at least `DOMINATION_POP_PCT` of the world population (placeholders);~~
+  **OVERRULED BY THE AMENDMENT AT THE END OF THIS FILE — read it before implementing or
+  reviewing this condition.** The engine requires BOTH shares, over the MAP's land, and that
+  implementation is correct; this paragraph was wrong.
 - **cultural** — your total culture reaches `CULTURAL_VICTORY_CULTURE` (placeholder);
 - **score** — at the turn limit, the highest score wins.
 
@@ -2094,6 +2097,35 @@ toward another player's conquest.
 - Balance evidence from the harness for at least one new knob (culture rate or victory
   threshold), honest about whether it shows an effect.
 - A played golden that INCLUDES a victory, so the end of a game is covered at hash level.
+
+---
+
+# AMENDMENT — the domination condition was specified WRONG, and the implementation was right
+
+The M9+M10 contract above says domination needs `DOMINATION_LAND_PCT` of the land **"or"**
+`DOMINATION_POP_PCT` of the population. The implementation requires **both**, and divides the land
+share by the MAP's land rather than by "land tiles that any city claims". The implementing agent
+deviated from my frozen text and argued the case at the rule site; the verifier then found the
+docs still repeating my wording.
+
+**I am ruling for the implementation, and the contract was wrong.** Civ 3's domination victory
+requires both shares, so "or" would have been the less faithful reading of a system whose whole
+stated premise is Civ-3-shaped; and a land share measured against *claimed* land is a moving
+denominator that a player can lower by claiming less, which makes the condition easier the worse
+you play. Both halves of the implementation are therefore correct and the frozen text was not.
+
+This is the second time in this project that my own frozen wording was the defect rather than the
+code (the M4b `legalActions` draft was the first). The pattern is worth naming: a contract written
+quickly by the person who has not yet read the precedent is the likeliest place for a wrong rule
+to enter, and the defence is that agents are told to report a disagreement rather than obey it
+silently — which is what happened here.
+
+The condition's real limits are recorded as a measured shortfall, not silently fixed: domination
+has ended **0 of 100** AI-played games and is demonstrated only on hand-built boards with patched
+thresholds, and conquest has ended AI-played games only with the AI in one seat against a
+do-nothing opponent (0 of 100 self-play games). A3's literal wording is met by cultural and score
+victories, which do end real self-play games; "the victory system works" would be an overstatement
+and must not be claimed.
 
 ---
 

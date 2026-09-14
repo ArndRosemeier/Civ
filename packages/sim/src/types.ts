@@ -56,6 +56,7 @@ import type {
   TerrainYields,
   UnitDomain,
   UnitRole,
+  VictoryConditionId,
 } from '@civts/core';
 import type { Ruleset } from '@civts/rules';
 
@@ -204,6 +205,25 @@ export interface SimulationResult {
   readonly finalState: GameState;
   readonly metrics: readonly TurnMetrics[];
   readonly violations: readonly Violation[];
+  /**
+   * **How many registry checks this run really ran** (F2) — counted at the moment each
+   * predicate was invoked, never derived from the turns played.
+   *
+   * For a run that checks every turn the answer is `turnsPlayed * registry.length`, and that
+   * product was what the CLI *reported* while the loop did something else: it read the
+   * game-over condition **before** the registry and broke on the turn that decided the game,
+   * so a decided run was one whole registry short — the one turn a game is won on, which is
+   * exactly the capture or completion turn the capture and conservation invariants exist to
+   * fire on. `runner.ts` now runs the registry before that break, and this field counts what
+   * it ran, so the reported figure and the executed figure are one number rather than two
+   * computations that happened to agree only on undecided games.
+   *
+   * **Required and always present**, like `violations` and `plannerFailures`: a report that
+   * fell back to `turnsPlayed * registry.length` when this was absent would be back to the
+   * derived figure this field exists to replace. `0` is a real value — a run whose registry is
+   * empty ran no checks — and is not the same as "not reported".
+   */
+  readonly invariantChecks: number;
   /**
    * **Every planner failure a policy reported while this run polled it, oldest first — each one
    * naming a throw that actually happened in *this* run.**
@@ -362,14 +382,31 @@ export interface MetricAggregate {
  * and none happened" — and that is now false in the other direction: there are four
  * conditions, so a batch that reported no wins would be hiding them.
  *
- * `outcome` is the **condition id**, not a prose label, so a consumer counting these is
- * counting the same vocabulary `GameOutcome.condition` uses. `winner` is the seat, so
- * "who won" is answerable without walking the runs.
+ * `outcome` is the **condition id**, typed as the engine's own `VictoryConditionId` rather than
+ * as a string, so a consumer counting these counts the same vocabulary `GameOutcome.condition`
+ * uses and a renamed condition is a compile error rather than a row that silently reads zero.
+ *
+ * **`byPlayer` replaced a single `winner` field (P1).** The old field kept the *first* winner of
+ * the condition and nothing else, so a batch of five cultural wins split 3–2 between two
+ * civilizations reported `winner: 0` — a count of five games carrying the winner of one of them,
+ * which is the same defect the tournament report had one layer up (a report that cannot say who
+ * won). Wins are now counted per player, ascending by player id, and `draws` counts the games a
+ * condition ended level. `count === sum(byPlayer[].wins) + draws` holds by construction and is
+ * asserted by `batch.test.ts`.
  */
 export interface WinCount {
-  readonly outcome: string;
+  readonly outcome: VictoryConditionId;
   readonly count: number;
-  readonly winner: PlayerId | null;
+  /** Wins of this condition, by player, ascending by player id — every winner is here. */
+  readonly byPlayer: readonly PlayerWinCount[];
+  /** Games this condition ended level — a condition that held and named no winner. */
+  readonly draws: number;
+}
+
+/** One player's wins of one condition. */
+export interface PlayerWinCount {
+  readonly playerId: PlayerId;
+  readonly wins: number;
 }
 
 export interface BatchOptions {

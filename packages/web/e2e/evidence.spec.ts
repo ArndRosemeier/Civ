@@ -26,6 +26,7 @@ import {
   driveScript,
   hashOf,
   headlessNewGame,
+  OPPONENT_OFF,
   openApp,
   readState,
   replayScript,
@@ -101,7 +102,15 @@ test('acceptance evidence: a game played through the UI is captured as a screens
   page,
 }, testInfo) => {
   await openApp(page);
-  const probe = await seedApp(page, SEED);
+  // **The opponent is held still.** The replay half below is `newGame` + `applyCommand` in this
+  // process and plays no policy for the rival seat, while the app plays `SMART_POLICY` for every
+  // non-human seat on each `End turn` click — so with the opponent left on, the played game and the
+  // replayed one are different games and the hash equality this evidence rests on cannot hold. The
+  // setting is seeded ONCE and read back out of `probe.settings`, so the headless engine is given
+  // the browser's own settings object (`settings` is part of the hashed state). The second `seedApp`
+  // below re-seeds over the app's current settings, so the opponent stays off for the played game.
+  // See `OPPONENT_OFF` in `helpers.ts`.
+  const probe = await seedApp(page, SEED, OPPONENT_OFF);
   const settings = settingsFrom(probe.settings, SEED);
   const started = headlessNewGame(SEED, settings);
   expect(started.ok, 'the engine could not start the evidence game').toBe(true);

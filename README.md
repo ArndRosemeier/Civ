@@ -9,6 +9,17 @@ happiness, victory and score"), with M11 (save/load/replay + the alpha audit) be
 written in the working tree at the same time. `PLAN.md` §16 defines alpha and lists
 the exit criteria A1–A7; `docs/KNOWN-ISSUES.md` lists what is deliberately not in it.
 
+**One headline limit, stated here rather than buried.** The victory system is real and
+four conditions are implemented, but only two of them (`cultural` and `score`) have ever
+ended a game the AI played: `conquest` has ended an AI-played game only with the AI in
+one seat against a do-nothing opponent (**0 of 100** self-play games), and `domination`
+has ended **no** AI-played game at all (**0 of 100**) — it is demonstrated only on
+hand-built boards with patched thresholds. A3's literal requirement ("at least one
+victory condition demonstrated ending a real game") is met; **"every victory condition
+works in practice" would be an overstatement**. The counts, and the command that
+reproduces each, are in `docs/GDD.md` §5.1, `docs/BALANCE.md` §8 and
+`docs/KNOWN-ISSUES.md` §3.7.
+
 Every number quoted below was measured in one session on this machine
 (2026-09-13, 18:14–18:44 UTC, an eight-core box that other workspaces were also
 using — load average 3.0–13.1). Where a figure is a reading rather than a promise it
@@ -52,13 +63,31 @@ run — there is no server-side game state and no second copy of the rules. A
 production build is `pnpm --filter @civts/web build` followed by
 `pnpm --filter @civts/web preview` (same host and port).
 
-What you can do in the app: start a new game with settings (seed, map size, civ
-count), pan and zoom the map, select units and give orders, open the city screen
+What you can do in the app: play the game a page load starts on — a fixed default
+seed 1, map size `tiny`, 2 civilizations — pan and zoom the map, select units and give
+orders, open the city screen
 (growth, production queue, worked tiles, culture, happiness), open the technology
 tree and pick research, open the government selector, switch panels, watch the event
 log, read the scoreboard, and play on until a victory/defeat screen names the
 condition and the winner. Screenshots the suite produced live in
 `packages/web/artifacts/` (for example `played-game.png`).
+
+**The browser app has no AI opponent.** It hosts the engine and dispatches *your*
+commands; the other civilizations do nothing unless somebody moves them. The AI lives in
+`@civts/sim` and plays in the headless tournaments and the evidence scripts, which is
+where every win/loss figure in these documents comes from. That split is deliberate — it
+is the same engine in both places — but "there is an AI" and "the app has an opponent"
+are different claims, and only the first one is true.
+
+**Nor does the app offer game setup.** A fresh page has 20 buttons and not one of them
+chooses a seed, a map size or a civ count, and a finished game is terminal (22 buttons at
+the end, none of which starts another game) — A1's "choose settings" half is met by the
+CLI and by `window.__CIVTS__.seed(seed, options)`, which is the test seam rather than a
+player control. This sentence used to claim the app could "start a new game with settings
+(seed, map size, civ count)"; the audit O4 measured that there is no such control
+(`ALPHA-AUDIT.md` §A1, "the single loudest defect"), and R2 re-measured it on this tree
+with `pnpm --filter @civts/web exec playwright test --config playwright.config.ts
+alpha-audit-a1`, whose annotations print the page's whole button inventory.
 
 ### In a terminal (the way an agent plays)
 
@@ -127,47 +156,49 @@ at the top. They are readings from one session, not budgets.
 
 | Command | What it is | Measured wall time |
 |---|---|---|
-| `pnpm verify` | The fast gate: `check:static` (typecheck + cached eslint + cached prettier, run in parallel) then `vitest run` | **64.0 s** at 18:25 UTC — see the note below: that is the *previous* serial script, and the re-drawn one could not be measured end to end |
-| `pnpm verify:full` | The same, with the long tests running and the caches bypassed (`CIVTS_TEST_TIER=full`) | **491.6 s** — 8 min 12 s (18:27–18:35 UTC), against the 10-minute bound |
-| `pnpm --filter @civts/web test:e2e` | Starts the real app on 127.0.0.1:4174 and drives it in headless Chromium | **249.1 s** (≈4 min); 57 passed, 4 failed at load average 9.4 — the same 4 specs passed 9/9 on a re-run (87.2 s), so it is load-sensitive, not broken (see `docs/KNOWN-ISSUES.md`) |
-| `pnpm tournament:evidence` | **A3's experiment**: 20 seeds × 100 turns of self-play with the real AI, as evidence rather than as a gate | **149.8 s** (2 min 30 s) |
+| `pnpm verify` | The fast gate: `check:static` (typecheck + cached eslint + cached prettier, run in parallel) then `vitest run` | **31.4 s** warm / **56.2 s** cold, EXIT 0 (verifier); **32 s** on this tree at load 5.78 — see the table below |
+| `pnpm verify:full` | The same, with the long tests running and the caches bypassed (`CIVTS_TEST_TIER=full`) | **431.1 s** and **422.1 s** on two runs (7 min 11 s / 7 min 2 s), EXIT 0, against the 10-minute bound |
+| `pnpm --filter @civts/web test:e2e` | Starts the real app on 127.0.0.1:4174 and drives it in headless Chromium | **249.1 s** (≈4 min); 57 passed, 4 failed at load average 9.4 — the same 4 specs passed 9/9 on a re-run (87.2 s), and a later full run at load 2.3–3.5 passed **63/63** (3.9 min). Load-sensitive, and it flips on machine noise — see `docs/KNOWN-ISSUES.md` §3.4 |
+| `pnpm tournament:evidence` | **A3's experiment**: 20 seeds × 100 turns of self-play with the real AI, as evidence rather than as a gate | **149.8 s** (2 min 30 s); the 200-turn configuration is **≈190 s** |
 | `npx tsx scripts/balance-sweep.ts` | One production knob (`units.settler.cost`) over a fixed seed set | 14.0 s |
 | `npx tsx scripts/tech-balance-sweep.ts` | One technology-cost multiplier over a fixed seed set | 26.6 s |
 | `npx tsx scripts/combat-balance-sweep.ts --knob <id>` | One combat knob (`warrior-attack`, `grassland-defense`, `walls-bonus`, `damage-per-round`, `capture-divisor`) | ≈16 s per knob (15.9 s measured for the default) |
-| `pnpm rules:provenance` | The cited/placeholder table for every rules row | ~1 s (not separately timed) |
+| `pnpm rules:provenance` | The cited/placeholder table for every rules row | ~1 s (measured 1 s in this pass) |
 | `pnpm map`, `pnpm play` | Generate / play | ~1 s to first frame |
 
-**The slow ones are `verify:full` (8 min), the e2e suite (4 min) and the tournament
-evidence run (2.5 min).** Everything else is seconds. `verify:full` and the e2e
+**The slow ones are `verify:full` (≈7 min), the e2e suite (4 min) and the tournament
+evidence run (2.5–3 min).** Everything else is seconds. `verify:full` and the e2e
 suite are *not* part of `pnpm verify`; the tournament run is deliberately not a test
 at all, because a per-commit gate cannot hold it (M7b's decision, recorded in
 `scripts/tournament-evidence.ts`).
 
 The fast tier's bound is **≤ 70 s** (the internal target; alpha criterion A5's own
-bound is 90 s). Measured headroom at 64.0 s is therefore 6.0 s — thin, and the honest
-answer is that the tier is one long test away from its target.
+bound is 90 s). The composed command is now measured **green**, and the honest figure
+for a fresh checkout is the **cold** one, because a warm run reuses the eslint and
+prettier caches:
 
-The 64.0 s reading is from the **previous** serial script
-(`typecheck && lint && format:check && test`) at 18:25 UTC, before M11's new files
-existed. The script was re-drawn at 18:30 into a parallel, cache-backed
-`check:static` plus `test`, with `check:static:full` and `lint:full`/`format:check:full`
-kept for an honest uncached pass. Its components measured at 18:48:
+| reading | raw wall | load average | result |
+|---|---|---|---|
+| `pnpm verify`, warm caches (verifier) | **31.414 s** | 2.11 → 4.89 | EXIT 0 |
+| `pnpm verify`, cold (`.cache` deleted, verifier) | **56.153 s** | 2.87 → 6.16 | EXIT 0 |
+| `pnpm verify` on this checkout (this pass, warm) | **32 s** | 5.78 → 7.95 | EXIT 0 — 64 files, 2112 passed, 56 skipped of 2168 |
 
-| step | wall |
-|---|---|
-| `pnpm typecheck` | 8.2 s |
-| `pnpm lint` (cached) | 4.2 s |
-| `pnpm lint:full` (uncached) | 31.0 s |
-| `pnpm format:check` (cached) | 3.1 s |
-| `pnpm test` | 24.5 s — 64 files, 2095 passed, 56 skipped of 2151 (18:52 UTC) |
+So the headroom against the 70 s target is **38.6 s warm (55 %)** and **13.8 s cold
+(20 %)** — inside the bound, and not by a wide margin on a cold checkout. The earlier
+**64.0 s** reading quoted here was the *previous* serial script
+(`typecheck && lint && format:check && test`) at 18:25 UTC, before M11's files existed,
+and its footnote — that the composed `pnpm verify` had not been measured green — is
+superseded. What the M11 re-draw bought is visible in the parts, re-measured at 18:48:
+typecheck **8.2 s**, cached eslint **4.2 s** (uncached `lint:full` **31.0 s**), cached
+prettier **3.1 s**, and the test step **≈26 s** over 64 files.
 
-The three static steps run in parallel inside `check:static` rather than one after
-another, and the cache is where most of the win is (31.0 s → 4.2 s for eslint alone).
-**The composed `pnpm verify` was not measured green**, because at 18:50–18:52 it
-stopped inside `check:static` — 8 of M11's own files were unformatted, one of its new
-e2e specs had an eslint error, and its `repl.test.ts` did not typecheck — while that
-wave was still landing. The test step itself was green on every attempt. The M11 wave
-owns that change and its numbers: re-measure rather than assuming any figure above.
+The test step on this tree, measured alone at 21:38 UTC under load 2.60: **64 files,
+2112 passed, 56 skipped of 2168**, `pnpm test` in **28 s** raw. The composed gate was
+green twice more in the same session — **32 s** at load 5.78 → 7.95 and **41 s** at load
+10.75 → 13.20, the second reporting **2113 passed / 56 skipped of 2169** because another
+workstream added a test in between. Anything above that figure — the composed command's
+exact total, or the exact test count, on a given afternoon — is a reading of a shared box
+in a moving tree, not a budget.
 
 ## Rules provenance
 
