@@ -605,24 +605,56 @@ true; the claim is gone.
 
 ## 4. UI limits
 
-### 4.1 The city screen scrolls inside its own panel at 900 px
+### 4.1 A side screen is 380 px wide now, and the strip scrolls on a short window
 
-The panels are **docked under the map**, not floating over it, and the layout rule is
-that an open panel covers neither the map nor the action buttons (a `position: fixed`
-centred dialog was implemented, measured, found to intercept the pointer and the wheel
-— it turned three green tests red — and reverted with the evidence recorded).
+**What changed, and why the old text was rewritten.** Until Phase 3 of the UI overhaul the
+panels were **docked under the map**, in the map column, capped at 40 % of its height. Two
+problems came with that, and the second one was measured: the column had two claimants, so
+opening a panel shrank the map — at 900×1000 the map region fell from 915 px to 546 px when the
+debug panel opened — which moves the box the camera clamps against and the click hit-test
+inverts *while the player is looking at the same view*. (Putting the dock back under the map as a
+mutation check in Phase 3 reproduced it at 1280×900: the canvas fell from 813×813 to 330×330 while
+the debug panel was open, which is what the new assertion reports.) The dialogs
+are now docked at the foot of the sidebar, where they share the strip with the panels (the stack
+keeps 40 %, the dock may take 60 %), so the map column has one claimant and the map's box is
+byte-identical with and without a panel open. `panel-usability.spec.ts` asserts that equality
+directly, and the map-covering rule it has asserted since M8 is unchanged: a `position: fixed`
+centred dialog was implemented, measured, found to intercept the pointer and the wheel, and
+reverted with the evidence recorded.
 
-The consequence is honest and visible: the dock bounds the panel
-(`dialog { max-height: 100%; … overflow: auto }`, `styles.css:241` and `:247`) and the
-panel column scrolls inside itself
-(`main > section[aria-label='Panels'] { overflow-y: auto }`, `styles.css:148`). At a **900 px-tall window** the city screen's content is taller
-than the dock, so a player scrolls *within* the panel. What the suite asserts
-(`packages/web/e2e/panel-usability.spec.ts`, measured passing in this session's
-re-run) is **geometric**: the panel's box is inside the window and the points that
-matter — the middle of the map, an action button in the panel column — still belong to
-the game rather than to a panel. It does not assert that no scrolling is ever needed,
-and a future panel that needs more room than the dock has will scroll rather than
-fail.
+**The honest cost, and it is a cost.** A docked panel is now **380 px wide** (the strip's width,
+which is §7.7.5's still-open question) instead of as wide as the map column. The city screen is
+the panel that feels it: twenty-one worked-tile labels at 380 px wrap onto many rows, so at a
+900 px-tall window a player scrolls *within* the panel to see them all — `dialog { max-height:
+100%; overflow: auto }` bounds it by the dock and the dock by the strip. Widening the sidebar is
+the lever, and that is the owner's decision to make, not this phase's.
+
+**What the suite asserts now, and what it still does not.** Geometric, and stronger than before:
+the panel's box and its Close control are inside the window; the panel's box does not overlap the
+unit's orders popup and the point at the centre of an orders control belongs to that control; the
+middle of the map still belongs to the canvas; and the sidebar at 1280×900 — with a full event
+log, a founded city and a live opponent — holds every panel and every scoreboard row and cell
+without scrolling in either direction (`panel-usability.spec.ts`, "X1 sidebar"). It does **not**
+assert that no scrolling is ever needed anywhere:
+
+- **On a short window.** At 1600×700 the panels measure 765 px against a 617 px strip, so the
+  stack scrolls: 249 px of it shows and 765 px of panels are in it, and the panel at the fold is
+  cut by the stack's edge like any scrolled list. What the `flex: 0 0 auto` rule in `styles.css`
+  prevents is the *other* resolution — the flex algorithm squeezing a panel's own box (measured:
+  the scoreboard panel shrank 106 px → 10 px) — not this.
+- **With a dialog open.** The dock may take 60 % of the strip and divides it among the open
+  dialogs; measured with three open at 1280×900, they were 163 px, 189 px and 117 px tall holding
+  973 px, 1031 px and 582 px of content. Each scrolls inside itself and each keeps its Close
+  control visible (every dialog puts it directly under its heading), which is why the placement
+  test still passes — but a player looking at the city screen in that state sees about a sixth of
+  it.
+- **Neither of those scrollbars is reliably visible.** Measured at 1600×700 while the stack
+  overflowed: `offsetWidth === clientWidth === 380`, i.e. no classic scrollbar is being laid out,
+  so Chromium paints an overlay scrollbar that appears only while scrolling. A vision review of
+  screenshots taken for this phase read the result as *"the sidebar has stacked panels extending
+  below the window without a visible scrollbar"* and *"the CITY 1 panel is cut off by the bottom
+  edge"* — both true of the pixels, and both a scroll away from being wrong. Nothing is lost, and
+  the honest way to say it is: below the fold the strip looks clipped rather than scrollable.
 
 ### 4.2 The map pixel test is not evidence about the terrain palette
 

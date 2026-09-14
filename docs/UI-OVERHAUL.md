@@ -669,7 +669,8 @@ button deletion safe.
 2. **The click contract, and the popup.** Merge the shell's `Abilities for unit <id>` group and the
    panel's `Actions for unit <id>` group into **one** popup with the frozen name — today they are
    two independent lists, which is also two independent labellers (§3, idea 12). — **landed**, see §9.
-3. **Sidebar re-partition.** Unit controls leave; everything else stays and stops overflowing.
+3. **Sidebar re-partition.** Unit controls leave; everything else stays and stops overflowing. —
+   **landed**, see §9.
 4. **Goto.** Engine route query first, then the intent decision of §7.4.
 5. **Next-unit flow and keyboard.** Still additive: no keyboard contract exists today.
 6. **Hover layer.** Tile yields, movement cost, combat odds.
@@ -1003,3 +1004,163 @@ explicit choices" — is satisfied for the *unit's* orders by the popup's own co
 context menu at the clicked tile yet: the ambiguous city case is cleared by a control in the popup
 rather than by a menu at the tile. The dock still sits under the map (Phase 3), the sidebar is still
 380 px (the owner's §7.7.5 is open), and no keyboard contract exists (Phase 5).
+
+## Phase 3 — the sidebar re-partition, and the dialogs come home to it — landed
+
+**What changed.** The dialogs are no longer docked under the map. The layout is now two columns
+with one claimant each: `[data-layout='map-column']` holds the map and nothing else, and
+`section[aria-label='Panels']` — the sidebar — holds everything that is not a direct unit action,
+in two regions of its own. `[data-layout='panel-stack']` carries the nine panels;
+`[data-layout='dock']`, at the strip's foot, carries the dialogs the panels open. That is the
+owner's design for this phase read literally (§7.6: *"the leftover sidebar hosts everything that is
+not a direct unit action"*), and a side screen is the most "not a unit action" thing the UI has.
+`main.ts` builds the two regions in `buildShell` and moves the dialogs into the dock at mount;
+`styles.css` states the split and the reasons.
+
+**Unit controls are no longer in the sidebar, and Phase 2 is why.** `unitPanelCommands` already
+filters every order that names a tile, and the whole `Actions for unit <id>` group was moved over
+the map in Phase 2, so the strip's `Units` region was left holding the unit list and the readouts —
+which is what the region is for and what the frozen M8 row (`region`/`Units`, plus the group beside
+it) names. Nothing further had to leave. What *did* leave the sidebar's neighbourhood is the dock.
+
+**The dock decision (§7.6 asked for it, and the old 40 % was a holding position).** The dialogs went
+into the sidebar, and the two regions now bound **each other** rather than the window: the panel
+stack keeps a 40 % minimum and the dock may take 60 % (minus the flex gap, because 40 + 60 + a gap
+would overflow the box the strip promises never to overflow). The reason is not taste. The brief's
+own tests open the debug panel and then click the *Technology* button, which lives in the panel
+stack: a side screen that took the whole strip would hide the player's way back to the controls, and
+the 40 % floor is what makes that impossible by construction. The old cap bounded the dock by the
+column it sat in, which is exactly what let it take height from the map.
+
+**Why that mattered: the map's box was moving while the player looked at it.** The box the camera
+clamps against, the renderer walks and the click hit-test inverts is the map region's, and the map
+region used to shrink whenever a panel opened. Measured before the move, at 900×1000: the map region
+fell from **915 px to 546 px** when the debug panel opened. Reproduced in this phase as a mutation
+(the dock put back under the map, all else unchanged), at 1280×900: the canvas fell from
+**813×813 to 330×330** while the debug panel was open. The new test asserts the equality directly —
+the canvas box and the orders popup's box are measured before a panel opens and compared with the
+same boxes after, and again with two panels open — because "is anything covered?" cannot see a map
+that has moved.
+
+**The overflow fix was not a layout change, and the measurements are why.** At 1280×900, with the
+event log full and the opponent live, the sidebar held **1219 px of content in an 823 px box** — 396 px
+of overflow, which is the scoreboard cut off mid-row at the bottom edge and the save and debug panels
+below the fold entirely. A scrollbar was the old answer and it is not an answer: half a scoreboard row
+says nothing to a player. The strip therefore no longer scrolls at all (`overflow: hidden`), and the
+content was made to fit it:
+
+| panel | before | after | what changed |
+| --- | --- | --- | --- |
+| status strip | 236 px | 187 px | padding, heading margins, a 2.6 em rate field, the two verdict lines on their own rows |
+| event log | 271 px | 129 px | its list's own bound: 220 px → 96 px |
+| units | 152 px | 84 px | its list is bounded (58 px) and scrolls *inside its own panel* |
+| cities | 47 px | 62 px | the same bound; this row is the one that grew, because the run behind the "after" column founded a city |
+| technology | 46 px | 38 px | padding and heading margins |
+| scoreboard | 168 px | 106 px | 11 px data / 10 px headers, 2 px padding, the duplicate caption hidden |
+| save / debug | 93 / 93 px | 58 / 58 px | heading and controls on one row, the engine's line beneath |
+| outcome wrapper | 18 px | 0 px | `display: contents`: it is a `Show outcome` control, not a panel with a body |
+
+(The two columns are two played games at the same window rather than one state rendered twice — the
+"before" run is 12 turns with the opponent on and no city founded, the "after" run is 14 turns with a
+city founded — so the per-panel numbers are close comparisons and the headline is exact: 1219 px of
+content in an 823 px box became 765 px in an 817 px box.) Measured after: the stack holds **765 px in
+an 817 px box** — 0 px of overflow in either direction, every panel wholly inside the strip, and
+every scoreboard row and the `Score` cell inside it too.
+
+**The horizontal half of the defect was the worse half, and the owner's sentence caught both.** The
+scoreboard's table measured **530 px inside a 378 px panel**, so its right-hand columns — including
+M10's `Score`, the column the score victory is read from — were off the edge, behind a scrollbar on
+the strip. Compacting the type fits it (362 px inside a 362 px content box), and one rule makes that
+robust rather than lucky: the first cell may break a word, so the one column whose width is *data*
+(the player's name) wraps instead of pushing the table over. The table's body is also bounded
+(`max-height`, with `display: block` so the bound means something on a table box), because a game
+seeded with sixteen civilizations would otherwise put sixteen rows where five fit.
+
+**A defect found while measuring the fix, and it is the same defect one level down.** With the
+panels compacted, the stack still overflowed at 1600×700 — and the browser resolved that overflow by
+**shrinking the scoreboard panel from 106 px to 10 px**, because a flex item's automatic minimum size
+is its content's only while its `overflow` is `visible`, and two of these panels need their own
+`overflow`. Cutting the table off is the defect this phase exists to remove, so the stack's children
+are `flex: 0 0 auto`: a panel keeps the height its content asks for and the stack scrolls instead. At
+700 px tall the panels measure 765 px against a 617 px strip, so the stack does scroll there, and the
+panel at the fold is cut by the stack's edge — like any scrolled list, and visibly so, because
+Chromium paints an overlay scrollbar that appears only while scrolling (measured: the stack's
+`offsetWidth` equals its `clientWidth`, so no scrollbar is being laid out). What the rule prevents is
+the *other* resolution, which is worse and was measured: squeezing a panel's own box. Recorded in
+`docs/KNOWN-ISSUES.md` §4.1.
+
+**On the dead space the phase was asked to close — and a correction to Phase 1's note.** Phase 1's
+section says the unused height below the square map at a narrow window *"closes when the dock's
+contents move to the sidebar"*. Measured, that is not what the dock was doing: at 900×1000 with
+nothing open the dock was **0 px tall** (a closed `<dialog>` is `display: none`), so it was not
+reserving the height. What the dock did was *take* the column's height when a panel opened, which
+pushed the map up and shrank it — and that is the defect, not the empty space. The empty space is
+inherent to a square map in a tall region: at 900×1000 the map is width-limited, so the region has
+~460 px the square cannot use, and no arrangement of the sidebar changes that. What Phase 3 closes is
+the *reservation*: the map column holds one thing, so no panel can move the map, and the leftover
+height belongs to nothing.
+
+**Measured after the phase**, canvas side at the three windows Phase 1 used (the canvas grew a little
+because the dock's 8 px gap is gone from the column and `[data-panel]`'s padding is denser):
+
+| viewport | canvas before | canvas after | sidebar | stack content |
+| --- | --- | --- | --- | --- |
+| 1280×900 | 797×797 | **813×813** | 823 px, 0 overflow | 765 px in 817 px |
+| 900×1000 | 450×450 | **454×454** | 923 px, 0 overflow | 765 px in 917 px |
+| 1600×700 | 597×597 | **613×613** | 623 px, 0 overflow | 765 px in 617 px (scrolls) |
+
+**The tests, and the mutations that prove they can fail.** `panel-usability.spec.ts` gains "X1
+sidebar: at 1280×900 the strip holds every panel and the whole scoreboard, and does not scroll to do
+it" — with a *control* that the event log's own list is longer than its box, so the test cannot pass
+on an empty strip — and its existing placement test is strengthened with the map-box and orders-box
+equality checks, the popup-overlap check and a hit-test at the centre of an orders control. Five
+mutations, each RED with a message naming the failure, each restored byte-identical (`styles.css`
+`8dbf3ba3…`, `main.ts` `6f8217b9…`):
+
+1. **The scoreboard's compaction reverted** (14 px type, 8 px cell padding): *"the scoreboard's
+   columns are 168 px wider than the panel, so its right-hand columns are behind a horizontal
+   scrollbar"*.
+2. **The first cell's word-break removed, with the type back to 14 px**: *"the scoreboard's columns
+   are 9 px wider than the panel…"* — the assertion catches a regression nine pixels over the line,
+   not only a dramatic one.
+3. **The log's bound taken off** (96 px → 400 px): *"the panel stack holds 252 px more content than it
+   can show, so the panels at its bottom are below the fold"*.
+4. **The dock put back under the map**: *"opening a panel moved or resized the map, so the camera's
+   clamp box and the click inverse changed while the player was looking at the same view"*, with the
+   diff showing 812.7×812.7 → 330.4×330.4.
+5. **The dialogs floated over the game** (the layout M8 measured and reverted), once on its own —
+   *"the open panel's box overlaps the unit's orders popup"* — and once with the popup's `z-index`
+   lowered too, which reaches the hit-test assertion: *"something other than the unit's own control
+   owns the point at the centre of that control"* (expected `BUTTON`, received `DL`).
+
+**Looked at, once, through a model that can see.** The agent that wrote this phase cannot accept
+image input, so five screenshots were captured for it (fresh and played at 1280×900, the city screen
+open, three panels open, and a 1600×700 window) and read by a vision-capable model through a workflow
+agent. It confirms the headline claims from the pixels: the sidebar's panels in the order the table
+above lists them, **all eight scoreboard columns visible including `Score`**, the table's right edge
+inside the sidebar, and no clipped, ellipsised or overlapping text in either 1280×900 state. It
+reports two defects, and they are worth recording as its reading rather than this phase's:
+
+- *"The map canvas is stretched, wider than tall"* in three of the five shots. **Measured false**: the
+  canvas is 813×813 at 1280×900 and 613×613 at 1600×700 in every state, with and without dialogs
+  open, and `map.spec.ts`'s "fluid square" test asserts the squareness at three window sizes. What the
+  model is describing is the drawn map *inside* a square canvas, which is not a square region — the
+  tiles are projected as a diamond and the unexplored ground around them is flat. The assertion stands
+  and this paragraph is the record of a disagreement between a reading and a measurement.
+- *"The CITY 1 panel is cut off by the bottom edge"*, *"panels extending below the window without a
+  visible scrollbar"*, *"`(10`"* mid-word at the bottom of the technology panel. All three are real
+  and are the honest cost of the split: content below the fold is reachable by scrolling inside the
+  dialog or the stack, but Chromium paints no persistent scrollbar for it, so it *looks* clipped.
+  Measured and recorded in `docs/KNOWN-ISSUES.md` §4.1.
+
+**Not done in this phase, and not claimed.** No human has looked at the result — the review above is
+a model's, not mine and not the owner's, and the app's own `played-game.png` artifact was not
+reviewed at all. The sidebar is still 380 px, which is §7.7.5 and still the owner's call — and it is
+now the number that decides how cramped a docked city screen is, which makes that question sharper
+than it was. `display: contents` on the outcome wrapper is Chrome-era CSS, so that wrapper's box (and
+nothing else) is untested on older engines. No keyboard or focus contract exists (Phase 5), and
+nothing here touches it. A game with many civilizations keeps its scoreboard whole only because the
+table's body is bounded; that bound is asserted at the shipped settings (3 players), not at 16. And
+three dialogs open at once leave each of them small (measured: 163 px, 189 px and 117 px of content in
+boxes of 973 px, 1031 px and 582 px) — readable, closable and scrollable, but not a state anyone
+designed.
