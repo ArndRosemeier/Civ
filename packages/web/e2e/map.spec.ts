@@ -863,8 +863,10 @@ test('the orders popup follows the camera: a pan, a zoom and a resize all leave 
         async () => {
           const next = await popupBox();
           const moved =
-            Math.abs(next.x - popup.x) > 0.5 || Math.abs(next.y - popup.y) > 0.5 ||
-            Math.abs(next.width - popup.width) > 0.5 || Math.abs(next.height - popup.height) > 0.5;
+            Math.abs(next.x - popup.x) > 0.5 ||
+            Math.abs(next.y - popup.y) > 0.5 ||
+            Math.abs(next.width - popup.width) > 0.5 ||
+            Math.abs(next.height - popup.height) > 0.5;
           popup = next;
           return moved;
         },
