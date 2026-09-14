@@ -262,6 +262,73 @@ main {
 }
 
 /*
+ * The map is in the tab order (phase 5), so it must say so when it has the focus — a keyboard user
+ * who cannot see where the focus is has been given a key that does nothing visible. `:focus-visible`
+ * rather than `:focus`, so a *pointer* press on the map does not paint a ring around it: the ring is
+ * for the keyboard, which is the only user who needs it. `outline` is used rather than a border
+ * because it is drawn outside the box and cannot change the size the camera clamps against.
+ */
+[data-panel='map']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/*
+ * The keyboard help panel (phase 5). It inherits the docked dialog layout like every other panel;
+ * this only makes a two-column list of key/meaning pairs readable inside a 380px strip — the keys
+ * are short and must not be squeezed by the sentences beside them.
+ */
+/*
+ * The help panel: a scrolling body and a Close control that never scrolls away.
+ *
+ * Measured at 1280×900 with the panel open: its content is 514 px against the 488 px the dock may
+ * take (60 % of the 823 px strip, `styles.css` above), so the panel as a whole scrolled — and the
+ * last thing in it is its own `Close`. That is the below-the-fold defect this stylesheet already
+ * records for the city and tech screens, pointed the other way. `overflow: hidden` on the dialog
+ * with one scrollable child puts the way out outside the scrolling, so the control a player needs is
+ * always on screen and the bindings scroll behind it.
+ */
+/*
+ * The `[open]` on the selector is **load-bearing, and it was measured rather than reasoned about.**
+ * `dialog:not([open]) { display: none }` is a USER-AGENT rule, so any author `display` on the
+ * element defeats it: with a bare `[data-panel='keyboard']` selector the *closed* help panel was
+ * rendered, took 355 px of the sidebar's dock at load, dropped the panel stack from 817 px to
+ * 462 px, and made `getByRole('dialog')` match a dialog nobody had opened.
+ * `panel-usability.spec.ts` caught it — *"the panel stack holds 277 px more content than it can
+ * show, so the panels at its bottom are below the fold"* — and so did the keyboard spec's own
+ * `closeDialogs`. The rule now applies only while the panel is open, which is when it means
+ * anything.
+ */
+[data-panel='keyboard'][open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+[data-panel='keyboard'] [data-role='keys'] {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+[data-panel='keyboard'] dl {
+  grid-template-columns: 4.5em 1fr;
+  align-items: baseline;
+}
+
+[data-panel='keyboard'] dt {
+  font-family: ui-monospace, monospace;
+  color: var(--accent);
+}
+
+[data-panel='keyboard'] section + section {
+  margin-top: 6px;
+}
+
+[data-panel='keyboard'] h3 {
+  margin: 0 0 2px;
+}
+
+/*
  * The sidebar: a strip that holds everything which is not a direct unit action, and that never
  * overflows.
  *

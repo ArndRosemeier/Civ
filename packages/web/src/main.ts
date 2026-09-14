@@ -68,6 +68,7 @@ import {
   type GameState,
   type PlayerId,
   type Settings,
+  type TileIndex,
   type UnitId,
 } from '@civts/core';
 import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
@@ -112,6 +113,8 @@ import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from 
 import { tileNamedBy, unitNamedBy } from './ui/schema.js';
 import { nextGotoStep, startGoto, type GotoIntent } from './ui/goto.js';
 import { problemText } from './ui/problem.js';
+import { nextUnitNeedingOrders, unitsNeedingOrders } from './ui/nextunit.js';
+import { KEY_HELP, mapActionFor, sessionActionFor, type KeyContext } from './ui/keys.js';
 
 /** The seed a page load starts on, when nothing has seeded it. */
 const DEFAULT_SEED = 1;
@@ -157,6 +160,18 @@ const UNIT_ACTIONS_GAP_PX = 6;
  * the number is a gesture threshold in the presentation layer and is never consulted by a rule.
  */
 const DRAG_CLICK_TOLERANCE_PX = 4;
+
+/**
+ * The map's keyboard hint, on the region rather than on the canvas.
+ *
+ * The canvas's own `aria-description` is the *cursor* readout — the contract requires it to name the
+ * visible dimensions and the tile under the pointer, and `map.spec.ts` asserts it — so the map's
+ * keys are described on the region that owns them. A keyboard user reaches the region with `Tab`,
+ * and this is what tells them what the region will do with the keys they press.
+ */
+const MAP_KEY_HINT =
+  'The map is in the tab order. Arrow keys pan it, plus and minus zoom it. ' +
+  'Space selects the next unit that needs orders and Enter ends the turn.';
 
 const el = <K extends keyof HTMLElementTagNameMap>(
   doc: Document,
@@ -297,6 +312,25 @@ interface Shell {
   readonly panelStack: HTMLElement;
   /** The dialogs' dock, at the foot of the sidebar — see `buildShell`. */
   readonly dock: HTMLElement;
+  /**
+   * The next-unit flow's control (Phase 5).
+   *
+   * A **new accessible name** — `Next unit` — stated here and in `docs/UI-OVERHAUL.md` §9 rather
+   * than in the frozen M8 table, which the M9+M10 note forbids extending in place. It collides with
+   * none of the names in that table, and it dispatches **nothing**: moving to the next unit is
+   * navigation, not an order (§2.A), so a control for it must be a control that issues no command.
+   */
+  readonly nextUnit: HTMLButtonElement;
+  /**
+   * The keyboard contract's discoverable half (Phase 5): the button that opens the bindings, and
+   * the docked panel that lists them.
+   *
+   * Both carry the **new** accessible name `Keyboard` (a `button` and a `dialog`), which collides
+   * with nothing in the frozen table. The panel is docked in the sidebar like every other dialog
+   * (`styles.css` states why an opened panel never floats over the game), and its contents come
+   * from `ui/keys.ts` `KEY_HELP`, so the help cannot describe a key the handler does not have.
+   */
+  readonly keyboard: { readonly open: HTMLButtonElement; readonly dialog: HTMLDialogElement };
   readonly newGame: NewGameControls;
 }
 
@@ -393,6 +427,55 @@ const buildNewGame = (doc: Document): NewGameControls => {
   return { dialog, open, seed, mapSize, civCount, opponent, start, problem };
 };
 
+/**
+ * The keyboard help: the header control that opens the bindings, and the panel that lists them.
+ *
+ * **Discoverability is the half of a keyboard contract that is easy to skip.** A binding nobody can
+ * find is a binding that does not exist for a new player, so the keys are listed in one place a
+ * player can open, from the header, beside the other app-level controls — and the list is
+ * `KEY_HELP`, derived from the binding table itself (`ui/keys.ts`), so the help cannot advertise a
+ * key that does nothing or omit one that works.
+ *
+ * It is a `<dialog>` with its own `Close`, exactly like the city screen and the tech tree, and it is
+ * a **new** accessible name (`Keyboard`) rather than a row in the frozen M8 table, which the
+ * M9+M10 note forbids extending in place. The heading is the same word as the control that opens
+ * it, which is the shape `New game` already has (a `button` and a `dialog`).
+ */
+const buildKeyboardHelp = (doc: Document): Shell['keyboard'] => {
+  const dialog = doc.createElement('dialog');
+  dialog.setAttribute('aria-label', 'Keyboard');
+  dialog.dataset['panel'] = 'keyboard';
+
+  const close = el(doc, 'button', 'Close');
+  close.type = 'button';
+  close.addEventListener('click', () => {
+    dialog.close();
+  });
+
+  const heading = el(doc, 'h2', 'Keyboard');
+  // The bindings live in their own scroll box, and the `Close` control does not: measured at
+  // 1280×900, the nine rows plus their two notes are taller than the share of the sidebar a docked
+  // panel gets, so a panel that scrolled as a whole put its own Close button below the fold — which
+  // is the defect `styles.css` records for the *other* direction and is just as bad this way round.
+  // The body scrolls; the way out stays put.
+  const body = el(doc, 'div');
+  body.dataset['role'] = 'keys';
+  for (const section of KEY_HELP) {
+    const group = el(doc, 'section');
+    const rows = el(doc, 'dl');
+    for (const row of section.rows) {
+      rows.append(el(doc, 'dt', row.keys), el(doc, 'dd', row.meaning));
+    }
+    group.append(el(doc, 'h3', section.where), el(doc, 'p', section.note), rows);
+    body.append(group);
+  }
+  dialog.append(heading, body, close);
+
+  const open = el(doc, 'button', 'Keyboard');
+  open.type = 'button';
+  return { open, dialog };
+};
+
 const buildShell = (doc: Document): Shell => {
   const root = el(doc, 'div');
   root.id = 'civts-app';
@@ -402,6 +485,13 @@ const buildShell = (doc: Document): Shell => {
   const endTurn = el(doc, 'button', 'End turn');
   endTurn.type = 'button';
   endTurn.dataset['command'] = 'EndTurn';
+  // The next-unit flow's control: **navigation, and it deliberately carries no `data-command`**,
+  // because it issues no command at all. It exists so the flow is discoverable with a pointer as
+  // well as with `Space` — a keyboard-only feature is a feature half the players cannot find.
+  const nextUnit = el(doc, 'button', 'Next unit');
+  nextUnit.type = 'button';
+  nextUnit.dataset['role'] = 'next-unit';
+  const keyboard = buildKeyboardHelp(doc);
   const newGame = buildNewGame(doc);
   // The order channel — see `Shell.orderStatus` for what it carries and why its name is what it is.
   // Empty until something happens to an order, and `styles.css` keeps it to one line whatever it
@@ -412,7 +502,7 @@ const buildShell = (doc: Document): Shell => {
   orderStatus.setAttribute('role', 'status');
   orderStatus.setAttribute('aria-label', 'Order');
   orderStatus.dataset['role'] = 'order';
-  header.append(title, newGame.open, endTurn, orderStatus);
+  header.append(title, newGame.open, endTurn, nextUnit, keyboard.open, orderStatus);
 
   const main = el(doc, 'main');
 
@@ -428,6 +518,12 @@ const buildShell = (doc: Document): Shell => {
   mapRegion.setAttribute('role', 'application');
   mapRegion.setAttribute('aria-label', 'Map');
   mapRegion.dataset['panel'] = 'map';
+  // **The map is in the tab order** (Phase 5). `role=application` is the ARIA statement that the
+  // region handles keys itself, and a region a keyboard cannot reach is a region whose keys nobody
+  // can press — which is exactly the gap the inventory called "the sharpest" (§4.6e). Tab still
+  // moves on afterwards: nothing here traps it, and the hint below says what the keys do.
+  mapRegion.tabIndex = 0;
+  mapRegion.setAttribute('aria-description', MAP_KEY_HINT);
 
   const canvas = doc.createElement('canvas');
   // The backing store is resized by `draw` from the measured CSS box and the device pixel ratio;
@@ -461,11 +557,17 @@ const buildShell = (doc: Document): Shell => {
   root.append(header, main);
   doc.body.append(root);
   dock.append(newGame.dialog);
+  // The keyboard help is docked like every other panel rather than floated over the map: `styles.css`
+  // states the rule and the measurement behind it (a floating panel over the game ate the gestures
+  // the game is driven by, and turned three green tests red).
+  dock.append(keyboard.dialog);
   return {
     root,
     canvas,
     mapRegion,
     endTurn,
+    nextUnit,
+    keyboard,
     orderStatus,
     panelsRoot,
     panelStack,
@@ -1114,6 +1216,187 @@ const start = async (): Promise<void> => {
     },
     { passive: false },
   );
+
+  /* ------------------------------ the keyboard --------------------------- */
+
+  /**
+   * **THE KEYBOARD CONTRACT, wired.** The bindings themselves are `ui/keys.ts` — one table, which
+   * the help panel is rendered from as well, so this half cannot drift from what the player is told.
+   * What is here is the three things a table cannot state:
+   *
+   * 1. **Where each half is bound.** The session keys (`Space`, `Enter`, `Escape`) are the
+   *    document's, because a player should not have to focus the map to advance a unit; the map keys
+   *    are the **region's**, so a keydown reaches them only when the focus is already inside the map
+   *    and the arrows cannot be taken away from a scrollable panel. That split is structural — the
+   *    listener placement *is* the guard — which is why `ui/keys.ts`'s resolver takes "is a dialog
+   *    open" for the session half and not for the map half.
+   * 2. **What the page looks like when the key arrives.** A `keydown` carries the key and the
+   *    modifiers; the two facts the deferral rule also needs (is a text field focused, is a dialog
+   *    open) are read here, because they are facts about a DOM and `ui/keys.ts` deliberately knows
+   *    nothing about one.
+   * 3. **`preventDefault` only when the key is ours.** Nothing is prevented for a key the contract
+   *    does not claim, so `Tab`, `PageDown`, `F5` and every browser shortcut behave exactly as they
+   *    did before this phase — the one thing the brief for it asked for by name.
+   */
+  const isTextEntry = (target: EventTarget | null): boolean => {
+    if (!(target instanceof HTMLElement)) return false;
+    const tag = target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+  };
+
+  const keyContext = (event: KeyboardEvent, dialogOpen: boolean): KeyContext => ({
+    key: event.key,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    altKey: event.altKey,
+    inTextField: isTextEntry(event.target),
+    dialogOpen,
+  });
+
+  /**
+   * Pan the view by whole tiles — the keyboard's half of a drag.
+   *
+   * `panCamera` is the projection module's own pan, and the sign is the one the drag handler uses:
+   * the camera moves by `-dx / tileSize`, so asking for the view to move right means a negative
+   * delta here. Expressing it as tiles rather than pixels is the whole point of the binding: a key
+   * press is not a gesture with a distance, and "one tile" is the unit a player can see.
+   */
+  const panByTiles = (tilesX: number, tilesY: number): void => {
+    const size = tileScreenPx(camera);
+    camera = panCamera(camera, extent(), viewport(), -tilesX * size, -tilesY * size);
+    redraw();
+  };
+
+  /** Zoom one step, anchored on the middle of the view — the keyboard's half of the wheel. */
+  const zoomByStep = (steps: number): void => {
+    const size = viewport();
+    camera = zoomCamera(camera, extent(), viewport(), steps, {
+      x: size.width / 2,
+      y: size.height / 2,
+    });
+    redraw();
+  };
+
+  shell.mapRegion.addEventListener('keydown', (event) => {
+    // No dialog clause: this listener only hears keys aimed at the map (see the note above), and a
+    // side panel does not suspend the map it is docked beside.
+    const action = mapActionFor(keyContext(event, false));
+    if (action === undefined) return;
+    event.preventDefault();
+    switch (action) {
+      case 'pan-left':
+        panByTiles(-1, 0);
+        return;
+      case 'pan-right':
+        panByTiles(1, 0);
+        return;
+      case 'pan-up':
+        panByTiles(0, -1);
+        return;
+      case 'pan-down':
+        panByTiles(0, 1);
+        return;
+      case 'zoom-in':
+        zoomByStep(1);
+        return;
+      case 'zoom-out':
+        zoomByStep(-1);
+        return;
+    }
+  });
+
+  /**
+   * Cancel the pending goto, and say so — Phase 4's owed item, paid here.
+   *
+   * §9 of the plan records the debt in the phase that created it: *"no way to cancel a goto except
+   * by giving the unit another order … and no Escape binding — Phase 5 owns the keyboard."* An
+   * `Escape` with no goto pending is deliberately **silent**: there is nothing to cancel and nothing
+   * to apologize for, and a message about a journey nobody is on would be exactly the sort of claim
+   * this app does not make. The intent is dropped without a dispatch, because a goto is UI memory
+   * and cancelling it is not an order the engine has any part in.
+   */
+  const cancelGoto = (): void => {
+    if (pendingGoto === undefined) return;
+    setOrderMessage(`the goto to tile ${tileText(pendingGoto.destination)} is cancelled`);
+    pendingGoto = undefined;
+  };
+
+  /**
+   * **The next-unit flow** (`ui/nextunit.ts` decides; this executes).
+   *
+   * Selecting a unit is navigation and issues nothing (§2.A), so this dispatches nothing: it moves
+   * the selection and, when the unit is off screen, the camera. That second half has a rule worth
+   * stating — **the view follows only when it has to**: a player cycling two units that are both on
+   * screen should be able to watch both, and a camera that jumped on every press would make the map
+   * impossible to read. So the camera is re-centred only when the next unit's tile is not wholly
+   * within the canvas, which is measured against the same projection the renderer drew with.
+   *
+   * The answer "there is no next unit" is said out loud, in the order channel, because silence from
+   * a key that is supposed to do something is indistinguishable from a broken key. Which of the two
+   * sentences it says is the engine's count, not a guess: no unit needs orders at all, or every unit
+   * that does is the one already selected.
+   */
+  function advanceToNextUnit(): void {
+    const seat = humanSeatOf(state);
+    if (seat === undefined) return;
+    const from = panels.selection().unitId;
+    const next = nextUnitNeedingOrders(state, ruleset, seat, from);
+    if (next === undefined) {
+      const waiting = unitsNeedingOrders(state, ruleset, seat).length;
+      setOrderMessage(waiting === 0 ? 'no unit needs orders' : 'no other unit needs orders');
+      return;
+    }
+    panels.selectUnit(next);
+    const unit = state.units.find((each) => each.id === next);
+    if (unit !== undefined && !tileIsOnScreen(unit.tile)) {
+      camera = centreOnTile(camera, extent(), viewport(), {
+        x: indexToX(state.map, unit.tile),
+        y: indexToY(state.map, unit.tile),
+      });
+    }
+    placeUnitActions();
+    redraw();
+  }
+
+  /** Whether a tile is wholly inside the canvas — the question "does the view have to follow?". */
+  const tileIsOnScreen = (tile: TileIndex): boolean => {
+    const size = tileScreenPx(camera);
+    const at = tileToScreen(camera, indexToX(state.map, tile), indexToY(state.map, tile));
+    const box = viewport();
+    return at.x >= 0 && at.y >= 0 && at.x + size <= box.width && at.y + size <= box.height;
+  };
+
+  shell.nextUnit.addEventListener('click', () => {
+    advanceToNextUnit();
+  });
+
+  shell.keyboard.open.addEventListener('click', () => {
+    shell.keyboard.dialog.show();
+  });
+
+  doc.addEventListener('keydown', (event) => {
+    const dialogOpen = doc.querySelector('dialog[open]') !== null;
+    const action = sessionActionFor(keyContext(event, dialogOpen));
+    if (action === undefined) return;
+    // Ours, so the browser's default goes: Space would scroll the page and Enter would re-press
+    // whatever has focus, and both are the app's now (the deferral rule has already given them back
+    // to a field, a dialog and every modified press).
+    event.preventDefault();
+    if (action === 'next-unit') {
+      advanceToNextUnit();
+      return;
+    }
+    if (action === 'end-turn') {
+      // **The button's own click, not a second statement of ending a turn.** Playing the opponent
+      // seats, dispatching `EndTurn`, resuming a goto — all of it is that listener, so the key
+      // cannot end a turn differently from the control, and a test's dispatch instrumentation sees
+      // exactly what it sees for a press. A disabled button (a finished game) fires nothing, which
+      // is the engine's own `isGameOver` answer rather than a second guard here.
+      shell.endTurn.click();
+      return;
+    }
+    cancelGoto();
+  });
 
   /**
    * A click on the map, ordered through the engine's own list.

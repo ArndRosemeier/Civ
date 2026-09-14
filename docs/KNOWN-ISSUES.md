@@ -701,10 +701,10 @@ Recorded here because each is a limit a reader would otherwise have to infer fro
   routing around the obstacle. The consequence is real: a rival moving anywhere that changes the
   route tree can cancel a goto that could have continued, and the player re-clicks. The alternative
   reading of §7.7.4 ("recompute") is the one the owner rejected.
-- **The only way to cancel a goto is to give that unit another order.** Clicking a different
+- **To cancel a goto you give that unit another order, or press `Escape`.** Clicking a different
   destination, or any other order naming the same unit, displaces it (that is `unitNamedBy` in
-  `src/ui/schema.ts`, and it is tested both ways). There is no "stop" control, no Escape binding and
-  no right-click binding; Phase 5 owns the keyboard contract.
+  `src/ui/schema.ts`, and it is tested both ways); Phase 5 added the `Escape` binding this item was
+  waiting for (see §4.4). There is still no "stop" *control* and no right-click binding.
 - **A goto does not survive a save, and cannot.** It is UI memory by design (`docs/UI-OVERHAUL.md`
   §7.4 (b)), so a load drops it — silently, because there is nothing to say about a journey nobody is
   on any more. §7.4 (c), a stored `GoTo` in the unit, is what would fix it, at the price of the six
@@ -716,7 +716,35 @@ Recorded here because each is a limit a reader would otherwise have to infer fro
 - **No human has looked at the channel.** Its text is asserted by role and name in the e2e suite and
   its rendering is CSS; whether it reads well at a glance in a real window is not measured.
 
-### 4.4 Other UI limits
+### 4.4 Phase 5's keyboard contract: what it deliberately does not do
+
+The phase added a contract where none existed (`docs/UI-OVERHAUL.md` §9), so its limits are choices
+rather than debts — recorded because a reader would otherwise have to infer them from the code.
+
+- **`Escape` cannot clear the selection, and the orders popup cannot be dismissed with the
+  keyboard.** The reason is pre-existing and one level down from the keyboard: `defaultUnitId`
+  (`packages/web/src/panels/unitpanel.ts`) resolves the selection on every refresh and falls back to
+  the seat's first unit, so **"nothing is selected" is unreachable while the seat owns a unit**.
+  `docs/UI-OVERHAUL.md` §2.E rule 3 ("Escape, deselecting, or completing an order dismisses it") is
+  therefore only half available: Phase 5 gave `Escape` the one job that was owed (`cancelGoto`) and
+  left the rest unimplemented rather than half-implemented. Closing it means changing what
+  "selected" means to the unit panel, which is a phase of its own.
+- **No order is bound to a key, and there is no auto-advance.** §6.2 ("next-unit auto-advance — yes
+  or no?") is an owner question and is still open; the flow happens only when the player asks for it.
+  A keyboard `MoveUnit`/`FoundCity` would be a third path to a command that already has two surfaces.
+- **The keyboard help panel occupies up to 60 % of the sidebar while it is open**, which is the
+  dock's stated share (`styles.css`), and it pushes the panel stack to its 40 % floor. It is a panel
+  like any other and closes with its own `Close`; what nobody has done is look at it.
+- **The selection is not readable through the frozen test seam.** `keyboard.spec.ts` reads the
+  selected unit out of the contractual group name (`Actions for unit <id>`), which is a legitimate
+  contract but an awkward integer to parse. A `selection()` on `window.__CIVTS__` would be an
+  amendment to a frozen interface and was not taken.
+- **The map's keyboard pan and zoom are anchored on the middle of the view, not on the pointer** —
+  a key press has no pointer position, so there is nothing else it could be anchored on. A player who
+  has just zoomed with the wheel and then presses `+` gets a different anchor than the wheel gave
+  them.
+
+### 4.5 Other UI limits
 
 - The interactive-TTY branch of the REPL cannot be exercised in this environment
   (no TTY); pipes, EOF and `--script` are covered. A human should run `pnpm play`

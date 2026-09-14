@@ -672,7 +672,8 @@ button deletion safe.
 3. **Sidebar re-partition.** Unit controls leave; everything else stays and stops overflowing. —
    **landed**, see §9.
 4. **Goto.** Engine route query first, then the intent decision of §7.4. — **landed**, see §9.
-5. **Next-unit flow and keyboard.** Still additive: no keyboard contract exists today.
+5. **Next-unit flow and keyboard.** Still additive: no keyboard contract exists today. — **landed**,
+   see §9.
 6. **Hover layer.** Tile yields, movement cost, combat odds.
 
 ## 7.7 Open questions this raises
@@ -1320,7 +1321,10 @@ of how: it does not merely get slower, it can lose a browser.
 - **No way to cancel a goto except by giving the unit another order.** Clicking a different
   destination, or any other order for that unit, replaces or displaces the goto (that is `unitNamedBy`
   in the schema, and it is tested); there is no "stop" control and no Escape binding — Phase 5 owns
-  the keyboard.
+  the keyboard. **Phase 5 has since landed the Escape binding** (§9): `Escape` cancels the pending
+  goto and says so in the same channel. The rest of the sentence stands: there is still no *control*
+  that stops a goto, and a cancelled goto still does not resume. The record is left as it was written
+  so the phase that owed the item can be seen to have paid it.
 - **The goto is not in a save, and cannot be.** It is UI memory by design (§7.4 (b)), so loading a
   game mid-journey drops the goto silently. §7.4 (c) — a stored `GoTo` — is what would fix that, and
   it costs the six goldens.
@@ -1337,3 +1341,129 @@ of how: it does not merely get slower, it can lose a browser.
   half of §7.7.4.
 - **No human has looked at the channel.** Its rendering is asserted by role and name and by text; how
   it reads at a glance in a real window is not measured here.
+
+## Phase 5 — the next-unit flow and the keyboard — landed
+
+**The phase was additive, as §7.6 said it would be, and the measurement is stark.** At the previous
+commit there was **no `keydown`, no `tabindex` and no `focus()` anywhere in `packages/web/src`** —
+`git grep` over the tree returns nothing for all three, which is the "sharpest gap" §4.6e recorded.
+There are now **two `keydown` listeners** (`main.ts`: one on the map region, one on the document),
+the map region is **in the tab order** (`mapRegion.tabIndex = 0`, with a `:focus-visible` ring so a
+keyboard user can see where the focus is), and the bindings are one table in `ui/keys.ts`.
+
+### The contract, in full
+
+| where | key | what it does |
+| --- | --- | --- |
+| anywhere | `Space` | select the next unit the **engine** still offers an order, wrapping; says so when there is nothing to move to |
+| anywhere | `Enter` | end the turn — literally the `End turn` button's own click |
+| anywhere | `Escape` | cancel the selected unit's goto, and say so in the order channel |
+| the map | `←` `→` `↑` `↓` | pan the view by one tile |
+| the map | `+` or `=` | zoom in one step, anchored on the middle of the view |
+| the map | `-` or `_` | zoom out one step |
+
+Six bound actions, nine key spellings, and **no order is bound to a key**: this phase's brief is
+navigation, and a keyboard `MoveUnit` would be a third path to a command that already has two
+surfaces (the tile and the unit's own popup).
+
+Four rules make it safe to take keys at all, and each is tested rather than asserted in a comment:
+
+1. **`ctrl`/`meta`/`alt` are never ours.** A modified press is the browser's or the operating
+   system's. `shift` is deliberately *not* treated that way, because `+` is `Shift+=` on most
+   layouts and refusing shift would make zoom-in unreachable on those keyboards — so `+` and `=`
+   are both in the table and both are tested.
+2. **A text field keeps its keys.** The rates row is three number fields; Enter in one of them must
+   not end the turn, and Space must be a space. `main.ts` reads `INPUT`/`TEXTAREA`/`SELECT`/
+   `contenteditable` and the resolver refuses the key.
+3. **An open panel keeps its keys.** The panels are non-modal side screens and a control inside one
+   is activated by `Enter`/`Space`; a session handler that ran as well would act twice on one press.
+4. **`Tab` is not touched, and the map keys belong to the region.** There is no focus trap and no
+   `preventDefault` on `Tab`; the arrows are bound to the map **region**, not the document, so a
+   keydown reaches them only when the focus is already inside the map — which is also what stops the
+   arrows being taken from every scrollable panel in the sidebar. The region's `aria-description`
+   says what its keys do, and the help panel says it again in prose.
+
+**Where the keys are discoverable.** A `Next unit` button beside `End turn` (the flow with a
+pointer), a `Keyboard` button that opens a docked `Keyboard` panel listing the table, and the map
+region's own `aria-description`. Both new names are stated in `main.ts` and here rather than in the
+frozen M8 table, which the M9+M10 note forbids extending in place; neither collides with a name in
+that table. The help panel is rendered **from the binding table**, so the panel cannot list a key the
+handler does not have — and `keys.test.ts` asserts that the documented list and the table are the
+same list.
+
+### The next-unit flow is one engine call, and that is the whole design
+
+`unitActions(state, ruleset, unitId)` is the engine's list for a unit, so "needs orders" is
+**`unitActions(...)` is not empty** and nothing else (`ui/nextunit.ts`). The module never reads
+`movementLeft`, a cost, a terrain row or a unit's statistics, and it never asks whether a unit is
+fortified — it does not have to: fortifying **spends the movement**, so a fortified unit yields
+nothing and drops out by the engine's own arithmetic.
+
+That claim has a falsifier, not just a comment. `nextunit.test.ts` builds a board whose unit has
+`movementLeft: 1` and **nothing the engine offers it** (a military unit ringed by the ruleset's own
+impassable terrain), and asserts the flow does not offer it — so a predicate written as
+`unit.movementLeft > 0` fails the test. The same file cross-checks the flow against a **different
+engine function**: `unitsNeedingOrders` uses `unitActions` (the unit context) and the test compares
+its answer with the units named by `legalActions` (the player context).
+
+**No auto-advance.** §6.2 leaves "next-unit auto-advance — yes or no?" as an owner question and §3
+idea 5 sketches the version where an order advances the selection by itself. That is a change to how
+the game is played rather than a keyboard binding, so it is **not** in this phase: the flow happens
+only when the player asks for it. Recorded here because the absence is deliberate and the plan asked
+for it to be.
+
+**The "nothing to move to" answers are spoken.** A key that does nothing is indistinguishable from a
+broken key, so the order channel says `no other unit needs orders` (every unit that needs orders is
+the one already selected) or `no unit needs orders` (the engine offers nothing to anybody). Both
+sentences come from the engine's count, and both are asserted end-to-end.
+
+### The measurements
+
+| what | before (the previous commit) | after |
+| --- | --- | --- |
+| `keydown` listeners in `packages/web/src` | **0** | 2 (the map region's, the document's) |
+| `tabindex` in `packages/web/src` | **0** | 1 (the map region, `0`) |
+| `focus()` calls in `packages/web/src` | **0** | 0 written by hand — the browser's `Tab` is the whole mechanism |
+| documented bindings | none | 9 key spellings over 6 actions, in one table |
+| reaching the next unit that has orders | click its row in the `Units` list, and work out which unit still has orders by looking at the map | one press or one click, from anywhere; the engine decides which unit |
+| the message when there is nothing to move to | (no key existed) | one sentence in the order channel, naming which of the two situations it is |
+
+Measured through the app in `keyboard.spec.ts`, which prints what it walked: seed 8123 with the
+opponent off, **the seat owns 2 units, the engine offers orders for 2 of them, and the flow reaches
+the other one in 1 keypress from any selection**. The `Units` list is the pointer path to the same
+thing: 2 rows in a 57 px box — and a row says nothing about whether that unit still has orders, which
+is the information the flow supplies.
+
+### Mutation-checked, each restored byte-identical
+
+`ui/nextunit.ts` (`bd7f743a…`), `ui/keys.ts` (`91185ae2…`), `main.ts` (`7f030716…`):
+
+| mutation | the suite | what went red |
+| --- | --- | --- |
+| the flow's predicate becomes `unit.movementLeft > 0` | `test/ui/nextunit.test.ts` | `the flow offered a unit the engine offers nothing for: "needs orders" is not a movement count: expected [ +0, 1, 4 ] to not include 4`, and `on the ringed board the flow and legalActions name different units: expected Set{ +0, 1, 4 } to deeply equal Set{ +0, 1 }` |
+| the flow stops excluding the unit already selected | `test/ui/nextunit.test.ts` | `expected +0 to be undefined` |
+| `sessionActionFor` stops deferring to an open panel | `test/ui/keys.test.ts` | `Space was claimed while a panel was open, where Enter and Space press its controls: expected 'next-unit' to be undefined` |
+| the session keys are never handled at all | `e2e/keyboard.spec.ts` | `press 1 of Space selected unit 0; the engine's own lists say unit 1 is the next one with orders`, and `the next-unit key answered with the unit already selected instead of saying there was nothing to move to` |
+| a text field stops keeping the keys (`isTextEntry` → `false`) | `e2e/keyboard.spec.ts` | `a key pressed inside a text field was handled by the app: Enter or Space escaped the field` |
+| the arrow keys pan the other way (`panCamera`'s sign flipped) | `e2e/keyboard.spec.ts` | `ArrowRight did not pan the map exactly one tile to the right` |
+
+Note the pair in that table: mutating the *session handler away* leaves the deferral test **green**
+(nothing is claimed, so nothing is wrongly claimed), and mutating the *field guard away* leaves the
+flow tests green. Neither test alone can show the contract works; the two together are what pin it —
+which is why both are in the file.
+
+### Not done in this phase, and not claimed
+
+- **No auto-advance** (§6.2 stays open), and **no order on a key** (only navigation, the turn, and
+  the goto cancellation).
+- **`Escape` cannot clear the selection or dismiss the orders popup**, and the reason is pre-existing:
+  `defaultUnitId` (`unitpanel.ts`) falls back to the seat's first unit, so "nothing selected" is
+  unreachable while the seat owns a unit. Phase 5 therefore gave `Escape` the one job that was owed
+  and left §2.E rule 3's "Escape dismisses chrome" unimplemented rather than half-implemented.
+  Recorded in `docs/KNOWN-ISSUES.md`.
+- **The selection is not readable through the frozen test seam**, so `keyboard.spec.ts` reads it out
+  of the contractual group name (`Actions for unit <id>`). A `selection()` getter on
+  `window.__CIVTS__` would be an amendment to a frozen interface; not taken.
+- **No human has reviewed the help panel's layout**, and it is a new panel in a strip that is already
+  tight (see §9 phase 3): at 1280×900 it occupies up to 60 % of the sidebar while it is open, which
+  is the dock's stated share, but nobody has looked at it.
