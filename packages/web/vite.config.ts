@@ -22,7 +22,21 @@ import { defineConfig } from 'vite';
 
 const resolvePath = (relative: string): string => fileURLToPath(new URL(relative, import.meta.url));
 
+/**
+ * Public asset base for production hosting under a subdirectory (domainfactory).
+ * Local `pnpm --filter @civts/web build` / preview keep `/` unless `CIV_BASE` is set.
+ * Deploy CI passes `CIV_BASE=/Civ/` so built asset URLs resolve under https://futuremagic.de/Civ/.
+ */
+function resolveBase(): string {
+  const fromEnv = process.env.CIV_BASE?.trim();
+  if (fromEnv === undefined || fromEnv.length === 0) {
+    return '/';
+  }
+  return fromEnv.endsWith('/') ? fromEnv : `${fromEnv}/`;
+}
+
 export default defineConfig({
+  base: resolveBase(),
   /**
    * **`process.env` does not exist in a browser tab, and one imported module reads it.**
    *

@@ -1,0 +1,67 @@
+name: Deploy to futuremagic.de
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web package for domainfactory
+        env:
+          CIV_BASE: /Civ/
+        run: pnpm --filter @civts/web build
+
+      - name: Prepare Apache assets in dist/
+        working-directory: packages/web
+        run: |
+          if [ ! -f public/.htaccess ]; then
+            echo "public/.htaccess is missing" >&2
+            exit 1
+          fi
+          # Vite does not copy public/.htaccess (dotfile). Mirror Campaigner:
+          # strip UTF-8 BOM if present, then set RewriteBase to /Civ/.
+          sed '1s/^\xEF\xBB\xBF//' public/.htaccess \
+            | sed -E 's|^([[:space:]]*RewriteBase[[:space:]]+)\S+|\1/Civ/|' \
+            > dist/.htaccess
+
+      - name: Verify dist/index.html exists
+        working-directory: packages/web
+        run: |
+          if [ ! -f dist/index.html ]; then
+            echo "dist/index.html is missing after build" >&2
+            exit 1
+          fi
+          if [ ! -f dist/.htaccess ]; then
+            echo "dist/.htaccess is missing after prepare step" >&2
+            exit 1
+          fi
+
+      - name: Upload dist/ via FTP (incremental sync)
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ftp.futuremagic.de
+          username: 12529-Pyrion
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftp
+          local-dir: ./packages/web/dist/
+          server-dir: /webseiten/Civ/
+          dangerous-clean-slate: false
