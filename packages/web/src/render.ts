@@ -178,13 +178,7 @@ export interface Canvas2D {
   imageSmoothingEnabled: boolean;
   fillRect(x: number, y: number, width: number, height: number): void;
   strokeRect(x: number, y: number, width: number, height: number): void;
-  drawImage(
-    image: CanvasImageSource,
-    dx: number,
-    dy: number,
-    dw: number,
-    dh: number,
-  ): void;
+  drawImage(image: CanvasImageSource, dx: number, dy: number, dw: number, dh: number): void;
   beginPath(): void;
   moveTo(x: number, y: number): void;
   lineTo(x: number, y: number): void;

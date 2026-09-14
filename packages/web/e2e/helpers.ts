@@ -407,6 +407,12 @@ export const drawCount = (page: Page): Promise<number> =>
  * flake this wait exists to prevent.
  */
 export const seedApp = async (page: Page, seed: number, options?: unknown): Promise<UiState> => {
+  // Wait for the seam before using it. The app now decodes the terrain and unit sprites before it
+  // publishes `window.__CIVTS__`, because `ready` promises a first frame painted with the real art
+  // rather than a flat-colour flash — so the seam appears a moment after the document does. A spec
+  // that reloads and seeds immediately was racing that decode and failing with "the M8 test seam
+  // is missing", which is a race in this caller, not a missing seam.
+  await waitForApp(page);
   await page.evaluate(
     (input) => {
       const api = window.__CIVTS__;

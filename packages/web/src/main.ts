@@ -1039,4 +1039,33 @@ const extentOf = (state: GameState): ViewportSize => ({
   height: state.map.height,
 });
 
-void start();
+/**
+ * Put a failed boot on the page instead of leaving it blank.
+ *
+ * `start` is async because it decodes the art before the first frame, so a rejected promise is now
+ * a possible outcome of a page load. `void start()` would turn a missing or corrupt asset into an
+ * empty page with nothing but a console message — and `tiles.ts` claims a bad tile is "a broken
+ * build, not a silent flat colour", which is only true if somebody is actually told. This is the
+ * telling.
+ */
+const reportStartFailure = (error: unknown): void => {
+  const doc = document;
+  const banner = el(doc, 'div');
+  banner.id = 'civts-start-failure';
+  banner.setAttribute('role', 'alert');
+  const heading = el(doc, 'h2', 'CivTS could not start');
+  const detail = el(doc, 'p', error instanceof Error ? error.message : String(error));
+  const hint = el(
+    doc,
+    'p',
+    'A missing or unreadable art asset is the usual cause. Reload once before assuming the ' +
+      'worst; the browser console has the full error.',
+  );
+  banner.append(heading, detail, hint);
+  doc.body.replaceChildren(banner);
+};
+
+start().catch((error: unknown) => {
+  console.error(error);
+  reportStartFailure(error);
+});
