@@ -824,7 +824,64 @@ would otherwise have to infer from the code.
   `off` for that reason. A structured `aria-describedby` version would be an accessibility
   improvement nobody has measured the need for.
 
-### 4.6 Other UI limits
+### 4.6 The orders popup does not follow the map — found by looking, not by measuring (2026-09-14)
+
+**Open. Nothing in the suite can see it, and a fix was attempted and withdrawn.**
+
+Every phase of this overhaul was verified by measurement and mutation, and six phases in, nobody had
+looked at the result. The first visual review — a vision-capable model reading three screenshots,
+because every agent on this work ran on a text-only route — found this immediately:
+
+> The action popup is at exactly the same screen position as in image 1 (x 513–691, y 474–517) even
+> though the selected unit moved one tile up-left… So in this frame the popup is *not* beside the
+> selected unit.
+
+**Cause.** `placeUnitActions` (`main.ts`) is called when the *selection* changes and never when the
+*camera* does. The popup's coordinates are the selected unit's screen position, so any pan, zoom or
+resize leaves it behind. The hover readout added in phase 6 gets this right — `redraw` rebuilds it
+precisely "because what it describes can change while the pointer stands still: a move, a new turn, a
+key that pans the map" — and the popup three hundred lines above it did not.
+
+**The obvious fix was tried and is wrong.** Adding `placeUnitActions()` to `redraw()` makes the popup
+follow correctly, and turns **three** green tests red (measured, same box, same command):
+
+| test | failure |
+|---|---|
+| `m8-adversarial.spec.ts` reachable | `clicking tile 885 for unit 1 did not issue a MoveUnit; dispatched [{"type":"StartWork","unitId":1,"kind":"irrigation"}]` — the click was taken by one of the popup's own buttons |
+| `map.spec.ts` fog | `no rival unit in the player's sight could be panned onto the canvas, so the control half of this test could not be taken` |
+| `map.spec.ts` hover (phase 6) | `the priced tile could not be hovered a second time` |
+
+Reverting the one line returns all three to green in 1m24s. So the defect and its fix are not
+separable by a one-liner: **a popup that follows the map sweeps its buttons across tiles as the map
+moves**, and can come to rest over the very tile a click is aimed at. Phase 2 accepted that collision
+as inherent ("the popup is unavoidably larger than one tile, and no placement avoids every neighbour")
+and mitigated it with `pointer-events: none` and a `clickTile` that clicks any unobstructed point
+*inside* the target tile — but both assume the popup holds still between the hit-test and the click,
+which following breaks. Resolving it is a design decision, not a patch: either the popup yields while
+the camera moves (hidden during a drag and re-placed after), or the map keeps a click-priority rule
+over the popup's buttons, or the popup is placed in the map region's margin where it covers no tiles.
+Whichever is chosen must be measured against the three tests above.
+
+**Three more findings from the same review, also open, also invisible to the suite:**
+
+1. **A scoreboard label collides with its first value.** The longest row reads `Barbarians0` with
+   about 4 px of clearance. §4.1's work fixed the table's *horizontal overflow*; this is the cell
+   padding being too tight for the one data-driven column.
+2. **The keyboard help panel clips its last visible row.** `← pan the map one tile left` is sliced
+   along the baseline and jammed against the `Close` button, with `SAVE` and `DEBUG` pushed out of
+   view. Phase 5 measured the panel's body as scrolling by 159 px with `Close` at y 851–879 — inside
+   the window — which is true and is not the same claim as "the panel looks finished".
+3. **The scoreboard body is empty in the help-panel screenshot** while it is populated in the other
+   two. Unexplained; possibly the panel is being squeezed by the help panel beside it. Not
+   investigated.
+
+**The lesson, recorded because it is the whole point:** a suite that measures geometry, text and
+engine agreement can be green for six phases while the thing it describes looks wrong. Screenshots
+are cheap; the reason they were not taken earlier is that every model on this work was text-only and
+the vision route (`deepseek-v4-flash-vision-exp`, the only catalog entry declaring
+`inputModalities: ["text","image"]`) was never tried. It works, and it should be part of the loop.
+
+### 4.7 Other UI limits
 
 - The interactive-TTY branch of the REPL cannot be exercised in this environment
   (no TTY); pipes, EOF and `--script` are covered. A human should run `pnpm play`
