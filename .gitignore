@@ -17,3 +17,6 @@ test-results/
 # Deploy credentials (never committed)
 .ftp.env.local
 ftp.env
+
+# Python bytecode from the deploy helpers
+__pycache__/

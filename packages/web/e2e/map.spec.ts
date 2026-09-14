@@ -32,6 +32,7 @@ import {
   endTurns,
   humanPlayerId,
   authoritativeState,
+  mapCanvas,
   mapDescription,
   mapViewport,
   openApp,
@@ -838,8 +839,40 @@ test('the orders popup follows the camera: a pan, a zoom and a resize all leave 
     return { dx: popup.x - tile.x, dy: popup.y - tile.y };
   };
 
+  /*
+   * The three geometric claims are read only once the popup has SETTLED, and that word is doing real
+   * work. A pan or a zoom repaints inside the same frame, so an immediate read is correct there; a
+   * **resize** is not — `setViewportSize` changes the device metrics, CSS lays the canvas out again,
+   * and the `ResizeObserver` that re-places the popup is delivered one rendering update after that.
+   * Measured on this exact read before it polled: the popup's top came back **496.39** (the value from
+   * before the resize) and was **535.74** twenty-two milliseconds later, with no input of any kind and
+   * the camera untouched. The assertion was therefore racing the browser, and it failed only when
+   * `map.spec.ts` ran as a file and passed when the whole suite did — the most expensive kind of flake,
+   * because a green full run argues against reproducing it.
+   *
+   * So `anchored` polls on the property itself until the popup's box stops moving, then asserts. It is
+   * the same pattern the fluid-square test in this file uses, for the same reason: the box is laid out
+   * by CSS while the thing that depends on it is updated a beat later, and a test that reads both in
+   * the same instant is measuring the gap between them. The settled box is then held to the *same*
+   * three claims, unchanged — this does not relax what is asserted, only when it is safe to assert it.
+   */
   const anchored = async (where: string): Promise<void> => {
-    const [popup, tile] = [await popupBox(), await tileBox()];
+    let popup = await popupBox();
+    await expect
+      .poll(
+        async () => {
+          const next = await popupBox();
+          const moved =
+            Math.abs(next.x - popup.x) > 0.5 || Math.abs(next.y - popup.y) > 0.5 ||
+            Math.abs(next.width - popup.width) > 0.5 || Math.abs(next.height - popup.height) > 0.5;
+          popup = next;
+          return moved;
+        },
+        { message: `${where}: the popup never settled after the camera or the window changed` },
+      )
+      .toBe(false);
+
+    const tile = await tileBox();
     expect(
       popup.x >= tile.x + tile.width - 1 || popup.x + popup.width <= tile.x + 1,
       `${where}: the popup (${String(Math.round(popup.x))}..${String(
@@ -914,13 +947,70 @@ test('the orders popup follows the camera: a pan, a zoom and a resize all leave 
   // is the canvas really changing (asserted below, through the observer, which is asynchronous), and
   // its claim is the same anchor as everywhere else: whatever the window does, the popup is still
   // beside the tile it belongs to and still inside the map it floats over.
+  //
+  // **The settle condition is the app's own, not the layout's, and that is the whole reason this step
+  // used to fail two runs in five.** A canvas box that has taken the new window is *not* evidence that
+  // the app has heard about it: `setViewportSize` changes the device metrics, CSS lays the canvas out
+  // again immediately, and `ResizeObserver` — which is what calls `onViewportChanged`, re-clamps the
+  // camera and re-places the popup — is delivered one rendering update later. Measured on the tree
+  // before this change, inside that window: the canvas box read **654 wide at y 106** while the popup
+  // still carried its pre-resize top of **496.39** — the old canvas top (66.297) plus the tile's own
+  // offset, to the hundredth — and **22 ms later, with no input of any kind and the camera untouched
+  // (`x` was 16.814697265625 in both reads), the popup was at 535.74** and stayed there, while the
+  // unit's tile top was 535.74. That is the `the popup's top (496) is neither the unit's tile top
+  // (536)` failure this step reported, and it is a reading of a half-applied resize rather than a
+  // popup left behind: a frame-by-frame record taken inside the page shows **no frame in which the
+  // canvas has the new size and the popup the old one**, because the app's own observer callback and
+  // the popup's `style.top` assignment land in the same rendering update as the resize, before that
+  // frame is painted.
+  //
+  // So the wait is on the app's own signal, the canvas's **backing store**: `draw` writes it, from the
+  // size `measureCanvas` has just read, and `redraw` calls `draw` and then `placeUnitActions` with no
+  // await between them — a backing store that matches the box on screen *now* therefore means the box
+  // on screen is the one the app has measured and the popup has already been re-placed for it. It is
+  // compared against the box read in the same snapshot rather than merely against the old number, so a
+  // second reflow of the same resize is waited out rather than read through. Phase 1's fluid-square
+  // test polls for the same reason and with the same shape, and this one fails loudly if the app stops
+  // handling the resize at all, which is the defect this step exists to catch.
+  const canvasSnapshot = async (): Promise<{
+    readonly backing: number;
+    readonly css: number;
+    readonly ratio: number;
+  }> =>
+    (await mapCanvas(page)).evaluate((element) => {
+      if (!(element instanceof HTMLCanvasElement)) {
+        throw new Error('the map viewport contains no <canvas> whose backing store to read');
+      }
+      // One snapshot: the backing store and the box it should have been measured from cannot be
+      // allowed to straddle a reflow between two reads.
+      return {
+        backing: element.width,
+        css: Math.round(element.getBoundingClientRect().width),
+        ratio: window.devicePixelRatio,
+      };
+    });
+
   const canvasBeforeResize = await canvasBox(page);
+  const backingBeforeResize = await canvasSnapshot();
   await page.setViewportSize({ width: 1100, height: 820 });
   await expect
     .poll(async () => (await canvasBox(page)).width, {
       message: 'the canvas never took the smaller window, so the resize was never observed',
     })
     .not.toBe(canvasBeforeResize.width);
+  await expect
+    .poll(
+      async () => {
+        const { backing, css, ratio } = await canvasSnapshot();
+        return backing !== backingBeforeResize.backing && backing === Math.round(css * ratio);
+      },
+      {
+        message:
+          'the app never repainted at the new canvas size, so it never handled the resize: the ' +
+          'popup would be read against a canvas the app has not measured',
+      },
+    )
+    .toBe(true);
   await anchored('after a resize');
   const afterResize = await popupBox();
   const canvasAfterResize = await canvasBox(page);
