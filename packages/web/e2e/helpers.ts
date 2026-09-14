@@ -1760,6 +1760,45 @@ export const bringTileToCentre = async (
 };
 
 /**
+ * Issue a map order THE WAY A PLAYER DOES: by clicking the ground the order names.
+ *
+ * `MoveUnit` and `AttackUnit` are the only two commands whose payload names a tile, and they are
+ * exactly the two the map itself can issue (see `src/ui/schema.ts`). Driving them through a control
+ * named "Move to x,y" made the tests depend on a button the map already makes redundant, and it hid
+ * the thing worth proving — that clicking the destination issues the order.
+ *
+ * **The pan is not optional, and the camera must be re-read after it.** `clickTile` throws when the
+ * destination's centre falls outside the canvas, and rightly: a click on the wrong tile would be a
+ * test that lied about what it ordered. So the tile has to be brought on screen first.
+ * `bringTileToCentre` does that by *dragging the map*, and `clickTileOrder` turns a tile into a page
+ * point through the camera it is handed — so a camera captured before the drag describes where the
+ * tile *used* to be. Reading it late clicks the wrong tile; reading it early is the same bug wearing
+ * a different hat, and its symptom would be this function's own "did not issue" error, which reads
+ * like a missing feature rather than a stale coordinate.
+ *
+ * The click keeps the fallback `clickTileOrder` gives every other caller — a control named after the
+ * coordinates — because until the movement buttons are actually deleted there is a control that can
+ * issue this order, and a test that refused to use it would be testing the roadmap rather than the
+ * app.
+ */
+const orderByMapClick = async (
+  page: Page,
+  state: UiState,
+  tile: number,
+  wanted: 'MoveUnit' | 'AttackUnit',
+): Promise<void> => {
+  await bringTileToCentre(page, state, tile);
+  const camera = await cameraOf(page);
+  const issued = await clickTileOrder(page, camera, tile, state.map.width, wanted);
+  if (!issued) {
+    throw new Error(
+      `clicking tile ${String(tile)} did not issue a ${wanted}: the map could not reach an order ` +
+        `the engine offers`,
+    );
+  }
+};
+
+/**
  * Drive a script of commands through the UI'S OWN CONTROLS, one control per command.
  *
  * This is the counterpart of `replayScript`: the same commands, but every one of them issued by
@@ -1789,13 +1828,14 @@ export const driveScript = async (page: Page, script: readonly unknown[]): Promi
       }
       case 'MoveUnit': {
         const state = await readState(page);
-        const to = command.to;
         await selectUnit(page, state, await cameraOf(page), Number(command.unitId));
-        await clickUnitAction(
-          page,
-          Number(command.unitId),
-          new RegExp(`^Move to ${String(tileX(state, to))},${String(tileY(state, to))}$`),
-        );
+        await orderByMapClick(page, state, command.to, 'MoveUnit');
+        break;
+      }
+      case 'AttackUnit': {
+        const state = await readState(page);
+        await selectUnit(page, state, await cameraOf(page), Number(command.unitId));
+        await orderByMapClick(page, state, command.target, 'AttackUnit');
         break;
       }
       case 'StartWork': {

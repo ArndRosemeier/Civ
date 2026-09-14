@@ -25,14 +25,19 @@
 
 import { expect, test, type Page } from '@playwright/test';
 
+import { enumeratedIn } from '../src/ui/schema.js';
+
 import {
   actionControlIndices,
   actionTarget,
   actionsFor,
   actionType,
-  canonicalAction,
+  bringTileToCentre,
   cameraOf,
+  canonicalAction,
   canvasBox,
+  clearDispatchLog,
+  clickTile,
   clickTileOrder,
   dispatch,
   dispatchLog,
@@ -47,6 +52,8 @@ import {
   seedApp,
   selectUnit,
   stateHash,
+  tileX,
+  tileY,
   unitAbilitiesGroup,
   unitActionButtons,
   unitActionsGroup,
@@ -59,28 +66,39 @@ import {
 const SEED = 31337;
 
 /**
- * The commands `actionsFor` *enumerates* for a unit.
+ * The commands `actionsFor` *enumerates* for a unit — asked of the schema, not restated here.
  *
- * The distinction matters and is the engine's own (docs/INTERFACES.md, `actions.ts`):
- * some legal commands are enumerated — a unit either can or cannot step onto each of
- * its eight neighbours — while others are *queried*, because their space is content
- * or a search space rather than a list (`FortifyUnit`, `SetRates`, `SetResearch`,
- * `SetWorkedTiles`, `SetProduction`). A UI control for a queried command is legal and
- * required (A4 names "fortify" among the unit orders), so the offered-controls sweep
- * asserts what the contract asserts — that the engine ACCEPTS it — and additionally
- * that every *enumerated* command it offers is present in the engine's own list.
+ * The distinction is the engine's own (docs/INTERFACES.md, `actions.ts`): some legal commands are
+ * enumerated — a unit either can or cannot step onto each of its eight neighbours — while others are
+ * *queried*, because their space is content or a search space (`FortifyUnit`, `SetRates`,
+ * `SetResearch`, `SetWorkedTiles`). A UI control for a queried command is legal and required (A4
+ * names "fortify" among the unit orders), so the offered-controls sweep asserts what the contract
+ * asserts — that the engine ACCEPTS it — and additionally that every *enumerated* command it offers
+ * is present in the engine's own list.
+ *
+ * These two sets used to be written out by hand, and that is exactly how this file came to disagree
+ * with `src/ui/schema.ts` about `SetProduction`: the schema called it globally queried while this set
+ * called it enumerated, and *neither could be checked*, because a hand-maintained list is a second
+ * statement of a fact that already had an owner. Deriving them means the sweep and the UI cannot
+ * disagree about what the UI is obliged to offer.
+ *
+ * `EndTurn` is deliberately **not** in the unit set any more, and that is a correction rather than a
+ * relaxation. The filter below asks "must this command be in the engine's list *for this unit*?" —
+ * and `actionsFor({ unitId })` answers with `unitActions`, which by design never yields the turn (a
+ * unit's actions are its own, `actions.ts:127-137`). `EndTurn` in a set meaning "must be in the
+ * unit's list" was simply wrong.
+ *
+ * **State the cost plainly, because it is real:** a unit control that wrongly dispatched `EndTurn`
+ * would no longer be flagged by this sweep. I first wrote that the assertion below would catch it,
+ * and that is FALSE — `EndTurn` is accepted from anywhere, so the engine cannot refuse it. Nothing
+ * here compensates. The claim being given up was never the keystone invariant (which is about
+ * reachability and acceptance); this set was simply the wrong instrument for it, and carrying
+ * `EndTurn` in it bought a check that misdescribed what the check meant.
  */
-const ENUMERATED_UNIT_COMMANDS = new Set([
-  'MoveUnit',
-  'AttackUnit',
-  'FoundCity',
-  'StartWork',
-  'CancelWork',
-  'EndTurn',
-]);
+const ENUMERATED_UNIT_COMMANDS: ReadonlySet<string> = new Set(enumeratedIn('unit'));
 
-/** The one command `actionsFor` enumerates for a city. */
-const ENUMERATED_CITY_COMMANDS = new Set(['SetProduction']);
+/** The commands `actionsFor` enumerates for a city — likewise the schema's answer. */
+const ENUMERATED_CITY_COMMANDS: ReadonlySet<string> = new Set(enumeratedIn('city'));
 
 /** A fresh, identical game on the page, zoomed in and panned so tiles are clickable. */
 const freshGame = async (page: Page): Promise<void> => {
@@ -236,6 +254,71 @@ test('keystone UI adds no rules: every command the engine accepts for a unit is 
     `commands the engine offers that the UI cannot reach: ${JSON.stringify(comparison.onlyInB)}\n` +
       `commands the UI produced that the engine does not offer: ${JSON.stringify(comparison.onlyInA)}`,
   ).toBe(true);
+});
+
+test('the map ALONE can issue every map order the engine offers — no control is clicked', async ({
+  page,
+}) => {
+  // WHY THIS TEST EXISTS, and why the reachability test above cannot cover it.
+  //
+  // That test reaches a map command by trying the click, and then falling back to a control named
+  // after the coordinates (`clickTileOrder`). The fallback means it cannot distinguish a map that
+  // works from one that does not — and since the movement buttons currently reach everything, its map
+  // path is dead code that has never proved anything. It also `continue`s past any target it cannot
+  // currently see, so a target it never even attempted is silently absent from its evidence.
+  //
+  // `docs/UI-OVERHAUL.md` §5 plans to DELETE those buttons. Doing that is only safe against an
+  // assertion that the map alone suffices, made by clicking nothing but the tile. That is this test.
+  await openApp(page);
+  await freshGame(page);
+  expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
+
+  const settle = await humanUnit(page, 'settler');
+  const offered = (await actionsFor(page, { unitId: settle.id })).filter(
+    (action) => mapOrderType(action) !== undefined,
+  );
+  // Non-vacuity: if the engine offered the settler no map order, every line below would pass while
+  // testing nothing, and this spec would go on reporting success after the map had stopped working.
+  expect(
+    offered.length,
+    'the engine offered the settler no map order at all, so this proved nothing',
+  ).toBeGreaterThan(0);
+
+  const failures: string[] = [];
+  for (const action of offered) {
+    await freshGame(page);
+    const unit = await humanUnit(page, 'settler');
+    await select(page, unit.id);
+    const state = await readState(page);
+    const type = mapOrderType(action);
+    const tile = actionTarget(action);
+    if (type === undefined || tile === undefined) continue;
+
+    // Pan first, then read the camera. `bringTileToCentre` drags the map, and a camera captured
+    // before that drag describes where the tile used to be — a stale camera here would click some
+    // other tile and then report a missing feature.
+    await bringTileToCentre(page, state, tile);
+    const camera = await cameraOf(page);
+    await clearDispatchLog(page);
+    await clickTile(page, camera, tileX(state, tile), tileY(state, tile));
+
+    const log = await dispatchLog(page);
+    const issued = log.some(
+      (entry) => mapOrderType(entry.action) === type && actionTarget(entry.action) === tile,
+    );
+    if (!issued) {
+      failures.push(
+        `tile ${String(tile)} at (${String(tileX(state, tile))},${String(tileY(state, tile))}): ` +
+          `clicking it issued no ${type}. Dispatched: ` +
+          JSON.stringify(log.map((entry) => entry.action)),
+      );
+    }
+  }
+
+  expect(
+    failures,
+    `map orders the engine offers that a tile click alone cannot issue:\n${failures.join('\n')}`,
+  ).toEqual([]);
 });
 
 test('keystone UI adds no rules: every control the city screen offers dispatches a command the engine accepts, and every production option is offered', async ({

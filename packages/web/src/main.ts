@@ -106,6 +106,7 @@ import { loadUnitSprites, type UnitSprites } from './units.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
 import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
+import { tileNamedBy } from './ui/schema.js';
 
 /** The seed a page load starts on, when nothing has seeded it. */
 const DEFAULT_SEED = 1;
@@ -286,12 +287,15 @@ const abilityLabel = (state: GameState, command: Command): string => {
   }
 };
 
-/** The tile a map order names, or `undefined` for a command that is not a map order. */
-const commandTile = (command: Command): number | undefined => {
-  if (command.type === 'MoveUnit') return command.to;
-  if (command.type === 'AttackUnit') return command.target;
-  return undefined;
-};
+/**
+ * Which tile a map order names is the schema's question, not this file's.
+ *
+ * `tileNamedBy` in `ui/schema.ts` is the single answer, and the click handler below asks it. There
+ * used to be a local `commandTile` here doing the same job with an `if` chain; two definitions of
+ * "which tile does this command point at" is the same class of defect the contract bans for the
+ * projection (`docs/INTERFACES.md:1908`), and it is how a click ends up dispatching an order for a
+ * tile the caller did not mean.
+ */
 
 /* ------------------------------------------------------------------ *
  * The app
@@ -918,7 +922,7 @@ const start = async (): Promise<void> => {
     // engine's answer, so a destination that appears here is one `applyCommand` accepts.
     if (!over && selected !== undefined) {
       const ordered = unitActions(state, ruleset, selected).find(
-        (command) => commandTile(command) === index,
+        (command) => tileNamedBy(command) === index,
       );
       if (ordered !== undefined) {
         armDispatch(ordered);
