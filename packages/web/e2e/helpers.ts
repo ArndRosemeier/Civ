@@ -952,6 +952,50 @@ export const colourDistance = (a: Rgb, b: Rgb): number =>
 export const describeColour = (colour: Rgb): string =>
   `rgb(${String(colour.r)}, ${String(colour.g)}, ${String(colour.b)})`;
 
+/**
+ * How far a painted tile centre may sit from the colour `TERRAIN_COLOURS` documents for it.
+ *
+ * Textured tiles are why this is not zero. A terrain used to be one flat fill, so a sample
+ * either matched the documented colour exactly or the renderer was wrong. Now a tile's centre
+ * is a blend of a texture, and it moves with the tile's sub-pixel offset and with the zoom
+ * level, so the documented colour is the *middle* of a range rather than the value.
+ *
+ * Both numbers here are measured, by `e2e/terrain-palette-probe.spec.ts` over 79 seeds:
+ *
+ *   - **44 covers the spread.** The worst tile of any terrain sat 36 from its terrain's mean
+ *     (grassland, n = 1677). Eight points of margin over the widest thing observed.
+ *   - **44 is still narrow enough to catch a real defect.** The closest two terrains are
+ *     hills and mountains at 75 apart, so a tile painted with the wrong terrain's texture
+ *     lands at least `75 - 23 = 52` from the colour documented for it — outside the tolerance
+ *     with 8 to spare. A tolerance that swallowed that gap would make the pixel tests
+ *     vacuous, which is exactly what `m8-adversarial.spec.ts` exists to prevent.
+ *
+ * **This took three attempts, and each one moved the palette.** Mountains rested on 3 tiles
+ * first, because the probe exited as soon as all six terrains appeared and never reached the
+ * seeds collected for them; fixing that moved hills and mountains. Then `MOUNTAIN_SEEDS` held
+ * only 30 of the 39 seeds it claimed to hold — the list was copied from a script that printed
+ * `slice(0, 30)` while the prose said "that list", so the evidence was narrower than its own
+ * description. Completing it moved hills, mountains and ocean again. A verifier caught the
+ * second one by counting the list against the engine's enumeration; both are recorded because
+ * the numbers were quoted as evidence while they were still moving.
+ */
+export const TERRAIN_CENTRE_TOLERANCE = 44;
+
+/**
+ * How far apart two tiles of the SAME terrain may sample and still count as agreeing.
+ *
+ * This was 8, which was right when a terrain was one flat fill: every tile of it was the same
+ * byte for byte, and 8 left room for antialiasing at a tile edge. A texture makes that
+ * impossible — the widest is grassland at **48** across 1677 tiles — so the old bound would
+ * have failed on the art regardless of whether the renderer was correct.
+ *
+ * 56 covers the measured 48 with margin and stays below the closest distance between two
+ * terrains' documented colours (hills/mountains, 75). That second bound is the one that keeps
+ * this meaningful: if two tiles of one terrain could disagree by more than two terrains differ,
+ * "the sampling is a function of terrain" would stop being a statement about anything.
+ */
+export const TERRAIN_SAME_KIND_TOLERANCE = 56;
+
 /* ------------------------------------------------------------------ *
  * The draw trace
  * ------------------------------------------------------------------ */

@@ -103,6 +103,7 @@ import {
   visibleTiles,
   yearIndicator,
   RULESET,
+  TERRAIN_CENTRE_TOLERANCE,
   type UiState,
 } from './helpers.js';
 
@@ -1445,7 +1446,10 @@ test('pixel sampling is not vacuous: the tile-colour predicate separates the ter
     const painted = await sampleTileColour(page, camera, x, y);
     sampled += 1;
     const expected = parseHexColour(wanted);
-    if (colourDistance(painted, expected) > 8) {
+    // The tolerance a texture needs, in one shared place: it was 8, which was written when a
+    // terrain was a flat fill. See `TERRAIN_CENTRE_TOLERANCE` for the measurement that sets it
+    // and for why it is still narrow enough to catch a wrong-terrain mapping.
+    if (colourDistance(painted, expected) > TERRAIN_CENTRE_TOLERANCE) {
       mismatches.push(
         `tile ${String(tile)} (${terrain}): painted ${describeColour(painted)}, the palette says ${wanted}`,
       );
@@ -1465,20 +1469,23 @@ test('pixel sampling is not vacuous: the tile-colour predicate separates the ter
   // The control: the same reading, on an image that is deliberately broken — every pixel the same
   // colour. Two points that lie on different terrains in the real frame must come back identical,
   // which is what makes a green run on the real canvas evidence rather than decoration.
-  const uniformVerdict = await page.evaluate((hex) => {
-    const canvas = document.createElement('canvas');
-    canvas.width = 32;
-    canvas.height = 32;
-    const context = canvas.getContext('2d');
-    if (context === null) return null;
-    context.fillStyle = hex;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    const read = (x: number, y: number): string => {
-      const data = context.getImageData(x, y, 1, 1).data;
-      return `${String(data[0] ?? 0)},${String(data[1] ?? 0)},${String(data[2] ?? 0)}`;
-    };
-    return { first: read(4, 4), second: read(28, 28) };
-  }, '#4a9d4a');
+  const uniformVerdict = await page.evaluate(
+    (hex) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 32;
+      canvas.height = 32;
+      const context = canvas.getContext('2d');
+      if (context === null) return null;
+      context.fillStyle = hex;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const read = (x: number, y: number): string => {
+        const data = context.getImageData(x, y, 1, 1).data;
+        return `${String(data[0] ?? 0)},${String(data[1] ?? 0)},${String(data[2] ?? 0)}`;
+      };
+      return { first: read(4, 4), second: read(28, 28) };
+    },
+    Object.values(palette)[0] ?? '#000000',
+  );
   expect(uniformVerdict, 'the page could not build the control image').not.toBeNull();
   if (uniformVerdict !== null) {
     expect(

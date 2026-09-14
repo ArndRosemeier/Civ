@@ -10,6 +10,13 @@ from PIL import Image, ImageEnhance, ImageFilter
 ROOT = Path(__file__).resolve().parent
 SIZE = 256
 
+# NOT the render contract. This dict is the middletone this script grades each tile toward
+# while processing. The colour the app *documents* for a terrain is `TERRAIN_COLOURS` in
+# `packages/web/src/render.ts`, and it is the MEAN of what the terrain paints on the canvas,
+# measured by `packages/web/e2e/terrain-palette-probe.spec.ts` — a different list, on purpose,
+# because a painted tile centre is a blend rather than a single pixel. Changing a value here
+# does not change what the tests expect; it changes the art, which then changes the expectation
+# only once the probe is re-run. See `docs/KNOWN-ISSUES.md` 3.12.
 PALETTE: dict[str, tuple[int, int, int]] = {
     "grassland": (0x4A, 0x9D, 0x4A),
     "plains": (0xB8, 0xA2, 0x4A),

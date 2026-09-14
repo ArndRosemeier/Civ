@@ -56,11 +56,18 @@ laptop. Neither script generates anything; neither is needed to build or run the
 - `assets/units/process_units.py` — chroma-keys the background away by sampling the
   corners, then resizes to 128 px.
 
-**`lock_centre` does not achieve what it looks like it achieves**, and this is worth
-knowing before anyone trusts it: it locks the centre pixel of the *source* file, but
-the end-to-end tests sample the *painted canvas* after the texture has been scaled
-into the tile rect, where that single pixel is blended away. See
-`docs/KNOWN-ISSUES.md` §3.12 for the measurement and the two tests it leaves failing.
+**`lock_centre` does not set the colour contract**, and this is worth knowing before anyone
+trusts it: it locks the centre pixel of the *source* file, but the tests that check the
+contract sample the *painted canvas* after the texture has been scaled into the tile rect,
+where that single pixel is blended away. The two were reconciled by measuring the art:
+`TERRAIN_COLOURS` in `src/render.ts` is now the **mean of what each terrain paints**, derived
+by `e2e/terrain-palette-probe.spec.ts`, and the `PALETTE` dict in `process_tiles.py` is only
+the grading target the script pulls toward while processing. The two are deliberately not the
+same list, and the one that is the contract is the one in `render.ts`. See
+`docs/KNOWN-ISSUES.md` §3.12 for the measurements.
+
+The comment in `process_tiles.py` says the same thing at the point of use, so nobody re-grades
+a tile expecting the script's palette to be the contract.
 
 ## What is still open
 
@@ -70,6 +77,7 @@ terms the code and these images are offered under. The origin above is recorded 
 that the choice can be made with the facts in hand.
 
 Nothing else about the art is unresolved: the set is complete, the names match the
-catalog exactly, the transparency is real, and a missing or unreadable file fails
-loudly on the page rather than leaving a blank canvas (see `reportStartFailure` in
-`packages/web/src/main.ts`).
+catalog exactly, the transparency is real, the palette the renderer documents is now the
+colour the art actually paints (measured, not asserted — §3.12 of `docs/KNOWN-ISSUES.md`),
+and a missing or unreadable file fails loudly on the page rather than leaving a blank canvas
+(see `reportStartFailure` in `packages/web/src/main.ts`).

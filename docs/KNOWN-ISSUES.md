@@ -389,7 +389,7 @@ is exactly the class of defect this document exists to catch.
   final hashes. The millisecond figures are readings of the box, not properties of the
   engine, which is why every one of them is quoted with a load average.
 
-### 3.12 Textured tiles broke a contract they claimed to keep — three e2e tests fail, open
+### 3.12 Textured tiles broke a contract they claimed to keep — **resolved: the palette adopted the art**
 
 The sprite commit (`2376dd5`) added sixteen generated PNGs and painted the map with
 them. All sixteen are correct and complete against the catalog
@@ -419,13 +419,89 @@ in the same commit, so the test's *opening* `zoomTo(page, 1, 1)` now lands on th
 maximum level (128 px per tile) and the later zoom has nowhere left to go:
 `128 == 128`. This is deterministic, not load flake — it reproduces on an idle box.
 
-**Why these are recorded rather than fixed.** Both are questions about which art is
-canonical, and neither is a mechanic's call:
+**Both were decisions about which art is canonical, and both were put to the project owner,
+who chose to adopt the art.** What that meant in practice:
 
-- either the tiles are re-graded so the *painted* centre lands on the documented
-  palette (which means the lock has to be verified through the renderer, not in the
-  file), or the palette in `render.ts` and those two tests adopt the art;
-- either the test's opening zoom changes, or the default zoom goes back to `2`.
+*The palette was re-derived from the pixels, not re-guessed.*
+`e2e/terrain-palette-probe.spec.ts` (`CIVTS_PALETTE_PROBE=1`) samples painted tile centres
+through the app's own seam and prints the mean, the spread and the pairwise separation. Its
+first version found only two terrains, because a seeded start explores a patch of about 6x6
+tiles; sweeping seeds fixed that, and the mountains needed naming explicitly — a script over
+the engine found that only 39 of the first 2500 `tiny` seeds put a mountain inside a starting
+visibility radius. Over 79 seeds:
+
+```
+coast      n= 277  mean=rgb(71,202,208)  #47cad0  worst-offset=23  max-pairwise=44
+grassland  n=1677  mean=rgb(90,145,56)   #5a9138  worst-offset=36  max-pairwise=48
+hills      n= 281  mean=rgb(125,107,71)  #7d6b47  worst-offset=23  max-pairwise=37
+mountains  n=  78  mean=rgb(125,126,127) #7d7e7f  worst-offset=15  max-pairwise=27
+ocean      n=  70  mean=rgb(41,87,141)   #29578d  worst-offset=29  max-pairwise=44
+plains     n= 145  mean=rgb(193,153,60)  #c1993c  worst-offset=10  max-pairwise=18
+```
+
+Those means are now `TERRAIN_COLOURS` in `render.ts`, and the two tolerances the commit had
+outgrown (24 and 8) are one shared constant each, both measured rather than chosen:
+`TERRAIN_CENTRE_TOLERANCE` = 44 (covers the widest 36 with margin) and
+`TERRAIN_SAME_KIND_TOLERANCE` = 56 (covers the widest 48, and stays under the closest
+separation between two terrains, hills/mountains at 75).
+
+**This table took three attempts, and its own numbers are what caught the first two.**
+
+1. The probe exited as soon as all six terrains had appeared, which for this seed list happened
+   before the seeds collected *for their mountains* were ever reached — so mountains rested on
+   **3 tiles**. The weakest number was weak because of an early `break`, not because mountains
+   are rare. Removing it took mountains to 56 and **moved hills and mountains**.
+2. `MOUNTAIN_SEEDS` then held **30 of the 39** seeds it claimed to hold. The list had been copied
+   out of a script that printed `slice(0, 30)` while the prose said "that list" — the evidence was
+   narrower than its own description, which is the failure mode this document exists to catch.
+   A verifier found it by enumerating the seeds against the engine instead of reading the list.
+   Completing it took mountains to 78 and **moved hills, mountains and ocean**.
+
+The palette has therefore moved three times, by one point in each affected channel, and the
+tests passed through all three — because `TERRAIN_CENTRE_TOLERANCE` is 44 and a point is nothing
+beside it. `render.ts` now says so at the point of use, so that nobody chases the last digit:
+what has to be right is the evidence, not the rounding. The lessons are the two this project
+keeps re-learning — a number produced by a loop with an early exit describes the loop (§3.8),
+and a claim is only as wide as the thing it actually enumerates. `lock_centre` is left in
+`process_tiles.py` and is now documented as *not* the thing that sets the contract — it locks
+a file's centre pixel, and the contract is about the canvas.
+
+*Because the tolerance widened, an assertion was added — and an independent verifier then showed
+it does not do what its comment claimed.* `map.spec.ts` also requires each sample to be **nearer
+its own terrain's documented colour than any other terrain's**. The claim was that this catches a
+wrong-terrain mapping "that the tolerance alone would hide". It does not: the global minimum of
+`separation − spread of the painted terrain` is 52, which is above the 44 tolerance, so a
+mispainted tile is always caught by the tolerance line first and never reaches this one. What it
+actually catches is a **documentation collision** — two terrains documented too close to tell
+apart — which the absolute bound cannot see, since it compares a sample with one colour at a
+time. Setting `hills` to grassland's colour fails this line and only this line; swapping two
+terrains' textures fails the tolerance line. Both checks are worth having; the comment now says
+which is which instead of claiming the stronger one.
+
+*A worse hole, found the same way.* The pixel test seeded once, and at `SEED` (4242) the starting
+patch holds only coast, grassland and ocean. **Swapping the hills and mountains textures — the
+closest pair in the palette, 75 apart, and the one most worth checking — left both
+`map.spec.ts` and `m8-adversarial.spec.ts` green.** The test now sweeps `PALETTE_SEEDS` (4242,
+70, 75), a cover found by enumerating the engine over seeds 1..120 rather than by guessing, and
+it asserts that the sampled terrains equal the palette's keys — so the coverage cannot quietly
+shrink again. Verified by mutation: the hills/mountains swap now fails with
+`tile 733 is hills and sampled rgb(120, 121, 122), but the app documents #7d6b47 for it`
+(70 > 44). `m8-adversarial.spec.ts` still samples a single frame, so its coverage remains limited
+to whatever terrains that frame holds; that is recorded rather than presented as complete.
+
+*The zoom test zooms out instead of in.* The app keeps its `2x` opening
+(`ZOOM_DEFAULT_INDEX` stays 3, so textured tiles read clearly); the test's own opening
+`zoomTo` had already climbed to the innermost level, so the assertion was measuring the
+ceiling of the zoom range rather than the projection changing.
+
+**Verified by breaking it, not by watching it go green.** Swapping the grassland and hills
+textures in `src/tiles.ts` turns `map.spec.ts` red with
+`tile 2008 is grassland and sampled rgb(130, 111, 76), but the app documents #5a9138 for it`
+— so the widened tolerance still sees a wrong terrain — and `src/tiles.ts` reverted
+byte-identical. The zoom assertion is **not** independently falsifiable: collapsing every zoom
+ratio to the same value makes `zoomSign` throw first, so that requirement is enforced by the
+helper and the assertion restates it. That is said in the code beside the assertion rather
+than left implied.
 
 Two further tests that the same commit broke — `determinism.spec.ts:156` and
 `panels.spec.ts:64`, both failing with "the M8 test seam is missing" — were **races,
@@ -435,7 +511,8 @@ immediately was racing the decode; `seedApp` now waits for the seam the way `ope
 always did. The same commit also shipped with the fast gate red (`render.ts` was not
 prettier-clean) and turned a failed boot into a blank page — `void start()` with no
 `catch` — which now reports on the page instead. Suite state: **58 passed / 5 failed
-before, 60 passed / 3 failed after.**
+before, 60 passed / 3 failed after the first pass, 63 passed / 0 failed once the art was
+adopted.**
 
 ---
 

@@ -40,6 +40,8 @@ import {
   seedApp,
   stateHash,
   terrainAtTile,
+  TERRAIN_CENTRE_TOLERANCE,
+  TERRAIN_SAME_KIND_TOLERANCE,
   tileCentre,
   tileIsClear,
   tilePagePoint,
@@ -56,6 +58,12 @@ import { BASE_TILE_PX, clampCamera, screenToTilePoint, tileScreenPx } from '../s
 /** A fixed seed, so every claim below is reproducible. */
 const SEED = 4242;
 
+/**
+ * The seeds this file's palette test sweeps, chosen to cover all six shipped terrains between
+ * them. See the comment at the sampling loop: one seed shows three terrains, and the two that
+ * were missing were exactly the pair most worth checking.
+ */
+export const PALETTE_SEEDS = [SEED, 70, 75] as const;
 test('A4 map render: the first frame draws tiles, and the draw trace names the tiles and terrains it claims', async ({
   page,
 }) => {
@@ -168,10 +176,6 @@ test("rendering: a tile's centre is painted the colour the app documents for its
   page,
 }, testInfo) => {
   await openApp(page);
-  const state = await seedApp(page, SEED);
-  const camera = await cameraOf(page);
-  const box = await canvasBox(page);
-  const player = humanPlayerId(state);
   // The app's OWN palette, if it documents one. Nothing is asserted against a palette invented
   // here: a test that pins colours the renderer never claimed reports a defect that does not
   // exist, and the contract freezes the sample, not the swatches.
@@ -180,24 +184,42 @@ test("rendering: a tile's centre is painted the colour the app documents for its
   // Sample tiles that are clear (no unit or city painted over the terrain) and explored (fog is
   // a colour of its own, and a fogged tile says nothing about the terrain). Up to two tiles per
   // terrain id, because the second is what proves the mapping is a *function* of terrain.
+  //
+  // **More than one seed, because one seed does not show every terrain.** This test used to seed
+  // once, and at `SEED` the starting patch holds only coast, grassland and ocean — so plains,
+  // hills and mountains were never sampled by anything, and a verifier demonstrated the cost:
+  // swapping the hills and mountains textures, the closest pair in the palette and the one most
+  // worth checking, left this test and `m8-adversarial.spec.ts` **both green**. Seeds 70 and 75
+  // were chosen by enumerating the engine (`newGame` over seeds 1..120, terrain ids over
+  // `state.explored[player]`): between them they hold all six, and the assertion below refuses to
+  // let that coverage quietly go away again.
   const samples = new Map<string, { tile: number; colour: Rgb }[]>();
-  for (const tile of visibleTiles(state, camera, box)) {
-    if (!tileIsClear(state, tile)) continue;
-    if (state.explored[player]?.[tile] !== true) continue;
-    const terrain = terrainAtTile(state, tile);
-    const bucket = samples.get(terrain) ?? [];
-    if (bucket.length >= 2) continue;
-    bucket.push({
-      tile,
-      colour: await sampleTileColour(page, camera, tileX(state, tile), tileY(state, tile)),
-    });
-    samples.set(terrain, bucket);
+  for (const seed of PALETTE_SEEDS) {
+    const state = await seedApp(page, seed);
+    const camera = await cameraOf(page);
+    const box = await canvasBox(page);
+    const player = humanPlayerId(state);
+    for (const tile of visibleTiles(state, camera, box)) {
+      if (!tileIsClear(state, tile)) continue;
+      if (state.explored[player]?.[tile] !== true) continue;
+      const terrain = terrainAtTile(state, tile);
+      const bucket = samples.get(terrain) ?? [];
+      if (bucket.length >= 2) continue;
+      bucket.push({
+        tile,
+        colour: await sampleTileColour(page, camera, tileX(state, tile), tileY(state, tile)),
+      });
+      samples.set(terrain, bucket);
+    }
   }
 
+  // Every shipped terrain, not merely "something was on screen": a palette check that skipped
+  // three of the six would pass while three terrains went unpainted and unnoticed.
   expect(
-    samples.size,
-    'no clear, explored tile was on screen to sample, so nothing about the map’s colours was tested',
-  ).toBeGreaterThan(0);
+    [...samples.keys()].sort(),
+    'not every shipped terrain was on screen to sample, so this run says nothing about the ones ' +
+      'that were missing — extend PALETTE_SEEDS with a seed that shows them',
+  ).toEqual(Object.keys(palette ?? {}).sort());
 
   let compared = 0;
   const seen: { terrain: string; colour: Rgb }[] = [];
@@ -212,24 +234,58 @@ test("rendering: a tile's centre is painted the colour the app documents for its
     if (documented !== undefined) {
       const expected = parseHexColour(documented);
       for (const sample of bucket) {
+        const own = colourDistance(sample.colour, expected);
         expect(
-          colourDistance(sample.colour, expected),
+          own,
           `tile ${String(sample.tile)} is ${terrain} and sampled ${describeColour(
             sample.colour,
           )}, but the app documents ${documented} for it`,
-        ).toBeLessThanOrEqual(24);
+        ).toBeLessThanOrEqual(TERRAIN_CENTRE_TOLERANCE);
+
+        // What this actually catches, stated precisely because an earlier version of this comment
+        // overstated it: a **documentation collision** — two terrains documented so close together
+        // that a sample falls within tolerance of both. The absolute bound above cannot see that,
+        // because it only ever compares a sample with one colour at a time.
+        //
+        // What it does NOT do, and a verifier demonstrated by mutation: it will not fire *before*
+        // the tolerance bound for a wrong-texture mapping. For every pair in this palette the 44
+        // bound fires first — the global minimum of `separation − spread of the painted terrain`
+        // is 52, which is above 44 — so a mispainted tile is caught by the line above and never
+        // reaches this one. Swapping two terrains' textures fails the tolerance assertion; setting
+        // two terrains to the SAME documented colour fails this one and only this one. Both are
+        // worth having. They are not the same check, and this comment used to claim they were.
+        let nearestTerrain = '';
+        let nearestDistance = Number.POSITIVE_INFINITY;
+        for (const [other, otherHex] of Object.entries(palette ?? {})) {
+          if (other === terrain) continue;
+          const distance = colourDistance(sample.colour, parseHexColour(otherHex));
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestTerrain = other;
+          }
+        }
+        expect(
+          own,
+          `tile ${String(sample.tile)} is ${terrain} and sampled ${describeColour(
+            sample.colour,
+          )}, which is nearer the colour documented for ${nearestTerrain} (${String(
+            nearestDistance,
+          )}) than the one documented for ${terrain} (${String(own)})`,
+        ).toBeLessThan(nearestDistance);
         compared += 1;
       }
     }
     // The same terrain, two places, one colour: a per-tile coincidence would show up here as
-    // two samples of the "same" terrain disagreeing.
+    // two samples of the "same" terrain disagreeing. The bound is the measured spread of the
+    // widest texture (48, grassland) rather than the old 8, which was written when a terrain was
+    // a single fill and every tile of it was the same byte for byte.
     const first = bucket[0];
     const second = bucket[1];
     if (first !== undefined && second !== undefined) {
       expect(
         colourDistance(first.colour, second.colour),
         `two ${terrain} tiles sampled different colours — the mapping is not a function of terrain`,
-      ).toBeLessThanOrEqual(8);
+      ).toBeLessThanOrEqual(TERRAIN_SAME_KIND_TOLERANCE);
     }
     if (first !== undefined) seen.push({ terrain, colour: first.colour });
   }
@@ -325,8 +381,22 @@ test('rendering: the sampled colour changes when the map pans and zooms, so the 
   // And zooming genuinely changes the projection the sample is taken through: the
   // tile size the app reports changes, so the coordinates below are not a fixed
   // screen grid that would make every sample identical by construction.
-  const zoomedIn = await zoomTo(page, 1, 1);
-  expect(tileScreenPx(zoomedIn)).not.toBe(tileScreenPx(panned));
+  // Zoom *out* one step, not in: the app now opens at 2x (`ZOOM_DEFAULT_INDEX` 3) because
+  // textured tiles read better there, and the test's own opening `zoomTo` has already climbed to
+  // the innermost level. Asking for one more step inward therefore asked for a level that does
+  // not exist, and `tileScreenPx` correctly returned the same number — the assertion was testing
+  // the ceiling of the zoom range rather than the projection changing.
+  //
+  // Said plainly: the assertion below is not independently falsifiable, because `zoomSign`
+  // already throws when a wheel leaves the tile size unchanged — verified by collapsing every
+  // zoom ratio to the same value and watching the helper, not this line, go red. It is kept
+  // because it states the requirement where the sample is taken, and it costs nothing.
+  const zoomedOut = await zoomTo(page, -1, 1);
+  expect(
+    tileScreenPx(zoomedOut),
+    'the app reports the same tile size at two different zoom levels, so the sampled ' +
+      'coordinates are a fixed screen grid and every sample below is the same sample',
+  ).not.toBe(tileScreenPx(panned));
   const zoomColour = await sampleCanvasPixel(page, local);
   expect(zoomColour.a).toBe(255);
 });

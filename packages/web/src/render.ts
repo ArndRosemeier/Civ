@@ -18,10 +18,29 @@
  * `TERRAIN_COLOURS` is exported as a plain record of `#rrggbb` strings, which is what the e2e
  * suite's palette probe reads (`e2e/helpers.ts`' `paletteOf`, source 2): a pixel sample is then
  * checked against the colour the **renderer** documents, rather than against a swatch the test
- * invented. Textured tiles keep that same centre colour. The six ids are the shipped ruleset's
- * own terrain catalog; `FALLBACK_TERRAIN_COLOUR` covers a ruleset that ships a row this build has
- * never heard of, so the renderer stays total (a tile with an unknown terrain is painted, not
- * skipped) without pretending to know it.
+ * invented. The six ids are the shipped ruleset's own terrain catalog; `FALLBACK_TERRAIN_COLOUR`
+ * covers a ruleset that ships a row this build has never heard of, so the renderer stays total (a
+ * tile with an unknown terrain is painted, not skipped) without pretending to know it.
+ *
+ * **These values are measured from the art, not invented, and they are the *mean* of what each
+ * terrain paints.** When tiles were flat fills a terrain had exactly one colour and a sample
+ * either was that colour or the renderer was wrong; the textures changed that, because a tile's
+ * centre is now a blend of the texture that also moves with the tile's sub-pixel offset and with
+ * the zoom level. So the documented colour is the centre of the spread rather than the value, and
+ * what it promises is "the middle of this terrain's range" — `TERRAIN_CENTRE_TOLERANCE` in
+ * `e2e/helpers.ts` carries the width of that range and the evidence for it. `lock_centre` in
+ * `assets/tiles/process_tiles.py` locks the *file's* centre pixel and cannot deliver this: the
+ * test samples the *canvas*, after scaling has blended that pixel away.
+ *
+ * `e2e/terrain-palette-probe.spec.ts` re-derives the table from the canvas
+ * (`CIVTS_PALETTE_PROBE=1`), so a re-graded tile can be checked against these numbers rather than
+ * trusted to match them.
+ *
+ * **These are not exact, and should not be chased.** A mean over a finite sweep of seeds moves by
+ * a point in each channel when the sweep grows — it moved three times while this table was being
+ * derived, and every time it did the tests still passed, because `TERRAIN_CENTRE_TOLERANCE` is 44
+ * and a point is nothing beside it. What the record has to keep straight is the *evidence*, not
+ * the last digit: the sweep, its size, and the fact that the numbers came from it.
  *
  * That default is deliberately a colour no shipped terrain uses: an unknown row is visible as
  * "something this build does not paint", which is the honest reading, rather than a plausible
@@ -90,12 +109,12 @@ import { tileRect, visibleTileBounds, type Camera, type ScreenPoint } from './vi
  * The exact numbers are presentation and nothing else — no rule, no yield and no hash reads them.
  */
 export const TERRAIN_COLOURS: Readonly<Record<string, string>> = {
-  grassland: '#4a9d4a',
-  plains: '#b8a24a',
-  hills: '#8a7a52',
-  mountains: '#8c8c94',
-  ocean: '#1d4f8a',
-  coast: '#3aa0c8',
+  grassland: '#5a9138',
+  plains: '#c1993c',
+  hills: '#7d6b47',
+  mountains: '#7d7e7f',
+  ocean: '#29578d',
+  coast: '#47cad0',
 };
 
 /** Painted for a terrain id this build has no colour for — never a colour a shipped terrain uses. */
