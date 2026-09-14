@@ -63,8 +63,12 @@ import {
 } from './helpers.js';
 import {
   asTileIndex,
+  asUnitId,
   isExplored,
+  planMove,
   planRoute,
+  unitActions,
+  type GameState as EngineState,
   // The ENGINE's `visibleTiles` — what a player can see — is a different function from this
   // suite's `visibleTiles` (which tiles the VIEWPORT covers). They are named apart here on
   // purpose: conflating "in sight" with "on screen" is the mistake `render.ts` records for the
@@ -1204,4 +1208,227 @@ test('fog: a rival the player cannot see is not painted, one it can see is, and 
       `and its marker is painted: ${String(unknownRead.matching)} of its tile's pixels are the ` +
       `city colour ${CITY_COLOUR}`,
   ).toBe(0);
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 6 — the hover layer
+ *
+ * The readout is asserted against the engine, for the same reason everything else in this file is:
+ * the claim "this tile costs 2 for the selected unit" is the ENGINE's claim (`planMove`), and the
+ * claim "3 steps away" is `planRoute`'s. A test that computed either itself would be a second
+ * statement of the rules, in the one place this project has banned one (`docs/INTERFACES.md`,
+ * "The UI must not contain game rules").
+ * ------------------------------------------------------------------ */
+
+/** A box on screen, as `boundingBox()` reports one. */
+interface Box {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** The engine's answer, or a loud failure so a fixture cannot quietly measure nothing. */
+const costOf = (state: EngineState, unitId: number, tile: number): number => {
+  const plan = planMove(state, RULESET, asUnitId(unitId), asTileIndex(tile));
+  if (!plan.ok) throw new Error(`the engine refuses the fixture move to tile ${String(tile)}`);
+  return plan.value.cost;
+};
+
+test('hover (phase 6): the tile under the pointer is read out from the engine, and the readout never takes a click meant for the map', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await openApp(page);
+  const ui = await seedApp(page, SEED, OPPONENT_OFF);
+  const engine = await authoritativeState(page);
+  const seat = humanSeatOf(engine);
+  expect(seat, 'the state names no civilization to play as').toBeDefined();
+  if (seat === undefined) return;
+
+  // The readout exists from the first frame but is **hidden** until the pointer is over a tile —
+  // there is nothing to say about a pointer that is nowhere — so the existence check asks the DOM
+  // rather than the accessibility tree: a role query would report "not found" for an element that is
+  // deliberately not yet shown. The role-and-name query below is the one a player's screen reader
+  // would use, and it is asserted as soon as there is something to read.
+  const readout = page.getByRole('status', { name: 'Tile' });
+  await expect(
+    page.locator("[data-floating='tile-readout']"),
+    'the shell built no tile readout',
+  ).toHaveCount(1);
+
+  const settler = engine.units.find((unit) => unit.owner === seat && unit.type.includes('settler'));
+  expect(settler, 'the fixture seat has no settler').toBeDefined();
+  if (settler === undefined) return;
+  await selectUnit(page, ui, await cameraOf(page), settler.id);
+
+  /** Pan a tile onto the canvas and hover its centre; report where the readout landed. */
+  const hoverTile = async (
+    tile: number,
+  ): Promise<{ readonly ok: boolean; readonly text: string; readonly box: Box | null }> => {
+    await bringTileToCentre(page, ui, tile);
+    const camera = await cameraOf(page);
+    const box = await canvasBox(page);
+    const local = tileCentre(camera, tileX(ui, tile), tileY(ui, tile));
+    const onCanvas = local.x >= 0 && local.y >= 0 && local.x < box.width && local.y < box.height;
+    if (!onCanvas) return { ok: false, text: '', box: null };
+    const point = await tilePagePoint(page, camera, tileX(ui, tile), tileY(ui, tile));
+    await page.mouse.move(point.x, point.y);
+    await expect(readout).toBeVisible();
+    const readoutBox = await readout.boundingBox();
+    return { ok: true, text: (await readout.innerText()).trim(), box: readoutBox };
+  };
+
+  /* ------------------- (1) yields and the movement cost ------------------- */
+
+  // A destination the engine offers the settler, preferring one that costs 2: a board where every
+  // step costs 1 cannot tell "the engine priced this tile" from "the readout always says one".
+  const offered = unitActions(engine, RULESET, settler.id).filter(
+    (command) => command.type === 'MoveUnit',
+  );
+  expect(offered.length, 'the fixture settler was offered nowhere to go').toBeGreaterThan(0);
+  const destinations = offered.map((command) => ({
+    tile: Number(command.to),
+    cost: costOf(engine, settler.id, Number(command.to)),
+  }));
+  const priced = destinations.find((destination) => destination.cost === 2) ?? destinations[0];
+  expect(priced, 'the engine offered the settler no priced destination').toBeDefined();
+  if (priced === undefined) return;
+
+  const hovered = await hoverTile(priced.tile);
+  expect(
+    hovered.ok,
+    `tile ${String(priced.tile)} could not be panned onto the canvas, so nothing could be hovered`,
+  ).toBe(true);
+  // `terrainAtTile` is the ENGINE's id for the tile ("grassland"); the readout prints the ruleset's
+  // name for it ("Grassland"), so the comparison is case-insensitive — the id is what the state
+  // holds, and the name is `CATALOG`'s, which is the same content the browser is running.
+  const terrain = terrainAtTile(ui, priced.tile);
+  expect(
+    hovered.text,
+    'the readout does not name the tile it is about, so a player cannot tell what it describes',
+  ).toContain(`${String(tileX(ui, priced.tile))},${String(tileY(ui, priced.tile))}`);
+
+  expect(
+    hovered.text.toLowerCase(),
+    `the readout of tile ${String(priced.tile)} does not name its terrain (${terrain})`,
+  ).toContain(terrain.toLowerCase());
+  expect(
+    hovered.text,
+    'the readout does not say what the selected unit would spend: the engine prices this step at ' +
+      String(priced.cost),
+  ).toContain(`costs ${String(priced.cost)}`);
+
+  // The canvas's own description — the frozen contract's cursor readout — still names the same tile:
+  // the hover layer is an ADDITION to it, not a replacement for it.
+  expect(
+    await mapDescription(page),
+    'the hover layer replaced the canvas’s own pointer readout instead of sitting beside it',
+  ).toContain(`${String(tileX(ui, priced.tile))},${String(tileY(ui, priced.tile))}`);
+
+  /* ------------- (3) a far, explored tile is a journey, priced ------------ */
+
+  const far = engine.map.terrain.findIndex(
+    (_terrain, tile) =>
+      isExplored(engine, seat, asTileIndex(tile)) &&
+      tile !== Number(settler.tile) &&
+      !planMove(engine, RULESET, settler.id, asTileIndex(tile)).ok,
+  );
+  expect(far, 'no explored far tile exists on the fixture board').toBeGreaterThanOrEqual(0);
+  // Asked of the board **as it stands now**: the sections above only hover, but a readout whose
+  // expectation was captured before them would be comparing two different boards the moment one of
+  // them did anything at all.
+  const atFar = await authoritativeState(page);
+  const route = planRoute(atFar, RULESET, settler.id, asTileIndex(far));
+  if (route.ok && route.value.steps.length > 1) {
+    const farHover = await hoverTile(far);
+    if (farHover.ok) {
+      expect(
+        farHover.text,
+        `the readout of distant tile ${String(far)} does not give the engine's route length ` +
+          `(${String(route.value.steps.length)} steps)`,
+      ).toContain(`${String(route.value.steps.length)} steps away`);
+    }
+  }
+
+  /* ------------- (4) and nothing about ground the player has not seen ----- */
+
+  // The readout is a *tooltip*, and a tooltip that named a rival standing on unexplored ground
+  // would be the §7.8 fog leak with a new surface. The vacuity guard first: the state really does
+  // know where these units are.
+  const hidden = engine.units.filter(
+    (unit) => unit.owner !== seat && !isExplored(engine, seat, unit.tile),
+  );
+  expect(
+    hidden.length,
+    'no rival stood on unexplored ground on this board, so the fog half of the readout could not ' +
+      'be observed — re-measure the seed',
+  ).toBeGreaterThan(0);
+  const hiddenUnit = hidden.find((unit) => Number(unit.tile) !== priced.tile);
+  expect(hiddenUnit, 'the only hidden rival is the tile already hovered').toBeDefined();
+  if (hiddenUnit === undefined) return;
+  const hiddenHover = await hoverTile(Number(hiddenUnit.tile));
+  if (hiddenHover.ok) {
+    expect(
+      hiddenHover.text,
+      'the readout describes ground the player has never explored, which the map itself paints as flat fog',
+    ).toContain('unexplored');
+    expect(
+      hiddenHover.text,
+      `the readout named a rival (${hiddenUnit.type}) the player cannot see`,
+    ).not.toContain(hiddenUnit.type);
+  }
+
+  /* ------------------ (5) and it goes away with the pointer -------------- */
+
+  await page.mouse.move(2, 2);
+  await expect(readout, 'the readout stayed on screen after the pointer left the map').toBeHidden();
+
+  /* ---------------- (2) the readout never takes a click ----------------
+   * Last, because the click is a real order: it moves a unit.
+   *
+   * **The hover is taken again here, and that is not tidiness.** Section (5) leaves the pointer off
+   * the map, which hides the readout; a hit test at the box it *used* to occupy would then be asking
+   * the browser about empty canvas, and the assertion would pass with the readout hit-testable —
+   * measured, with `pointer-events: auto` on the readout this block passed until the hover was
+   * re-taken. So the readout is put back on screen, its visibility is asserted, and only then is the
+   * browser asked what owns the point at its middle.
+   */
+  const again = await hoverTile(priced.tile);
+  expect(again.ok, 'the priced tile could not be hovered a second time').toBe(true);
+  await expect(readout, 'the readout is not on screen at the moment of the hit test').toBeVisible();
+  expect(again.box, 'the readout has no box to hit-test').not.toBeNull();
+  if (again.box === null) return;
+  const middle = {
+    x: again.box.x + again.box.width / 2,
+    y: again.box.y + again.box.height / 2,
+  };
+  expect(
+    await page.evaluate(
+      ({ x, y }) => document.elementFromPoint(x, y)?.tagName ?? 'nothing',
+      middle,
+    ),
+    'the tile readout is hit-testable: a box floating over the map that can be hit is a box that ' +
+      'eats the clicks aimed at the tiles beneath it',
+  ).toBe('CANVAS');
+
+  await page.evaluate(() => {
+    const canvas = document.querySelector('canvas');
+    if (canvas === null) return;
+    const counter = { clicks: 0 };
+    (window as unknown as { __HOVER_CLICKS__?: { clicks: number } }).__HOVER_CLICKS__ = counter;
+    canvas.addEventListener('click', () => {
+      counter.clicks += 1;
+    });
+  });
+  await page.mouse.click(middle.x, middle.y);
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { __HOVER_CLICKS__?: { clicks: number } }).__HOVER_CLICKS__?.clicks ??
+        -1,
+    ),
+    'a click at the middle of the tile readout never reached the canvas, so the readout took a ' +
+      'click the player aimed at the map',
+  ).toBe(1);
 });

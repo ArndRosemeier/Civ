@@ -471,6 +471,85 @@ test('X1 placement: an open panel covers neither the map nor the action buttons,
 });
 
 /* ------------------------------------------------------------------ *
+ * 1a. THE HOVER LAYER (phase 6), AND THE ONE RULE IT MUST OBEY
+ * ------------------------------------------------------------------ */
+
+/**
+ * **The rule this test exists for is phase 2's, applied to phase 6's box.** The unit action popup
+ * carries `pointer-events: none` with `auto` on its buttons, because a menu floating over a
+ * clickable map that can be hit is a menu that eats the clicks aimed at the tiles beneath it — and
+ * the paragraph above records the measurement that produced it. The tile readout is a box floating
+ * over the same map, so it obeys the same discipline, and this is where that is measured rather
+ * than asserted in a comment.
+ *
+ * The assertions are the browser's own hit test at two points: the middle of the map (which must
+ * still belong to the canvas while a readout is on screen) and the middle of the readout itself
+ * (which must belong to the canvas too — `elementFromPoint` skips an element that cannot be hit).
+ * Neither of them is weakened by this phase: the map-centre assertion already existed here and is
+ * re-taken with the readout up.
+ */
+test('X1 hover: the tile readout appears over the map, and the map keeps every click it is aimed at', async ({
+  page,
+}) => {
+  await openApp(page);
+  await seedApp(page, SEED, OPPONENT_OFF);
+
+  const canvas = await canvasBox(page);
+  const mapCentre = centreOf(canvas);
+  const readout = page.getByRole('status', { name: 'Tile' });
+  await expect(
+    readout,
+    'the tile readout is on screen before the pointer is over the map',
+  ).toBeHidden();
+
+  await page.mouse.move(mapCentre.x, mapCentre.y);
+  await expect(
+    readout,
+    'hovering the middle of the map produced no tile readout: the hover layer is not wired to the pointer',
+  ).toBeVisible();
+  await expect(readout, 'the readout says nothing about the tile it is over').not.toBeEmpty();
+
+  expect(
+    await elementAt(page, mapCentre),
+    'something covers the middle of the map while the tile readout is up',
+  ).toBe('CANVAS');
+
+  const readoutBox = await boxOf(readout);
+  expect(
+    readoutBox.x >= canvas.x - 1 &&
+      readoutBox.y >= canvas.y - 1 &&
+      readoutBox.x + readoutBox.width <= canvas.x + canvas.width + 1 &&
+      readoutBox.y + readoutBox.height <= canvas.y + canvas.height + 1,
+    `the readout is not on the map: its box ${
+      `(${String(Math.round(readoutBox.x))},${String(Math.round(readoutBox.y))} ` +
+      `${String(Math.round(readoutBox.width))}x${String(Math.round(readoutBox.height))})`
+    } is outside the canvas (${String(Math.round(canvas.x))},${String(Math.round(canvas.y))} ` +
+      `${String(Math.round(canvas.width))}x${String(Math.round(canvas.height))})`,
+  ).toBe(true);
+
+  expect(
+    await elementAt(page, centreOf(readoutBox)),
+    'the tile readout is hit-testable: the point at its own middle belongs to it, so a click aimed ' +
+      'at the tile beneath it would be taken by the tooltip',
+  ).toBe('CANVAS');
+
+  // A panel opened while the pointer is on the map does not change the map's box (phase 3's
+  // structural claim) and does not take the readout's job: it is docked in the sidebar, which is
+  // where the panel column is, so neither box can reach the other.
+  const debug = await openPanel(page, /^Debug$/);
+  await expect(debug).toBeVisible();
+  expect(
+    { x: (await canvasBox(page)).x, y: (await canvasBox(page)).y },
+    'opening a panel moved the map while the hover layer was measuring it',
+  ).toEqual({ x: canvas.x, y: canvas.y });
+  expect(await elementAt(page, mapCentre)).toBe('CANVAS');
+  await closeDialogs(page);
+
+  await page.mouse.move(2, 2);
+  await expect(readout, 'the readout stayed up after the pointer left the map').toBeHidden();
+});
+
+/* ------------------------------------------------------------------ *
  * 1b. THE SIDEBAR: EVERYTHING THAT IS NOT A UNIT ORDER, AND NOTHING CUT OFF
  * ------------------------------------------------------------------ */
 

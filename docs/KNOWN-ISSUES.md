@@ -733,8 +733,18 @@ rather than debts — recorded because a reader would otherwise have to infer th
   or no?") is an owner question and is still open; the flow happens only when the player asks for it.
   A keyboard `MoveUnit`/`FoundCity` would be a third path to a command that already has two surfaces.
 - **The keyboard help panel occupies up to 60 % of the sidebar while it is open**, which is the
-  dock's stated share (`styles.css`), and it pushes the panel stack to its 40 % floor. It is a panel
-  like any other and closes with its own `Close`; what nobody has done is look at it.
+  dock's stated share (`styles.css`), and it pushes the panel stack to its 40 % floor. Measured at
+  1280×900 with it open: the dialog is 355 px tall, its body scrolls by 159 px (nine rows and two
+  notes do not fit the share a docked panel gets), and the `Close` control sits at 851–879 px, inside
+  the window — the body scrolls and the way out does not, which is what
+  `[data-panel='keyboard'][open]` in `styles.css` is for. What nobody has done is look at it.
+- **A `display` on a closed `<dialog>` re-renders it, and an author rule beats the user-agent
+  one.** `dialog:not([open]) { display: none }` is a UA rule, so `[data-panel='keyboard'] { display:
+  flex }` made the *closed* help panel visible: 355 px of the dock at load, the panel stack down from
+  817 px to 462 px, and `getByRole('dialog')` matching a dialog nobody had opened.
+  `panel-usability.spec.ts` caught it (*"the panel stack holds 277 px more content than it can
+  show…"*) on the first run. The rule is scoped to `[open]` now, and the note is here because the
+  next floating element will be written by somebody who has not read this.
 - **The selection is not readable through the frozen test seam.** `keyboard.spec.ts` reads the
   selected unit out of the contractual group name (`Actions for unit <id>`), which is a legitimate
   contract but an awkward integer to parse. A `selection()` on `window.__CIVTS__` would be an
@@ -744,7 +754,40 @@ rather than debts — recorded because a reader would otherwise have to infer th
   has just zoomed with the wheel and then presses `+` gets a different anchor than the wheel gave
   them.
 
-### 4.5 Other UI limits
+### 4.5 The hover layer quotes the engine, and where the engine is silent
+
+`docs/UI-OVERHAUL.md` §9 phase 6 records the design; these are its limits, each of which a reader
+would otherwise have to infer from the code.
+
+- **There is no combat-odds query in the engine, and the readout shows less than the plan promised
+  because of it.** `packages/web/src/ui/hover.ts` gets the figure the way the AI does: it applies the
+  engine's own offered `AttackUnit` to a **copy** of the state and reads `attackerWinPct` off the
+  `CombatResolved` event the engine emitted. That number is `resolveCombat`'s own **per-round**
+  chance. The **chance of winning the whole battle** is a multi-round quantity, no exported engine
+  function returns it, and the AI's model for it (`battleWinPctOf` in `packages/sim/src/ai/smart.ts`)
+  is private to that package. The readout therefore says "percent per round of combat" and does not
+  extrapolate. Closing the gap means an *engine* change — an exported odds query, or exporting the
+  `CombatContext` builder that `applyBattle` keeps private — not arithmetic in the web package, which
+  is what the plan forbids.
+- **A distant tile is priced as a journey, not as a cost.** The brief for the phase asks what a move
+  "would cost"; for a tile that is not one step away the engine has no answer of that shape —
+  `planMove` refuses anything non-adjacent and there is no multi-turn cost concept (`MoveUnit` is a
+  single step, `docs/UI-OVERHAUL.md` §4.4a) — so the readout prints the route query's step count
+  instead. That is the engine's answer to the question that exists, and it is labelled as steps.
+- **The readout names improvements but does not price them.** A tile with a mine says so; what the
+  mine contributes is folded into `tileYields` and not broken out, because breaking it out would mean
+  a second reading of `applyImprovements` in the UI.
+- **It says nothing about a tile the pointer is not over.** The keyboard has no way to ask the map
+  "what is that tile worth?": the readout is pointer-driven, and making it cursor-driven (a keyboard
+  cursor on the map) is a phase of its own.
+- **Nothing is highlighted on hover** — no reachable-tile shading, no route overlay, no attacker or
+  defender preview. The `map` surface of the schema is still the tile itself.
+- **The order of the sentence is fixed and assembled by `readoutText`.** It is one string in one
+  element, so a screen reader reads the whole line whenever it changes; `aria-live` is explicitly
+  `off` for that reason. A structured `aria-describedby` version would be an accessibility
+  improvement nobody has measured the need for.
+
+### 4.6 Other UI limits
 
 - The interactive-TTY branch of the REPL cannot be exercised in this environment
   (no TTY); pipes, EOF and `--script` are covered. A human should run `pnpm play`

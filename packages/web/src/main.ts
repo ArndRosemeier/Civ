@@ -115,6 +115,7 @@ import { nextGotoStep, startGoto, type GotoIntent } from './ui/goto.js';
 import { problemText } from './ui/problem.js';
 import { nextUnitNeedingOrders, unitsNeedingOrders } from './ui/nextunit.js';
 import { KEY_HELP, mapActionFor, sessionActionFor, type KeyContext } from './ui/keys.js';
+import { hoverReadout, readoutText } from './ui/hover.js';
 
 /** The seed a page load starts on, when nothing has seeded it. */
 const DEFAULT_SEED = 1;
@@ -160,6 +161,17 @@ const UNIT_ACTIONS_GAP_PX = 6;
  * the number is a gesture threshold in the presentation layer and is never consulted by a rule.
  */
 const DRAG_CLICK_TOLERANCE_PX = 4;
+
+/**
+ * How far the tile readout sits from the pointer, in CSS pixels (Phase 6).
+ *
+ * Two numbers rather than one because a tooltip is read *after* the thing it is about: it is placed
+ * down and to the right of the pointer by the same amount a caption sits below a figure, and it is
+ * flipped to the other side at the map's edge so it never leaves the canvas. Presentation only — no
+ * rule and no engine answer depends on where it lands.
+ */
+const READOUT_GAP_X_PX = 14;
+const READOUT_GAP_Y_PX = 18;
 
 /**
  * The map's keyboard hint, on the region rather than on the canvas.
@@ -331,6 +343,14 @@ interface Shell {
    * from `ui/keys.ts` `KEY_HELP`, so the help cannot describe a key the handler does not have.
    */
   readonly keyboard: { readonly open: HTMLButtonElement; readonly dialog: HTMLDialogElement };
+  /**
+   * The tile readout (Phase 6): the hover layer's one element.
+   *
+   * A **new** accessible name — `status`/`Tile` — again stated here rather than in the frozen table.
+   * It is `aria-live="off"` on purpose: the text changes on every pointer move, and a live region
+   * that announced each one would make the map unusable with a screen reader.
+   */
+  readonly tileReadout: HTMLElement;
   readonly newGame: NewGameControls;
 }
 
@@ -538,6 +558,17 @@ const buildShell = (doc: Document): Shell => {
   // cursor, which is what lets "which tile is under the pointer" be asserted without a colour.
   canvas.setAttribute('aria-description', 'Map');
   mapRegion.append(canvas);
+  // The tile readout (Phase 6) is a sibling of the canvas, like the orders popup, and it is placed
+  // from the pointer's own client coordinates — see `showReadout`. It is `aria-live="off"`: the
+  // text changes on every pointer move, and a live region that read each one aloud would make the
+  // map unusable with a screen reader rather than more useful.
+  const tileReadout = el(doc, 'p');
+  tileReadout.setAttribute('role', 'status');
+  tileReadout.setAttribute('aria-label', 'Tile');
+  tileReadout.setAttribute('aria-live', 'off');
+  tileReadout.dataset['floating'] = 'tile-readout';
+  tileReadout.hidden = true;
+  mapRegion.append(tileReadout);
   mapColumn.append(mapRegion);
 
   // The sidebar: a strip holding everything that is not a direct unit action, in two regions. The
@@ -569,6 +600,7 @@ const buildShell = (doc: Document): Shell => {
     nextUnit,
     keyboard,
     orderStatus,
+    tileReadout,
     panelsRoot,
     panelStack,
     dock,
@@ -721,6 +753,10 @@ const start = async (): Promise<void> => {
     // load or a new game re-opens it and the button can never be out of step with the state.
     shell.endTurn.disabled = isGameOver(state, ruleset);
     draw();
+    // The hover readout is rebuilt here rather than only on `pointermove`, because what it describes
+    // can change while the pointer stands still: a move, a new turn, a key that pans the map. See
+    // `updateReadout` — it reads the engine and changes nothing.
+    updateReadout();
     ready = true;
   };
 
@@ -895,6 +931,89 @@ const start = async (): Promise<void> => {
     top = Math.max(box.top, Math.min(top, box.bottom - height));
     popup.style.left = `${String(left)}px`;
     popup.style.top = `${String(top)}px`;
+  };
+
+  /* ------------------------------ the readout ---------------------------- */
+
+  /**
+   * **The hover layer** (`docs/UI-OVERHAUL.md` §7.6 phase 6): what the tile under the pointer
+   * yields, what the selected unit would spend to go there, and what the engine says an attack on it
+   * would be. Every number comes from `ui/hover.ts`, which asks the engine and computes no rule of
+   * its own — this half only says *when* to ask and *where* to put the answer.
+   *
+   * **Why it is a sibling of the canvas and `position: fixed`.** The same arrangement, and the same
+   * reasons, as the orders popup above: a child of the padded, size-contained region would need that
+   * box's padding and border undone before canvas coordinates meant anything, and measuring from the
+   * pointer's own client coordinates removes the arithmetic instead of getting it right.
+   *
+   * **Why it never blocks the map.** It carries `pointer-events: none` (`styles.css`) — the rule
+   * Phase 2 established for the popup, and for the same measured reason: a box floating over a
+   * clickable map that can be hit is a box that eats the clicks aimed at the tiles beneath it. The
+   * readout has no controls at all, so there is nothing that needs `auto` back, and
+   * `elementFromPoint` at the middle of the map therefore still answers `CANVAS`
+   * (`panel-usability.spec.ts` asserts exactly that, and this phase did not weaken it).
+   *
+   * It is shown only while the pointer is over the **canvas** — not merely inside the region — so a
+   * pointer over the orders popup (which is a menu, not map) leaves the readout for the tile it was
+   * last over… which is nothing: the readout is hidden, because the thing under the pointer is not
+   * the map. What counts as "the tile under the pointer" is `screenToTile`, the one inverse mapping
+   * the renderer's projection and the canvas's own `aria-description` already agree on.
+   */
+  let pointerAt: { readonly clientX: number; readonly clientY: number } | null = null;
+
+  const hideReadout = (): void => {
+    shell.tileReadout.hidden = true;
+  };
+
+  /**
+   * Put the readout beside the pointer: right and below by preference, flipped at the map's edge,
+   * then clamped inside the canvas so it can never leave the map's own box. Presentation only.
+   */
+  const placeReadout = (): void => {
+    if (pointerAt === null || shell.tileReadout.hidden) return;
+    const box = canvas.getBoundingClientRect();
+    const width = shell.tileReadout.offsetWidth;
+    const height = shell.tileReadout.offsetHeight;
+    let left = pointerAt.clientX + READOUT_GAP_X_PX;
+    if (left + width > box.right) left = pointerAt.clientX - width - READOUT_GAP_X_PX;
+    let top = pointerAt.clientY + READOUT_GAP_Y_PX;
+    if (top + height > box.bottom) top = pointerAt.clientY - height - READOUT_GAP_Y_PX;
+    left = Math.max(box.left, Math.min(left, box.right - width));
+    top = Math.max(box.top, Math.min(top, box.bottom - height));
+    shell.tileReadout.style.left = `${String(left)}px`;
+    shell.tileReadout.style.top = `${String(top)}px`;
+  };
+
+  /**
+   * Read the tile under the pointer and say what the engine says about it.
+   *
+   * Called on every pointer move *and* from `redraw`, which is what makes the readout honest: the
+   * state it describes can change without the pointer moving (a move, a new turn, a key that pans
+   * the map), and a readout that only updated on `pointermove` would go on describing a tile the
+   * camera had already moved away from. Nothing in this function dispatches, and `ui/hover.ts`
+   * cannot change the state — it reads the engine, folds a command on a copy, and throws the copy
+   * away — so a pointer that never clicks cannot play the game for the player.
+   */
+  const updateReadout = (): void => {
+    if (pointerAt === null) {
+      hideReadout();
+      return;
+    }
+    const tile = tileAt(localPoint(pointerAt));
+    if (tile === undefined) {
+      hideReadout();
+      return;
+    }
+    const seat = humanSeatOf(state) ?? asPlayerId(0);
+    const index = asTileIndex(tile.y * state.map.width + tile.x);
+    const readout = hoverReadout(state, ruleset, seat, panels.selection().unitId, index);
+    const text = readoutText(readout);
+    shell.tileReadout.textContent = text;
+    // The whole sentence, for a long one that the box's own width would clip — the same arrangement
+    // the order channel uses, and for the same reason.
+    shell.tileReadout.title = text;
+    shell.tileReadout.hidden = false;
+    placeReadout();
   };
 
   /* ------------------------------ dispatching ---------------------------- */
@@ -1114,7 +1233,7 @@ const start = async (): Promise<void> => {
 
   /* ------------------------------- the map ------------------------------- */
 
-  const localPoint = (event: MouseEvent): ScreenPoint => {
+  const localPoint = (at: { readonly clientX: number; readonly clientY: number }): ScreenPoint => {
     const rect = canvas.getBoundingClientRect();
     // No scale factor, and that is a real simplification rather than an omission. `draw` paints in
     // the CSS pixels of the measured box (`viewport()`), so a client point minus the box's origin is
@@ -1122,7 +1241,7 @@ const start = async (): Promise<void> => {
     // `CANVAS_WIDTH_PX / rect.width` factor existed to undo a stylesheet that stretched a canvas
     // whose CSS size was its own pixel size; the layout owns the CSS size now, so there is nothing
     // to undo — and any factor here would be a second opinion about the size the renderer used.
-    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    return { x: at.clientX - rect.left, y: at.clientY - rect.top };
   };
 
   const tileAt = (point: ScreenPoint): { readonly x: number; readonly y: number } | undefined =>
@@ -1174,12 +1293,24 @@ const start = async (): Promise<void> => {
   });
 
   shell.mapRegion.addEventListener('pointermove', (event) => {
+    // The hover layer follows the pointer, and **only while the pointer is over the canvas**. The
+    // region is bigger than the canvas (it has padding) and it also holds the orders popup, so
+    // "inside the region" is not the same question as "over the map": a tile readout under a menu
+    // would be describing the ground beneath a control the player is about to press. `target` is the
+    // browser's own answer to which element the pointer is over, so this needs no geometry — and a
+    // pointer that leaves the canvas takes the readout away with it.
+    pointerAt = event.target === canvas ? { clientX: event.clientX, clientY: event.clientY } : null;
+    updateReadout();
     const tile = tileAt(localPoint(event));
     const next = tile === undefined ? null : { x: tile.x, y: tile.y };
     if (next?.x !== cursor?.x || next?.y !== cursor?.y) {
       cursor = next;
       draw();
     }
+    // The readout is positioned from the pointer, so a move *within* one tile still moves it; the
+    // content above is only recomputed when the pointer moves at all, which is what keeps a hover
+    // over a defended tile from folding a battle on every frame the camera moves.
+    placeReadout();
     if (!dragging) return;
     const dx = event.clientX - lastX;
     const dy = event.clientY - lastY;
@@ -1201,6 +1332,11 @@ const start = async (): Promise<void> => {
   shell.mapRegion.addEventListener('pointerleave', () => {
     dragging = false;
     cursor = null;
+    // The pointer is gone, so there is no tile under it and nothing to read out. The readout is a
+    // claim about *the pointer's* tile, and leaving a stale one behind would be a claim about a
+    // pointer that is no longer over the map.
+    pointerAt = null;
+    hideReadout();
     draw();
   });
 

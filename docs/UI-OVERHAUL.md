@@ -674,7 +674,9 @@ button deletion safe.
 4. **Goto.** Engine route query first, then the intent decision of §7.4. — **landed**, see §9.
 5. **Next-unit flow and keyboard.** Still additive: no keyboard contract exists today. — **landed**,
    see §9.
-6. **Hover layer.** Tile yields, movement cost, combat odds.
+6. **Hover layer.** Tile yields, movement cost, combat odds. — **landed**, see §9 (with one gap
+   recorded there: the engine has no whole-battle odds function, so the readout shows the engine's
+   own per-round figure and nothing it could not be).
 
 ## 7.7 Open questions this raises
 
@@ -1467,3 +1469,156 @@ which is why both are in the file.
 - **No human has reviewed the help panel's layout**, and it is a new panel in a strip that is already
   tight (see §9 phase 3): at 1280×900 it occupies up to 60 % of the sidebar while it is open, which
   is the dock's stated share, but nobody has looked at it.
+
+## Phase 6 — the hover layer — landed
+
+**What a player gets.** Hovering a tile puts one sentence on the map, beside the pointer: the tile's
+coordinates, its terrain, **what it yields**, any improvement standing on it, who is on it, **what the
+selected unit would spend to go there** (or how many steps away it is, or the engine's reason it
+cannot), and — when the tile holds something foreign — **what the engine says an attack would be**.
+Before this phase the only per-tile readout anywhere was the canvas's `aria-description`
+("pointer over tile x,y"), which is a test instrument, not something a player can read: there was no
+visible answer to any of those questions on the map at all.
+
+### The trap, and the exact source of every number
+
+§4.4b and §7.6 both warn that a hover readout is one bad decision away from being **a second
+statement of the rules**. `packages/web/src/ui/hover.ts` therefore contains no arithmetic over a game
+quantity, and each number is a call into the engine:
+
+| the question | who answers it | what the module does |
+| --- | --- | --- |
+| what does this tile yield? | `tileYields` (`improvements.ts`) | prints the three numbers |
+| may the selected unit step here, and at what cost? | `planMove` (`commands.ts`) | prints `cost` and `movementLeft` |
+| how far is it, if it is not one step? | `planRoute` (`route.ts`) | prints `steps.length` |
+| why can it not go there? | `planMove`'s or `planRoute`'s own `GameError`, through `problemText` | prints the engine's sentence |
+| what would an attack do? | the engine's own offered `AttackUnit`, **folded through `applyCommand` on a copy**, read for the `CombatResolved` event the engine emitted | prints `attackerWinPct`, verbatim |
+| can the player know this tile at all? | `isExplored` (terrain and yields — memory), `visibleTiles` (units — current sight) | decides what to say |
+
+**The combat figure is the phase's one honest shortfall, and it is stated rather than papered over.
+The engine has no odds *query*.** `combat.ts` exports `resolveCombat`, which fights a battle from a
+fully built `CombatContext`, and the modifier helpers (`defenderBonusPct`, `veteranBonusPct`,
+`terrainDefenseBonus`); the *construction* of that context — both units' statistics, the defender's
+terrain, its fortification, whether it is standing in its own city and whether that city has walls —
+lives inside `applyBattle` in `commands.ts`, **which is not exported**. Building it in the web
+package would mean the UI deciding which bonuses apply, i.e. exactly the defect class the brief
+forbids. So the odds are obtained the way the AI obtains them (`packages/sim/src/ai/smart.ts`'s
+assault read): the engine's offered `AttackUnit` is applied to a **copy** of the state and the
+`CombatResolved` event it emits is read for `attackerWinPct`. That is `resolveCombat`'s own number,
+on the real board, through the real applier — the same call the click would make — and the copy is
+thrown away, so the state and the RNG are untouched (asserted: the test hovers **every tile of the
+board** and compares `hashValue` and `state.rng` before and after).
+
+What it is *not* is the chance of winning the whole battle. That is a multi-round quantity, no engine
+function returns it, and the AI's own model for it (`battleWinPctOf`) is private to `packages/sim`.
+The readout therefore says **"percent per round of combat"**, because that is what the engine
+computed, and it does not multiply it by anything. `docs/KNOWN-ISSUES.md` §4.6 records the gap and
+what closing it would take: an exported odds query in the engine (or an exported `CombatContext`
+builder), not arithmetic in the UI.
+
+**Fog is asked of the same two functions the renderer asks, and one leak was caught by the test.**
+Terrain and yields are **memory** (`isExplored`), because `render.ts` already paints an explored
+tile's terrain and border tint from memory; a **unit** is **current sight** (`visibleTiles`), because a
+unit marker is a claim about what the player can see this instant. The first version of the module
+named the *terrain* of an unexplored tile while withholding its yields, and
+`test/ui/hover.test.ts` caught it — *"an unexplored tile named its terrain: expected 'Grassland' to be
+undefined"* — which is the §7.8 leak with a new surface. The readout says `unexplored ground` and
+nothing else about such a tile.
+
+### It does not block the map, and that is measured at three points
+
+The readout carries `pointer-events: none` — phase 2's rule for the orders popup, and for the same
+measured reason — and it has no controls, so there is nothing that needs `auto` back. Three
+assertions hold it in place, in two files:
+
+- `panel-usability.spec.ts`'s new `X1 hover` test: the middle of the map still belongs to the canvas
+  while a readout is on screen, the readout's box is inside the canvas, and **the point at the middle
+  of the readout belongs to the canvas too** (`elementFromPoint` skips an element that cannot be hit);
+- `map.spec.ts`'s hover test: the same `elementFromPoint` check, plus the stronger half — a click at
+  that point is *delivered* to the canvas (counted with a listener), not merely attributed to it;
+- the existing `X1 placement` test is untouched and still green: nothing covers the middle of the map.
+
+The readout is rebuilt on every `redraw` as well as on `pointermove`, because what it describes can
+change while the pointer stands still (a move, a new turn, a key that pans the map). It is shown only
+while the pointer is over the **canvas**, so a pointer over the orders popup — a menu, not map —
+leaves nothing on screen rather than describing the ground beneath a control.
+
+### The measurements
+
+**Nothing moved.** The two phases added two header buttons (`Next unit`, `Keyboard`) and a floating
+readout, so the layout was re-measured at the three windows phase 1 and phase 3 used, before and
+after, through the running app:
+
+| viewport | canvas before | canvas after | sidebar | stack overflow | map region |
+| --- | --- | --- | --- | --- | --- |
+| 1280×900 | 813×813 | **813×813** | 380 px, 0 | 0 | 852×823 |
+| 900×1000 | 454×454 | **454×454** | 380 px, 0 | 0 | 472×923 |
+| 1600×700 | 613×613 | **613×613** | 380 px, 0 | 52 px (as phase 3 recorded) | 1172×623 |
+
+Identical to the pixel, including the header's 45 px and the orders popup's box. The two new buttons
+cost no height because the header is one flex row and they sit on it; the readout is
+`position: fixed` and out of the flow, so it cannot move anything.
+
+**What one hover replaces.** The readout for the fixture board's priced tile reads
+`30,35 — Grassland, 2 food, 1 shield, 1 commerce; Worker 1 (yours); moving there costs 1, leaving 1
+movement` — four engine-derived facts (terrain, three yields, the occupant, the step's cost and the
+movement left over) that before this phase existed only inside the engine. A tile with a rival on it
+adds the engine's refusal or its odds; a distant tile adds the route length. The e2e assertions take
+each of those apart and compare them with `planMove`/`planRoute`/`applyCommand` in the test process,
+never with a number written in the test.
+
+### Mutation-checked, each restored byte-identical
+
+`ui/hover.ts` (`76f5d498…`), `styles.css` (`9af541e3…`), `main.ts` (`7f030716…`):
+
+| mutation | the suite | what went red |
+| --- | --- | --- |
+| the odds become a made-up figure (`rollBound` instead of the engine's `attackerWinPct`) | `test/ui/hover.test.ts` | `the readout priced no battle for a tile the engine offers an attack on: expected { Object (kind, perRoundPct) } to deeply equal { kind: 'odds', perRoundPct: 60 }` |
+| every tile is treated as explored | `test/ui/hover.test.ts` | `expected true to be false` (the fog case) |
+| the refusal stops being the engine's sentence | `test/ui/hover.test.ts` | `expected { kind: 'refused', …(1) } to deeply equal { kind: 'refused', …(1) }` |
+| units are named through the fog (the §7.8 leak again) | `test/ui/hover.test.ts` | `the readout named a rival the player cannot see: expected 'Settler 2 (rival)' to be undefined` |
+| the movement left over is predicted wrongly | `test/ui/hover.test.ts` | `the readout predicted the wrong movement left over: expected +0 to be 1` |
+| the readout becomes hit-testable (`pointer-events: auto`) | `panel-usability.spec.ts` **and** `map.spec.ts` | `the tile readout is hit-testable: the point at its own middle belongs to it…` — `Expected: "CANVAS"`, `Received: "P[Tile]"` |
+| the readout describes the neighbouring tile | `e2e/map.spec.ts` | `the readout does not name the tile it is about, so a player cannot tell what it describes` |
+
+**One of those mutations came back GREEN at first, and it was a defect in the new test rather than in
+the production code.** With `pointer-events: auto` on the readout, `map.spec.ts`'s hit test passed:
+the block runs last, the sections before it leave the pointer off the map, so the readout was
+**hidden** at the moment of the check and the browser was being asked about empty canvas. The block
+now re-takes the hover and asserts the readout is visible before asking (`map.spec.ts`, "the hover is
+taken again here, and that is not tidiness"), and the same mutation turns it red. This is the "a test
+that cannot fail is decoration" failure the project names, found here by mutating rather than by
+reading. `panel-usability.spec.ts` caught it either way, which is also why the mutation was run
+against **both** suites.
+
+### A defect this phase introduced, and the existing test that caught it
+
+The help panel added by phase 5 was given `display: flex` so that its bindings could scroll while its
+`Close` control stayed put. **`dialog:not([open]) { display: none }` is a *user-agent* rule, and an
+author `display` defeats it** — so the *closed* help panel was rendered: it took **355 px of the
+sidebar's dock at load**, cut the panel stack from **817 px to 462 px**, and made
+`getByRole('dialog')` match a dialog nobody had opened. `panel-usability.spec.ts`'s sidebar test
+caught it on the first run (*"the panel stack holds 277 px more content than it can show, so the
+panels at its bottom are below the fold"*), as did `closeDialogs` in the new keyboard spec. The rule
+is now `[data-panel='keyboard'][open]`, with the measurement written beside it, and the layout numbers
+above are the after-the-fix readings. Recorded because it is a clean instance of the point §4.5 makes:
+this suite's geometry assertions are load-bearing, not decoration.
+
+### Not done in this phase, and not claimed
+
+- **No whole-battle odds.** The engine has no such function and this phase did not invent one; see
+  above and `docs/KNOWN-ISSUES.md` §4.6.
+- **No e2e assertion sees a percentage.** The odds figure is pinned by `test/ui/hover.test.ts` against
+  the engine's own `CombatResolved` event, and the e2e proves the *combat field* is wired (it reports
+  the engine's refusal for a unit that cannot attack, and names a rival it can see). Reaching an
+  adjacent enemy in the browser means the attack scene search of `orders.spec.ts` (a seed sweep and
+  an eighty-turn script), which is why a percentage is not asserted end to end.
+- **Improvements are named, not priced.** The readout says a mine is on a tile; it does not say what
+  the mine contributes, because that would be a second reading of `applyImprovements`.
+- **Nothing is drawn on hover.** No highlight, no reachable-tile shading, no route overlay; the
+  affordance the schema calls `map` is still the tile itself.
+- **The readout is not updated while the pointer is over the orders popup** (it is hidden there, by
+  design), and it says nothing about a tile the pointer is not over — a keyboard user cannot ask it
+  anything.
+- **Nobody with working eyes has reviewed it.** The sentence is asserted by text and by engine
+  equality; how it reads at a glance, and whether 12 px is the right size, is not measured.

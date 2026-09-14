@@ -262,6 +262,46 @@ main {
 }
 
 /*
+ * The tile readout: the hover layer (phase 6), and it obeys the rule above rather than repeating it.
+ *
+ * **`pointer-events: none`, and there is nothing in it that needs `auto`.** The unit action popup
+ * had to give its buttons the pointer back because a menu is a thing you press; this is a thing you
+ * read, so the whole element is transparent to the pointer. That is what keeps phase 2's measured
+ * finding true — a box floating over the map that can be hit is a box that swallows the clicks aimed
+ * at the tiles under it — and it is why `panel-usability.spec.ts` can go on asserting that the
+ * browser's own hit test at the middle of the map answers `CANVAS`: `elementFromPoint` skips an
+ * element that cannot be hit at all.
+ *
+ * `position: fixed` for the reason the popup gives (the shell positions it from the pointer's client
+ * coordinates and the canvas's own rectangle, so the region's padding and border never enter the
+ * arithmetic), `max-width` so a long sentence wraps in a column rather than running across the map,
+ * and `line-height` set back to a readable value because the map region sets `line-height: 0` to
+ * close the inline gap under the canvas and this element is a child of that region.
+ *
+ * The type is small and the colours are the panel palette: information, not chrome — the plan's
+ * §2.E rule 5 asks for it on hover precisely so that it does not compete with the game for room.
+ */
+[data-floating='tile-readout'] {
+  position: fixed;
+  z-index: 4;
+  pointer-events: none;
+  max-width: 20rem;
+  margin: 0;
+  padding: 4px 7px;
+  line-height: 1.45;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid #3a4652;
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 45%);
+}
+
+[data-floating='tile-readout'][hidden] {
+  display: none;
+}
+
+/*
  * The map is in the tab order (phase 5), so it must say so when it has the focus — a keyboard user
  * who cannot see where the focus is has been given a key that does nothing visible. `:focus-visible`
  * rather than `:focus`, so a *pointer* press on the map does not paint a ring around it: the ring is
@@ -287,8 +327,7 @@ main {
  * records for the city and tech screens, pointed the other way. `overflow: hidden` on the dialog
  * with one scrollable child puts the way out outside the scrolling, so the control a player needs is
  * always on screen and the bindings scroll behind it.
- */
-/*
+ *
  * The `[open]` on the selector is **load-bearing, and it was measured rather than reasoned about.**
  * `dialog:not([open]) { display: none }` is a USER-AGENT rule, so any author `display` on the
  * element defeats it: with a bare `[data-panel='keyboard']` selector the *closed* help panel was
