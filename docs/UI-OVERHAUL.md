@@ -668,7 +668,7 @@ button deletion safe.
 1. **The map becomes square and fluid.** New priority, because it is the enabler. — **landed**, see §9.
 2. **The click contract, and the popup.** Merge the shell's `Abilities for unit <id>` group and the
    panel's `Actions for unit <id>` group into **one** popup with the frozen name — today they are
-   two independent lists, which is also two independent labellers (§3, idea 12).
+   two independent lists, which is also two independent labellers (§3, idea 12). — **landed**, see §9.
 3. **Sidebar re-partition.** Unit controls leave; everything else stays and stops overflowing.
 4. **Goto.** Engine route query first, then the intent decision of §7.4.
 5. **Next-unit flow and keyboard.** Still additive: no keyboard contract exists today.
@@ -952,3 +952,54 @@ re-partitions it, and the 40% cap is a holding position rather than a design. A 
 space closes when the dock's contents move to the sidebar. The sidebar's 380px is the current
 number, not an answer to §7.7.5, which is still open for the owner. And no keyboard or focus
 contract exists yet — that is Phase 5 and was not touched here.
+
+## Phase 2 — the unit action popup, and the orders the map cannot give — landed
+
+**One list and one labeller instead of two.** The shell built its own `Abilities for unit <id>` group
+beside the panel's `Actions for unit <id>`, and each had its own labeller: the shell's ended in
+`default: return command.type`, so a new command member would have reached a button as its own type
+name, while the panel's ends in `assertNever` and stops the build. The merge **deletes** the shell's
+list rather than combining two lists, because the panel's is a strict superset: `unitPanelCommands`
+is the engine's `unitActions` — which already enumerates one `AttackUnit` per adjacent legal target
+(`core/src/actions.ts:209`) — followed by the queried `FortifyUnit`. That is exactly why
+`unitQueriedActions` adds only fortify. The frozen M8 row (`Actions for unit <id>`) is untouched, and
+`Abilities for unit <id>` was never in the frozen table.
+
+**The popup is placed, not rebuilt, and it floats beside the unit.** The panel owns the element, its
+role, its frozen name and its contents; the shell owns where it sits — the same placement split the
+docked dialogs already use. It is anchored to the selected unit's tile, prefers the right of that
+tile, flips left when it would run off, and clamps inside the canvas. It is placed in the ring
+*around* the unit's tile, never on it.
+
+**The movement buttons are gone, which is what the owner asked for.** `unitPanelCommands` now filters
+by the schema's own `tileNamedBy`: an order that names a tile is issued on the map by clicking that
+tile, so it needs no button; the rest (`Found city`, `Fortify`, `Start work`, `Cancel work`) have no
+tile to click and do need one. This was not only tidiness: a starting settler offers eight moves, the
+unfiltered group rendered **256×321 px** — two tiles by two and a half at 128 px — and measurements
+showed a click on a city tile beneath it being swallowed by one of its own buttons. Filtering it to
+one short row is what made the map clickable again.
+
+**The one order the map cannot give keeps a control, and this is §7.3 measured for real.** A click on
+a tile holding the player's own city opens the city screen — `openCity` is checked before the unit's
+orders — so a `MoveUnit` onto your own city is unreachable by clicking it. §7.3 said a movement button
+was the only thing holding that order up; removing the destination buttons made that load-bearing
+rather than incidental, and the adversarial reachability sweep caught it within the hour (`clicking
+tile 945 for unit 1 did not issue a MoveUnit; dispatched []` — dispatched *nothing*, because the click
+had opened a city). The filter therefore keeps a control for exactly that case, and `clickTileOrder`
+keeps a narrow, coordinate-named fallback for it.
+
+**A defect in the floating placement, found by measurement.** The popup is a sibling of the canvas
+inside the map region, so a press on it never reaches the map's click handler — the DOM gives that
+guard for free. But every *continuing* gesture has to be bound to the region instead: with the wheel
+still on the canvas, a wheel over the popup stopped zooming ("a wheel event over the map did not
+change the zoom at all"), a pointer move over it left the map's own description reading "pointer over
+no tile", and a drag that ENDED over the popup never ended at all, leaving the map stuck to the
+pointer. Gestures that start something new belong to the map's own surface; gestures that continue or
+end something already running belong to the region holding both. The popup also carries
+`pointer-events: none` with `auto` on its buttons, so only a press on a button is the popup's.
+
+**Not done in this phase, and not claimed.** `decision 1` — "an ambiguous click opens a popup with the
+explicit choices" — is satisfied for the *unit's* orders by the popup's own contents, but there is no
+context menu at the clicked tile yet: the ambiguous city case is cleared by a control in the popup
+rather than by a menu at the tile. The dock still sits under the map (Phase 3), the sidebar is still
+380 px (the owner's §7.7.5 is open), and no keyboard contract exists (Phase 5).

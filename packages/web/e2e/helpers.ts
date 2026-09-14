@@ -842,7 +842,45 @@ export const clickTile = async (
         `${String(box.x)},${String(box.y)} ${String(box.width)}x${String(box.height)}`,
     );
   }
-  await page.mouse.click(point.x, point.y);
+
+  // **Where inside the tile the click lands does not matter; which tile it lands in does.** The app
+  // resolves an order from the point through its own inverse projection, so any point in the tile
+  // addresses the same tile — and that matters because a floating unit action popup can be sitting
+  // over the exact centre (it is anchored to a neighbouring unit and is unavoidably larger than one
+  // tile, so no placement of it avoids every neighbour). Clicking the centre blindly then presses a
+  // menu button instead of the map, and the order silently never happens.
+  //
+  // The candidates stay within a quarter of a tile of the centre, so they cannot spill into a
+  // neighbouring tile and address the wrong one; the first candidate the map actually owns is used.
+  // If none of them is the map's, the click is not attempted and the failure says so, rather than
+  // reporting a missing order that was never asked for.
+  const size = tileScreenPx(camera);
+  const quarter = size / 4;
+  const candidates = [
+    point,
+    { x: point.x, y: point.y + quarter },
+    { x: point.x, y: point.y - quarter },
+    { x: point.x + quarter, y: point.y + quarter },
+    { x: point.x - quarter, y: point.y + quarter },
+    { x: point.x + quarter, y: point.y - quarter },
+    { x: point.x - quarter, y: point.y - quarter },
+  ];
+  const reachable = await page.evaluate(
+    (points) =>
+      points.map((at) => {
+        const element = document.elementFromPoint(at.x, at.y);
+        return element !== null && element.tagName === 'CANVAS';
+      }),
+    candidates,
+  );
+  const chosen = candidates.find((_, index) => reachable[index] === true);
+  if (chosen === undefined) {
+    throw new Error(
+      `every point inside tile (${String(x)}, ${String(y)}) is covered by something other than the ` +
+        `map, so the order cannot be issued by clicking it`,
+    );
+  }
+  await page.mouse.click(chosen.x, chosen.y);
 };
 
 /* ------------------------------------------------------------------ *
@@ -1496,14 +1534,6 @@ export const selectUnit = async (
 };
 
 /**
- * The group of commands the engine's *planners* accept for a unit — `Abilities for unit <id>`:
- * fortify, and one attack per adjacent tile the engine accepts an attack on (the queried side
- * of the command union, which `unitActions` deliberately does not enumerate).
- */
-export const unitAbilitiesGroup = (page: Page, unitId: number): Locator =>
-  page.getByRole('group', { name: `Abilities for unit ${String(unitId)}` });
-
-/**
  * Open a city's screen the way a player does: click its entry in the `Cities` list.
  *
  * The list entry is a button whose accessible name is the city's own name, so the locator is
@@ -1586,12 +1616,16 @@ export const clickUnitAction = async (
 };
 
 /**
- * Issue a move or an attack by clicking the destination tile — the way a player
- * does it — accepting either shape the UI may use: a click that dispatches the
- * command directly, or a click that selects the tile and a control that confirms.
+ * Issue a move or an attack by clicking the destination tile — the way a player does it.
  *
- * Returns whether the engine was asked, which keeps "the UI has no such control" a
- * fact the spec asserts rather than an exception it has to catch.
+ * Returns whether the engine was asked, which keeps "the UI has no such control" a fact the spec
+ * asserts rather than an exception it has to catch.
+ *
+ * **This tries the map first and keeps a control fallback for one case.** The map is how a player
+ * issues a map order, and since `unitPanelCommands` stopped offering a button per destination it is
+ * the only route for almost all of them. The exception is a destination holding the player's own
+ * city: a click there opens the city screen, so the order cannot be given on the map at all, and the
+ * group keeps a single control for it. See the fallback's own note below.
  */
 export const clickTileOrder = async (
   page: Page,
@@ -1611,10 +1645,22 @@ export const clickTileOrder = async (
     });
   if (await dispatched()) return true;
 
-  // Otherwise the click selected the destination and a control confirms it. The control is
-  // found by the coordinates it NAMES (`Move to 3,4`, `Attack 3,4`) rather than by being the
-  // first button that says "move" — clicking a control for a different tile would issue a
-  // command nobody asked for and then report the order as unreachable.
+  /*
+   * The control fallback, restored — for exactly one case, and the reason is worth stating because
+   * this was deleted once already on the argument that the map is the only way to issue a map order.
+   *
+   * That argument is true of every destination EXCEPT one: a tile holding the player's own city. A
+   * click there opens the city screen, because `openCity` is checked before the unit's orders, so the
+   * move onto your own city **cannot** be issued by clicking it. `unitPanelCommands` keeps a control
+   * for that case alone — and only for that case, since every other destination is a click away — so
+   * a fallback here is not a way of dodging the map: it is the only route that exists for the order
+   * the map cannot give. `docs/UI-OVERHAUL.md` §7.3 measured this and named the button as the thing
+   * holding that order up.
+   *
+   * The control is found by the coordinates it NAMES (`Move to 3,4`), not by being the first button
+   * that says "move": clicking a control for a different tile would issue a command nobody asked for
+   * and then report the order as reachable.
+   */
   const x = tile % mapWidth;
   const y = Math.floor(tile / mapWidth);
   const verb = wanted === 'MoveUnit' ? 'move' : 'attack';
@@ -1623,11 +1669,6 @@ export const clickTileOrder = async (
   });
   if ((await named.count()) > 0) {
     await named.first().click();
-    if (await dispatched()) return true;
-  }
-  const confirm = page.getByRole('button', { name: /confirm/i }).first();
-  if ((await confirm.count()) > 0) {
-    await confirm.click();
     if (await dispatched()) return true;
   }
   return false;

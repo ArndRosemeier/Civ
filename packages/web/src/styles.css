@@ -141,6 +141,53 @@ main {
 }
 
 /*
+ * The unit action popup: the unit panel's `Actions for unit <id>` group, moved over the map beside
+ * the unit it belongs to. The shell places it (see `placeUnitActions`); this is what it looks like.
+ *
+ * `position: fixed` because the shell positions it from the canvas's own rectangle — the map region
+ * is a padded, centred, size-contained box, and absolute positioning inside it would mean undoing
+ * that box's padding and border before canvas coordinates meant anything.
+ *
+ * `line-height` is set back to a readable value deliberately: the map region sets `line-height: 0`
+ * to close the inline gap under the canvas, and this element is a child of that region, so without
+ * this rule every button label would be squashed flat. `[hidden]` needs its own rule for the same
+ * class of reason — `display: flex` below would otherwise defeat the `hidden` attribute the shell
+ * sets when nothing is selected.
+ */
+[data-floating='unit-actions'] {
+  position: fixed;
+  z-index: 5;
+  /*
+   * The map keeps its gestures underneath the popup, and only the buttons take the pointer.
+   *
+   * Floating a menu over an interactive map has one unavoidable cost — whatever the menu covers
+   * cannot be clicked — and this reduces it to the part that is *correct*: a press on a button is
+   * meant for the button, and a press anywhere else in the popup is meant for the map below it.
+   * Without this rule the popup's own padding and gaps swallow map clicks, which was measured:
+   * a sweep that clicked a destination tile under the popup's background issued nothing at all.
+   */
+  pointer-events: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 16rem;
+  padding: 6px 8px;
+  line-height: 1.45;
+  background: var(--panel);
+  border: 1px solid #3a4652;
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 45%);
+}
+
+[data-floating='unit-actions'][hidden] {
+  display: none;
+}
+
+[data-floating='unit-actions'] > button {
+  pointer-events: auto;
+}
+
+/*
  * The dock itself: whatever region the map leaves at the bottom of the window. It is a flex
  * column so two panels opened at once share it, and it never overlaps the map above it or the
  * panel column beside it.

@@ -95,7 +95,6 @@ import {
   tileY,
   treasuryIndicator,
   turnIndicator,
-  unitAbilitiesGroup,
   unitActionButtons,
   unitById,
   unitPanel,
@@ -149,7 +148,7 @@ const LISTED_COMMANDS = new Set([
  * status strip's rates control (`SetRates`) and — M9 — the government selector beside it
  * (`SetGovernment`, whose rows are the catalog and whose judge is `planSetGovernment`).
  * `FortifyUnit` is deliberately *not* here — its control is a unit order, and the offered-direction
- * sweep in this same file clicks it through `Abilities for unit <id>`.
+ * sweep in this same file clicks it through the unit's `Actions for unit <id>` group.
  */
 const QUERIED_SETTERS = ['SetRates', 'SetResearch', 'SetWorkedTiles', 'SetGovernment'] as const;
 
@@ -288,18 +287,19 @@ const playToMidGame = async (page: Page, seed: number): Promise<UiState> => {
   return readState(page);
 };
 
-/** One control a unit is offering: which group, which position, and what it says. */
+/**
+ * One control a unit is offering: which position, and what it says.
+ *
+ * There used to be a `group: 'actions' | 'abilities'` beside this, because the shell built a second
+ * list of unit orders and the sweep had to cover both. The shell no longer builds one — the panel's
+ * `Actions for unit <id>` group is the single surface for a unit's orders — so the field is gone
+ * rather than kept at a constant value, which would have read as a distinction that no longer exists.
+ */
 interface ControlSpec {
   readonly unitId: number;
-  readonly group: 'actions' | 'abilities';
   readonly index: number;
   readonly label: string;
 }
-
-const groupButtons = (page: Page, unitId: number, group: 'actions' | 'abilities'): Locator =>
-  group === 'actions'
-    ? unitActionButtons(page, unitId)
-    : unitAbilitiesGroup(page, unitId).getByRole('button');
 
 /**
  * Select a unit and read the controls it is offering.
@@ -317,12 +317,10 @@ const groupButtons = (page: Page, unitId: number, group: 'actions' | 'abilities'
 const controlsOf = async (page: Page, unitId: number): Promise<readonly ControlSpec[]> => {
   await selectUnit(page, await readState(page), await cameraOf(page), unitId);
   const specs: ControlSpec[] = [];
-  for (const group of ['actions', 'abilities'] as const) {
-    const buttons = groupButtons(page, unitId, group);
-    const count = await buttons.count();
-    for (let index = 0; index < count; index += 1) {
-      specs.push({ unitId, group, index, label: (await buttons.nth(index).innerText()).trim() });
-    }
+  const buttons = unitActionButtons(page, unitId);
+  const count = await buttons.count();
+  for (let index = 0; index < count; index += 1) {
+    specs.push({ unitId, index, label: (await buttons.nth(index).innerText()).trim() });
   }
   return specs;
 };
@@ -377,8 +375,9 @@ test('adversarial keystone — offered: no control on the page dispatches a comm
     // A few turns, so produced units exist and the position is not the opening one.
     await endTurns(page, 5);
 
-    // Each unit the seat owns, by every control it offers while it is selected — the action group
-    // and the shell's abilities group (fortify, and one attack per neighbour the engine accepts).
+    // Each unit the seat owns, by every control it offers while it is selected — one group now,
+    // which is the engine's enumerated actions plus the queried fortify (an attack per neighbour the
+    // engine accepts is enumerated by `unitActions` itself).
     const state = await readState(page);
     const owner = humanPlayerId(state);
     const swept: string[] = [];
@@ -388,19 +387,19 @@ test('adversarial keystone — offered: no control on the page dispatches a comm
         const now = await readState(page);
         if (unitById(now, spec.unitId) === undefined) break;
         await selectUnit(page, now, await cameraOf(page), spec.unitId);
-        const buttons = groupButtons(page, spec.unitId, spec.group);
+        const buttons = unitActionButtons(page, spec.unitId);
         if ((await buttons.count()) <= spec.index) continue;
         const control = buttons.nth(spec.index);
         const dispatched = await clickAndJudge(
           page,
           control,
-          `seed ${String(seed)} unit ${String(spec.unitId)} ${spec.group} ${String(spec.index)}`,
+          `seed ${String(seed)} unit ${String(spec.unitId)} control ${String(spec.index)}`,
           findings,
           records,
           await listedNow(page),
         );
         swept.push(
-          `${spec.group}[${String(spec.index)}] "${spec.label}" -> ${dispatched ? 'dispatched' : 'nothing'}`,
+          `control[${String(spec.index)}] "${spec.label}" -> ${dispatched ? 'dispatched' : 'nothing'}`,
         );
       }
     }
@@ -522,17 +521,17 @@ test('adversarial keystone — reachable: every command the engine lists for a u
         continue;
       }
       await selectUnit(page, fresh, await cameraOf(page), spec.unitId);
-      const buttons = groupButtons(page, spec.unitId, spec.group);
+      const buttons = unitActionButtons(page, spec.unitId);
       if ((await buttons.count()) <= spec.index) {
         findings.push(
-          `unit ${String(spec.unitId)}'s ${spec.group} group had no control ${String(spec.index)} on a ` +
+          `unit ${String(spec.unitId)} had no control ${String(spec.index)} on a ` +
             'replay of the same seed',
         );
         continue;
       }
       const control = buttons.nth(spec.index);
       const label = (await control.innerText()).trim();
-      const where = `seed ${String(seed)} unit ${String(spec.unitId)} ${spec.group} ${String(spec.index)}`;
+      const where = `seed ${String(seed)} unit ${String(spec.unitId)} control ${String(spec.index)}`;
       // Determinism, as a by-product: the same seed and the same script put the same control in the
       // same place with the same name. A difference here means the sweep is clicking something else.
       if (label !== spec.label) {
@@ -591,7 +590,16 @@ test('adversarial keystone — reachable: every command the engine lists for a u
         continue;
       }
       const issued = await clickTileOrder(page, camera, target, fresh.map.width, type);
-      expect(issued, `clicking tile ${String(target)} did not issue a ${type}`).toBe(true);
+      // The failure names what was actually dispatched, because the interesting way for this to fail
+      // is not "nothing happened" but "the click did something else" — a tile holding one of your own
+      // cities resolves the click to the city screen before the unit's orders are consulted, so a
+      // move onto it is issued through the control that `unitPanelCommands` keeps for that one case.
+      const what = (await dispatchLog(page)).map((entry) => JSON.stringify(entry.action));
+      expect(
+        issued,
+        `clicking tile ${String(target)} for unit ${String(unitId)} did not issue a ${type}; ` +
+          `dispatched ${JSON.stringify(what)}`,
+      ).toBe(true);
       for (const entry of await dispatchLog(page)) {
         records.push({
           where: `seed ${String(seed)} map`,

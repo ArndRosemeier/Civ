@@ -34,6 +34,7 @@ import {
   authoritativeState,
   mapDescription,
   openApp,
+  OPPONENT_OFF,
   pagePointToTile,
   paletteOf,
   parseHexColour,
@@ -43,6 +44,7 @@ import {
   sampleTileColour,
   seedApp,
   selectUnit,
+  unitActionButtons,
   stateHash,
   terrainAtTile,
   TERRAIN_CENTRE_TOLERANCE,
@@ -688,6 +690,87 @@ test('the map is a fluid square, and the click still lands where the renderer dr
     ),
     'the camera the app settled on is not one the clamp would produce',
   ).toEqual(settled);
+});
+
+/**
+ * The unit action popup: one surface, beside the unit, holding only what the map cannot do.
+ *
+ * Three separate claims, each of which fails for a different mistake:
+ *
+ *  1. **One surface.** The shell used to build its own `Abilities for unit <id>` group beside the
+ *     panel's `Actions for unit <id>` — two lists of one unit's orders, with two labellers (the
+ *     shell's ended in `default: return command.type`, so a new command member would have reached a
+ *     button as its own type name). Only the panel's group should exist now, and it carries the
+ *     frozen M8 name (`docs/INTERFACES.md`: `selected unit actions | group | Actions for unit <id>`).
+ *  2. **Nothing that names a tile.** Moving and attacking are map clicks; a button per destination is
+ *     what the owner called unnecessary, and it is also why this phase nearly shipped broken: a
+ *     starting settler offers eight moves, the group rendered 256×321 px, and a click on a city tile
+ *     beneath it was swallowed by one of its own buttons. The label check here is a *proxy* for
+ *     `tileNamedBy` — `unitpanel.test.ts` asserts the property itself against the engine, and this
+ *     asserts that what reaches the DOM is that list rather than a longer one.
+ *  3. **Beside the unit, not on it** — and the map keeps the pointer underneath it. The second half
+ *     is the one that matters for playability, so it is measured directly at the unit's own tile
+ *     rather than inferred from the popup's geometry.
+ */
+test('the unit popup is the only surface for a unit’s orders, holds no tile-named order, and leaves the map clickable', async ({
+  page,
+}) => {
+  await openApp(page);
+  const state = await seedApp(page, SEED, OPPONENT_OFF);
+  const owner = humanPlayerId(state);
+  const settler = state.units.find((one) => one.owner === owner);
+  if (settler === undefined) throw new Error('the human seat owns no unit to select');
+  await selectUnit(page, state, await cameraOf(page), settler.id);
+
+  // (1) Exactly one group for this unit's orders, and it is named the way M8 froze it.
+  const orders = page.getByRole('group', { name: /^(Actions|Abilities) for unit / });
+  await expect(orders, "more than one group offers this unit's orders").toHaveCount(1);
+  await expect(orders).toHaveAccessibleName(`Actions for unit ${String(settler.id)}`);
+
+  // (2) Nothing in it names a tile.
+  const labels = await unitActionButtons(page, settler.id).allInnerTexts();
+  expect(labels.length, 'the popup offers the settler nothing at all').toBeGreaterThan(0);
+  for (const label of labels) {
+    expect(
+      label.trim(),
+      `the popup offers "${label.trim()}", which names a tile — that order belongs to the map`,
+    ).not.toMatch(/\d+\s*,\s*\d+/);
+  }
+
+  // (3) It sits beside the unit's tile, not over it, and the map still receives clicks there.
+  const camera = await cameraOf(page);
+  const box = await canvasBox(page);
+  const tile = settler.tile;
+  const centre = tileCentre(camera, tileX(state, tile), tileY(state, tile));
+  const popup = await page.locator("[data-floating='unit-actions']").boundingBox();
+  if (popup === null) throw new Error('the unit action popup has no box (is it hidden?)');
+  expect(
+    centre.x + box.x >= popup.x &&
+      centre.x + box.x <= popup.x + popup.width &&
+      centre.y + box.y >= popup.y &&
+      centre.y + box.y <= popup.y + popup.height,
+    'the popup covers the tile it belongs to, so the player cannot see what they are ordering',
+  ).toBe(false);
+
+  // The point that decides whether the map stays playable with a menu open — and it has to be a
+  // point INSIDE the popup, not merely near it. The popup's own padding is such a point: whatever
+  // the map is beneath it, the page must still see the CANVAS there, because only the buttons take
+  // the pointer. Probing the unit's tile instead would prove nothing, since (3) has already
+  // established the popup is not over that tile — the assertion would be unable to fail.
+  //
+  // Losing `pointer-events: none` is silent: the menu looks right and quietly eats clicks aimed at
+  // the tiles beneath it, which is one of the two ways this phase was broken before the filter
+  // removed the eight move buttons.
+  const topLeft = { x: popup.x + 2, y: popup.y + 2 };
+  const onTop = await page.evaluate(({ x, y }) => {
+    const element = document.elementFromPoint(x, y);
+    if (element === null) return 'NOTHING';
+    return element.tagName === 'CANVAS' ? 'CANVAS' : element.tagName;
+  }, topLeft);
+  expect(
+    onTop,
+    'the popup is between the pointer and the map, so the tiles under it cannot be clicked',
+  ).toBe('CANVAS');
 });
 
 test('refusals: a click the engine would refuse leaves the state exactly as it was', async ({

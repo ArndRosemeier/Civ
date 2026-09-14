@@ -12,12 +12,11 @@
  * take goes through `applyCommand`, and every control that offers an action is built from an
  * engine answer:
  *
- * - the unit panel and its `Actions for unit <id>` group (W2) render `unitActions` verbatim;
+ * - the unit panel and its `Actions for unit <id>` group (W2) render `unitActions` verbatim, plus
+ *   the engine's *queried* commands — `planFortifyUnit`'s fortify, which `unitActions` yields to
+ *   nobody because it emits no event, and which A4 nevertheless names as a unit order;
  * - the city screen (W2) renders `cityProductionOptions` and asks `planSetWorkedTiles` about the
  *   assignment each checkbox would write;
- * - this file's own `Abilities for unit <id>` group is `planFortifyUnit` and one `AttackUnit` per
- *   adjacent tile `planAttackUnit` accepts — the engine's *queried* commands, which no generator
- *   advertises (fortify emits no event) and which A4 nevertheless names as a unit order;
  * - a click on the map is resolved by looking the clicked tile up in the unit's own action list
  *   (`unitActions`), so the click can only ever issue a command the engine already offered. A
  *   click the engine would refuse (an empty tile further than the unit can walk) is dispatched
@@ -26,11 +25,17 @@
  *
  * ## What the shell owns, and what it must not own
  *
- * The shell owns `Map` (the `application` role), `End turn` (the button) and the turn pipeline's
- * dispatch. It must **not** render a second copy of any element the panels own: two elements with
- * one accessible name make a role-and-name locator ambiguous, which is a worse failure than a
- * missing one. The panels' own header lists them; this file adds only what A4 requires of the
- * shell (`Map`, `End turn`) plus the abilities group the unit panel deliberately leaves out.
+ * The shell owns `Map` (the `application` role), `End turn` (the button), the turn pipeline's
+ * dispatch, and the *placement* of the panels' elements — where a thing sits, never what it says.
+ * It must **not** render a second copy of any element the panels own: two elements with one
+ * accessible name make a role-and-name locator ambiguous, which is a worse failure than a missing
+ * one. It adds exactly what A4 requires of the shell and nothing else (`Map`, `End turn`).
+ *
+ * That rule has teeth, and it was being broken here. This file used to build its own
+ * `Abilities for unit <id>` group — a second list of orders for a unit, beside the panel's
+ * `Actions for unit <id>`, with a second labeller of its own whose `default` arm would have put a
+ * raw command name on a button. The group is gone: the shell now moves the panel's group to the map
+ * (see the placement note in `start`) rather than restating its contents.
  *
  * ## Determinism
  *
@@ -52,20 +57,16 @@ import {
   indexToY,
   isExplored,
   isGameOver,
-  neighbors8,
   mergeSettings,
   newGame,
   opponentModeOf,
   parseSettings,
-  planAttackUnit,
-  planFortifyUnit,
   unitActions,
   visibleTiles,
   type Command,
   type GameEvent,
   type GameState,
   type PlayerId,
-  type RulesetView,
   type Settings,
   type UnitId,
 } from '@civts/core';
@@ -89,6 +90,7 @@ import {
   panCamera,
   screenToTile,
   tileScreenPx,
+  tileToScreen,
   zoomCamera,
   type Camera,
   type ScreenPoint,
@@ -135,6 +137,15 @@ const CANVAS_FALLBACK_PX = 540;
 
 /** One wheel notch of zoom, in zoom levels. */
 const WHEEL_STEP = 1;
+
+/**
+ * How far the unit action popup sits from the tile it belongs to, in CSS pixels.
+ *
+ * It is a presentation constant and never a rule: it decides only where a menu is drawn. The popup
+ * is placed in the ring *around* the unit's tile rather than on it, so the tile being decided about
+ * is never covered by the menu doing the deciding.
+ */
+const UNIT_ACTIONS_GAP_PX = 6;
 
 /**
  * How far the pointer may travel between press and release and still count as a click.
@@ -238,67 +249,6 @@ const cityMarkers = (state: GameState, viewer: PlayerId): readonly CityMarker[] 
     .filter((city) => isExplored(state, viewer, city.tile))
     .map((city) => ({ tile: city.tile, colour: colourOfPlayer(state, city.owner) }));
 
-/* ------------------------------------------------------------------ *
- * The queried commands: fortify, and the attacks the engine accepts
- * ------------------------------------------------------------------ */
-
-/**
- * A unit's **queried** commands: the ones no generator advertises but `applyCommand` accepts.
- *
- * `planFortifyUnit` decides fortify — it emits no event, which is why `unitActions` yields it to
- * nobody (`actions.ts`), and A4 names fortify among the unit orders the UI must offer. The
- * attacks are here for a different reason: `unitActions` *does* enumerate them, so they are not
- * queried at all, and this group repeats them by name over the same adjacency ring and through
- * the same `planAttackUnit`, because attacking is an order a player issues against a tile on the
- * map and the group is where the map's orders are listed. Either way the control exists only
- * where the engine's own evaluator accepted it, so the keystone property holds by construction.
- */
-const abilityCommands = (
-  state: GameState,
-  ruleset: RulesetView,
-  seat: PlayerId | undefined,
-  unitId: UnitId,
-): readonly Command[] => {
-  if (seat === undefined) return [];
-  const unit = state.units.find((candidate) => candidate.id === unitId);
-  if (unit === undefined) return [];
-
-  const commands: Command[] = [];
-  if (planFortifyUnit(state, seat, unitId).ok) commands.push({ type: 'FortifyUnit', unitId });
-  for (const target of neighbors8(state.map, unit.tile)) {
-    if (planAttackUnit(state, ruleset, seat, unitId, target).ok) {
-      commands.push({ type: 'AttackUnit', unitId, target });
-    }
-  }
-  return commands;
-};
-
-/**
- * What an ability control says. Named after the same vocabulary the unit panel uses, so a player
- * reads one set of words for one set of orders, and a coordinate-bearing label (`Move to 3,4`,
- * `Attack 3,4`) is discoverable by name rather than by position.
- */
-const abilityLabel = (state: GameState, command: Command): string => {
-  const at = (tile: number): string =>
-    `${String(indexToX(state.map, tile))},${String(indexToY(state.map, tile))}`;
-  switch (command.type) {
-    case 'FortifyUnit':
-      return 'Fortify';
-    case 'AttackUnit':
-      return `Attack ${at(command.target)}`;
-    case 'MoveUnit':
-      return `Move to ${at(command.to)}`;
-    case 'FoundCity':
-      return 'Found city';
-    case 'CancelWork':
-      return 'Cancel work';
-    case 'StartWork':
-      return `Start work: ${command.kind}`;
-    default:
-      return command.type;
-  }
-};
-
 /**
  * Which tile a map order names is the schema's question, not this file's.
  *
@@ -316,6 +266,12 @@ const abilityLabel = (state: GameState, command: Command): string => {
 interface Shell {
   readonly root: HTMLElement;
   readonly canvas: HTMLCanvasElement;
+  /**
+   * The map region: the box the canvas is a square inside, and where the unit action popup is
+   * placed. Exposed so the shell can put a panel element *over the map* without owning its markup —
+   * the same split that lets the dialogs be docked (see the placement note in `start`).
+   */
+  readonly mapRegion: HTMLElement;
   readonly endTurn: HTMLButtonElement;
   readonly panelsRoot: HTMLElement;
   /** Where an opened panel is docked — see `buildShell`. */
@@ -469,7 +425,7 @@ const buildShell = (doc: Document): Shell => {
   root.append(header, main);
   doc.body.append(root);
   dock.append(newGame.dialog);
-  return { root, canvas, endTurn, panelsRoot, dock, newGame };
+  return { root, canvas, mapRegion, endTurn, panelsRoot, dock, newGame };
 };
 
 /**
@@ -710,35 +666,78 @@ const start = async (): Promise<void> => {
   );
 
   /**
-   * The abilities group: the shell's own, because these are the orders a player issues against
-   * the map as much as from a list. Appended beside the unit panel's action group so the two read
-   * together, and named separately so a keystone sweep can tell them apart.
+   * The unit action popup: **the panel's own group, moved beside the unit.**
+   *
+   * This used to be two lists — the shell's `Abilities for unit <id>` group (fortify plus one attack
+   * per adjacent target) sitting beside the panel's `Actions for unit <id>` group (the engine's
+   * enumerated actions plus fortify). Two lists meant two independent statements of "what may this
+   * unit do?", and two independent labellers to go with them: the shell's `abilityLabel` ended in
+   * `default: return command.type`, so a new command member would have reached the screen as its own
+   * type name, while the panel's `actionLabel` ends in `assertNever` and stops the build (§3, idea
+   * 12).
+   *
+   * The merge **deletes** the shell's list rather than combining two lists, because the panel's is
+   * already a strict superset: `unitPanelCommands` is the engine's `unitActions` — which enumerates
+   * one `AttackUnit` per adjacent legal target, `core/src/actions.ts:209` — followed by the queried
+   * `FortifyUnit`. That is precisely why `unitQueriedActions` adds only fortify: adding attacks there
+   * would offer the same command twice. Nothing the old group offered is lost, and a test in
+   * `map.spec.ts` now asserts the superset rather than leaving it to a comment.
+   *
+   * It is a *placement*, not a second copy, exactly like the docked dialogs above: the panel owns the
+   * element, its role, its frozen name (`Actions for unit <id>`, `docs/INTERFACES.md` M8) and its
+   * contents; the shell owns where it sits. What the move buys is the owner's design — the orders a
+   * unit can take appear next to that unit, over the map, instead of in a column at the far right of
+   * the screen (§8 decision 1, §7.6 phase 2).
    */
-  const abilities = el(doc, 'div');
-  abilities.setAttribute('role', 'group');
-  shell.panelsRoot.append(abilities);
+  shell.mapRegion.append(panels.elements.unitActions);
+  panels.elements.unitActions.dataset['floating'] = 'unit-actions';
 
-  const refreshAbilities = (): void => {
+  /**
+   * Put the popup beside the selected unit, and keep it on the map.
+   *
+   * **Beside, never over.** The popup is placed in the ring around the unit's own tile, so the tile
+   * a player is deciding about is never hidden by the menu they are deciding with — which is also
+   * what keeps `panel-usability.spec.ts`'s "nothing covers the middle of the map" honest when the
+   * selected unit is standing in the middle of the map, as it does at the start of a game.
+   *
+   * `position: fixed` with the canvas's own rectangle, rather than absolute positioning inside the
+   * map region: the region is a padded, centred box with `container-type: size`, so an absolutely
+   * positioned child needs that box's padding and border widths undone before canvas coordinates mean
+   * anything. Measuring the canvas directly removes the arithmetic instead of getting it right.
+   *
+   * The size is read *after* the panel has rebuilt the buttons, so the flip and the clamp use the
+   * popup's real width rather than a guess; a control that runs off the map is an order the player
+   * cannot give.
+   */
+  const placeUnitActions = (): void => {
+    const popup = panels.elements.unitActions;
     const unitId = panels.selection().unitId;
-    abilities.replaceChildren();
-    if (unitId === undefined) {
-      abilities.setAttribute('aria-label', 'Abilities for unit none');
+    const unit = unitId === undefined ? undefined : state.units.find((one) => one.id === unitId);
+    const box = canvas.getBoundingClientRect();
+    if (unit === undefined) {
+      // Nothing selected: the group keeps its frozen empty name (`Actions for unit none`) and leaves
+      // the map. Hidden rather than removed, so its role and name stay in the document the way the
+      // M8 table describes them.
+      popup.hidden = true;
       return;
     }
-    abilities.setAttribute('aria-label', `Abilities for unit ${String(unitId)}`);
-    // M10: on a finished game the orders are still listed — they are what this unit could have done
-    // — but they are closed, because `applyCommand` would refuse every one of them with `game-over`.
-    const closed = isGameOver(state, ruleset);
-    for (const command of abilityCommands(state, ruleset, humanSeatOf(state), unitId)) {
-      const button = el(doc, 'button', abilityLabel(state, command));
-      button.type = 'button';
-      button.dataset['command'] = command.type;
-      button.disabled = closed;
-      button.addEventListener('click', () => {
-        armDispatch(command);
-      });
-      abilities.append(button);
-    }
+    popup.hidden = false;
+
+    const size = tileScreenPx(camera);
+    const at = tileToScreen(camera, indexToX(state.map, unit.tile), indexToY(state.map, unit.tile));
+    const width = popup.offsetWidth;
+    const height = popup.offsetHeight;
+    const gap = UNIT_ACTIONS_GAP_PX;
+
+    // Right of the tile by preference, then left, then clamped: the flip keeps the popup off the
+    // tile it belongs to at the map's right edge, and the clamp keeps it on screen everywhere else.
+    let left = box.left + at.x + size + gap;
+    if (left + width > box.right) left = box.left + at.x - width - gap;
+    let top = box.top + at.y;
+    left = Math.max(box.left, Math.min(left, box.right - width));
+    top = Math.max(box.top, Math.min(top, box.bottom - height));
+    popup.style.left = `${String(left)}px`;
+    popup.style.top = `${String(top)}px`;
   };
 
   /* ------------------------------ dispatching ---------------------------- */
@@ -769,7 +768,7 @@ const start = async (): Promise<void> => {
       // The panels still re-render: a refusal is a normal answer, and a control that must not
       // change has to be rebuilt from the state that did not change.
       panels.refresh();
-      refreshAbilities();
+      placeUnitActions();
       return { outcome: 'refused', events: [] };
     }
 
@@ -780,7 +779,7 @@ const start = async (): Promise<void> => {
     // `dispatchCommand`, so one append per accepted command is one statement of "what happened".
     logEvents(outcome.value.events);
     panels.refresh();
-    refreshAbilities();
+    placeUnitActions();
     redraw();
     return { outcome: 'ok', events: outcome.value.events };
   }
@@ -822,7 +821,7 @@ const start = async (): Promise<void> => {
     panels.selectUnit(undefined);
     panels.selectCity(undefined);
     panels.refresh();
-    refreshAbilities();
+    placeUnitActions();
     redraw();
   }
 
@@ -858,6 +857,28 @@ const start = async (): Promise<void> => {
    */
   let travelled = 0;
 
+  /**
+   * Which element each map gesture is bound to — and they are deliberately not all the same one.
+   *
+   * The canvas and the unit action popup are **siblings** inside the map region, because the popup
+   * is placed over the map. That single fact decides the whole split:
+   *
+   * - `click` and `pointerdown` stay on the **canvas**. A press on the popup therefore never reaches
+   *   the map's click handler — the canvas is not an ancestor of the popup, so the event does not
+   *   travel through it — which is what stops a button press from also ordering the unit onto
+   *   whatever tile happens to lie beneath the menu. The DOM gives that guard for free, which is why
+   *   there is no "was this click inside the popup?" test in the handler below.
+   * - everything else belongs to the **region**: the wheel, the pointer move, the release and the
+   *   leave. Bound to the canvas, each goes dark the moment the pointer crosses the popup, and that
+   *   was measured rather than reasoned about. With the wheel still on the canvas, a wheel over the
+   *   popup stopped zooming ("a wheel event over the map did not change the zoom at all"), and a
+   *   pointer move over it left the map's own description reading "pointer over no tile". The worst
+   *   of the four was `pointerup`: a drag that ENDED over the popup never ended, leaving the map
+   *   stuck to the pointer.
+   *
+   * The rule underneath: gestures that START something new belong to the map's own surface, and
+   * gestures that continue or end something already running belong to the region holding both.
+   */
   canvas.addEventListener('pointerdown', (event) => {
     dragging = true;
     travelled = 0;
@@ -865,7 +886,7 @@ const start = async (): Promise<void> => {
     lastY = event.clientY;
   });
 
-  canvas.addEventListener('pointermove', (event) => {
+  shell.mapRegion.addEventListener('pointermove', (event) => {
     const tile = tileAt(localPoint(event));
     const next = tile === undefined ? null : { x: tile.x, y: tile.y };
     if (next?.x !== cursor?.x || next?.y !== cursor?.y) {
@@ -888,15 +909,15 @@ const start = async (): Promise<void> => {
   const endDrag = (): void => {
     dragging = false;
   };
-  canvas.addEventListener('pointerup', endDrag);
-  canvas.addEventListener('pointercancel', endDrag);
-  canvas.addEventListener('pointerleave', () => {
+  shell.mapRegion.addEventListener('pointerup', endDrag);
+  shell.mapRegion.addEventListener('pointercancel', endDrag);
+  shell.mapRegion.addEventListener('pointerleave', () => {
     dragging = false;
     cursor = null;
     draw();
   });
 
-  canvas.addEventListener(
+  shell.mapRegion.addEventListener(
     'wheel',
     (event) => {
       // The page must not scroll under a wheel aimed at the map: the gesture is zoom, and a
@@ -980,7 +1001,7 @@ const start = async (): Promise<void> => {
     const own = state.units.find((unit) => unit.tile === index && unit.owner === seat);
     if (own !== undefined) {
       panels.selectUnit(own.id);
-      refreshAbilities();
+      placeUnitActions();
       redraw();
       return;
     }
@@ -1038,7 +1059,7 @@ const start = async (): Promise<void> => {
     // The human must SEE what the rival did: the log is the engine's own story of the game, and an
     // opponent that acts invisibly is indistinguishable from one that does nothing.
     panels.refresh();
-    refreshAbilities();
+    placeUnitActions();
     redraw();
   }
 
@@ -1102,7 +1123,7 @@ const start = async (): Promise<void> => {
     replaceState: (next) => {
       state = next;
       panels.refresh();
-      refreshAbilities();
+      placeUnitActions();
       redraw();
     },
     drawTrace: () => trace.tiles,
@@ -1120,7 +1141,7 @@ const start = async (): Promise<void> => {
   // so it is set by the draw itself rather than by a timer or by a load event.
   camera = openingCamera(state);
   panels.refresh();
-  refreshAbilities();
+  placeUnitActions();
   redraw();
 
   /* ------------------------------ resizing ------------------------------- */

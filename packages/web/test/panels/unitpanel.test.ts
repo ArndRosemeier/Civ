@@ -37,6 +37,7 @@ import {
   unitQueriedActions,
   unitRows,
 } from '../../src/panels/unitpanel.js';
+import { tileNamedBy } from '../../src/ui/schema.js';
 
 const validated = validateRuleset(CATALOG, 'tuned');
 if (!validated.ok) throw new Error('the shipped catalog does not validate');
@@ -150,15 +151,36 @@ describe("the group's queried commands (fortify)", () => {
 });
 
 describe("the group's contents", () => {
-  it("is the engine's enumerated list, in order, with fortify after it", () => {
+  it("is the engine's enumerated list minus its tile-named orders, in order, with fortify after it", () => {
     const commands = unitPanelCommands(STATE, RULESET, P0, asUnitId(0));
-    expect(commands.slice(0, unitActionList(STATE, RULESET, asUnitId(0)).length)).toEqual([
-      ...unitActionList(STATE, RULESET, asUnitId(0)),
-    ]);
+    const onTheMap = unitActionList(STATE, RULESET, asUnitId(0)).filter(
+      (command) => tileNamedBy(command) !== undefined,
+    );
+    expect(commands.slice(0, -1)).toEqual(
+      unitActionList(STATE, RULESET, asUnitId(0)).filter(
+        (command) => tileNamedBy(command) === undefined,
+      ),
+    );
     expect(commands.at(-1)?.type).toBe('FortifyUnit');
+    // The premise, asserted rather than assumed: the engine really does offer orders this group
+    // leaves out, so the two assertions above are about a filter that removes something. A board on
+    // which the unit could not move anywhere would make the filter invisible and this test vacuous.
+    expect(onTheMap.length, 'the engine offered no tile-named order to filter out').toBeGreaterThan(
+      0,
+    );
   });
 
-  it('offers every enumerated command the engine lists, and nothing it refuses', () => {
+  it('offers nothing that names a tile — those orders belong to the map', () => {
+    const commands = unitPanelCommands(STATE, RULESET, P0, asUnitId(0));
+    for (const command of commands) {
+      expect(
+        tileNamedBy(command),
+        `${command.type} names a tile, so it is a map click and must not be a button`,
+      ).toBeUndefined();
+    }
+  });
+
+  it('offers every command it does list, and the engine accepts every one of them', () => {
     const commands = unitPanelCommands(STATE, RULESET, P0, asUnitId(0));
     expect(commands.length).toBeGreaterThan(0);
     for (const command of commands) {
@@ -166,7 +188,13 @@ describe("the group's contents", () => {
         true,
       );
     }
-    for (const command of unitActionList(STATE, RULESET, asUnitId(0))) {
+    // The enumerated commands it DOES offer are all of them — the filter removes a property of the
+    // command (it names a tile), not an arbitrary subset. Anything the engine lists and this group
+    // does not offer must be reachable on the map instead, and that is what `tileNamedBy` says.
+    const kept = unitActionList(STATE, RULESET, asUnitId(0)).filter(
+      (command) => tileNamedBy(command) === undefined,
+    );
+    for (const command of kept) {
       expect(commands).toContainEqual(command);
     }
   });

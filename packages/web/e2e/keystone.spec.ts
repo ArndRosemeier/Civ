@@ -35,7 +35,6 @@ import {
   bringTileToCentre,
   cameraOf,
   canonicalAction,
-  canvasBox,
   clearDispatchLog,
   clickTile,
   clickTileOrder,
@@ -54,11 +53,9 @@ import {
   stateHash,
   tileX,
   tileY,
-  unitAbilitiesGroup,
   unitActionButtons,
   unitActionsGroup,
   unitsOf,
-  visibleTiles,
   zoomTo,
   type UiUnit,
 } from './helpers.js';
@@ -141,26 +138,23 @@ test('keystone UI adds no rules: every control the unit panel offers dispatches 
   await select(page, settle.id);
   const controlIndices = await actionControlIndices(unitActionsGroup(page, settle.id));
   expect(controlIndices.length, 'the UI offers no controls for the settler').toBeGreaterThan(0);
-  // The abilities group is the queried side of the command union — fortify, and one attack per
-  // tile the engine's own `planAttackUnit` accepts — so it is swept too: a control there must be
-  // accepted by the engine just as surely as one in the action group.
-  const abilityIndices = await actionControlIndices(unitAbilitiesGroup(page, settle.id));
-
+  // ONE group is swept, and that is the merge this test now guards: the shell used to build a
+  // second list of unit orders (`Abilities for unit <id>` — fortify, plus one attack per tile
+  // `planAttackUnit` accepts) and this sweep covered both. The panel's list is a strict superset of
+  // it, so the second list is gone, and the sweep would be sweeping the same buttons twice if the
+  // ability indices were kept. `map.spec.ts` asserts the superset directly, so this test does not
+  // have to prove the merge by counting the same controls twice.
   const failures: string[] = [];
   const produced: unknown[] = [];
-  for (const index of [...controlIndices, ...abilityIndices.map((at) => -1 - at)]) {
+  for (const index of controlIndices) {
     // Every control is exercised on its own identical game, so one click cannot hide
     // the next control's answer (founding a city consumes the settler).
     await freshGame(page);
     const unit = await humanUnit(page, 'settler');
     await select(page, unit.id);
-    const inAbilities = index < 0;
-    const buttons = inAbilities
-      ? unitAbilitiesGroup(page, unit.id).getByRole('button')
-      : unitActionButtons(page, unit.id);
-    const at = inAbilities ? -1 - index : index;
-    const label = (await buttons.nth(at).innerText()).trim();
-    await buttons.nth(at).click();
+    const buttons = unitActionButtons(page, unit.id);
+    const label = (await buttons.nth(index).innerText()).trim();
+    await buttons.nth(index).click();
     const log = await dispatchLog(page);
     if (log.length === 0) {
       failures.push(`control "${label}" dispatched nothing at all`);
@@ -234,9 +228,15 @@ test('keystone UI adds no rules: every command the engine accepts for a unit is 
     const unit = await humanUnit(page, 'settler');
     await select(page, unit.id);
     const state = await readState(page);
+    // The target is brought to the middle of the map first, and the camera is re-read afterwards.
+    // The guard that used to be here asked `visibleTiles`, which is true of a tile that is only
+    // PARTLY on screen — and `clickTile` needs the tile's centre inside the canvas, so a tile clipped
+    // by the map's edge passed the guard and then threw. It went unnoticed while moves were also
+    // buttons, because this loop only ran for whatever the controls had not already covered; with the
+    // destination buttons gone, every move and attack comes through here. Panning is also what a
+    // player does, and it is what `orderByMapClick` does for the same reason.
+    await bringTileToCentre(page, state, target);
     const camera = await cameraOf(page);
-    const box = await canvasBox(page);
-    if (!visibleTiles(state, camera, box).includes(target)) continue;
     const issued = await clickTileOrder(page, camera, target, state.map.width, type);
     expect(issued, `clicking tile ${String(target)} did not issue a ${type}`).toBe(true);
     for (const entry of await dispatchLog(page)) reachable.push(entry.action);

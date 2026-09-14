@@ -66,6 +66,7 @@ import {
   type UnitId,
 } from '@civts/core';
 import { assertNever, governmentLabel, productionItemName } from '../events.js';
+import { tileNamedBy } from '../ui/schema.js';
 import { commandsClosed } from './closed.js';
 import type { PanelContext } from './index.js';
 
@@ -145,21 +146,55 @@ export const unitQueriedActions = (
   planFortifyUnit(state, playerId, unitId).ok ? [{ type: 'FortifyUnit', unitId }] : [];
 
 /**
- * **What the group renders**: the engine's enumerated list followed by its queried commands.
+ * **What the group renders**: the engine's enumerated list followed by its queried commands, minus
+ * the orders that name a tile.
  *
- * This is the single statement of the group's contents, used by the panel and by the tests —
- * so "what the UI offers for this unit" has one definition rather than one in the DOM and a
- * second in a test.
+ * This is the single statement of the group's contents, used by the panel and by the tests — so
+ * "what the UI offers for this unit" has one definition rather than one in the DOM and a second in
+ * a test.
+ *
+ * The filter is the point of the group, and it comes from the schema rather than from a list of
+ * command names written here: `tileNamedBy` answers "does this order point at a tile?", so
+ * `MoveUnit` and `AttackUnit` are issued **on the map** — by clicking the destination, which is what
+ * a player does anyway — and everything else (`Found city`, `Fortify`, `Start work`, `Cancel work`)
+ * has no tile to click and therefore needs a button. The owner's own words: "the movement buttons
+ * seem to be unneccessary, no player would actually move units like this when you can use the map
+ * directly".
+ *
+ * It is not only a tidiness argument, and the measurements are why this is a filter rather than a
+ * hand-written list of the four commands that survive it. Every move the engine offers is one more
+ * button, and a starting settler offers eight: the group rendered 256×321 px, which at 128 px tiles
+ * is a menu covering two tiles by two and a half, floating over the map beside the unit it belongs
+ * to. Measured: a click on a city tile beneath that menu was swallowed by one of its buttons instead
+ * of reaching the map, so the tile a player most wanted was the one they could not press. Filtered,
+ * the group is one short row.
+ *
+ * `keystone.spec.ts` already expects this: its reachability test clicks every control, then issues
+ * whatever is *missing* by clicking the destination tile.
  */
 export const unitPanelCommands = (
   state: GameState,
   ruleset: RulesetView,
   playerId: PlayerId,
   unitId: UnitId,
-): readonly Command[] => [
-  ...unitActionList(state, ruleset, unitId),
-  ...unitQueriedActions(state, playerId, unitId),
-];
+): readonly Command[] =>
+  [
+    ...unitActionList(state, ruleset, unitId),
+    ...unitQueriedActions(state, playerId, unitId),
+  ].filter((command) => {
+    const tile = tileNamedBy(command);
+    // No tile to click: the order can only be given here, so it is always a control.
+    if (tile === undefined) return true;
+    // **A tile-named order the map cannot issue has to stay a control, and there is exactly one such
+    // case.** A click on a tile holding one of the player's own cities opens that city's screen —
+    // `openCity` is checked before the unit's orders, because a city is a landmark and a unit
+    // standing in it is not what a player means by clicking it. So a move onto your own city is
+    // unreachable by clicking it, and a control is the only way to give that order. §7.3 in
+    // `docs/UI-OVERHAUL.md` measured this and said the button was the only thing holding it up; the
+    // filter above is what makes that true rather than incidental. Every OTHER destination — hostile
+    // ground, empty ground, a tile holding only your own unit — is one click away, so it stays out.
+    return state.cities.some((city) => city.tile === tile && city.owner === playerId);
+  });
 
 /**
  * What a button that issues `command` says. Pure and total over the `Command` union: the
