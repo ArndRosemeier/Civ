@@ -273,8 +273,11 @@ interface Shell {
    */
   readonly mapRegion: HTMLElement;
   readonly endTurn: HTMLButtonElement;
+  /** The sidebar: the strip holding everything that is not a direct unit action. */
   readonly panelsRoot: HTMLElement;
-  /** Where an opened panel is docked — see `buildShell`. */
+  /** The nine panels, inside the sidebar. This is the one region of it that may scroll. */
+  readonly panelStack: HTMLElement;
+  /** The dialogs' dock, at the foot of the sidebar — see `buildShell`. */
   readonly dock: HTMLElement;
   readonly newGame: NewGameControls;
 }
@@ -386,12 +389,11 @@ const buildShell = (doc: Document): Shell => {
 
   const main = el(doc, 'main');
 
-  // The map and the dock share one column, so a panel that opens lands UNDER the map rather than
-  // over the game. An opened panel is a side screen of a game that is still being played, and the
-  // placement is what makes that true: a `<dialog open>` in the document flow sits below the fold
-  // (a 900 px window showed a title and a Close button and nothing else), and a floating one
-  // intercepts the pointer the map and the action buttons need. See `styles.css` for the measured
-  // evidence. The dialogs themselves are moved in here by `start`, once the panels exist.
+  // The map column holds the map and nothing else, so the map's box — the box the camera clamps
+  // against and the click hit-test inverts — cannot move because a panel opened. It used to hold the
+  // map *and* the dock, and the dock took up to 40 % of the column's height: measured at 900×1000,
+  // opening the debug panel cut the map region from 915 px to 546 px. See `styles.css`, which states
+  // the two-column rule and where a dialog is docked now.
   const mapColumn = el(doc, 'div');
   mapColumn.dataset['layout'] = 'map-column';
 
@@ -413,19 +415,26 @@ const buildShell = (doc: Document): Shell => {
   // cursor, which is what lets "which tile is under the pointer" be asserted without a colour.
   canvas.setAttribute('aria-description', 'Map');
   mapRegion.append(canvas);
+  mapColumn.append(mapRegion);
 
-  const dock = el(doc, 'div');
-  dock.dataset['layout'] = 'dock';
-  mapColumn.append(mapRegion, dock);
-
+  // The sidebar: a strip holding everything that is not a direct unit action, in two regions. The
+  // stack carries the panels; the dock, at its foot, carries the dialogs the panels open. Both live
+  // here rather than in the map column because a side screen belongs with the other side furniture
+  // and because the two of them must share one bounded strip — see `styles.css` for the 40/60 split
+  // and for what the strip's overflow used to cost.
   const panelsRoot = el(doc, 'section');
   panelsRoot.setAttribute('aria-label', 'Panels');
+  const panelStack = el(doc, 'div');
+  panelStack.dataset['layout'] = 'panel-stack';
+  const dock = el(doc, 'div');
+  dock.dataset['layout'] = 'dock';
+  panelsRoot.append(panelStack, dock);
   main.append(mapColumn, panelsRoot);
 
   root.append(header, main);
   doc.body.append(root);
   dock.append(newGame.dialog);
-  return { root, canvas, mapRegion, endTurn, panelsRoot, dock, newGame };
+  return { root, canvas, mapRegion, endTurn, panelsRoot, panelStack, dock, newGame };
 };
 
 /**
@@ -642,23 +651,30 @@ const start = async (): Promise<void> => {
     stateHash: () => hashValue(state),
   };
 
-  const panels: PanelsHandle = mountPanels(shell.panelsRoot, panelsApi);
+  const panels: PanelsHandle = mountPanels(shell.panelStack, panelsApi);
 
   /**
-   * Dock the panels' three dialogs under the map.
+   * Dock the panels' dialogs at the foot of the sidebar.
    *
    * The panels own the elements — their roles, their names and their contents are all built in
    * `panels/` — and the shell owns the *layout*, which is the split `panels/index.ts` states. So
    * this is a placement, not a second copy: the elements move, they are not duplicated, and every
-   * panel's own `open()` keeps working because it holds the element it always held. What the move
-   * buys is that an opened panel cannot cover the map (wheel, drag and click stay the map's) or the
-   * action buttons in the panel column (a player can keep playing with a panel up), which is
-   * exactly what the two green tests that a floating layout broke are asserting.
+   * panel's own `open()` keeps working because it holds the element it always held.
+   *
+   * **They used to be docked under the map, and moving them here is the phase's structural
+   * change.** The map column then had two claimants and the map lost height whenever a panel
+   * opened — measured at 900×1000, where opening the debug panel cut the map region from 915 px to
+   * 546 px — which moves the box the camera clamps against and the click hit-test inverts *while
+   * the player is playing*. The sidebar is the home of everything that is not a direct unit action
+   * (the owner's design, §7.6 phase 3), and a side screen belongs with it; the stack of panels and
+   * the dock share the strip rather than one of them taking the map's room. What the move buys,
+   * beyond the map standing still, is that an opened panel still covers neither the map nor the
+   * unit's orders — the two facts the green placement tests assert.
    */
   shell.dock.append(
     // M10's outcome screen goes first: it is the one dialog that is opened BY the game rather than
-    // by the player, and it should land at the top of the dock, under the map's lower edge, where
-    // the end of a game is impossible to miss.
+    // by the player, and it should land at the top of the dock, where the end of a game is
+    // impossible to miss.
     panels.elements.outcomeDialog,
     panels.elements.cityDialog,
     panels.elements.techDialog,
@@ -1156,9 +1172,11 @@ const start = async (): Promise<void> => {
    * clamp is the fix; the repaint is only so the player sees it.
    *
    * `ResizeObserver` rather than a window listener, because the box can change without the window
-   * changing: the dock grows as the event log fills, which moves the map's bottom edge. The window
-   * listener stays as the fallback for a browser without the observer, and is harmless where both
-   * exist — `measureCanvas` returns `false` when nothing moved, so the second caller does nothing.
+   * changing: a scrollbar appearing in the sidebar's panel stack takes width off the strip and
+   * therefore width off the map. (It used to be the dock growing under the map, which Phase 3 moved
+   * into the sidebar — the observer is the same one either way.) The window listener stays as the
+   * fallback for a browser without the observer, and is harmless where both exist — `measureCanvas`
+   * returns `false` when nothing moved, so the second caller does nothing.
    *
    * Wired *after* the first `redraw`, so the initial size is established by the normal paint path.
    *

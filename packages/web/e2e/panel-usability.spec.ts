@@ -1,9 +1,9 @@
 /**
- * X1 — the two things a player could not do: see a panel, and set the rates.
+ * X1 — the three things a player could not do: see a panel, set the rates, and read the sidebar.
  * See docs/INTERFACES.md, M8 ("The accessibility contract", "The UI must not contain game
  * rules", A1/A4 coverage).
  *
- * ## Why these two facts need their own assertions
+ * ## Why these facts need their own assertions
  *
  * 1. **A panel opened below the fold is an A1 failure.** The dialogs are non-modal on purpose
  *    (the game keeps being played while one is open), and a `<dialog open>` is laid out at its
@@ -12,11 +12,11 @@
  *    everything else. Nothing in the suite noticed, because every locator is role-and-name based
  *    and a scrolled-out element still *matches*. The assertions here are therefore geometric:
  *    the panel's box is inside the window, and the screen points that matter (the middle of the
- *    map, an action button in the panel column) still belong to the game rather than to a panel
- *    floating over it. That last half is not hypothetical either: centring the dialogs with
- *    `position: fixed` was implemented and measured, and it turned `debug.spec.ts` (which plays
- *    on while the debug panel is open) and the keystone wheel-zoom red — a panel over the game
- *    eats the gestures the game is driven by.
+ *    map, the unit's own controls) still belong to the game rather than to a panel floating over
+ *    it. That last half is not hypothetical either: centring the dialogs with `position: fixed`
+ *    was implemented and measured, and it turned `debug.spec.ts` (which plays on while the debug
+ *    panel is open) and the keystone wheel-zoom red — a panel over the game eats the gestures the
+ *    game is driven by.
  * 2. **`SetRates` had no control anywhere.** It is the one queried setter with no enumerable
  *    list behind it — the rate space is a search space over a triple — so the status strip now
  *    carries an editable triple beside the pools it feeds, and the ENGINE judges every edit
@@ -24,10 +24,18 @@
  *    whole loop: the engine's rates really move, the displayed strip stays in step, and an
  *    illegal triple is refused by the engine with the engine's own words rather than by a rule
  *    this UI invented.
+ * 3. **Phase 3 re-partitioned the sidebar, and both halves of that are geometry.** The dialogs
+ *    were docked under the map, where they took up to 40 % of the map column's height — measured at
+ *    900×1000, opening the debug panel cut the map region from 915 px to 546 px, which moves the box
+ *    the camera clamps against and the click hit-test inverts. They are docked in the sidebar now,
+ *    so the map's box is asserted to be *identical* with and without panels open. And the sidebar
+ *    itself, which used to hold 1219 px of content in an 823 px box at 1280×900 (its scoreboard cut
+ *    off mid-row, its table 530 px wide inside a 378 px panel), is asserted to hold all of it.
  *
- * Every locator is role + accessible name. The three rate controls and their verdict are the
- * *new* names this milestone adds (`Tax rate`, `Science rate`, `Luxury rate`, `Rates`); none of
- * them collides with the names the frozen table fixes.
+ * Every locator is role + accessible name, except where the claim is about the CSS box itself —
+ * see the note above `sidebarReport` for why that one exception is the right one. The new names this
+ * file's milestones add (`Tax rate`, `Science rate`, `Luxury rate`, `Rates`) collide with none of the
+ * names the frozen table fixes.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
@@ -44,6 +52,8 @@ import {
   dispatch,
   dispatchLog,
   endTurnButton,
+  endTurns,
+  eventLog,
   foundCity,
   hashOf,
   headlessNewGame,
@@ -61,6 +71,8 @@ import {
   settingsFrom,
   stateHash,
   treasuryIndicator,
+  unitActionsGroup,
+  unitsOf,
   zoomTo,
 } from './helpers.js';
 
@@ -135,6 +147,98 @@ const boxOf = async (locator: Locator): Promise<Box> => {
   if (box === null) throw new Error('the element has no bounding box, so it is not rendered');
   return box;
 };
+
+/* ------------------------------------------------------------------ *
+ * The sidebar, measured
+ *
+ * Phase 3 moved everything that is not a direct unit action into the strip beside the map and
+ * stopped it overflowing. Both halves of that are claims about geometry, so they are measured here
+ * rather than inferred from a stylesheet: which box is inside which, which box has more content
+ * than room, and whether the scoreboard's own cells are on screen.
+ *
+ * This is the one place in this file that names the layout (`data-layout`, `data-panel`) instead of
+ * a role and an accessible name. That is deliberate and it is not a hole in the contract: the claim
+ * is about the CSS — the same claim `styles.css` states in prose — and no role or accessible name
+ * can express "this box has 96 px more content than it can show". Everything a player or a screen
+ * reader is *offered* is still asserted by role and name, in this file and in `panels.spec.ts`.
+ * ------------------------------------------------------------------ */
+
+/** A box on screen, with whatever does not fit inside it. */
+interface MeasuredBox {
+  readonly name: string;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  /** How much more content there is than box, in each direction. Zero means nothing is clipped. */
+  readonly overflowX: number;
+  readonly overflowY: number;
+}
+
+interface SidebarReport {
+  readonly viewport: { readonly width: number; readonly height: number };
+  readonly sidebar: MeasuredBox;
+  readonly stack: MeasuredBox;
+  readonly panels: readonly MeasuredBox[];
+  readonly scoreTable: MeasuredBox;
+  /** The `Score` columnheader's cell — M10's column, the one the horizontal defect hid. */
+  readonly scoreHeader: MeasuredBox | null;
+  /** The last cell of every scoreboard row, i.e. the score itself, one per player. */
+  readonly scoreCells: readonly MeasuredBox[];
+}
+
+const sidebarReport = async (page: Page): Promise<SidebarReport> =>
+  page.evaluate(() => {
+    const measured = (element: Element, name: string): MeasuredBox => {
+      const rect = element.getBoundingClientRect();
+      const box = element as HTMLElement;
+      return {
+        name,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        overflowX: box.scrollWidth - box.clientWidth,
+        overflowY: box.scrollHeight - box.clientHeight,
+      };
+    };
+    const require = (selector: string): Element => {
+      const found = document.querySelector(selector);
+      if (found === null) throw new Error(`the page has no ${selector}`);
+      return found;
+    };
+
+    const stack = require("[data-layout='panel-stack']");
+    const table = require("[data-panel='scoreboard'] table");
+    const scoreHeader = table.querySelector('thead th:last-child');
+    const scoreCells: MeasuredBox[] = [];
+    let index = 0;
+    for (const row of table.querySelectorAll('tbody tr')) {
+      const cell = row.lastElementChild;
+      if (cell !== null) scoreCells.push(measured(cell, `score cell ${String(index)}`));
+      index += 1;
+    }
+    return {
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      sidebar: measured(require("main > section[aria-label='Panels']"), 'the sidebar'),
+      stack: measured(stack, 'the panel stack'),
+      panels: Array.from(stack.children)
+        // `display: contents` generates no box, so the outcome wrapper is skipped rather than
+        // reported at 0,0: what it holds is the `Show outcome` control, which is hidden until the
+        // game is over (`victory.ts`) and is covered by the ending-screen tests, not here.
+        .filter((child) => child.getBoundingClientRect().height > 0)
+        .map((child) => measured(child, child.getAttribute('data-panel') ?? child.tagName)),
+      scoreTable: measured(table, 'the scoreboard table'),
+      scoreHeader: scoreHeader === null ? null : measured(scoreHeader, 'the Score columnheader'),
+      scoreCells,
+    };
+  });
+
+const within = (inner: MeasuredBox, outer: MeasuredBox, tolerance = 1): boolean =>
+  inner.x >= outer.x - tolerance &&
+  inner.y >= outer.y - tolerance &&
+  inner.x + inner.width <= outer.x + outer.width + tolerance &&
+  inner.y + inner.height <= outer.y + outer.height + tolerance;
 
 /** Assert `what`'s box — and its Close control — are entirely inside the window. */
 const expectFullyVisible = async (what: string, dialog: Locator): Promise<void> => {
@@ -238,12 +342,74 @@ test('X1 placement: an open panel covers neither the map nor the action buttons,
   // measurement on the panels and the controls beside them. See `OPPONENT_OFF` in `helpers.ts`.
   await seedApp(page, SEED, OPPONENT_OFF);
 
+  // Phase 3: the panel that opens is docked in the sidebar, and the unit's orders float over the
+  // map. Both of those are boxes, so both are measured BEFORE the panel opens — a panel that moves
+  // the map (as the old dock under the map did, taking up to 40 % of the column's height) changes
+  // the box the camera clamps against and the click hit-test inverts, which is a defect that a
+  // "is anything covered?" check cannot see at all.
+  const before = await readState(page);
+  const owner = humanPlayerId(before);
+  const unit = unitsOf(before, owner)[0];
+  expect(unit, 'the acting seat has no unit, so there is no orders popup to measure').toBeDefined();
+  if (unit === undefined) return;
+  const orders = unitActionsGroup(page, unit.id);
+  await expect(orders, 'no orders popup is on screen before anything is opened').toBeVisible();
+  const canvasBefore = await canvasBox(page);
+  const ordersBefore = await boxOf(orders);
+
   // The debug panel is the one `debug.spec.ts` plays on through, so it is the one that must be
   // proven not to be in the way.
   const debug = await openPanel(page, /^Debug$/);
   await expect(debug).toBeVisible();
 
-  // 1. The middle of the map belongs to the canvas. This is the assertion a panel floating over
+  // 1. The map's box did not move, and neither did the unit's orders. This is the assertion that
+  //    pins Phase 3's structural half: the dialogs are docked in the sidebar, so the map column has
+  //    one claimant and the popup's placement is a function of the canvas alone.
+  const canvasAfter = await canvasBox(page);
+  expect(
+    { x: canvasAfter.x, y: canvasAfter.y, width: canvasAfter.width, height: canvasAfter.height },
+    'opening a panel moved or resized the map, so the camera’s clamp box and the click inverse ' +
+      'changed while the player was looking at the same view',
+  ).toEqual({
+    x: canvasBefore.x,
+    y: canvasBefore.y,
+    width: canvasBefore.width,
+    height: canvasBefore.height,
+  });
+  const ordersAfter = await boxOf(orders);
+  expect(
+    { x: ordersAfter.x, y: ordersAfter.y, width: ordersAfter.width, height: ordersAfter.height },
+    'opening a panel moved the unit’s orders popup',
+  ).toEqual({
+    x: ordersBefore.x,
+    y: ordersBefore.y,
+    width: ordersBefore.width,
+    height: ordersBefore.height,
+  });
+
+  // 2. A press on the popup's own control lands on that control, and the panel's box is beside the
+  //    popup rather than over it. Both halves are asserted because they fail for different reasons:
+  //    the hit-test is what the player experiences — the popup carries its own `z-index`, so it
+  //    survives a dialog floated over it, which means a covered *control* takes a second mistake and
+  //    this check is what catches that one — and the box overlap is the layout claim, which fails on
+  //    its own the moment a panel is allowed to share pixels with the map.
+  const orderButton = orders.getByRole('button').first();
+  await expect(orderButton, 'the popup offers no control to press').toBeVisible();
+  const buttonBox = await boxOf(orderButton);
+  expect(
+    await elementAt(page, centreOf(buttonBox)),
+    'something other than the unit’s own control owns the point at the centre of that control',
+  ).toBe('BUTTON');
+
+  const debugBox = await boxOf(debug);
+  const overlaps =
+    ordersAfter.x < debugBox.x + debugBox.width &&
+    debugBox.x < ordersAfter.x + ordersAfter.width &&
+    ordersAfter.y < debugBox.y + debugBox.height &&
+    debugBox.y < ordersAfter.y + ordersAfter.height;
+  expect(overlaps, 'the open panel’s box overlaps the unit’s orders popup').toBe(false);
+
+  // 3. The middle of the map belongs to the canvas. This is the assertion a panel floating over
   //    the game fails: the box is inside the window, and it is on top of the map.
   const canvas = await canvasBox(page);
   const mapCentre = centreOf(canvas);
@@ -252,14 +418,14 @@ test('X1 placement: an open panel covers neither the map nor the action buttons,
     'something covers the middle of the map while a panel is open',
   ).toBe('CANVAS');
 
-  // 2. The map actually receives the pointer: its description names the tile under the cursor.
+  // 4. The map actually receives the pointer: its description names the tile under the cursor.
   await page.mouse.move(mapCentre.x, mapCentre.y);
   await expect(page.getByRole('application', { name: 'Map' }).locator('canvas')).toHaveAttribute(
     'aria-description',
     /pointer over tile \d+,\d+/,
   );
 
-  // 3. The wheel is the zoom gesture, and it still reaches the map. A panel over the map swallows
+  // 5. The wheel is the zoom gesture, and it still reaches the map. A panel over the map swallows
   //    it and the camera does not move — which is exactly how the floating layout was caught.
   const beforeZoom = await cameraOf(page);
   const zoomed = await zoomTo(page, 1, 1);
@@ -268,24 +434,165 @@ test('X1 placement: an open panel covers neither the map nor the action buttons,
     'the wheel over the map did not zoom while a panel was open',
   ).not.toBe(beforeZoom.zoomNumerator);
 
-  // 4. The panel column is operable: the shell's turn control works with a panel up...
+  // 6. The panel column is operable: the shell's turn control works with a panel up...
   const beforeTurn = await readState(page);
   await endTurnButton(page).click();
   expect((await readState(page)).turn, 'End turn did not advance the game').toBe(
     beforeTurn.turn + 1,
   );
 
-  // ... and so does a unit order, issued from the group beside the panel.
+  // ... and so does a unit order, issued from the popup beside the unit.
   const city = await foundCity(page);
   expect(city.owner, 'founding a city through the panel column produced a foreign city').toBe(
     humanPlayerId(await readState(page)),
   );
 
-  // 5. And a second panel opened beside the first is still fully visible: they share the dock.
+  // 7. And a second panel opened beside the first is still fully visible: they share the dock — and
+  //    the map is still where it was, with three things now on screen.
   const tech = await openPanel(page, /^Technology$/);
   await expectFullyVisible('the Technology panel beside the Debug panel', tech);
   await expectFullyVisible('the Debug panel beside the Technology panel', debug);
+  const canvasWithTwo = await canvasBox(page);
+  expect(
+    {
+      x: canvasWithTwo.x,
+      y: canvasWithTwo.y,
+      width: canvasWithTwo.width,
+      height: canvasWithTwo.height,
+    },
+    'a second open panel moved or resized the map',
+  ).toEqual({
+    x: canvasBefore.x,
+    y: canvasBefore.y,
+    width: canvasBefore.width,
+    height: canvasBefore.height,
+  });
   await closeDialogs(page);
+});
+
+/* ------------------------------------------------------------------ *
+ * 1b. THE SIDEBAR: EVERYTHING THAT IS NOT A UNIT ORDER, AND NOTHING CUT OFF
+ * ------------------------------------------------------------------ */
+
+/**
+ * The defect this test is about, in the owner's words: *"at 1280×900 the sidebar overflows and the
+ * scoreboard is cut off mid-row"*. Measured before the fix, with the event log full and the opponent
+ * live: **1219 px of content in an 823 px box** (396 px of overflow, so the save and debug panels
+ * were below the fold entirely), and a scoreboard table **530 px wide inside a 378 px panel**, which
+ * clipped its right-hand columns — `Score` among them — and could only be reached by scrolling the
+ * whole strip sideways.
+ *
+ * So the assertions are about content that has been played into existence, not about a fresh board:
+ * a founded city, a live opponent and an event log whose own list is provably longer than its box.
+ * That last one is the control. Without it this test would pass on an empty log in a strip with
+ * nothing in it, which is the "a test that cannot fail is decoration" failure this project names.
+ */
+test('X1 sidebar: at 1280×900 the strip holds every panel and the whole scoreboard, and does not scroll to do it', async ({
+  page,
+}) => {
+  await openApp(page);
+  expect(page.viewportSize(), 'this test is about the 1280×900 window').toEqual(VIEWPORT);
+  await seedApp(page, SEED);
+  // A city in the `Cities` list and a second unit in the `Units` list, and then a played game so the
+  // event log fills to its own bound — the state the overflow was measured in.
+  await foundCity(page);
+  await endTurns(page, 14);
+
+  const logOverflow = await eventLog(page).evaluate(
+    (element) => element.scrollHeight - element.clientHeight,
+  );
+  expect(
+    logOverflow,
+    'the event log is not longer than its own box, so this test is measuring an empty strip and ' +
+      'could not fail for the defect it is about',
+  ).toBeGreaterThan(0);
+
+  const report = await sidebarReport(page);
+
+  // 1. The strip itself never overflows, in either direction. A strip that scrolls is how the
+  //    scoreboard got cut off in the first place: a scrollbar does not tell a player that the row
+  //    they are looking at is half a row.
+  expect(
+    report.sidebar.overflowY,
+    `the sidebar holds ${String(report.sidebar.overflowY)} px more content than it can show, so a ` +
+      `panel at its bottom edge is cut off`,
+  ).toBeLessThanOrEqual(1);
+  expect(
+    report.sidebar.overflowX,
+    `the sidebar holds ${String(report.sidebar.overflowX)} px more content than it is wide, so a ` +
+      `panel is clipped at its right edge`,
+  ).toBeLessThanOrEqual(1);
+
+  // 2. And neither does the stack inside it — which is the stronger claim, because that is the
+  //    element that could scroll instead: the strip would look tidy while the stack hid the
+  //    scoreboard behind a scrollbar.
+  expect(
+    report.stack.overflowY,
+    `the panel stack holds ${String(report.stack.overflowY)} px more content than it can show, so ` +
+      `the panels at its bottom are below the fold`,
+  ).toBeLessThanOrEqual(1);
+
+  // 3. Every panel is whole, inside the strip and inside the window. Named individually, because
+  //    "one of them is cut off" is not a useful failure message.
+  expect(report.panels.length, 'the sidebar is not holding the panels').toBeGreaterThan(5);
+  for (const panel of report.panels) {
+    expect(
+      within(panel, report.sidebar, 1.5),
+      `the ${panel.name} panel is not inside the sidebar: the panel is at ${String(
+        Math.round(panel.y),
+      )}..${String(Math.round(panel.y + panel.height))} and the sidebar holds ${String(
+        Math.round(report.sidebar.y),
+      )}..${String(Math.round(report.sidebar.y + report.sidebar.height))}`,
+    ).toBe(true);
+    expect(
+      panel.overflowY,
+      `the ${panel.name} panel has ${String(panel.overflowY)} px of its own content hidden inside it`,
+    ).toBeLessThanOrEqual(1);
+  }
+
+  // 4. The scoreboard is the panel the defect was measured on, so it is asserted cell by cell: the
+  //    table is inside the strip (its width is the part that was cut off sideways), there is a row
+  //    per player — so "every row is on screen" is not a claim about an empty table — and the last
+  //    cell of each row, which is M10's score, is on screen.
+  const players = (await readState(page)).players.length;
+  expect(
+    report.scoreTable.x + report.scoreTable.width,
+    'the scoreboard is clipped by the strip',
+  ).toBeLessThanOrEqual(report.sidebar.x + report.sidebar.width + 1);
+  // The table's OWN box, not only the strip's. The tempting band-aid for a table that does not fit
+  // is to let the table scroll sideways inside its panel — which hides the same columns one level
+  // down, behind a scrollbar that nothing in the app ever shows a player. Measured before the fix:
+  // 530 px of table in a 378 px panel.
+  expect(
+    report.scoreTable.overflowX,
+    `the scoreboard's columns are ${String(report.scoreTable.overflowX)} px wider than the panel, so ` +
+      `its right-hand columns are behind a horizontal scrollbar`,
+  ).toBeLessThanOrEqual(1);
+  expect(
+    report.scoreCells.length,
+    'the scoreboard has no rows, so nothing below is a claim about the scoreboard',
+  ).toBe(players);
+  const scoreHeader = report.scoreHeader;
+  expect(scoreHeader, 'the scoreboard has no Score columnheader to measure').not.toBeNull();
+  if (scoreHeader === null) return;
+  expect(
+    within(scoreHeader, report.sidebar, 1.5),
+    `the Score columnheader is off the edge of the strip at x=${String(Math.round(scoreHeader.x))}, ` +
+      `which is where the horizontal half of the defect put it`,
+  ).toBe(true);
+  for (const cell of report.scoreCells) {
+    expect(
+      within(cell, report.sidebar, 1.5),
+      `${cell.name} is cut off: the cell is at y=${String(Math.round(cell.y))}..${String(
+        Math.round(cell.y + cell.height),
+      )}, x=${String(Math.round(cell.x))}..${String(Math.round(cell.x + cell.width))}, and the ` +
+        `sidebar holds y=${String(Math.round(report.sidebar.y))}..${String(
+          Math.round(report.sidebar.y + report.sidebar.height),
+        )}, x=${String(Math.round(report.sidebar.x))}..${String(
+          Math.round(report.sidebar.x + report.sidebar.width),
+        )}`,
+    ).toBe(true);
+  }
 });
 
 /* ------------------------------------------------------------------ *

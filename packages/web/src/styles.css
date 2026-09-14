@@ -8,7 +8,33 @@
  * fixed box: the camera clamps against that box, and a fluid one would make "which tile is under
  * this point?" depend on the window size at the moment of the click.
  *
- * ## The window is the frame, and an opened panel is DOCKED — it never floats over the game
+ * ## Two columns: the map, and everything that is not a direct unit action
+ *
+ * `[data-layout='map-column']` holds the map and **nothing else**; `section[aria-label='Panels']`
+ * is the strip that holds everything else — the status strip, the lists, the scoreboard, the event
+ * log, the save and debug controls, and (in `[data-layout='dock']`, at its foot) the dialogs the
+ * panels open. That is the owner's design for this phase, stated in `docs/UI-OVERHAUL.md` §7.6:
+ * *"the map should be a square, covering the left side of the screen and the leftover sidebar hosts
+ * everything that is not a direct unit action."* The unit's orders are not in either column — they
+ * are the popup float over the map, beside the unit they belong to.
+ *
+ * ## The dock used to be under the map, and moving it is what stopped the map from moving
+ *
+ * The dialogs were docked in the map column, under the map, taking up to 40 % of the column's
+ * height. Two things were wrong with that. The obvious one: the column then had two claimants, so
+ * the map gave up height whenever a panel opened — measured at 900×1000, where the map region fell
+ * from 915 px to 546 px (a 450 px canvas became a 450 px canvas in a squeezed region) the moment the
+ * debug panel opened — and the map's box is the box the camera clamps against and the click
+ * hit-test inverts. A window that re-lays-out the map when a panel opens is a window where a tile's
+ * screen point can change between the moment a test computes it and the moment it clicks. The less
+ * obvious one: the dock's 40 % was a holding position, not a design, and a side screen deserved
+ * either the whole strip or a stated share of it.
+ *
+ * In the sidebar the two regions *share* the strip instead: the stack of panels keeps a minimum
+ * share (40 %), the dock may take the rest (60 %), and neither can take the other's. The map column
+ * has one claimant and its box never changes.
+ *
+ * ## An opened panel is DOCKED — it never floats over the game
  *
  * An opened panel used to be laid out in the document flow, which put it *below the fold*: a
  * `<dialog>` opened with `show()` is `position: absolute` from the UA stylesheet with no block
@@ -22,19 +48,30 @@
  * (found a city, end a turn) while the debug panel is open, and `keystone.spec.ts` measures the
  * wheel-zoom gesture while a city screen is open, so a dialog over the map swallows both.
  *
- * So the layout has three regions and the panel has its own: `[data-layout='map-column']` holds the
- * map and, under it, `[data-layout='dock']`, which is where the panels' dialogs are moved at mount.
- * The dock is bounded by the window, the dialog inside it is bounded by the dock (`max-height`,
- * `overflow: auto`), and neither the map nor the panel column is ever covered — which is what keeps
- * the map's wheel/drag/click gestures and the action buttons in the panel column working while a
- * panel is open. `main.ts` states the same rule where the move happens.
+ * So a dialog is docked **inside the sidebar**, bounded by it (`max-height`, `overflow: auto`), and
+ * neither the map nor the panels above it is covered: the panels keep their share of the strip and
+ * the map keeps all of its own box. `main.ts` states the same rule where the move happens.
  *
- * To make that stable, the *document* no longer grows: the app is exactly one window tall, the
- * panel column scrolls inside itself, and the map's box — the box the camera clamps against and
- * the hit-test inverts — is in the same place whatever is open. A scrolling page would move the
- * canvas out from under a pointer between the moment a test computes a tile's screen point and the
- * moment it clicks it, and would make the dock's position depend on how far the page happened to be
- * scrolled.
+ * To make that stable, the *document* never grows: the app is exactly one window tall, the strip
+ * never scrolls as a whole (its panel stack does, when the content genuinely cannot fit), and the
+ * map's box — the box the camera clamps against and the hit-test inverts — is in the same place
+ * whatever is open. A scrolling page would move the canvas out from under a pointer between the
+ * moment a test computes a tile's screen point and the moment it clicks it, and would make the
+ * dock's position depend on how far the page happened to be scrolled.
+ *
+ * ## The strip fits what it holds, and that took more than a rule about overflow
+ *
+ * A measured defect of the previous arrangement (`docs/UI-OVERHAUL.md` §9, phase 3): at 1280×900
+ * the sidebar's content was **1219 px in an 823 px box** once the event log filled, so it scrolled;
+ * the scoreboard was cut off mid-row at the bottom edge, and the table was **530 px wide inside a
+ * 378 px panel**, which cut its right-hand columns — including M10's `Score` — off entirely. The
+ * strip's own scrolling is not a fix for either, because a scrollbar does not tell a player that the
+ * row they are looking at is half of a row. So the panels are **densified** (tighter padding,
+ * margins and gaps), the three unbounded lists get a bounded body that scrolls **inside its own
+ * panel**, the scoreboard's type is sized to fit the strip, and the save and debug rows put their
+ * controls on one line. The result is measured in `panel-usability.spec.ts`: with a full log, a
+ * founded city and a live opponent, the sidebar's content is smaller than its box, and every panel
+ * — and every scoreboard row — is entirely on screen.
  */
 
 :root {
@@ -97,16 +134,16 @@ main {
   overflow: hidden;
 }
 
-/* The map and the dock share one column, so a docked panel sits under the map. */
+/* The map column: the map, and nothing else. It has one claimant, so the map's box never changes
+   when a panel opens — see the module note. `display: flex` is what lets the region below stretch. */
 [data-layout='map-column'] {
   /* The map takes the room the sidebar leaves. It used to be `0 0 auto`, sized by its contents —
      a fixed 720 px canvas. Now the layout owns the width and the canvas fits itself inside it. */
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  min-height: 0;
 }
 
 /*
@@ -188,71 +225,198 @@ main {
 }
 
 /*
- * The dock itself: whatever region the map leaves at the bottom of the window. It is a flex
- * column so two panels opened at once share it, and it never overlaps the map above it or the
- * panel column beside it.
+ * The sidebar: a strip that holds everything which is not a direct unit action, and that never
+ * overflows.
  *
- * `contain: inline-size` is load-bearing rather than decorative. Without it the dock's width —
- * and with it the whole map column's, which is sized by its contents — comes from what is docked
- * inside, and a city screen's max-content width runs to thousands of pixels (a `<fieldset>` of
- * twenty-one worked-tile labels laid out on a single line). Measured: the map column grew to
- * 3114 px and pushed the panel column off the right of a 1280 px window. Size containment makes
- * the dock's inline size independent of its contents, so the map column is exactly as wide as the
- * map and a panel is exactly as wide as the dock — with its own scrollbar when its content needs
- * one, which is what `dialog`'s `overflow: auto` above provides.
+ * `overflow: hidden` is the phase's whole point rather than a tidy-up. This element used to be
+ * `overflow-y: auto` over **1219 px of content in an 823 px box** at 1280×900 (measured with the
+ * event log full and the opponent live), which cut the scoreboard off mid-row and left the save and
+ * debug panels entirely below the fold. A scrollbar is not a fix for that: a panel the player has to
+ * scroll to find may as well not be there, and half a scoreboard row says nothing at all. So the
+ * strip itself never scrolls, and the one region inside it that may is the panel stack below.
+ *
+ * A strip, not a competitor, for the width: `1 1 380px` let the sidebar grow alongside the map and
+ * the two split the leftover; the owner's design is a square map covering the left and the sidebar
+ * hosting everything that is not a direct unit action, so the sidebar states its width and the map
+ * takes what remains. It may still shrink to `min-width` on a narrow window rather than pushing the
+ * map off-screen. The width is a number the owner is still deciding (§7.7.5) and Phase 3 does not
+ * settle it.
+ */
+main > section[aria-label='Panels'] {
+  flex: 0 1 380px;
+  min-width: 340px;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/*
+ * The panel stack: the nine panels in the order the panels mount them, and the ONE part of the
+ * sidebar that may scroll.
+ *
+ * It scrolls only when it has to, and that is a claim the suite measures rather than assumes: with
+ * no dialog open at 1280×900 the stack's content is smaller than its box, so nothing in it is cut
+ * off and the scrollbar does not appear. It is a scroll container at all so that the two cases
+ * where the content genuinely cannot fit still show every panel instead of hiding some — a window
+ * shorter than the panels (1600×700 holds 623 px of sidebar for ~790 px of panels) and a dialog
+ * sharing the strip (where the stack keeps the 40 % below).
+ *
+ * `overflow-x: hidden` is deliberate: the stack must never gain a horizontal scrollbar, because the
+ * one thing that used to overflow sideways was the scoreboard's table, and its columns are made to
+ * fit the strip by the table rules further down. A horizontal scrollbar in a 380 px column would
+ * hide the right-hand columns of the one table a player reads at a glance.
+ */
+[data-layout='panel-stack'] {
+  flex: 1 1 auto;
+  min-height: 40%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/*
+ * A panel keeps its own height: the stack scrolls before a panel is squeezed.
+ *
+ * `flex: 0 0 auto` is not decoration. A flex item's automatic minimum size is its content's, but
+ * only while its `overflow` is `visible` — and two of these panels need their own `overflow` (the
+ * scoreboard bounds its body, the bounded lists are inside panels). Measured without this rule at
+ * 1600×700: the stack overflowed by 147 px and the browser resolved it by shrinking the scoreboard
+ * panel from 106 px to 10 px, i.e. by cutting the table off rather than scrolling — the very defect
+ * this phase exists to remove, moved one level down. With it, the panels keep their heights and the
+ * stack scrolls, so a panel is either whole on screen or whole below it, never half.
+ */
+[data-layout='panel-stack'] > * {
+  flex: 0 0 auto;
+}
+
+/*
+ * The dock: the dialogs, docked at the foot of the sidebar. It is a flex column so two panels
+ * opened at once share it, and it never overlaps the map (it is not in the map's column at all) or
+ * the panels above it.
+ *
+ * **The 60 % is the answer to the phase-3 question about the old 40 % cap, and it is a share rather
+ * than a limit.** The old cap bounded the dock by the *window*; this bounds the two regions by each
+ * other, so a side screen can never take the strip the panels need to stay reachable. That is not
+ * hypothetical: `panel-usability.spec.ts` opens the debug panel and then opens the technology panel
+ * from the button between the panels, so a dialog that covered the stack outright would break a
+ * player's way back to the controls, not merely a test. `max-height` is `60% - 6px` because the
+ * flex `gap` between the two regions is part of the strip too, and 40 + 60 + a gap would overflow
+ * the box the strip declares it never overflows.
+ *
+ * `contain: inline-size` is load-bearing rather than decorative. Without it the dock's width — and
+ * with it the whole sidebar's, which is a flex item whose automatic minimum is its min-content
+ * width — comes from what is docked inside, and a city screen's max-content width runs to thousands
+ * of pixels (a `<fieldset>` of twenty-one worked-tile labels laid out on a single line). Measured
+ * under the old arrangement: the column grew to 3114 px and pushed the panel column off the right
+ * of a 1280 px window. Size containment makes the dock's inline size independent of its contents,
+ * so a panel is exactly as wide as the strip — with its own scrollbar when its content needs one,
+ * which is what `dialog`'s `overflow: auto` below provides.
  */
 [data-layout='dock'] {
-  /* The map has first claim on the column's height now that it is fluid, so the dock takes what its
-     content needs and no more — capped, because a docked event log would otherwise grow until the
-     map was a postage stamp. Past the cap it scrolls inside itself, which is what `overflow` was
-     already doing. The share of the column it may take is deliberately a small one: this is a
-     map-centric layout, and Phase 3 re-partitions the dock's contents into the sidebar anyway. */
   flex: 0 1 auto;
-  max-height: 40%;
+  max-height: calc(60% - 6px);
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   overflow: hidden;
   contain: inline-size;
 }
 
-main > section[aria-label='Panels'] {
-  /* A strip, not a competitor. `1 1 380px` let the sidebar grow alongside the map and the two
-     split the leftover; the owner's design is a square map covering the left and the sidebar
-     hosting everything that is not a direct unit action, so the sidebar states its width and the
-     map takes what remains. It may still shrink to `min-width` on a narrow window rather than
-     pushing the map off-screen. */
-  flex: 0 1 380px;
-  min-width: 340px;
-  min-height: 0;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
+/*
+ * The panels, densified. Every number below was chosen by measuring the strip, not by taste: with
+ * the event log full at 1280×900 the sidebar held 1219 px of content in an 823 px box, and 396 px
+ * of it had nowhere to go. Padding, heading margins and the gap between panels are what a column of
+ * nine panels spends that space on, so those are what this block tightens — nothing is hidden and
+ * no panel loses a control.
+ */
 [data-panel] {
   background: var(--panel);
   border: 1px solid #2b333d;
   border-radius: 4px;
-  padding: 8px 10px;
+  padding: 4px 8px;
 }
 
 [data-panel] h2,
 [data-panel] h3 {
-  font-size: 13px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--muted);
-  margin: 4px 0 6px;
+  margin: 0 0 4px;
 }
 
+/*
+ * The status strip, and the two rows that set the economy inside it.
+ *
+ * These sit *in* the strip rather than in the column's flow (see `mountPanels`): the numbers a
+ * player reads and the numbers a player sets are one region. Each row is a wrapping flex line and
+ * each of its own lines costs a whole row of the strip, so the fields are sized to keep a row to
+ * as few lines as the controls allow — the three rate inputs are as wide as three digits and a
+ * spinner, not four ems.
+ */
 [data-panel='status'] {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 16px;
+  gap: 2px 10px;
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The body of a panel that grows with the world: the unit list, the city list and the event log.
+ *
+ * These three are the only panels whose height is a function of how much game there is, so they are
+ * the only ones that give space back. `max-height` bounds the panel and `overflow: auto` keeps the
+ * rest reachable *inside that panel* — which is the difference between a list that scrolls and a
+ * list that walks off the bottom of the strip and takes the scoreboard with it. The numbers are a
+ * few rows each: enough to see that the list is a list, and never enough to push a panel below the
+ * fold.
+ */
+[data-panel='units'] > ul,
+[data-panel='cities'] > ul {
+  max-height: 58px;
+  overflow: auto;
+}
+
+/*
+ * The save and debug panels: one row of controls, with the engine's line beneath.
+ *
+ * Each of them is a heading, a button and a one-line status, which stacked reads as three rows for
+ * two facts. Laid out as a wrapping flex line the heading and the button share a row, and the
+ * status — the state hash, the save's outcome — takes a full row of its own so a long hash cannot
+ * push the button off the edge.
+ */
+[data-panel='save'],
+[data-panel='debug'] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+[data-panel='save'] h2,
+[data-panel='debug'] h2 {
+  margin: 0;
+}
+
+[data-panel='save'] [role='status'],
+[data-panel='debug'] [role='status'] {
+  flex: 1 1 100%;
+}
+
+/*
+ * The outcome wrapper: `Show outcome` exists only once the game is over (`victory.ts` hides it
+ * while the game runs), and while it is hidden the wrapper is an empty box with a border, a
+ * background and 8 px of padding — a visible nothing in the strip for the whole of a running game.
+ * `display: contents` removes the box and leaves the button as a direct item of the stack, which is
+ * what it is: a control, not a panel with a body. Nothing else lives in this element.
+ */
+[data-panel='outcome'] {
+  display: contents;
 }
 
 button {
@@ -276,15 +440,21 @@ button:disabled {
 
 ul,
 ol {
-  margin: 4px 0;
+  margin: 2px 0;
   padding-left: 18px;
+}
+
+/* The default `p` margin is 1em of line box above and below — 28 px for a two-line status line in
+   a 380 px strip, which is space this column does not have. */
+p {
+  margin: 2px 0;
 }
 
 dl {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 2px 10px;
-  margin: 4px 0;
+  margin: 2px 0;
 }
 
 dt {
@@ -307,12 +477,12 @@ dd {
 }
 
 /*
- * A panel, docked under the map (see the module note). `position: static` overrides the UA
- * stylesheet's `position: absolute`, which is what put an opened panel below the fold; `width` and
- * `max-height` are the dock's box, so the panel is fully visible inside the window and its own
- * content scrolls rather than growing past it. Nothing here floats: the map above and the panel
- * column beside never share a pixel with an open panel, so no gesture aimed at the game can land
- * on a panel by accident.
+ * A panel, docked at the foot of the sidebar (see the module note). `position: static` overrides the
+ * UA stylesheet's `position: absolute`, which is what put an opened panel below the fold; `width`
+ * and `max-height` are the dock's box, so the panel is fully visible inside the strip and its own
+ * content scrolls rather than growing past it. Nothing here floats: the map column beside the strip
+ * never shares a pixel with an open panel, so no gesture aimed at the game can land on a panel by
+ * accident.
  */
 dialog {
   position: static;
@@ -342,28 +512,37 @@ dialog::backdrop {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 12px;
+  gap: 2px 8px;
   width: 100%;
   border: 1px solid #2b333d;
+  padding: 2px 0;
 }
 
 [data-panel='rates'] label {
   color: var(--muted);
+  /* Label and field on one line, so "Tax" and its spinner are one item of the wrapping row rather
+     than two — the difference between a row and a row and a half. */
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
 [data-panel='rates'] input {
   font: inherit;
-  width: 4em;
+  /* Three digits and the spinner: the engine's own total is 10, so a wider field buys nothing but a
+     wrapped row. The bound is the same `RATE_TOTAL` the control already carries as `max`. */
+  width: 2.6em;
   color: var(--ink);
   background: #262e38;
   border: 1px solid #3a4550;
   border-radius: 3px;
-  padding: 2px 4px;
+  padding: 1px 3px;
 }
 
 [data-panel='rates'] [role='status'] {
   color: var(--accent);
-  font-size: 12px;
+  font-size: 11px;
+  flex: 1 1 100%;
 }
 
 /*
@@ -374,14 +553,22 @@ dialog::backdrop {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 12px;
+  gap: 2px 8px;
   width: 100%;
   border: 1px solid #2b333d;
+  padding: 2px 0;
+}
+
+[data-panel='government'] label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
 [data-panel='government'] [role='status'] {
   color: var(--accent);
-  font-size: 12px;
+  font-size: 11px;
+  flex: 1 1 100%;
 }
 
 /*
@@ -400,7 +587,7 @@ dialog::backdrop {
 }
 
 /*
- * The log's own list numbering has to fit inside the box.
+ * The log's own list numbering has to fit inside the box, and so does the box.
  *
  * `padding-left` was 22px, which holds a one-digit marker and nothing wider: `overflow: auto` clips
  * a marker that reaches past the border box, so a two-digit line number lost its leading digit and
@@ -408,9 +595,15 @@ dialog::backdrop {
  * hundreds of lines, so the numbers are wrong for essentially the whole game. 36px holds the three
  * digits `EVENT_LOG_LIMIT` can reach. Presentation only: markers are not part of a line's text, so
  * nothing the engine emits and nothing a test reads changes.
+ *
+ * The height is the other half of that and it is the phase-3 number: 220px of log is 220px of a
+ * strip that also has to hold eight other panels, and the log is the one panel whose content is
+ * *expected* to be longer than its box — a history is read from the bottom, and the engine's own
+ * `EVENT_LOG_LIMIT` truncates it at the top anyway. So the log carries the smallest bound of the
+ * three lists: it scrolls internally, and the panels below it stay on screen.
  */
 [role='log'] {
-  max-height: 220px;
+  max-height: 96px;
   overflow: auto;
   padding-left: 36px;
 }
@@ -423,10 +616,27 @@ dialog::backdrop {
 [data-panel='debug'] [role='status'] {
   color: var(--accent);
   font-family: ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 11px;
   word-break: break-all;
 }
 
+/*
+ * The scoreboard, sized to the strip.
+ *
+ * This is the second half of the defect the phase exists for, and it is the half a vertical fix
+ * misses: at 1280×900 the table measured **530 px inside a 378 px panel**, so the strip clipped its
+ * right-hand columns — M10's `Score` among them, the one column the score victory is read from —
+ * and a player could only reach them by scrolling the whole strip sideways. Two rules fix it: the
+ * type is one step down (11px of data, 10px of header, which is where the width actually goes —
+ * the columns are as wide as their longest word) and the padding is 2px. Measured after the change:
+ * 358 px, inside the 362 px the panel's content box offers.
+ *
+ * The first cell is allowed to break a word. Every other column is as wide as a header word like
+ * `Population`, so the table's width is stable; the player's *name* is the one cell whose width is
+ * data, and a long one — the barbarian row, or a name a catalog spells out — would otherwise push
+ * the whole table past the panel again. Breaking it wraps the name onto a second line instead,
+ * which costs a row rather than a column.
+ */
 table {
   border-collapse: collapse;
   width: 100%;
@@ -435,6 +645,49 @@ table {
 th,
 td {
   text-align: left;
-  padding: 2px 8px 2px 0;
+  padding: 1px 2px 1px 0;
   border-bottom: 1px solid #262e38;
+  white-space: nowrap;
+}
+
+/*
+ * The scoreboard's body is bounded like the other lists, for the case the 900 px window does not
+ * cover: the number of rows is the number of players, and a game seeded with sixteen civilizations
+ * puts sixteen rows in a strip that has room for five. `display: block` on the table is what makes
+ * `max-height` mean anything on it (a table box ignores it), and the internal table — an anonymous
+ * box the browser builds — still fills the panel's width and still lays out its columns. The panel
+ * itself becomes a flex column so the heading stays put while the body scrolls.
+ *
+ * With the shipped settings (four civilizations and the barbarians) nothing here scrolls: five rows
+ * measure 106 px against a 132 px bound. It is a bound, not a redesign.
+ */
+[data-panel='scoreboard'] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+[data-panel='scoreboard'] table {
+  font-size: 11px;
+  display: block;
+  max-height: 132px;
+  overflow: auto;
+}
+
+[data-panel='scoreboard'] th {
+  font-size: 10px;
+}
+
+[data-panel='scoreboard'] th:first-child,
+[data-panel='scoreboard'] td:first-child {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* The table's accessible name is its caption's text, and the caption is a second visible
+ * "Scoreboard" under the panel's own heading. The name is not lost with the box: the caption is
+ * still the table's first child, so `getByRole('table', { name: 'Scoreboard' })` still matches it
+ * (`panel-usability.spec.ts` and `panels.spec.ts` both ask for it by name). */
+[data-panel='scoreboard'] caption {
+  display: none;
 }
