@@ -55,6 +55,22 @@ no dead flags, no placeholder screens:
   a 3+ food terrain is sourced.
 - **A bankruptcy-driven building loss emits no event**, so it is a silent state
   change the REPL can only show after the fact. A `BuildingLost` event is still owed.
+- **There are now two route searches, and they answer different questions.**
+  `packages/core/src/route.ts` (Phase 4 of the UI overhaul) is the engine's route
+  query: the fewest single steps from a unit to a tile, built by asking `planMove`
+  about each destination tile, with the *rest of the world left on the board* so a
+  rival closes a route and the walk goes around it. `packages/sim/src/ai/smart.ts`
+  `stepsToTile` is the older one and is **not** replaced by it: it lifts every other
+  unit off the board (`searchStateFor`), because its question is "can this city ever
+  be reached" and a rival army in the way is passable ground to that answer; it takes
+  a `beside` goal set, which the UI's query deliberately does not (no goto-then-attack,
+  `docs/UI-OVERHAUL.md` §8 decision 2); and it is a measured hot path, memoised down
+  from 11.4 M to 2.2 M `planMove` calls per game, with the six golden games taken
+  through it. So the duplication is real and is recorded rather than hidden. What is
+  *not* duplicated is the rule: both ask `planMove` for every "may I step there?", and
+  neither reads a terrain cost, an `impassable` flag or an occupancy list of its own.
+  Unifying them means one search with a goal predicate and the AI's memoisation, and
+  it is a follow-up with a golden re-run attached, not a free cleanup.
 
 ---
 
@@ -670,11 +686,50 @@ terrain tests red, and no more.
 
 Do not read "the map pixel test is green" as "the terrain colours are all correct".
 
-### 4.3 Other UI limits
+### 4.3 Phase 4's goto: what it does not do, and one rule whose strictness is a choice
+
+Recorded here because each is a limit a reader would otherwise have to infer from the code.
+
+- **The route is not drawn on the map.** A goto is invisible: the unit walks, each step appears in
+  the `Events` log, and the header's `Order` status names the destination and then the cancellation —
+  but nothing highlights the path. `docs/UI-OVERHAUL.md` §2.C gives `MoveUnit` a `map` surface, and
+  that surface is the *destination tile*; a route overlay is a new presentation decision that has not
+  been taken.
+- **An invalidated goto is cancelled even when a detour exists, and that is decision 4 read
+  literally.** The check is equality against the route the player was given (`ui/goto.ts`
+  `nextGotoStep`), so any change in the engine's plan cancels with a message rather than quietly
+  routing around the obstacle. The consequence is real: a rival moving anywhere that changes the
+  route tree can cancel a goto that could have continued, and the player re-clicks. The alternative
+  reading of §7.7.4 ("recompute") is the one the owner rejected.
+- **The only way to cancel a goto is to give that unit another order.** Clicking a different
+  destination, or any other order naming the same unit, displaces it (that is `unitNamedBy` in
+  `src/ui/schema.ts`, and it is tested both ways). There is no "stop" control, no Escape binding and
+  no right-click binding; Phase 5 owns the keyboard contract.
+- **A goto does not survive a save, and cannot.** It is UI memory by design (`docs/UI-OVERHAUL.md`
+  §7.4 (b)), so a load drops it — silently, because there is nothing to say about a journey nobody is
+  on any more. §7.4 (c), a stored `GoTo` in the unit, is what would fix it, at the price of the six
+  goldens.
+- **The order channel is one line, and a long refusal is ellipsised.** It has to be: the header is
+  `flex: 0 0 auto` and a taller header would move the map's box. The whole sentence is in the
+  element's `title` and in its text for a screen reader, but a player on a narrow window reads the
+  beginning of the sentence and has to hover for the rest.
+- **No human has looked at the channel.** Its text is asserted by role and name in the e2e suite and
+  its rendering is CSS; whether it reads well at a glance in a real window is not measured.
+
+### 4.4 Other UI limits
 
 - The interactive-TTY branch of the REPL cannot be exercised in this environment
   (no TTY); pipes, EOF and `--script` are covered. A human should run `pnpm play`
   once in a real terminal.
+- **Five copies of "what the engine said" still exist.** `src/ui/problem.ts` is the
+  order channel's renderer and is stated once for that path, but `panels/index.ts`'
+  `refusalNote`, `panels/government.ts`' `refusalNote`, `panels/city.ts`'
+  `WorkedTileOption.legal`, `panels/techtree.ts`' `techRows(...).selectable` and
+  `ratesVerdict` each still format their own verdict. Collapsing them into
+  `problemText` is `docs/UI-OVERHAUL.md` §3 idea 11's remaining half; Phase 4 built
+  the channel and left the five panel-local verdicts alone, because each has its own
+  wording and its own tests and a refactor of five panels is not what that phase was
+  for.
 - Screenshots are captured for a human reviewer (`packages/web/artifacts/`); they are
   advisory evidence for legibility, never the gate for correctness.
 

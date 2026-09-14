@@ -671,7 +671,7 @@ button deletion safe.
    two independent lists, which is also two independent labellers (§3, idea 12). — **landed**, see §9.
 3. **Sidebar re-partition.** Unit controls leave; everything else stays and stops overflowing. —
    **landed**, see §9.
-4. **Goto.** Engine route query first, then the intent decision of §7.4.
+4. **Goto.** Engine route query first, then the intent decision of §7.4. — **landed**, see §9.
 5. **Next-unit flow and keyboard.** Still additive: no keyboard contract exists today.
 6. **Hover layer.** Tile yields, movement cost, combat odds.
 
@@ -1164,3 +1164,129 @@ table's body is bounded; that bound is asserted at the shipped settings (3 playe
 three dialogs open at once leave each of them small (measured: 163 px, 189 px and 117 px of content in
 boxes of 973 px, 1031 px and 582 px) — readable, closable and scrollable, but not a state anyone
 designed.
+
+## Phase 4 — goto, and the channel that says what the engine said — landed
+
+**The shape is §8 decision 3 (b), and the split between engine and UI is the point.** A new core
+module, `packages/core/src/route.ts`, is the **route query**: the fewest single steps from a unit to
+a tile. The destination and the route the player was given live in the UI, in
+`packages/web/src/ui/goto.ts` and the shell's memory — never in `GameState`, never hashed, never
+saved. That is exactly the fork §7.4 records, and the price §8 names (a pending goto emits
+dispatches a headless script would not contain) is paid where the plan says it must be: the
+determinism fixtures contain no goto, and `determinism.spec.ts` now says so **in the code that
+depends on it** rather than in this document alone.
+
+**The trap, and how the query avoids it.** A route query is one bad decision away from being a
+second statement of the movement rules. `route.ts` states none of them: every "may the unit step
+there?" answer is `planMove`'s, asked on a probe state — the real state with the one unit relocated
+to the tile being expanded, carrying the movement a fresh turn gives it (`UnitDef.movement`, the
+number `turn.ts` `refillMovement` writes). It never reads a `moveCost`, never asks whether terrain is
+`impassable`, never scans for a unit or a city on a tile, and never compares a cost against a
+movement allowance. `packages/core/test/route.test.ts` is built to fail if that stops being true:
+one board case per clause of `planMove` — a hills gap (cost 2) that a movement-2 settler crosses and
+a movement-1 warrior never can; a mountain wall with one gap; a rival on the gap that closes it; the
+player's *own* unit on the gap that does not (Civ 3 stacks); a rival city, likewise; and a
+`walksTheRoute` helper that applies every returned step through `applyCommand`, so a route the
+engine cannot execute fails the test that produced it.
+
+**The search runs backwards, from the destination, and that is what the UI's invalidation check is
+built on.** Enterability is a property of the destination tile alone, so the parent links form one
+tree rooted at the destination and the route is a function of `(board, unit, destination)`: the route
+from a route's second tile **is** the tail of the route from the first. So "the engine's plan for the
+rest of the journey is not the plan the player was given" is a checkable equality rather than a
+guess, and any difference means the world moved — which is how §8 decision 4 is implemented: **cancel
+and say so, never silently recompute.** A goto whose next step the unit cannot afford yet is *not*
+cancelled; it waits, and resumes when `End turn` refills the unit. Those three answers (`step`,
+`waiting`, `cancelled`) are pinned on real boards in `packages/web/test/ui/goto.test.ts`, because a
+UI that read "out of movement" as "the route is gone" would cancel every second goto with a message
+that is not true.
+
+**Two things the tests found rather than the reading.**
+
+- **The destination's enterability had to be checked explicitly.** It is the search's *root*, and
+  nothing discovers a root, so the first version returned routes that ended on a tile the engine
+  refuses — a rival standing there, or impassable ground. `walksTheRoute` caught it by being refused
+  at the last step (`{"kind":"occupied-by-enemy","unitId":0,"to":31}`). A refinement landed on top:
+  when the *destination itself* is what the engine refuses, the query returns `planMove`'s own error,
+  so a player clicking a mountain reads "tile 12 cannot be entered" rather than a claim about a
+  journey.
+- **A route is a statement about the board it was asked on, and `MoveUnit` can change that board.**
+  Entering a goody hut resolves inside the applier, and a barbarian band can appear on the map —
+  measured landing on the route itself (seed 31337, unit 2, destination 226, band on tile 393, four
+  steps along). The sweeps that assert "every step of a route is accepted" therefore ask a board with
+  no huts, and the hut case has its own test, which also pins what the UI would do about it: the
+  engine plans a *different* route afterwards, so the goto is cancelled rather than quietly detoured.
+
+**The channel: a refused order is now visible, and a cancelled goto uses the same one.** §1.4
+measured that `main.ts` discarded the engine's typed `GameError`, so a refused click looked exactly
+like a frozen game; §8's consequence says a goto needs "somewhere to say the route is gone", in the
+same channel. That channel is new: a `status` named **`Order`**, in the header, carrying (a) the
+engine's reason for a refused command, (b) `heading for tile x,y` while a goto is live, and (c) `the
+goto to tile x,y is cancelled: …`. It is a *new* accessible name stated here and in `main.ts` rather
+than in the frozen M8 table, which `docs/INTERFACES.md`'s M9+M10 note forbids extending in place; it
+collides with none of the names in that table (`Turn`, `Year`, `Treasury`, `Science`, `Luxury`,
+`Rates`, `State hash`, `Save status`, `Government verdict`, `New game problem`). The engine's words
+are rendered by `packages/web/src/ui/problem.ts`, whose `problem.test.ts` holds a
+`Record<GameError['kind'], GameError>` sample table so every refusal the engine can state renders as
+something and none renders blank — totality enforced by the compiler through the table, because the
+alternative (40 hand-written sentences) would be this package stating rules it does not own, and
+`assertNever` would take the channel dark the day the engine grows a kind.
+
+**One line, always — and that is a layout rule.** The header is `flex: 0 0 auto`, so a status line
+that wrapped or grew would take height off `main`, and the map's box is the box the camera clamps
+against and the click hit-test inverts (§4.6a, and the defect Phase 3 removed from the dock). The
+channel never wraps, is allowed to shrink, and ellipsises; the whole sentence goes in the element's
+`title`, and its text and accessible name stay complete for a test and a screen reader.
+
+**Click contract, unchanged and completed.** The click handler's order is the same as Phase 2's —
+your own city opens, then the engine's own offered map order, then your own unit selects — and the
+far-tile branch that used to dispatch a bare `MoveUnit` and let the engine refuse it now asks the
+route query first. A route means a goto; **no route means the bare `MoveUnit` is still dispatched**
+(so the engine's refusal stays the player's answer and the state stays untouched), and the channel
+reports the engine's reason for the *destination*. Nothing about goto turned a click that reaches
+nowhere into a click that says nothing. Goto-then-attack does not exist, per §8 decision 2: an
+enemy-occupied tile is unenterable ground to the query like any other.
+
+**Mutation-checked, each restored byte-identical.** On the engine side:
+`packages/core/src/route.ts` (`89c470ed…`, then `0451295c…` after the refinement): dropping the
+destination check (4 tests red, `the route to tile 206 contains tile 206, which the engine refuses:
+{"kind":"impassable","unitId":0,"to":206}`), asking with a movement budget of 1 instead of the
+unit's own (13 red, `planRoute(unit 0, tile 31) was refused`), ignoring `planMove` altogether (10
+red, `expected [17,10,3,4,13,22,31] to include 20` — the route walks through the mountain wall), and
+a tie-break that depends on where the unit stands (2 red, `expected [26,27,20,29,38,31] to strictly
+equal [10,11,20,13,22,31]`). **One mutation came back GREEN and is reported as such**: replacing the
+backward search with a forward one passed all 19 tests, and a scan of **31 432**
+`(unit, destination)` pairs across five seeds and two civilization counts found no counterexample —
+so the module note says the direction is chosen for the structural guarantee rather than to fix an
+observed failure, and the test's own claim is stated as the property it checks rather than as a
+discriminator it is not.
+
+**Measured before it was claimed: the query costs about 0.8 ms** on the app's default map (60×60,
+seed 1, four civilizations, 20 destinations per reading, `npx tsx` on the live tree). That is what
+makes it "cheaply re-askable" in §8's sense: the shell asks it once per click and once per step of an
+advance, and a journey is a handful of steps per turn.
+
+**Not done in this phase, and not claimed.**
+- **The route is not drawn.** A goto is invisible on the map: the unit walks, the log records each
+  step and the channel names the destination, but no highlight shows the path. §2.C's `map` surface is
+  about the *destination tile*, and a route overlay is a new presentation decision nobody has taken.
+- **No way to cancel a goto except by giving the unit another order.** Clicking a different
+  destination, or any other order for that unit, replaces or displaces the goto (that is `unitNamedBy`
+  in the schema, and it is tested); there is no "stop" control and no Escape binding — Phase 5 owns
+  the keyboard.
+- **The goto is not in a save, and cannot be.** It is UI memory by design (§7.4 (b)), so loading a
+  game mid-journey drops the goto silently. §7.4 (c) — a stored `GoTo` — is what would fix that, and
+  it costs the six goldens.
+- **`route.ts` and the AI's search are still two searches.** `ai/smart.ts` `stepsToTile` keeps its own
+  probe, its own goal set, its own caching, and it lifts every other unit off the board (a different
+  question: "is this city ever reachable", answered while treating a rival army as passable ground).
+  Unifying them is a real follow-up and is recorded in `docs/KNOWN-ISSUES.md` §2 rather than implied
+  away; the six goldens were taken through the AI's search and rewriting it is not this phase's work.
+- **The cancellation rule is strict, and its cost is stated.** A goto is cancelled when the engine's
+  plan for the *remaining* journey is not the plan the player was given — including when a detour
+  exists. That is decision 4 read literally ("rather than silently recomputed"), and it means a rival
+  moving anywhere that changes the tree can cancel a goto that could have continued. The message says
+  so and the player re-clicks; an owner who would rather be quietly re-routed is choosing the other
+  half of §7.7.4.
+- **No human has looked at the channel.** Its rendering is asserted by role and name and by text; how
+  it reads at a glance in a real window is not measured here.

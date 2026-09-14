@@ -124,6 +124,43 @@ body {
   letter-spacing: 0.04em;
 }
 
+/*
+ * The order channel: the header's `status` named `Order` (Phase 4). It says what the engine said
+ * about the last order — a refusal, a goto under way, a goto cancelled — and it lives in the header
+ * because a message that covers the map is a message that hides the thing it is about.
+ *
+ * **It is one line, always, and that is a layout rule rather than a taste.** The header is
+ * `flex: 0 0 auto`, so anything that makes it taller takes height off `main`, and the map's box is
+ * the box the camera clamps against and the click hit-test inverts — a status line that wrapped
+ * would move the map *while a test is computing a tile's screen point*, which is the defect Phase 3
+ * removed from the dock. So the line never wraps (`white-space: nowrap`), it is allowed to shrink
+ * (`min-width: 0`), and what does not fit is ellipsised; `main.ts` puts the whole sentence in the
+ * element's `title` so nothing is lost, and the accessible name and text stay complete for a test
+ * and for a screen reader (`overflow: hidden` clips pixels, not text).
+ *
+ * The two buttons keep their own width for the same reason — the message may not squeeze them out of
+ * existence — and the empty line is zero-height rather than a gap, so a game with nothing to report
+ * lays out exactly as it did before this element existed.
+ */
+#civts-app > header > p[data-role='order'] {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#civts-app > header > p[data-role='order']:empty {
+  flex: 0 1 0;
+  padding: 0;
+}
+
+#civts-app > header > button {
+  flex: 0 0 auto;
+}
+
 main {
   flex: 1 1 auto;
   min-height: 0;

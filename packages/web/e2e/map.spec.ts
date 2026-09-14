@@ -40,6 +40,7 @@ import {
   parseHexColour,
   readState,
   recordDispatches,
+  RULESET,
   sampleCanvasPixel,
   sampleTileColour,
   seedApp,
@@ -61,7 +62,9 @@ import {
   type Rgb,
 } from './helpers.js';
 import {
+  asTileIndex,
   isExplored,
+  planRoute,
   // The ENGINE's `visibleTiles` — what a player can see — is a different function from this
   // suite's `visibleTiles` (which tiles the VIEWPORT covers). They are named apart here on
   // purpose: conflating "in sight" with "on screen" is the mistake `render.ts` records for the
@@ -797,6 +800,20 @@ test('refusals: a click the engine would refuse leaves the state exactly as it w
   const hashBefore = await stateHash(page);
   const canRecord = await recordDispatches(page);
 
+  /*
+   * **"Cannot reach" now means "the engine's route query finds no way at all"**, and that is Phase
+   * 4's change to this test rather than a weakening of it. A far tile the unit *can* walk to is no
+   * longer a refusal: it is a goto, and the state is *supposed* to change when one starts (which is
+   * what `goto.spec.ts` asserts). What this test is about — a click the engine turns down must
+   * change nothing, and must be visible as a refusal — needs a destination with no route of any
+   * length. On this board that is water: a land unit may never stand on it, so `planRoute` refuses
+   * it outright, and the engine's own reason reaches the order channel.
+   */
+  const authoritative = await authoritativeState(page);
+  const settler = authoritative.units.find((each) => each.id === unit.id);
+  expect(settler, 'the selected unit is not in the authoritative state').toBeDefined();
+  if (settler === undefined) return;
+
   // Only tiles whose CENTRE is inside the canvas: the visible rectangle includes the tiles on
   // its edges, and a click aimed at the centre of one of those would land off the canvas.
   const centreInside = (tile: number): boolean => {
@@ -807,9 +824,17 @@ test('refusals: a click the engine would refuse leaves the state exactly as it w
     if (tile === unit.tile || !centreInside(tile)) return false;
     const dx = Math.abs(tileX(state, tile) - tileX(state, unit.tile));
     const dy = Math.abs(tileY(state, tile) - tileY(state, unit.tile));
-    return Math.max(dx, dy) > 1 && tileIsClear(state, tile);
+    if (Math.max(dx, dy) <= 1) return false;
+    if (!tileIsClear(state, tile)) return false;
+    // The goto's own criterion: no sequence of single steps reaches it, so the click has nothing to
+    // start. `planRoute` is the ENGINE's answer, not this test's idea of one.
+    return !planRoute(authoritative, RULESET, settler.id, asTileIndex(tile)).ok;
   });
-  expect(onScreen.length, 'no unreachable tile was on screen').toBeGreaterThan(0);
+  expect(
+    onScreen.length,
+    'no tile on screen is out of the unit\u2019s reach by any route, so this test could not tell a ' +
+      'refusal from a goto',
+  ).toBeGreaterThan(0);
   const target = onScreen[0];
   if (target === undefined) return;
 

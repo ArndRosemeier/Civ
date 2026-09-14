@@ -109,7 +109,9 @@ import { loadUnitSprites, type UnitSprites } from './units.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
 import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
-import { tileNamedBy } from './ui/schema.js';
+import { tileNamedBy, unitNamedBy } from './ui/schema.js';
+import { nextGotoStep, startGoto, type GotoIntent } from './ui/goto.js';
+import { problemText } from './ui/problem.js';
 
 /** The seed a page load starts on, when nothing has seeded it. */
 const DEFAULT_SEED = 1;
@@ -273,6 +275,22 @@ interface Shell {
    */
   readonly mapRegion: HTMLElement;
   readonly endTurn: HTMLButtonElement;
+  /**
+   * The **order channel**: the one place this app says what the engine said about an order.
+   *
+   * §1.4 measured the defect it fixes — a refused click applied nothing and said nothing — and it
+   * carries a second job Phase 4 needs: a goto that has been invalidated has to be *cancelled out
+   * loud* (`docs/UI-OVERHAUL.md` §8, decision 4), and this is the same channel a refusal uses, so
+   * there is one place a player reads "what happened to my order".
+   *
+   * It is a new accessible name — `status`/`Order` — and it is unique on the page. The frozen M8
+   * table may not be extended in place (`docs/INTERFACES.md`, M9+M10's note), which is why the name
+   * is stated here and in `docs/UI-OVERHAUL.md` §9 instead, and Playwright matches names by
+   * substring, so it must not be a substring of `Turn`, `Year`, `Treasury`, `Science`, `Luxury`,
+   * `Rates`, `State hash`, `Save status`, `Government verdict` or `New game problem`: it is none of
+   * those, and none of those contains it.
+   */
+  readonly orderStatus: HTMLElement;
   /** The sidebar: the strip holding everything that is not a direct unit action. */
   readonly panelsRoot: HTMLElement;
   /** The nine panels, inside the sidebar. This is the one region of it that may scroll. */
@@ -385,7 +403,16 @@ const buildShell = (doc: Document): Shell => {
   endTurn.type = 'button';
   endTurn.dataset['command'] = 'EndTurn';
   const newGame = buildNewGame(doc);
-  header.append(title, newGame.open, endTurn);
+  // The order channel — see `Shell.orderStatus` for what it carries and why its name is what it is.
+  // Empty until something happens to an order, and `styles.css` keeps it to one line whatever it
+  // says: the header is `flex: 0 0 auto`, so a status line that wrapped or grew would take height
+  // off the map column, and the map's box is the box the camera clamps against and the click
+  // hit-test inverts.
+  const orderStatus = el(doc, 'p');
+  orderStatus.setAttribute('role', 'status');
+  orderStatus.setAttribute('aria-label', 'Order');
+  orderStatus.dataset['role'] = 'order';
+  header.append(title, newGame.open, endTurn, orderStatus);
 
   const main = el(doc, 'main');
 
@@ -434,7 +461,17 @@ const buildShell = (doc: Document): Shell => {
   root.append(header, main);
   doc.body.append(root);
   dock.append(newGame.dialog);
-  return { root, canvas, mapRegion, endTurn, panelsRoot, panelStack, dock, newGame };
+  return {
+    root,
+    canvas,
+    mapRegion,
+    endTurn,
+    orderStatus,
+    panelsRoot,
+    panelStack,
+    dock,
+    newGame,
+  };
 };
 
 /**
@@ -650,6 +687,8 @@ const start = async (): Promise<void> => {
     },
     stateHash: () => hashValue(state),
   };
+  // (The panels' `replaceState` above is the Load path's first half; the seam's is the second. Both
+  // land on the same three lines below.)
 
   const panels: PanelsHandle = mountPanels(shell.panelStack, panelsApi);
 
@@ -759,12 +798,50 @@ const start = async (): Promise<void> => {
   /* ------------------------------ dispatching ---------------------------- */
 
   /**
+   * **The order channel's text, and the goto the player has given.**
+   *
+   * The header's `Order` status carries the answer to the last thing the player tried to do — a
+   * refusal, a goto that is under way, or a goto that was cancelled. `pendingGoto` is a destination
+   * plus the route the engine planned for it, held **here and nowhere else**: it is not state, it is
+   * never hashed, and it dies with the page. That is the shape `docs/UI-OVERHAUL.md` §7.4 (b)
+   * decides on, and §8 names its price: a pending goto emits dispatches a headless script would not
+   * contain, which is why the determinism fixtures contain no goto at all. See
+   * `determinism.spec.ts`, where that is stated where it is relied on.
+   */
+  let pendingGoto: GotoIntent | undefined;
+  /**
+   * Whether an advance is already running. The loop dispatches through `armDispatch`, which reaches
+   * `dispatchCommand`, which is also what cancels a goto when the player gives that unit another
+   * order — so the loop has to be able to tell its own steps from the player's.
+   */
+  let advancingGoto = false;
+
+  /** Say what happened to the last order, in the one place the player reads it. */
+  const setOrderMessage = (text: string): void => {
+    shell.orderStatus.textContent = text;
+    // The full sentence, for when the line is ellipsised on a narrow window: the channel is one line
+    // by construction (see `buildShell`), so the title is where a long message stays readable.
+    if (text === '') shell.orderStatus.removeAttribute('title');
+    else shell.orderStatus.title = text;
+  };
+
+  /** A tile as the rest of the app writes one: the map's own x,y. */
+  const tileText = (index: number): string =>
+    `${String(indexToX(state.map, index))},${String(indexToY(state.map, index))}`;
+
+  /**
    * Apply a command through the real applier, then bring the screen up to date.
    *
    * Returns the engine's own events beside the outcome: the log can only render what it is
    * handed, and reconstructing it by diffing states would be the UI deciding what happened (see
    * `panels/index.ts`). A refusal changes nothing — no state, no events — and is reported as
    * `'refused'` rather than thrown, so a caller can prove the refusal was the engine's.
+   *
+   * **A refusal is now also said out loud**, which §1.4 measured as missing: the engine's typed
+   * `GameError` used to be discarded here, so a click the engine turned down looked exactly like a
+   * frozen game. It goes to the order channel in the engine's own terms (`ui/problem.ts`), and the
+   * channel is cleared when an order is accepted, because a stale `refused` beside a unit that has
+   * just moved is a claim about the present that is no longer true.
    */
   function dispatchCommand(
     command: Command,
@@ -776,11 +853,21 @@ const start = async (): Promise<void> => {
     const seat = forSeat ?? humanSeatOf(state);
     if (seat === undefined) return { outcome: 'refused', events: [] };
 
+    // An order given to the unit that is walking somewhere replaces that goto — the player has just
+    // said what the unit should do instead. Silent, because the player did it, and *before* the
+    // apply, so that even a refused order cancels the old plan rather than leaving the unit
+    // committed to a journey the player has abandoned. `advancingGoto` is what keeps this from
+    // cancelling the goto's own steps.
+    if (!advancingGoto && pendingGoto !== undefined) {
+      if (unitNamedBy(command) === pendingGoto.unitId) pendingGoto = undefined;
+    }
+
     // Clear first: the buffer belongs to the call about to happen, so a refusal cannot leave the
     // previous command's events for the panels' dispatch to render again.
     lastEvents = [];
     const outcome = applyCommand(state, seat, command, ruleset);
     if (!outcome.ok) {
+      setOrderMessage(problemText(outcome.error));
       // The panels still re-render: a refusal is a normal answer, and a control that must not
       // change has to be rebuilt from the state that did not change.
       panels.refresh();
@@ -790,6 +877,7 @@ const start = async (): Promise<void> => {
 
     state = outcome.value.state;
     lastEvents = outcome.value.events;
+    setOrderMessage('');
     // The log is appended **here and nowhere else**: every path into the engine — a panel button,
     // an ability button, a map click, the `End turn` button, the seam — runs through
     // `dispatchCommand`, so one append per accepted command is one statement of "what happened".
@@ -799,6 +887,84 @@ const start = async (): Promise<void> => {
     redraw();
     return { outcome: 'ok', events: outcome.value.events };
   }
+
+  /**
+   * Walk a pending goto as far as this turn allows, one engine-offered step at a time.
+   *
+   * `nextGotoStep` decides (`ui/goto.ts`, and its unit test is where the decisions are pinned); this
+   * function only *executes* the decision and says what happened. Five things are worth stating
+   * here, because each is a way this could have been wrong:
+   *
+   * - **Steps go through `armDispatch`, never around it.** A goto step is a command this app issues
+   *   on its own initiative, which is exactly the kind of dispatch the seam's instrumentation must
+   *   see: a test's `recordDispatches` wrapper observes a goto step the same way it observes a
+   *   button press, so "the UI issued this" stays checkable. Applying it through `dispatchCommand`
+   *   directly would have hidden every step from the dispatch log.
+   * - **The loop terminates because each step consumes a step of the stored route**, and it stops the
+   *   moment the engine offers nothing (the unit is out of movement) rather than spinning.
+   *   `advancingGoto` is a belt on that brace: a re-entrant call cannot start a second loop.
+   * - **A refusal cancels the goto**, with the engine's reason — the same rule as an invalidated
+   *   route, and for the same reason: nothing is retried behind the player's back. The channel
+   *   already carries the engine's sentence, because `dispatchCommand` wrote it.
+   * - **An invalidated route cancels and says so** (§8 decision 4). `ui/goto.ts` decides that; here
+   *   the sentence is assembled, naming the tile in the map's own coordinates.
+   * - **A finished game ends the loop before it dispatches anything.** M10 refuses every command once
+   *   a game is over, and a goto that kept trying would fill the channel with `game-over` refusals
+   *   for a game that has already ended.
+   */
+  function advanceGoto(): void {
+    if (advancingGoto) return;
+    advancingGoto = true;
+    try {
+      while (pendingGoto !== undefined) {
+        if (isGameOver(state, ruleset)) {
+          pendingGoto = undefined;
+          break;
+        }
+        const decision = nextGotoStep(state, ruleset, pendingGoto);
+        if (decision.kind === 'step') {
+          pendingGoto = decision.intent;
+          const outcome = armDispatch(decision.command);
+          if (outcome !== 'ok') {
+            pendingGoto = undefined;
+            break;
+          }
+          continue;
+        }
+        if (decision.kind === 'waiting') {
+          // The intent stands and the unit is out of movement for it: not a cancellation but the
+          // next turn's work, and saying so is what stops this silence from reading as a broken
+          // order.
+          setOrderMessage(`heading for tile ${tileText(pendingGoto.destination)}`);
+          break;
+        }
+        if (decision.kind === 'cancelled') {
+          setOrderMessage(
+            `the goto to tile ${tileText(pendingGoto.destination)} is cancelled: ${decision.detail}`,
+          );
+          pendingGoto = undefined;
+          break;
+        }
+        // `arrived` — the unit is there, and an accepted step has already cleared the channel.
+        // `gone` — the unit is not in the state any more, and a message about a unit that is not
+        // there would be noise. Both discharge the intent and say nothing.
+        pendingGoto = undefined;
+        break;
+      }
+    } finally {
+      advancingGoto = false;
+    }
+  }
+
+  /**
+   * Drop the intent without a word: a new game, a load, or a game that has ended leaves nothing for
+   * a goto to be about, and a message about the old game's journey would be a claim about the new
+   * one.
+   */
+  const forgetGoto = (): void => {
+    pendingGoto = undefined;
+    setOrderMessage('');
+  };
 
   /* -------------------------------- seeding ------------------------------ */
 
@@ -836,6 +1002,9 @@ const start = async (): Promise<void> => {
     panels.log.clear();
     panels.selectUnit(undefined);
     panels.selectCity(undefined);
+    // A new game is a new world: the old game's pending goto and its message are about a board that
+    // no longer exists.
+    forgetGoto();
     panels.refresh();
     placeUnitActions();
     redraw();
@@ -959,12 +1128,20 @@ const start = async (): Promise<void> => {
    *    clicking it (the unit is still reachable from the `Units` region, and the map still
    *    selects any unit on a tile that has no city);
    * 3. a tile holding one of your own units selects it;
-   * 4. an empty tile that is not one of the unit's destinations is still dispatched as a
-   *    `MoveUnit`, and the engine refuses it. That is deliberate: the refusal is the player's
-   *    feedback, and a click that silently did nothing would be indistinguishable from a broken
-   *    control. A refusal leaves the state untouched;
-   * 5. a tile outside the map, or one held by somebody else with nothing to attack, leaves the
+   * 4. **a tile further away than one step starts a goto** (Phase 4, `docs/UI-OVERHAUL.md` §7.6):
+   *    the engine's route query (`@civts/core`'s `planRoute`) is asked, and if it finds a route the
+   *    destination is held as UI intent and the unit starts walking it, one engine-offered step at a
+   *    time, resuming after each `End turn`. When the query finds **no** route, the click falls
+   *    through to the bare `MoveUnit` below rather than becoming a silent no-op;
+   * 5. an empty tile with nothing to route to is still dispatched as a `MoveUnit`, and the engine
+   *    refuses it — which the order channel now *shows*, in the engine's own words, where §1.4
+   *    measured that nothing was shown at all. A refusal leaves the state untouched;
+   * 6. a tile outside the map, or one held by somebody else with nothing to attack, leaves the
    *    state alone rather than asking the engine a question whose answer is already known.
+   *
+   * What is deliberately **not** here: goto-then-attack. §8 decision 2 settles that a distant enemy
+   * does nothing, so a goto's destination is always ground the unit may stand on, and an
+   * enemy-occupied tile is refused by the route query like any other unenterable tile.
    */
   canvas.addEventListener('click', (event) => {
     // M10: an ended game issues no orders. A map click is a command like any other, so it stops
@@ -1027,11 +1204,27 @@ const start = async (): Promise<void> => {
       state.cities.some((candidate) => candidate.tile === index);
     if (occupied || over) return;
 
-    // An empty tile the unit's own list did not name: the command is issued anyway so the engine
-    // can refuse it out loud. The index is inside the map — `screenToTile` returned it — and
-    // `asTileIndex` is the engine's own constructor for the branded id rather than an escape from
-    // the type system. When the seat owns no unit at all the sentinel id is refused as
-    // `unknown-unit`: a refusal either way, never a silent no-op dressed up as success.
+    // **A far tile: the goto.** The engine's own route query decides whether this is a journey it
+    // can make, and the destination is then held here as intent — `advanceGoto` walks it, one step
+    // per turn, through the seam like any other control. `no-route` deliberately falls through to
+    // the bare `MoveUnit` below: the engine's refusal is the player's answer, and nothing about
+    // goto may turn a click that reaches nowhere into a click that says nothing. (`over` is not
+    // re-checked: the `occupied || over` guard above has already returned for a finished game.)
+    if (selected !== undefined) {
+      const began = startGoto(state, ruleset, selected, asTileIndex(index));
+      if (began.kind === 'started') {
+        pendingGoto = began.intent;
+        advanceGoto();
+        return;
+      }
+    }
+
+    // An empty tile the unit's own list did not name and the route query could not reach: the
+    // command is issued anyway so the engine can refuse it out loud. The index is inside the map —
+    // `screenToTile` returned it — and `asTileIndex` is the engine's own constructor for the branded
+    // id rather than an escape from the type system. When the seat owns no unit at all the sentinel
+    // id is refused as `unknown-unit`: a refusal either way, never a silent no-op dressed up as
+    // success.
     armDispatch({
       type: 'MoveUnit',
       unitId: selected ?? asUnitId(-1),
@@ -1082,6 +1275,12 @@ const start = async (): Promise<void> => {
   shell.endTurn.addEventListener('click', () => {
     playOpponentSeats();
     armDispatch({ type: 'EndTurn' });
+    // **A goto resumes at the turn boundary**, and this is the only place it can: `EndTurn` refills
+    // every unit's movement (`turn.ts` `refillMovement`), and the step the route query named may
+    // have been unaffordable with what was left of the last turn. A goto whose route the rival's
+    // move has closed cancels here, with the message the channel carries — which is the case §8
+    // decision 4 is about, and the one a player meets most often.
+    advanceGoto();
   });
 
   /* --------------------------- the new-game surface ---------------------- */
@@ -1138,6 +1337,11 @@ const start = async (): Promise<void> => {
     settings: () => state.settings,
     replaceState: (next) => {
       state = next;
+      // A loaded game is a different world, and the goto held against the old one describes a board
+      // that is gone. The intent is UI memory with no place in a save (`docs/UI-OVERHAUL.md` §7.4),
+      // so loading cannot restore it and must not pretend to: it is dropped, and the channel says
+      // nothing rather than something about a journey nobody is on.
+      forgetGoto();
       panels.refresh();
       placeUnitActions();
       redraw();

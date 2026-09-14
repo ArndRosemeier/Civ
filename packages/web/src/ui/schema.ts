@@ -58,7 +58,7 @@
  * present one only where that evaluator accepts it.
  */
 
-import type { Command, TileIndex } from '@civts/core';
+import type { Command, TileIndex, UnitId } from '@civts/core';
 import { assertNever } from '../events.js';
 
 /** Where a command is presented. See the module note for what each one means. */
@@ -193,6 +193,37 @@ export const tileNamedBy = (command: Command): TileIndex | undefined => {
 /** Whether this command is one the map itself can issue, by clicking the tile it names. */
 export const isMapCommand = (command: Command): boolean =>
   COMMAND_PLACEMENT[command.type].surface === 'map';
+
+/**
+ * The unit a command acts on, or `undefined` for a command that names no unit.
+ *
+ * **Why the schema owns this.** A goto is UI intent held against a unit id, and an order given to
+ * *that* unit replaces the goto (the player has said what the unit should do instead). Asking that
+ * question needs "which unit does this command name", and the answer has to be stated once: an `if`
+ * chain in the click handler and another in the order channel is the same duplicated-rule defect
+ * `tileNamedBy` above exists to prevent. Like that function, the switch has **no `default`**, so a
+ * new command member stops the build until somebody says whether it names a unit — the question a
+ * silent `undefined` would answer wrong for a command that does.
+ */
+export const unitNamedBy = (command: Command): UnitId | undefined => {
+  switch (command.type) {
+    case 'MoveUnit':
+    case 'AttackUnit':
+    case 'FoundCity':
+    case 'StartWork':
+    case 'CancelWork':
+    case 'FortifyUnit':
+      return command.unitId;
+    case 'EndTurn':
+    case 'SetProduction':
+    case 'SetWorkedTiles':
+    case 'SetResearch':
+    case 'SetRates':
+    case 'SetGovernment':
+      return undefined;
+  }
+  return assertNever(command);
+};
 
 /**
  * How many commands each surface carries.

@@ -123,7 +123,30 @@ test('determinism at the UI layer: a scripted game through the UI hashes exactly
     const recorded = await dispatchLog(page);
     await clearDispatchLog(page);
     const accepted = recorded.filter((entry) => entry.result === 'ok');
-    expect(accepted.length, `step ${String(step)} dispatched nothing at all`).toBeGreaterThan(0);
+    /*
+     * **Exactly one command per step, and that is the check that keeps gotos out of this fixture.**
+     *
+     * A goto is UI intent (`packages/web/src/ui/goto.ts`): when one is pending, the app dispatches
+     * steps of its own accord — between the commands this test chose, and between turns. Those
+     * dispatches would land in the recorded script and be replayed headlessly, so the equality below
+     * would still hold while proving something weaker than it claims: the script would no longer be
+     * "the commands a chooser picked from the engine's own lists", it would be that *plus* a UI
+     * planner. `docs/UI-OVERHAUL.md` §8 records this as the open debt of goto shape (b) and says the
+     * fixtures must keep gotos out and say so here.
+     *
+     * They stay out by construction: nothing in this file ever clicks the **map**, and a goto can
+     * only be started by a map click (`main.ts`, the far-tile branch). The assertion was
+     * `toBeGreaterThan(0)` — "something was dispatched" — which would have let a UI-initiated step
+     * through unnoticed. `toBe(1)` is the statement that this fixture contains only what the chooser
+     * asked for, so if a future change makes the app dispatch anything else here, this fails and
+     * names the step.
+     */
+    expect(
+      accepted.length,
+      `step ${String(step)} dispatched ${String(accepted.length)} commands (${JSON.stringify(
+        accepted.map((entry) => entry.action),
+      )}), and this fixture is supposed to contain exactly the one the chooser asked for`,
+    ).toBe(1);
     for (const entry of accepted) script.push(entry.action);
   }
 

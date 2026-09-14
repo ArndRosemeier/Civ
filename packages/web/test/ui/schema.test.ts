@@ -44,6 +44,7 @@ import {
   surfaceCounts,
   surfaceOf,
   tileNamedBy,
+  unitNamedBy,
 } from '../../src/ui/schema.js';
 
 const validated = validateRuleset(CATALOG, 'tuned');
@@ -226,6 +227,32 @@ describe('the UI schema', () => {
         );
       }
     }
+  });
+
+  it('names the unit a command acts on, and only for the commands that act on one', () => {
+    // Phase 4's goto is UI intent held against a unit id, and an order given to that unit replaces
+    // the goto — so "which unit does this command name?" is asked on every dispatch, and it has to
+    // be answered in one place. A wrong `undefined` here would leave a unit walking to a
+    // destination the player has just overridden.
+    //
+    // The samples all name unit 1 except `EndTurn`, which names none — so this asserts the whole
+    // classification, not just that a number comes back: six commands act on a unit, and six do not.
+    const actsOnAUnit = (command: Command): boolean => unitNamedBy(command) !== undefined;
+    expect(
+      EVERY_COMMAND.filter(actsOnAUnit)
+        .map((command) => command.type)
+        .sort(),
+    ).toEqual(['AttackUnit', 'CancelWork', 'FortifyUnit', 'FoundCity', 'MoveUnit', 'StartWork']);
+    for (const command of EVERY_COMMAND.filter(actsOnAUnit)) {
+      expect(unitNamedBy(command), `${command.type} should name unit 1`).toBe(1);
+    }
+    // The city and settings commands name no unit, and neither does the turn.
+    expect(unitNamedBy(SAMPLES['SetProduction'])).toBe(undefined);
+    expect(unitNamedBy(SAMPLES['SetWorkedTiles'])).toBe(undefined);
+    expect(unitNamedBy(SAMPLES['SetRates'])).toBe(undefined);
+    expect(unitNamedBy(SAMPLES['SetResearch'])).toBe(undefined);
+    expect(unitNamedBy(SAMPLES['SetGovernment'])).toBe(undefined);
+    expect(unitNamedBy(SAMPLES['EndTurn'])).toBe(undefined);
   });
 
   it('extracts the destination for a move and the victim for an attack, not the other way round', () => {
