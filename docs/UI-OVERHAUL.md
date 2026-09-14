@@ -947,6 +947,16 @@ byte-identical: removing the re-clamp ("the widening resize left the camera un-c
 the canvas to a 450px square ("the map never filled its region at 1280x900"), and restoring a stale
 scale factor in the hit-test ("the app never named a tile under the centre of the canvas").
 
+**The suite, twice, and one honest reading.** The full Playwright run is green — `71 passed |
+6 skipped (4.1m)` — and it was also green at 4.1m on the tree as it stood before the last two
+assertions were added. A third run, taken while two unrelated workspaces on the same box were
+running their own vitest suites (`loadavg` 4.3–10.5, 14 chrome processes), took **7.6m** and failed
+three keystone tests with `page.evaluate: Target crashed` — a **browser crash, not an assertion**.
+`keystone.spec.ts` alone is green in 39 s on the same tree, and the whole suite is green again on a
+calm box, which is what the numbers above are from. Recorded rather than smoothed over because
+`docs/KNOWN-ISSUES.md` §3.4 already says this suite is load-sensitive, and this is a second reading
+of how: it does not merely get slower, it can lose a browser.
+
 **Not done in this phase, and not claimed.** The dock still sits under the map — Phase 3 is what
 re-partitions it, and the 40% cap is a holding position rather than a design. A narrow, tall window
 (900×1000) leaves the square limited by width and a good deal of unused height beneath it; that dead
@@ -998,6 +1008,16 @@ no tile", and a drag that ENDED over the popup never ended at all, leaving the m
 pointer. Gestures that start something new belong to the map's own surface; gestures that continue or
 end something already running belong to the region holding both. The popup also carries
 `pointer-events: none` with `auto` on its buttons, so only a press on a button is the popup's.
+
+**The suite, twice, and one honest reading.** The full Playwright run is green — `71 passed |
+6 skipped (4.1m)` — and it was also green at 4.1m on the tree as it stood before the last two
+assertions were added. A third run, taken while two unrelated workspaces on the same box were
+running their own vitest suites (`loadavg` 4.3–10.5, 14 chrome processes), took **7.6m** and failed
+three keystone tests with `page.evaluate: Target crashed` — a **browser crash, not an assertion**.
+`keystone.spec.ts` alone is green in 39 s on the same tree, and the whole suite is green again on a
+calm box, which is what the numbers above are from. Recorded rather than smoothed over because
+`docs/KNOWN-ISSUES.md` §3.4 already says this suite is load-sensitive, and this is a second reading
+of how: it does not merely get slower, it can lose a browser.
 
 **Not done in this phase, and not claimed.** `decision 1` — "an ambiguous click opens a popup with the
 explicit choices" — is satisfied for the *unit's* orders by the popup's own contents, but there is no
@@ -1153,6 +1173,16 @@ reports two defects, and they are worth recording as its reading rather than thi
   dialog or the stack, but Chromium paints no persistent scrollbar for it, so it *looks* clipped.
   Measured and recorded in `docs/KNOWN-ISSUES.md` §4.1.
 
+**The suite, twice, and one honest reading.** The full Playwright run is green — `71 passed |
+6 skipped (4.1m)` — and it was also green at 4.1m on the tree as it stood before the last two
+assertions were added. A third run, taken while two unrelated workspaces on the same box were
+running their own vitest suites (`loadavg` 4.3–10.5, 14 chrome processes), took **7.6m** and failed
+three keystone tests with `page.evaluate: Target crashed` — a **browser crash, not an assertion**.
+`keystone.spec.ts` alone is green in 39 s on the same tree, and the whole suite is green again on a
+calm box, which is what the numbers above are from. Recorded rather than smoothed over because
+`docs/KNOWN-ISSUES.md` §3.4 already says this suite is load-sensitive, and this is a second reading
+of how: it does not merely get slower, it can lose a browser.
+
 **Not done in this phase, and not claimed.** No human has looked at the result — the review above is
 a model's, not mine and not the owner's, and the app's own `played-game.png` artifact was not
 reviewed at all. The sidebar is still 380 px, which is §7.7.5 and still the owner's call — and it is
@@ -1261,10 +1291,27 @@ so the module note says the direction is chosen for the structural guarantee rat
 observed failure, and the test's own claim is stated as the property it checks rather than as a
 discriminator it is not.
 
-**Measured before it was claimed: the query costs about 0.8 ms** on the app's default map (60×60,
-seed 1, four civilizations, 20 destinations per reading, `npx tsx` on the live tree). That is what
-makes it "cheaply re-askable" in §8's sense: the shell asks it once per click and once per step of an
-advance, and a journey is a handful of steps per turn.
+**Measured before it was claimed, two numbers.**
+
+- **The query costs about 0.8 ms** on the app's own board (60×60, seed 1, four civilizations,
+  `npx tsx` on the live tree, 20 destinations per reading: 0.91 ms at `tiny`, 0.73 ms at `small`).
+  That is what makes it "cheaply re-askable" in §8's sense: the shell asks it once per click and once
+  per step of an advance, and a journey is a handful of steps per turn.
+- **The gesture count, which is the point of the phase.** `goto.spec.ts` prints the journey it walked:
+  a **4-step** journey to tile 1176 took **1 map click and 1 `End turn` click**, with the app
+  dispatching the four single steps itself. Before this phase the same journey was **four map
+  clicks**, each on a tile the player had to work out — the `End turn` count is unchanged, because a
+  unit's movement is what it always was. The saving is in map clicks and in knowing the way.
+
+**The suite, twice, and one honest reading.** The full Playwright run is green — `71 passed |
+6 skipped (4.1m)` — and it was also green at 4.1m on the tree as it stood before the last two
+assertions were added. A third run, taken while two unrelated workspaces on the same box were
+running their own vitest suites (`loadavg` 4.3–10.5, 14 chrome processes), took **7.6m** and failed
+three keystone tests with `page.evaluate: Target crashed` — a **browser crash, not an assertion**.
+`keystone.spec.ts` alone is green in 39 s on the same tree, and the whole suite is green again on a
+calm box, which is what the numbers above are from. Recorded rather than smoothed over because
+`docs/KNOWN-ISSUES.md` §3.4 already says this suite is load-sensitive, and this is a second reading
+of how: it does not merely get slower, it can lose a browser.
 
 **Not done in this phase, and not claimed.**
 - **The route is not drawn.** A goto is invisible on the map: the unit walks, the log records each

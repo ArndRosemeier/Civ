@@ -63,6 +63,7 @@ import {
   selectUnit,
   tileX,
   tileY,
+  type UiState,
 } from './helpers.js';
 
 const SEED = 7;
@@ -71,6 +72,10 @@ const SEED = 7;
 const orderChannel = (page: Page) => page.getByRole('status', { name: 'Order' });
 
 const textOf = async (page: Page): Promise<string> => (await orderChannel(page).innerText()).trim();
+
+/** A tile as the order channel writes one: the map's own x,y. */
+const tileTextOf = (state: UiState, tile: number): string =>
+  `${String(tileX(state, tile))},${String(tileY(state, tile))}`;
 
 const unitById = (state: GameState, id: number): Unit => {
   const found = state.units.find((unit) => Number(unit.id) === id);
@@ -169,6 +174,19 @@ test('a click on a far tile walks the unit there, one engine-offered step at a t
       `(${String(route[0])})`,
   ).toBe(true);
 
+  // **The order is still live, and the channel says so.** The settler has two movement points, so a
+  // route of three or more steps cannot be walked in one turn: the app has stopped with steps still
+  // owed, and "heading for tile x,y" is the difference between "this will continue next turn" and "my
+  // click did nothing". Without this assertion that branch (`waiting`) is only unit-tested for its
+  // decision and never for its message.
+  const pending = await textOf(page);
+  expect(
+    pending,
+    `the channel read "${pending}" with steps still owed, so a player cannot tell a goto from a ` +
+      'no-op',
+  ).toContain('heading for tile');
+  expect(pending).toContain(tileTextOf(await readState(page), Number(destination)));
+
   // End turns until the unit is there. `End turn` is what resumes the goto — it refills movement —
   // and the loop is bounded so a stuck goto fails loudly instead of hanging the suite.
   let arrivedAt = Number(unitById(await authoritativeState(page), Number(settler.id)).tile);
@@ -194,6 +212,16 @@ test('a click on a far tile walks the unit there, one engine-offered step at a t
   // the app itself, between the turns this test clicked.
   expect(turns, 'the walk needed no turn at all, so it was one adjacent step').toBeGreaterThan(0);
   expect(await textOf(page), 'the channel still carried a message after the unit arrived').toBe('');
+
+  // The number this phase is *for*, printed rather than asserted: before it, walking `route.length`
+  // steps was one map click per step, each on a tile the player had to work out for themselves.
+  // Now it is one click and however many turns the journey needs — and the turns are the same
+  // either way, because a unit's movement is what it always was.
+  process.stdout.write(
+    `\ngoto: a ${String(route.length)}-step journey to tile ${String(destination)} took ` +
+      `1 map click and ${String(turns)} End turn clicks (the app dispatched the ` +
+      `${String(route.length)} single steps).\n`,
+  );
 });
 
 test('a goto the world closes is cancelled, out loud, and the unit stops where it stands', async ({
