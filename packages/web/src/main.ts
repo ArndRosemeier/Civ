@@ -39,11 +39,10 @@
  *
  * ## Determinism
  *
- * No clock, no randomness, no transcendentals anywhere in this file. The frame counter is a
- * counter — it is not derived from `Date.now()` or `performance.now()`, and nothing in the
- * simulation reads it. The renderer is a pure function of `(state, camera, viewport, markers)`,
- * so drawing more often cannot change the game and two runs of the same seed draw the same
- * pixels. The camera is presentation state: it is never hashed and never reaches `GameState`.
+ * The game never reads the presentation clock. Worker animations receive an explicit pose from
+ * requestAnimationFrame; the renderer is a pure function of its inputs, including that pose.
+ * Drawing more often cannot change the state or RNG. Camera and animation phase are UI memory,
+ * excluded from saves, replays and state hashes.
  */
 
 import {
@@ -112,6 +111,7 @@ import { loadTerrainSprites, type TerrainSprites } from './tiles.js';
 import { loadUnitSprites, type UnitSprites } from './units.js';
 import { createTerrainArtwork } from './terrain-art.js';
 import { loadMapSprites } from './map-art.js';
+import { createMapAnimation } from './animation.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
 import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
@@ -271,6 +271,9 @@ const unitMarkers = (
       hitPoints: hitPointsLeftOf(unit),
       maxHitPoints: maxHitPointsOf(unitDef(ruleset, unit.type), hitPointsLeftOf(unit)),
       fortified: unit.fortified === true,
+      ...(unit.work === undefined
+        ? {}
+        : { work: { kind: unit.work.kind, turnsLeft: unit.work.turnsLeft } }),
     }));
 };
 
@@ -713,6 +716,17 @@ const start = async (): Promise<void> => {
 
   /* -------------------------------- drawing ------------------------------ */
 
+  let animationStep = 0;
+  const motionPreference = window_?.matchMedia('(prefers-reduced-motion: reduce)');
+  const animation = createMapAnimation({
+    request: (callback) => window_?.requestAnimationFrame(callback) ?? 0,
+    cancel: (id) => window_?.cancelAnimationFrame(id),
+    paint: (step) => {
+      animationStep = step;
+      draw();
+    },
+  });
+
   const draw = (): FrameTrace => {
     // Measured at the top of the only function that paints, so the rectangle the renderer walks and
     // the box the hit-test inverts come from one layout read. A size cached at start would be stale
@@ -752,12 +766,16 @@ const start = async (): Promise<void> => {
       terrainArtwork,
       mapSprites,
       showGrid,
+      animationStep: motionPreference?.matches === true ? 0 : animationStep,
     });
     trace = frame;
     frames += 1;
     updateDescription(size, cursor);
     // The drawing surface documents the projection it used, beside the seam's own `camera()`.
     canvas.dataset['camera'] = JSON.stringify(camera);
+    animation.sync(
+      (frame.workingTiles?.length ?? 0) > 0 && !doc.hidden && motionPreference?.matches !== true,
+    );
     return frame;
   };
 
@@ -1947,6 +1965,12 @@ const start = async (): Promise<void> => {
   shell.grid.addEventListener('click', () => {
     showGrid = !showGrid;
     shell.grid.setAttribute('aria-pressed', String(showGrid));
+    draw();
+  });
+  doc.addEventListener('visibilitychange', () => {
+    draw();
+  });
+  motionPreference?.addEventListener('change', () => {
     draw();
   });
 

@@ -26,6 +26,11 @@ their count, with health bars and a fortification marker. Unexplored neighbours
 never contribute to terrain transitions. The renderer retains the current square
 projection; new terrain types, rivers and a full isometric art set remain future work.
 
+Working units show a swinging tool, strike particles and a subtle movement cycle,
+including a work indicator on stacks. Animation stops when the job ends or is
+cancelled, when the unit leaves the viewport, and while the page is hidden. Reduced
+motion uses a static work indicator. The animation clock never advances the game.
+
 Idle units heal one hit point per turn outside foreign territory; an owned city with
 barracks restores them fully. Moving, working or fighting prevents healing that turn.
 Population-cost production waits until at least one citizen can remain, retaining

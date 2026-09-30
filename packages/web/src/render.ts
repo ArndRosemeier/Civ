@@ -116,6 +116,8 @@ export interface FrameTrace {
   readonly tiles: readonly DrawEntry[];
   /** The tile the pointer is over, or `null` — the description's second fact. */
   readonly cursor: { readonly x: number; readonly y: number } | null;
+  /** Visible working stacks, used to start/stop the presentation clock. */
+  readonly workingTiles?: readonly TileIndex[];
 }
 
 /** A 2D context, narrowed to the calls this module makes. */
@@ -162,6 +164,7 @@ export interface UnitMarker {
   readonly hitPoints?: number;
   readonly maxHitPoints?: number;
   readonly fortified?: boolean;
+  readonly work?: { readonly kind: string; readonly turnsLeft: number };
 }
 
 /** A city marker: its tile, and the colour of its owner. */
@@ -221,6 +224,8 @@ export interface FrameInput {
   readonly mapSprites?: MapSprites;
   /** Optional tactical grid; terrain is continuous by default. */
   readonly showGrid?: boolean;
+  /** Presentation-only work cycle. Omitted (or zero) gives a static activity symbol. */
+  readonly animationStep?: number;
 }
 
 /** The `#rrggbb` colour parsed into three 0-255 channels. */
@@ -445,7 +450,7 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   // Settlements overlay their tile; terrain probes sample tiles without cities or units.
   for (const city of input.cities) {
     const rect = tileRect(camera, indexToX(state.map, city.tile), indexToY(state.map, city.tile));
-    if (!onScreen(rect.x, rect.y, viewport)) continue;
+    if (!onScreen(rect.x, rect.y, viewport, size)) continue;
     const population = city.population ?? 1;
     const art =
       input.mapSprites?.[
@@ -484,6 +489,7 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   }
 
   const stacks = new Map<number, UnitMarker[]>();
+  const workingTiles: TileIndex[] = [];
   for (const unit of input.units) {
     const stack = stacks.get(Number(unit.tile)) ?? [];
     stack.push(unit);
@@ -491,13 +497,16 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   }
   for (const stack of stacks.values()) {
     // Keep the selected unit on top instead of allowing a later array entry to cover it.
-    const unit = stack.find((marker) => marker.selected) ?? stack[0];
+    const working = stack.find((marker) => marker.work !== undefined);
+    const unit = stack.find((marker) => marker.selected) ?? working ?? stack[0];
     if (unit === undefined) continue;
     const rect = tileRect(camera, indexToX(state.map, unit.tile), indexToY(state.map, unit.tile));
-    if (!onScreen(rect.x, rect.y, viewport)) continue;
+    if (!onScreen(rect.x, rect.y, viewport, size)) continue;
     const sprite = input.unitSprites?.[unit.type];
     if (sprite !== undefined) {
-      paintUnitSprite(ctx, sprite, unit.colour, rect, size);
+      const pose = (input.animationStep ?? 0) % 6;
+      const bob = unit.work === undefined ? 0 : (([0, -1, -2, -1, 0, 1][pose] ?? 0) * size) / 64;
+      paintUnitSprite(ctx, sprite, unit.colour, rect, size, bob);
     } else {
       const inset = Math.max(1, size / 8);
       const half = size / 2;
@@ -535,6 +544,10 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
         );
       }
     }
+    if (working?.work !== undefined) {
+      workingTiles.push(unit.tile);
+      paintWorkActivity(ctx, rect, working.work.kind, input.animationStep ?? 0);
+    }
   }
 
   if (input.cursor !== null) {
@@ -544,7 +557,7 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
     ctx.strokeRect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
   }
 
-  return { tiles, cursor: input.cursor };
+  return { tiles, cursor: input.cursor, workingTiles };
 };
 
 /**
@@ -558,12 +571,13 @@ const paintUnitSprite = (
   ownerColour: string,
   rect: { readonly x: number; readonly y: number; readonly width: number; readonly height: number },
   size: number,
+  bob = 0,
 ): void => {
   const spriteSize = Math.max(8, Math.round((size * 3) / 4));
   const dx = rect.x + Math.round((size - spriteSize) / 2);
   const dy = rect.y + size - spriteSize - Math.max(1, Math.round(size / 16));
   ctx.imageSmoothingEnabled = size >= 16;
-  ctx.drawImage(sprite, dx, dy, spriteSize, spriteSize);
+  ctx.drawImage(sprite, dx, dy + bob, spriteSize, spriteSize);
   const badge = Math.max(3, Math.round(size / 6));
   const bx = rect.x + Math.max(1, Math.round(size / 16));
   const by = rect.y + size - badge - Math.max(1, Math.round(size / 16));
@@ -572,6 +586,58 @@ const paintUnitSprite = (
   ctx.strokeStyle = rgbCss(GRID_COLOUR);
   ctx.lineWidth = 1;
   ctx.strokeRect(bx + 0.5, by + 0.5, badge - 1, badge - 1);
+};
+
+/** A swinging tool and strike particles remain visible even when the worker is in a stack. */
+const paintWorkActivity = (
+  ctx: Canvas2D,
+  rect: { readonly x: number; readonly y: number; readonly size: number },
+  kind: string,
+  step: number,
+): void => {
+  const size = rect.size;
+  const pose = step % 6;
+  const [tipX, tipY] = [
+    [13, 3],
+    [17, 4],
+    [21, 8],
+    [20, 13],
+    [17, 8],
+    [14, 4],
+  ][pose] ?? [13, 3];
+  ctx.save();
+  ctx.translate(rect.x + size * 0.59, rect.y + size * 0.23);
+  ctx.scale(size / 64, size / 64);
+  ctx.fillStyle = '#192b25e8';
+  ctx.beginPath();
+  ctx.arc(13, 13, 13, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#edce83';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.strokeStyle = '#d9ad65';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(7, 23);
+  ctx.lineTo(tipX ?? 13, tipY ?? 3);
+  ctx.stroke();
+  ctx.strokeStyle = kind === 'irrigation' ? '#9ad1c9' : '#dbe1d7';
+  ctx.lineWidth = kind === 'road' ? 5 : 3;
+  ctx.beginPath();
+  ctx.moveTo((tipX ?? 13) - 6, (tipY ?? 3) + 2);
+  ctx.lineTo((tipX ?? 13) + 5, (tipY ?? 3) - 1);
+  ctx.stroke();
+  if (pose === 3 || pose === 4) {
+    ctx.fillStyle = kind === 'irrigation' ? '#9ad1c9' : '#edce83';
+    for (const [x, y] of [
+      [18, 23],
+      [24, 19],
+      [27, 26],
+    ]) {
+      ctx.fillRect((x ?? 0) + (pose - 3) * 2, (y ?? 0) - (pose - 3) * 2, 2, 2);
+    }
+  }
+  ctx.restore();
 };
 
 /** Eight-way road segments meet at identical edge/corner coordinates on neighbouring tiles. */
@@ -631,9 +697,9 @@ const paintRoads = (
   }
 };
 
-/** Is this tile's top-left corner inside the canvas (with one tile of slack for the edges)? */
-const onScreen = (x: number, y: number, viewport: ViewportPx): boolean =>
-  x > -64 && y > -64 && x < viewport.width + 64 && y < viewport.height + 64;
+/** Does this tile intersect the canvas at the current zoom? */
+const onScreen = (x: number, y: number, viewport: ViewportPx, size: number): boolean =>
+  x + size > 0 && y + size > 0 && x < viewport.width && y < viewport.height;
 
 /** A screen point, offset by the canvas's own page position — the hit-test's first step. */
 export const withinCanvas = (point: ScreenPoint, viewport: ViewportPx): boolean =>

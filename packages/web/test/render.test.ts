@@ -229,6 +229,37 @@ describe('drawFrame — the border layer', () => {
 });
 
 describe('map objects and unit stacks', () => {
+  it('keeps activity visible under a selected stack member, and omits offscreen work', () => {
+    const recorder = recordingContext();
+    const input = {
+      state: STATE,
+      viewer: Number(P0),
+      camera: cityCamera(),
+      viewport: VIEWPORT,
+      cities: [],
+      ownerColour: colourOf,
+      cursor: null,
+      units: [
+        { id: asUnitId(0), tile: CITY.tile, type: 'warrior', colour: '#ff0000', selected: true },
+        {
+          id: asUnitId(1),
+          tile: CITY.tile,
+          type: 'worker',
+          colour: '#ff0000',
+          selected: false,
+          work: { kind: 'road', turnsLeft: 2 },
+        },
+      ],
+    };
+    expect(drawFrame(recorder.ctx, input).workingTiles).toEqual([CITY.tile]);
+    expect(
+      drawFrame(recordingContext().ctx, {
+        ...input,
+        camera: { ...input.camera, x: STATE.map.width, y: STATE.map.height },
+      }).workingTiles,
+    ).toEqual([]);
+  });
+
   it('draws map objects only on explored tiles, including roads and improvements', () => {
     const first = CITY.tile;
     const hidden = asTileIndex(Number(first) + 1);
