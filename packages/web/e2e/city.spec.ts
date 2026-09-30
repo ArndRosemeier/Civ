@@ -103,6 +103,7 @@ test('A4 city screen: the City <name> dialog opens from the Cities list and show
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText(String(city.population));
   // The list entry that opened it is the city's own name, not a coordinate or an id.
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(cityList(page).getByRole('button', { name: city.name, exact: true })).toBeVisible();
   expect(state.cities.length).toBe(1);
 });

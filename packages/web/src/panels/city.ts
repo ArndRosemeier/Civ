@@ -330,9 +330,12 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
   const production = el(doc, 'fieldset');
   const queue = el(doc, 'section');
   queue.setAttribute('aria-label', 'Production queue');
-  dialog.append(title, close, facts, tiles, production, queue);
+  dialog.append(title, close, facts, production, queue, tiles);
 
   wrapper.append(el(doc, 'h2', 'Cities'), list, dialog);
+  const empty = el(doc, 'p', 'Found your first city with a settler to begin building your empire.');
+  empty.dataset['role'] = 'empty-state';
+  wrapper.append(empty);
   parent.append(wrapper);
 
   let openCityId: CityId | undefined;
@@ -343,7 +346,9 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
     const playerId = ctx.api.playerId();
 
     list.replaceChildren();
-    for (const entry of cityListEntries(state, ruleset, playerId)) {
+    const cityEntries = cityListEntries(state, ruleset, playerId);
+    empty.hidden = cityEntries.length > 0;
+    for (const entry of cityEntries) {
       const item = el(doc, 'li');
       const button = el(doc, 'button', entry.name);
       button.type = 'button';
@@ -355,7 +360,7 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
         el(
           doc,
           'span',
-          ` — ${String(entry.population)} ${entry.population === 1 ? 'citizen' : 'citizens'}${
+          `${String(entry.population)} ${entry.population === 1 ? 'citizen' : 'citizens'}${
             entry.building === undefined ? '' : `, building ${entry.building}`
           }`,
         ),

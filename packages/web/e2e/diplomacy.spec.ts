@@ -3,6 +3,7 @@ import { openApp, readState, authoritativeState, endTurnButton } from './helpers
 
 test('diplomacy controls declare war and negotiate peace through the engine', async ({ page }) => {
   await openApp(page);
+  await page.getByRole('tab', { name: 'Diplomacy', exact: true }).click();
   const rival = (await readState(page)).players.find(
     (player) => player.kind === 'civ' && player.id !== 0,
   );

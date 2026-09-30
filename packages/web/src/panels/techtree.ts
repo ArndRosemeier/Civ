@@ -190,6 +190,8 @@ export const mountTechPanel = (parent: HTMLElement, ctx: PanelContext): TechPane
 
   const openButton = el(doc, 'button', 'Technology');
   openButton.type = 'button';
+  const summary = el(doc, 'p');
+  summary.dataset['role'] = 'research-summary';
 
   const dialog = doc.createElement('dialog');
   dialog.setAttribute('aria-label', 'Technology');
@@ -201,7 +203,7 @@ export const mountTechPanel = (parent: HTMLElement, ctx: PanelContext): TechPane
   const status = el(doc, 'p');
   const list = el(doc, 'ul');
   dialog.append(el(doc, 'h2', 'Technology'), close, status, list);
-  element.append(openButton, dialog);
+  element.append(summary, openButton, dialog);
   parent.append(element);
 
   const refresh = (): void => {
@@ -210,6 +212,7 @@ export const mountTechPanel = (parent: HTMLElement, ctx: PanelContext): TechPane
     const playerId = ctx.api.playerId();
 
     const research = researchStatus(state, ruleset, playerId);
+    summary.textContent = `${research.name ?? 'Choose your next discovery'} · ${String(research.beakers)} beakers`;
     status.textContent =
       research.name === undefined
         ? `Researching: ${research.note} (${String(research.beakers)} beakers)`
@@ -235,8 +238,24 @@ export const mountTechPanel = (parent: HTMLElement, ctx: PanelContext): TechPane
         ctx.dispatch({ type: 'SetResearch', tech: row.id });
       });
       item.append(button);
+      const badge = el(
+        doc,
+        'small',
+        row.researching
+          ? 'Researching'
+          : row.state === 'known'
+            ? 'Discovered'
+            : row.state === 'available'
+              ? 'Available to research'
+              : 'Locked',
+      );
+      badge.dataset['role'] = 'technology-state';
+      badge.dataset['state'] = row.state;
+      item.append(badge);
       if (row.state === 'locked' && row.missing.length > 0) {
-        item.append(el(doc, 'span', ` — requires ${row.missing.join(', ')}`));
+        item.append(
+          el(doc, 'span', `Requires ${row.missing.map((id) => techName(ruleset, id)).join(', ')}`),
+        );
       }
       list.append(item);
     }

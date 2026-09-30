@@ -1757,6 +1757,7 @@ export const actionControlIndices = async (container: Locator): Promise<readonly
 export const openPanel = async (page: Page, pattern: RegExp): Promise<Locator> => {
   const existing = page.getByRole('dialog', { name: pattern });
   if ((await existing.count()) > 0) return existing.first();
+  if (pattern.test('Debug')) await page.getByRole('tab', { name: 'Game', exact: true }).click();
   const opener = page.getByRole('button', { name: pattern }).first();
   if ((await opener.count()) === 0) {
     const names: string[] = [];

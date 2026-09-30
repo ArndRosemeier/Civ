@@ -229,7 +229,11 @@ export const mountGovernmentControl = (
     // verdict rather than beside it. The menu itself stays usable — looking at what a government
     // would have been is not issuing a command — but the button that dispatches is not offered.
     button.disabled = !verdict.acceptable || commandsClosed(ctx.api);
-    notice.textContent = verdict.note;
+    notice.textContent = verdict.acceptable
+      ? verdict.note
+          .replace('the engine accepts ', 'Available: ')
+          .replace(' as your government', '')
+      : verdict.note.replace(/^the engine refuses it \([^)]+\): /, '');
   };
 
   select.addEventListener('change', () => {

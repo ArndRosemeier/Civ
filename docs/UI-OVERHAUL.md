@@ -1795,3 +1795,20 @@ Every file was restored byte-identical and checked with `sha256sum -c` before th
   would need is not available: the panels are 380 px wide around a scoreboard table that measures
   362/362, so the table would overflow its panel and clip the `Score` column that §4.1's work exists
   to protect.
+
+## Workspace redesign (September 2026)
+
+This implementation replaces the earlier simultaneous-panel and 40/60 dock layouts described above.
+
+- The top bar carries turn, year, treasury, science and luxury figures plus New game, Save and Load.
+- Five keyboard-accessible sidebar tabs separate Overview (units and cities), Empire (percentage budget and government), Diplomacy (relations and scoreboard), History (events) and Game (session information and debugging).
+- Research status, Technology, Next unit and End turn remain available below every view.
+- A docked dialog uses the sidebar's content area. Opening another closes the previous dialog; switching views closes the dialog. Covered controls become inert so keyboard focus cannot enter them.
+- The map's geometry remains unchanged when views or dialogs change. Grid, keyboard help, save feedback and order feedback live in the map toolbar.
+- The selected unit has an artwork portrait and separate health, movement and activity readouts. Unit rows show movement or their current job. Cities have population/production descriptions and an initial empty-state hint.
+- City information, production, queue and worked tiles are visually grouped. Research cards distinguish discovered, available, active and locked technologies and use readable prerequisite names.
+- Desktop layouts use a bounded sidebar with its own scrolling content. On phones, the map and sidebar stack vertically and persistent controls share a compact footer.
+
+Budget controls display percentages in steps of 10; conversion to the engine's tenths occurs only at the UI boundary. All command legality, costs, yields, research and government rules still come from the engine. Navigation, layout and artwork remain outside save state and state hashes.
+
+Verification: web unit tests, TypeScript, ESLint, production build, browser gameplay checks, navigation/focus checks and screenshots at desktop, narrow desktop and phone sizes. The obsolete assertions requiring every panel to be visible simultaneously were replaced by dedicated workspace coverage.

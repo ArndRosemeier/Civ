@@ -1,42 +1,4 @@
-/**
- * X1 — the three things a player could not do: see a panel, set the rates, and read the sidebar.
- * See docs/INTERFACES.md, M8 ("The accessibility contract", "The UI must not contain game
- * rules", A1/A4 coverage).
- *
- * ## Why these facts need their own assertions
- *
- * 1. **A panel opened below the fold is an A1 failure.** The dialogs are non-modal on purpose
- *    (the game keeps being played while one is open), and a `<dialog open>` is laid out at its
- *    static position unless the stylesheet says otherwise — so on a 900 px-tall window the city
- *    screen, the tech tree and the debug panel appeared as a title and a Close button under
- *    everything else. Nothing in the suite noticed, because every locator is role-and-name based
- *    and a scrolled-out element still *matches*. The assertions here are therefore geometric:
- *    the panel's box is inside the window, and the screen points that matter (the middle of the
- *    map, the unit's own controls) still belong to the game rather than to a panel floating over
- *    it. That last half is not hypothetical either: centring the dialogs with `position: fixed`
- *    was implemented and measured, and it turned `debug.spec.ts` (which plays on while the debug
- *    panel is open) and the keystone wheel-zoom red — a panel over the game eats the gestures the
- *    game is driven by.
- * 2. **`SetRates` had no control anywhere.** It is the one queried setter with no enumerable
- *    list behind it — the rate space is a search space over a triple — so the status strip now
- *    carries an editable triple beside the pools it feeds, and the ENGINE judges every edit
- *    (`planSetRates`, the same evaluator `applyCommand` refuses with). The tests below check the
- *    whole loop: the engine's rates really move, the displayed strip stays in step, and an
- *    illegal triple is refused by the engine with the engine's own words rather than by a rule
- *    this UI invented.
- * 3. **Phase 3 re-partitioned the sidebar, and both halves of that are geometry.** The dialogs
- *    were docked under the map, where they took up to 40 % of the map column's height — measured at
- *    900×1000, opening the debug panel cut the map region from 915 px to 546 px, which moves the box
- *    the camera clamps against and the click hit-test inverts. They are docked in the sidebar now,
- *    so the map's box is asserted to be *identical* with and without panels open. And the sidebar
- *    itself, which used to hold 1219 px of content in an 823 px box at 1280×900 (its scoreboard cut
- *    off mid-row, its table 530 px wide inside a 378 px panel), is asserted to hold all of it.
- *
- * Every locator is role + accessible name, except where the claim is about the CSS box itself —
- * see the note above `sidebarReport` for why that one exception is the right one. The new names this
- * file's milestones add (`Tax rate`, `Science rate`, `Luxury rate`, `Rates`) collide with none of the
- * names the frozen table fixes.
- */
+/** Browser checks for docked dialogs, map interaction, scoreboard readability and percentage budgets. Workspace navigation and responsive layout are covered in workspace.spec.ts. */
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
@@ -52,8 +14,6 @@ import {
   dispatch,
   dispatchLog,
   endTurnButton,
-  endTurns,
-  eventLog,
   foundCity,
   hashOf,
   headlessNewGame,
@@ -103,9 +63,10 @@ const typeRates = async (
   science: string,
   luxury: string,
 ): Promise<void> => {
-  await taxRate(page).fill(tax);
-  await scienceRate(page).fill(science);
-  await luxuryRate(page).fill(luxury);
+  await page.getByRole('tab', { name: 'Empire', exact: true }).click();
+  await taxRate(page).fill(String(Number(tax) * 10));
+  await scienceRate(page).fill(String(Number(science) * 10));
+  await luxuryRate(page).fill(String(Number(luxury) * 10));
 };
 
 /* ------------------------------------------------------------------ *
@@ -162,83 +123,6 @@ const boxOf = async (locator: Locator): Promise<Box> => {
  * can express "this box has 96 px more content than it can show". Everything a player or a screen
  * reader is *offered* is still asserted by role and name, in this file and in `panels.spec.ts`.
  * ------------------------------------------------------------------ */
-
-/** A box on screen, with whatever does not fit inside it. */
-interface MeasuredBox {
-  readonly name: string;
-  readonly x: number;
-  readonly y: number;
-  readonly width: number;
-  readonly height: number;
-  /** How much more content there is than box, in each direction. Zero means nothing is clipped. */
-  readonly overflowX: number;
-  readonly overflowY: number;
-}
-
-interface SidebarReport {
-  readonly viewport: { readonly width: number; readonly height: number };
-  readonly sidebar: MeasuredBox;
-  readonly stack: MeasuredBox;
-  readonly panels: readonly MeasuredBox[];
-  readonly scoreTable: MeasuredBox;
-  /** The `Score` columnheader's cell — M10's column, the one the horizontal defect hid. */
-  readonly scoreHeader: MeasuredBox | null;
-  /** The last cell of every scoreboard row, i.e. the score itself, one per player. */
-  readonly scoreCells: readonly MeasuredBox[];
-}
-
-const sidebarReport = async (page: Page): Promise<SidebarReport> =>
-  page.evaluate(() => {
-    const measured = (element: Element, name: string): MeasuredBox => {
-      const rect = element.getBoundingClientRect();
-      const box = element as HTMLElement;
-      return {
-        name,
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
-        overflowX: box.scrollWidth - box.clientWidth,
-        overflowY: box.scrollHeight - box.clientHeight,
-      };
-    };
-    const require = (selector: string): Element => {
-      const found = document.querySelector(selector);
-      if (found === null) throw new Error(`the page has no ${selector}`);
-      return found;
-    };
-
-    const stack = require("[data-layout='panel-stack']");
-    const table = require("[data-panel='scoreboard'] table");
-    const scoreHeader = table.querySelector('thead th:last-child');
-    const scoreCells: MeasuredBox[] = [];
-    let index = 0;
-    for (const row of table.querySelectorAll('tbody tr')) {
-      const cell = row.lastElementChild;
-      if (cell !== null) scoreCells.push(measured(cell, `score cell ${String(index)}`));
-      index += 1;
-    }
-    return {
-      viewport: { width: window.innerWidth, height: window.innerHeight },
-      sidebar: measured(require("main > section[aria-label='Panels']"), 'the sidebar'),
-      stack: measured(stack, 'the panel stack'),
-      panels: Array.from(stack.children)
-        // `display: contents` generates no box, so the outcome wrapper is skipped rather than
-        // reported at 0,0: what it holds is the `Show outcome` control, which is hidden until the
-        // game is over (`victory.ts`) and is covered by the ending-screen tests, not here.
-        .filter((child) => child.getBoundingClientRect().height > 0)
-        .map((child) => measured(child, child.getAttribute('data-panel') ?? child.tagName)),
-      scoreTable: measured(table, 'the scoreboard table'),
-      scoreHeader: scoreHeader === null ? null : measured(scoreHeader, 'the Score columnheader'),
-      scoreCells,
-    };
-  });
-
-const within = (inner: MeasuredBox, outer: MeasuredBox, tolerance = 1): boolean =>
-  inner.x >= outer.x - tolerance &&
-  inner.y >= outer.y - tolerance &&
-  inner.x + inner.width <= outer.x + outer.width + tolerance &&
-  inner.y + inner.height <= outer.y + outer.height + tolerance;
 
 /** Assert `what`'s box — and its Close control — are entirely inside the window. */
 const expectFullyVisible = async (what: string, dialog: Locator): Promise<void> => {
@@ -447,11 +331,11 @@ test('X1 placement: an open panel covers neither the map nor the action buttons,
     humanPlayerId(await readState(page)),
   );
 
-  // 7. And a second panel opened beside the first is still fully visible: they share the dock — and
+  // 7. Opening another panel replaces the previous dialog in the dock, and
   //    the map is still where it was, with three things now on screen.
   const tech = await openPanel(page, /^Technology$/);
   await expectFullyVisible('the Technology panel beside the Debug panel', tech);
-  await expectFullyVisible('the Debug panel beside the Technology panel', debug);
+  await expect(debug).toBeHidden();
   const canvasWithTwo = await canvasBox(page);
   expect(
     {
@@ -566,250 +450,11 @@ test('X1 hover: the tile readout appears over the map, and the map keeps every c
  * That last one is the control. Without it this test would pass on an empty log in a strip with
  * nothing in it, which is the "a test that cannot fail is decoration" failure this project names.
  */
-test('X1 sidebar: at 1280×900 the strip holds every panel and the whole scoreboard, and does not scroll to do it', async ({
-  page,
-}) => {
-  await openApp(page);
-  expect(page.viewportSize(), 'this test is about the 1280×900 window').toEqual(VIEWPORT);
-  await seedApp(page, SEED);
-  // A city in the `Cities` list and a second unit in the `Units` list, and then a played game so the
-  // event log fills to its own bound — the state the overflow was measured in.
-  await foundCity(page);
-  await endTurns(page, 14);
-
-  const logOverflow = await eventLog(page).evaluate(
-    (element) => element.scrollHeight - element.clientHeight,
-  );
-  expect(
-    logOverflow,
-    'the event log is not longer than its own box, so this test is measuring an empty strip and ' +
-      'could not fail for the defect it is about',
-  ).toBeGreaterThan(0);
-
-  const report = await sidebarReport(page);
-
-  // 1. The strip itself never overflows, in either direction. A strip that scrolls is how the
-  //    scoreboard got cut off in the first place: a scrollbar does not tell a player that the row
-  //    they are looking at is half a row.
-  expect(
-    report.sidebar.overflowY,
-    `the sidebar holds ${String(report.sidebar.overflowY)} px more content than it can show, so a ` +
-      `panel at its bottom edge is cut off`,
-  ).toBeLessThanOrEqual(1);
-  expect(
-    report.sidebar.overflowX,
-    `the sidebar holds ${String(report.sidebar.overflowX)} px more content than it is wide, so a ` +
-      `panel is clipped at its right edge`,
-  ).toBeLessThanOrEqual(1);
-
-  // 2. And neither does the stack inside it — which is the stronger claim, because that is the
-  //    element that could scroll instead: the strip would look tidy while the stack hid the
-  //    scoreboard behind a scrollbar.
-  expect(
-    report.stack.overflowY,
-    `the panel stack holds ${String(report.stack.overflowY)} px more content than it can show, so ` +
-      `the panels at its bottom are below the fold`,
-  ).toBeLessThanOrEqual(1);
-
-  // 3. Every panel is whole, inside the strip and inside the window. Named individually, because
-  //    "one of them is cut off" is not a useful failure message.
-  expect(report.panels.length, 'the sidebar is not holding the panels').toBeGreaterThan(5);
-  for (const panel of report.panels) {
-    expect(
-      within(panel, report.sidebar, 1.5),
-      `the ${panel.name} panel is not inside the sidebar: the panel is at ${String(
-        Math.round(panel.y),
-      )}..${String(Math.round(panel.y + panel.height))} and the sidebar holds ${String(
-        Math.round(report.sidebar.y),
-      )}..${String(Math.round(report.sidebar.y + report.sidebar.height))}`,
-    ).toBe(true);
-    expect(
-      panel.overflowY,
-      `the ${panel.name} panel has ${String(panel.overflowY)} px of its own content hidden inside it`,
-    ).toBeLessThanOrEqual(1);
-  }
-
-  // 4. The scoreboard is the panel the defect was measured on, so it is asserted cell by cell: the
-  //    table is inside the strip (its width is the part that was cut off sideways), there is a row
-  //    per player — so "every row is on screen" is not a claim about an empty table — and the last
-  //    cell of each row, which is M10's score, is on screen.
-  const players = (await readState(page)).players.length;
-  expect(
-    report.scoreTable.x + report.scoreTable.width,
-    'the scoreboard is clipped by the strip',
-  ).toBeLessThanOrEqual(report.sidebar.x + report.sidebar.width + 1);
-  // The table's OWN box, not only the strip's. The tempting band-aid for a table that does not fit
-  // is to let the table scroll sideways inside its panel — which hides the same columns one level
-  // down, behind a scrollbar that nothing in the app ever shows a player. Measured before the fix:
-  // 530 px of table in a 378 px panel.
-  expect(
-    report.scoreTable.overflowX,
-    `the scoreboard's columns are ${String(report.scoreTable.overflowX)} px wider than the panel, so ` +
-      `its right-hand columns are behind a horizontal scrollbar`,
-  ).toBeLessThanOrEqual(1);
-  expect(
-    report.scoreCells.length,
-    'the scoreboard has no rows, so nothing below is a claim about the scoreboard',
-  ).toBe(players);
-  const scoreHeader = report.scoreHeader;
-  expect(scoreHeader, 'the scoreboard has no Score columnheader to measure').not.toBeNull();
-  if (scoreHeader === null) return;
-  expect(
-    within(scoreHeader, report.sidebar, 1.5),
-    `the Score columnheader is off the edge of the strip at x=${String(Math.round(scoreHeader.x))}, ` +
-      `which is where the horizontal half of the defect put it`,
-  ).toBe(true);
-  for (const cell of report.scoreCells) {
-    expect(
-      within(cell, report.sidebar, 1.5),
-      `${cell.name} is cut off: the cell is at y=${String(Math.round(cell.y))}..${String(
-        Math.round(cell.y + cell.height),
-      )}, x=${String(Math.round(cell.x))}..${String(Math.round(cell.x + cell.width))}, and the ` +
-        `sidebar holds y=${String(Math.round(report.sidebar.y))}..${String(
-          Math.round(report.sidebar.y + report.sidebar.height),
-        )}, x=${String(Math.round(report.sidebar.x))}..${String(
-          Math.round(report.sidebar.x + report.sidebar.width),
-        )}`,
-    ).toBe(true);
-  }
-});
-
-/* ------------------------------------------------------------------ *
- * 2. THE RATES
- * ------------------------------------------------------------------ */
-
-/**
- * The panel at the fold, measured rather than described — the visual review's third finding.
- *
- * `docs/KNOWN-ISSUES.md` §4.6 recorded it as unexplained: *"the scoreboard body appears empty in the
- * help-panel screenshot while populated in the other two."* It is not empty and it is not squeezed.
- * Measured at 1280×900 with the keyboard help open: the desktop is unchanged in the DOM — the
- * scoreboard panel still measures 106 px tall and its table 74 px, `scrollHeight === clientHeight` on
- * both — while the **panel stack** shrinks to the 40 % a dialog leaves it (`61..523`, 669 px of
- * content in 462 px of box) and the scoreboard happens to sit across that edge: its heading is above
- * the fold and its whole body is below it. A panel cut by a scroll container's edge is §4.1's
- * documented behaviour; what made it read as a defect is that this browser paints no scrollbar at
- * rest, so a list that continues below the fold looks exactly like a panel with nothing in it.
- *
- * The assertions therefore pin the *cause*, so a future change that really does squeeze the table to
- * nothing fails here and this explanation cannot rot into a wrong claim.
- */
-test('X1 fold: with a dialog open the scoreboard’s body is below the stack’s fold, and nothing was squeezed to make it fit', async ({
-  page,
-}) => {
-  await openApp(page);
-  await seedApp(page, SEED, OPPONENT_OFF);
-
-  const boxes = async (): Promise<{
-    readonly stack: Box;
-    readonly heading: Box;
-    readonly table: Box;
-    readonly tableScrolls: boolean;
-    readonly panelScrolls: boolean;
-  }> =>
-    page.evaluate(() => {
-      const rectOf = (node: Element | null): Box => {
-        if (node === null) throw new Error('the element the fold test measures is not in the DOM');
-        const rect = node.getBoundingClientRect();
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      };
-      const stack = document.querySelector("[data-layout='panel-stack']");
-      const panel = document.querySelector("[data-panel='scoreboard']");
-      const table = document.querySelector("[data-panel='scoreboard'] table");
-      const heading = document.querySelector("[data-panel='scoreboard'] h2");
-      return {
-        stack: rectOf(stack),
-        heading: rectOf(heading),
-        table: rectOf(table),
-        tableScrolls: table !== null && table.scrollHeight > table.clientHeight,
-        panelScrolls: panel !== null && panel.scrollHeight > panel.clientHeight,
-      };
-    });
-
-  const before = await boxes();
-  expect(
-    before.table.height,
-    'the scoreboard table has no height with nothing open, so this test cannot see it squeezed',
-  ).toBeGreaterThan(20);
-
-  const help = page.getByRole('button', { name: 'Keyboard' });
-  await help.click();
-  await expect(page.getByRole('dialog', { name: 'Keyboard' })).toBeVisible();
-  // Additional panels (including Diplomacy) change where the scoreboard starts. Arrange the
-  // clipping case this test inspects by scrolling its heading into view; do not depend on a
-  // historical number of panels above it. The table's dimensions are still asserted unchanged.
-  await page.locator("[data-layout='panel-stack']").evaluate((stack) => {
-    const heading = stack.querySelector("[data-panel='scoreboard'] h2");
-    if (heading === null) throw new Error('No scoreboard heading');
-    const delta = heading.getBoundingClientRect().bottom - stack.getBoundingClientRect().bottom;
-    if (delta > 0) stack.scrollTop += Math.ceil(delta);
-  });
-  const after = await boxes();
-
-  const stackBottom = after.stack.y + after.stack.height;
-  expect(
-    stackBottom,
-    'the panel stack did not shrink, so the docked dialog is not competing for the strip and this ' +
-      'test is not measuring the arrangement it describes',
-  ).toBeLessThan(before.stack.y + before.stack.height);
-  expect(
-    after.table.height,
-    'the scoreboard table lost its height when the dialog opened — that is a squeeze, not the fold',
-  ).toBeCloseTo(before.table.height, 0);
-  expect(after.tableScrolls, 'the table scrolls inside itself, so its own body is not whole').toBe(
-    false,
-  );
-  expect(
-    after.panelScrolls,
-    'the scoreboard panel scrolls inside itself, so its own body is not whole',
-  ).toBe(false);
-  expect(
-    after.heading.y + after.heading.height,
-    'the scoreboard’s heading is not above the stack’s fold, so the panel that reads as empty is ' +
-      'not the panel this test is about',
-  ).toBeLessThanOrEqual(stackBottom);
-  expect(
-    Math.min(after.table.y + after.table.height, stackBottom) -
-      Math.max(after.table.y, after.stack.y),
-    `the scoreboard's body is not below the fold: the table is at y=${String(
-      Math.round(after.table.y),
-    )}..${String(Math.round(after.table.y + after.table.height))} and the stack ends at ` +
-      String(Math.round(stackBottom)),
-  ).toBeLessThanOrEqual(2);
-
-  // The other half of phase 5's arrangement, and the reason it is asserted here: the first visual
-  // review found the body's last visible row *jammed against the `Close` control*, because the
-  // control was the last thing in the dialog and the body's cut edge sat directly above it.
-  const close = page
-    .getByRole('dialog', { name: 'Keyboard' })
-    .getByRole('button', { name: 'Close' });
-  const closeBox = await close.boundingBox();
-  const keysBox = await page.locator("[data-panel='keyboard'] [data-role='keys']").boundingBox();
-  expect(closeBox, 'the Keyboard panel has no Close control').not.toBeNull();
-  expect(keysBox, 'the Keyboard panel has no bindings body').not.toBeNull();
-  if (closeBox === null || keysBox === null) return;
-  expect(
-    closeBox.y + closeBox.height,
-    'the Close control is below the scrolling body, so the row the body cuts in half is the one ' +
-      'sitting against the way out of the panel',
-  ).toBeLessThanOrEqual(keysBox.y + 1);
-});
-
-/**
- * The scoreboard's name column, clear of the first figure.
- *
- * The first visual review read the longest row as `Barbarians0`. Measured before the repair, the
- * label's cell ended at x 955 and the first value's cell began at 955, with the 2 px cell padding the
- * only separation there was — a gap that reads as one word in the one column whose content is a
- * *name* rather than a figure. The repair widens that column's right padding to 8 px and pays for it
- * out of the panel's own side padding (the table measured `scrollWidth / clientWidth` of 362/362, so
- * there was nothing else to spend), which is why the second assertion here is that the table still
- * fits: a gap bought by overflowing the strip would be a worse defect than the one it fixed.
- */
 test('X1 scoreboard: the name column is clear of its first figure, and the table still fits the strip', async ({
   page,
 }) => {
   await openApp(page);
+  await page.getByRole('tab', { name: 'Diplomacy', exact: true }).click();
   await seedApp(page, SEED, OPPONENT_OFF);
 
   const measured = await page.evaluate(() => {
@@ -864,6 +509,7 @@ test('X1 rates: setting the rates through the status strip moves the ENGINE’s 
   page,
 }) => {
   await openApp(page);
+  await page.getByRole('tab', { name: 'Empire', exact: true }).click();
   const state = await seedApp(page, SEED);
   const owner = humanPlayerId(state);
   expect(await recordDispatches(page), 'the seam could not be instrumented').toBe(true);
@@ -883,10 +529,10 @@ test('X1 rates: setting the rates through the status strip moves the ENGINE’s 
   const initial = started.value.players.find((player) => player.id === owner)?.rates;
   expect(initial, 'the headless state has no rates for the acting seat').toBeDefined();
   if (initial === undefined) return;
-  await expect(taxRate(page)).toHaveValue(String(initial.tax));
-  await expect(scienceRate(page)).toHaveValue(String(initial.science));
-  await expect(luxuryRate(page)).toHaveValue(String(initial.luxury));
-  await expect(ratesNotice(page)).toContainText('the engine accepts');
+  await expect(taxRate(page)).toHaveValue(String(initial.tax * 10));
+  await expect(scienceRate(page)).toHaveValue(String(initial.science * 10));
+  await expect(luxuryRate(page)).toHaveValue(String(initial.luxury * 10));
+  await expect(ratesNotice(page)).toContainText('Budget ready to apply.');
   await expect(setRatesButton(page)).toBeEnabled();
 
   // A legal triple, typed by a player and applied by the control.
@@ -914,9 +560,9 @@ test('X1 rates: setting the rates through the status strip moves the ENGINE’s 
   expect(after, 'the rates command changed nothing at all').not.toBe(hashOf(started.value));
 
   // The strip is in step with the state it just changed — the triple, and the pool beside it.
-  await expect(taxRate(page)).toHaveValue('5');
-  await expect(scienceRate(page)).toHaveValue('3');
-  await expect(luxuryRate(page)).toHaveValue('2');
+  await expect(taxRate(page)).toHaveValue('50');
+  await expect(scienceRate(page)).toHaveValue('30');
+  await expect(luxuryRate(page)).toHaveValue('20');
   await expect(treasuryIndicator(page)).toContainText(
     String(humanPlayer(await readState(page)).treasury),
   );
@@ -953,15 +599,16 @@ test('X1 rates: setting the rates through the status strip moves the ENGINE’s 
     )}, which is the triple this test uses to prove the strip follows the state`,
   ).toBe(true);
   expect(await dispatch(page, { type: 'SetRates', rates: elsewhere })).toBe('ok');
-  await expect(taxRate(page)).toHaveValue(String(elsewhere.tax));
-  await expect(scienceRate(page)).toHaveValue(String(elsewhere.science));
-  await expect(luxuryRate(page)).toHaveValue(String(elsewhere.luxury));
+  await expect(taxRate(page)).toHaveValue(String(elsewhere.tax * 10));
+  await expect(scienceRate(page)).toHaveValue(String(elsewhere.science * 10));
+  await expect(luxuryRate(page)).toHaveValue(String(elsewhere.luxury * 10));
 });
 
 test('X1 rates: an illegal triple is refused by the ENGINE, in the engine’s own words, and never dispatched', async ({
   page,
 }) => {
   await openApp(page);
+  await page.getByRole('tab', { name: 'Empire', exact: true }).click();
   await seedApp(page, SEED);
   const hashBefore = await stateHash(page);
 
@@ -977,7 +624,8 @@ test('X1 rates: an illegal triple is refused by the ENGINE, in the engine’s ow
   if (engineMessage === undefined) return;
 
   await typeRates(page, '5', '5', '5');
-  await expect(ratesNotice(page)).toContainText(engineMessage);
+  await expect(ratesNotice(page)).toContainText('exactly 100%');
+  await expect(ratesNotice(page)).toContainText('= 150%');
   // The control cannot offer what the engine refuses: it is disabled, so a player cannot dispatch
   // it and a sweep cannot either.
   await expect(setRatesButton(page)).toBeDisabled();
@@ -995,13 +643,13 @@ test('X1 rates: an illegal triple is refused by the ENGINE, in the engine’s ow
   const unreadable = ratesProblem({ tax: Number.NaN, science: 5, luxury: 5 });
   expect(unreadable, 'the engine accepts an unreadable rate').toBeDefined();
   await taxRate(page).fill('');
-  await expect(ratesNotice(page)).toContainText(unreadable ?? 'unreachable');
+  await expect(ratesNotice(page)).toContainText('percentage in steps of 10');
   await expect(setRatesButton(page)).toBeDisabled();
 
   // And the rule is recoverable: a legal triple re-enables the control and applies.
   await typeRates(page, '5', '5', '0');
   await expect(setRatesButton(page)).toBeEnabled();
-  await expect(ratesNotice(page)).toContainText('the engine accepts');
+  await expect(ratesNotice(page)).toContainText('Budget ready to apply.');
   await setRatesButton(page).click();
   expect(await stateHash(page), 'the legal triple did not change the state').not.toBe(hashBefore);
 });

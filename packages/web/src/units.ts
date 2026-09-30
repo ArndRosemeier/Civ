@@ -58,6 +58,12 @@ const UNIT_URLS: Readonly<Record<UnitSpriteId, string>> = {
   knight: knightUrl,
 };
 
+/** The same artwork used by the map and the unit inspector. */
+export const unitArtworkUrl = (type: string): string | undefined => {
+  const urls: Readonly<Partial<Record<string, string>>> = UNIT_URLS;
+  return urls[type];
+};
+
 /** Decode one PNG URL into an `HTMLImageElement` that is ready to paint. */
 const decodeUnit = async (url: string): Promise<HTMLImageElement> => {
   const image = new Image();

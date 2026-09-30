@@ -85,6 +85,7 @@ import { CATALOG, validateRuleset, type Ruleset } from '@civts/rules';
  */
 import { SMART_POLICY, policyRngFor } from '@civts/sim';
 import { hashValue } from '@civts/testing';
+import { arrangeWorkspace } from './workspace.js';
 
 import {
   centreOnTile,
@@ -108,7 +109,7 @@ import {
   type UnitMarker,
 } from './render.js';
 import { loadTerrainSprites, type TerrainSprites } from './tiles.js';
-import { loadUnitSprites, type UnitSprites } from './units.js';
+import { loadUnitSprites, unitArtworkUrl, type UnitSprites } from './units.js';
 import { createTerrainArtwork } from './terrain-art.js';
 import { loadMapSprites } from './map-art.js';
 import { createMapAnimation } from './animation.js';
@@ -397,6 +398,7 @@ interface NewGameControls {
 const buildNewGame = (doc: Document): NewGameControls => {
   const dialog = doc.createElement('dialog');
   dialog.setAttribute('aria-label', 'New game');
+  dialog.dataset['panel'] = 'new-game';
 
   const field = (label: string, control: HTMLElement): HTMLLabelElement => {
     const wrapper = el(doc, 'label', `${label} `);
@@ -457,7 +459,7 @@ const buildNewGame = (doc: Document): NewGameControls => {
   );
 
   const heading = el(doc, 'h2', 'New game');
-  dialog.append(heading, fields);
+  dialog.append(heading, close, fields);
 
   const open = el(doc, 'button', 'New game');
   open.type = 'button';
@@ -557,11 +559,7 @@ const buildShell = (doc: Document): Shell => {
 
   const main = el(doc, 'main');
 
-  // The map column holds the map and nothing else, so the map's box — the box the camera clamps
-  // against and the click hit-test inverts — cannot move because a panel opened. It used to hold the
-  // map *and* the dock, and the dock took up to 40 % of the column's height: measured at 900×1000,
-  // opening the debug panel cut the map region from 915 px to 546 px. See `styles.css`, which states
-  // the two-column rule and where a dialog is docked now.
+  // Keep map geometry independent of sidebar content and dialogs.
   const mapColumn = el(doc, 'div');
   mapColumn.dataset['layout'] = 'map-column';
 
@@ -602,11 +600,7 @@ const buildShell = (doc: Document): Shell => {
   mapRegion.append(tileReadout);
   mapColumn.append(mapRegion);
 
-  // The sidebar: a strip holding everything that is not a direct unit action, in two regions. The
-  // stack carries the panels; the dock, at its foot, carries the dialogs the panels open. Both live
-  // here rather than in the map column because a side screen belongs with the other side furniture
-  // and because the two of them must share one bounded strip — see `styles.css` for the 40/60 split
-  // and for what the strip's overflow used to cost.
+  // Workspace navigation and docked dialogs share a bounded sidebar.
   const panelsRoot = el(doc, 'section');
   panelsRoot.setAttribute('aria-label', 'Panels');
   const panelStack = el(doc, 'div');
@@ -867,6 +861,7 @@ const start = async (): Promise<void> => {
   };
 
   const panelsApi: PanelsApi = {
+    unitArtworkUrl,
     document: doc,
     ruleset,
     state: () => state,
@@ -888,24 +883,7 @@ const start = async (): Promise<void> => {
 
   const panels: PanelsHandle = mountPanels(shell.panelStack, panelsApi);
 
-  /**
-   * Dock the panels' dialogs at the foot of the sidebar.
-   *
-   * The panels own the elements — their roles, their names and their contents are all built in
-   * `panels/` — and the shell owns the *layout*, which is the split `panels/index.ts` states. So
-   * this is a placement, not a second copy: the elements move, they are not duplicated, and every
-   * panel's own `open()` keeps working because it holds the element it always held.
-   *
-   * **They used to be docked under the map, and moving them here is the phase's structural
-   * change.** The map column then had two claimants and the map lost height whenever a panel
-   * opened — measured at 900×1000, where opening the debug panel cut the map region from 915 px to
-   * 546 px — which moves the box the camera clamps against and the click hit-test inverts *while
-   * the player is playing*. The sidebar is the home of everything that is not a direct unit action
-   * (the owner's design, §7.6 phase 3), and a side screen belongs with it; the stack of panels and
-   * the dock share the strip rather than one of them taking the map's room. What the move buys,
-   * beyond the map standing still, is that an opened panel still covers neither the map nor the
-   * unit's orders — the two facts the green placement tests assert.
-   */
+  // Move existing dialogs into the sidebar; their owning panels keep their references.
   shell.dock.append(
     // M10's outcome screen goes first: it is the one dialog that is opened BY the game rather than
     // by the player, and it should land at the top of the dock, where the end of a game is
@@ -942,6 +920,13 @@ const start = async (): Promise<void> => {
    */
   shell.mapRegion.append(panels.elements.unitActions);
   panels.elements.unitActions.dataset['floating'] = 'unit-actions';
+  arrangeWorkspace(shell.root, shell.panelsRoot, shell.panelStack, shell.dock, panels.elements, {
+    endTurn: shell.endTurn,
+    nextUnit: shell.nextUnit,
+    grid: shell.grid,
+    keyboard: shell.keyboard.open,
+    order: shell.orderStatus,
+  });
 
   /**
    * Put the popup beside the selected unit, and keep it on the map.
@@ -1688,6 +1673,13 @@ const start = async (): Promise<void> => {
   });
 
   doc.addEventListener('keydown', (event) => {
+    // Native button activation takes priority over session shortcuts.
+    if (
+      (event.key === 'Enter' || event.key === ' ') &&
+      event.target instanceof HTMLElement &&
+      event.target.closest('button') !== null
+    )
+      return;
     const dialogOpen = doc.querySelector('dialog[open]') !== null;
     const action = sessionActionFor(keyContext(event, dialogOpen));
     if (action === undefined) return;

@@ -110,6 +110,7 @@ test('A4 status strip: treasury, science and luxury are the acting player’s ow
 test('A4 event log: the log is the engine’s own story of the game', async ({ page }) => {
   await openApp(page);
   const state = await seedApp(page, SEED);
+  await page.getByRole('tab', { name: 'History', exact: true }).click();
   await expect(eventLog(page)).toBeAttached();
   const linesAtStart = await eventLog(page).getByRole('listitem').count();
   expect(linesAtStart, 'a game that has just started already had events').toBe(0);
@@ -156,6 +157,7 @@ test('A4 scoreboard: one row per player, with the engine’s own counts', async 
   await foundCity(page);
   const after = await readState(page);
   const owner = humanPlayerId(after);
+  await page.getByRole('tab', { name: 'Diplomacy', exact: true }).click();
 
   const table = scoreboard(page);
   await expect(table).toBeVisible();

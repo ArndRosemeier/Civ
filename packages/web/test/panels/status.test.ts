@@ -63,9 +63,9 @@ describe('statusFacts', () => {
     expect(value('Luxury')).toBe('Luxury 0 luxuries');
   });
 
-  it('says out loud that luxuries do nothing yet, rather than implying a mechanic', () => {
+  it('describes luxury spending and the presentation calendar without obsolete milestone text', () => {
     const luxury = statusFacts(STATE, P0).find((fact) => fact.name === 'Luxury');
-    expect(luxury?.title).toContain('M9');
+    expect(luxury?.title).toContain('happy');
     const year = statusFacts(STATE, P0).find((fact) => fact.name === 'Year');
     expect(year?.title).toContain('no calendar');
   });

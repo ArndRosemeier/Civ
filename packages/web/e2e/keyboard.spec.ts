@@ -163,6 +163,7 @@ test('phase 5 next-unit: when there is nothing to move to, the flow says so inst
     'the seat has more than one unit with orders, so this case cannot arise',
   ).toBe(1);
   expect(await selectedUnit(page), 'the remaining unit is not the selected one').toBe(after[0]);
+  await mapViewport(page).focus();
   await page.keyboard.press('Space');
   expect(
     await orderChannel(page),
@@ -178,6 +179,7 @@ test('phase 5 next-unit: when there is nothing to move to, the flow says so inst
       message: 'fortifying the last unit did not leave the engine offering it nothing',
     })
     .toEqual([]);
+  await mapViewport(page).focus();
   await page.keyboard.press('Space');
   expect(await orderChannel(page)).toContain('no unit needs orders');
 });
@@ -197,6 +199,7 @@ test('phase 5 keyboard: a field, a panel and a modifier keep the keys the browse
   // The rates row is three number fields a player types into, and it is on the page for real. Enter
   // in a field is the field's; Space in a field is a space. A session key that ran anyway would make
   // the rate controls unusable — and Enter would end the turn while the player was typing a rate.
+  await page.getByRole('tab', { name: 'Empire', exact: true }).click();
   const taxRate = page.getByRole('spinbutton', { name: 'Tax rate' });
   await taxRate.focus();
   await page.keyboard.press('Enter');

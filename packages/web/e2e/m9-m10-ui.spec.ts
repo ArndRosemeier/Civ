@@ -391,6 +391,7 @@ test('M9 government: the menu is the engine’s catalog, and the refusal a playe
   await closeDialogs(page);
 
   const menu = governmentMenu(page);
+  await page.getByRole('tab', { name: 'Empire', exact: true }).click();
   const button = governmentButton(page);
   const notice = governmentVerdict(page);
   await expect(menu).toBeVisible();
@@ -417,7 +418,7 @@ test('M9 government: the menu is the engine’s catalog, and the refusal a playe
   expect(engineGovernment, 'the state carries no government for the acting seat').not.toBe('');
   await expect(menu).toHaveValue(engineGovernment);
   await expect(button).toBeEnabled();
-  await expect(notice).toContainText('the engine accepts');
+  await expect(notice).toContainText('Available:');
 
   // The hash of the position BEFORE any refusal, so the two refusals below are checked against
   // "nothing moved" rather than against a claim about what they did.
@@ -434,7 +435,7 @@ test('M9 government: the menu is the engine’s catalog, and the refusal a playe
   ).toBeDefined();
   if (gated === undefined) return;
   await menu.selectOption(gated.id);
-  await expect(notice).toContainText('government-tech-required');
+  await expect(notice).toContainText('needs');
   await expect(notice).toContainText(gated.name);
   await expect(button).toBeDisabled();
 
@@ -458,7 +459,7 @@ test('M9 government: the menu is the engine’s catalog, and the refusal a playe
   // …and back to the row the engine accepts, dispatched by the control itself.
   await menu.selectOption(engineGovernment);
   await expect(button).toBeEnabled();
-  await expect(notice).toContainText('the engine accepts');
+  await expect(notice).toContainText('Available:');
   await clearDispatchLog(page);
   await button.click();
   const dispatched = await dispatchLog(page);
@@ -511,6 +512,7 @@ test('M10 scoreboard: the Score column is the engine’s own scoreTable, player 
 
   const state = await readState(page);
   const table = scoreboard(page);
+  await page.getByRole('tab', { name: 'Diplomacy', exact: true }).click();
   await expect(table).toBeVisible();
   expect(
     await table.getByRole('columnheader', { name: 'Score' }).count(),
@@ -666,6 +668,7 @@ test('M10 victory screen: a real game played to its end shows the derived outcom
   // **No control keeps offering a command the engine would refuse.** The engine answers `game-over`
   // to every command but `EndTurn` on a finished game, so the controls that dispatch one are closed.
   await expect(endTurnButton(page)).toBeDisabled();
+  await page.getByRole('tab', { name: 'Empire', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Set rates' })).toBeDisabled();
   await expect(governmentButton(page)).toBeDisabled();
   expect(

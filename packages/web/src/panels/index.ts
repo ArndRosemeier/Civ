@@ -168,6 +168,7 @@ export interface PanelSelection {
 
 /** Everything the panels need from the app — see the module note for the full contract. */
 export interface PanelsApi {
+  readonly unitArtworkUrl?: (type: string) => string | undefined;
   /** The document elements are created in (the shell's document, or a test's). */
   readonly document: Document;
   /** The validated ruleset the session plays under. */
@@ -201,6 +202,8 @@ export interface PanelContext {
 
 /** The mounted elements, for the shell's layout and stylesheet. */
 export interface PanelsElements {
+  readonly rates: HTMLElement;
+  readonly diplomacy: HTMLElement;
   readonly statusbar: HTMLElement;
   /** The `Units` region: the unit list and the selected unit's readouts. */
   readonly units: HTMLElement;
@@ -305,7 +308,7 @@ export const statusFacts = (state: GameState, playerId: PlayerId): readonly Stat
     {
       name: 'Luxury',
       text: `Luxury ${String(luxuries)} luxuries`,
-      title: 'Luxuries accumulate and have no effect until happiness arrives (M9).',
+      title: 'Luxury spending helps keep your citizens happy.',
     },
   ];
 };
@@ -413,8 +416,19 @@ export const ratesVerdict = (
  */
 const rateFromInput = (input: HTMLInputElement | undefined): number => {
   if (input === undefined) return Number.NaN;
-  const parsed = Number.parseInt(input.value, 10);
+  const parsed = input.valueAsNumber;
   return Number.isFinite(parsed) ? parsed : Number.NaN;
+};
+
+/** Present the engine's rate quantities in the percentages used by the controls. */
+const budgetProblemText = (note: string): string => {
+  const problem = note.replace('the engine refuses it: ', '');
+  if (problem.includes('must be an integer'))
+    return 'Enter a non-negative percentage in steps of 10.';
+  if (problem.includes('rates must sum') || problem.includes('is capped at')) {
+    return problem.replace(/-?\d+(?:\.\d+)?/g, (number) => `${String(Number(number) * 10)}%`);
+  }
+  return problem;
 };
 
 export interface RatesControlHandle {
@@ -441,7 +455,7 @@ export const mountRatesControl = (parent: HTMLElement, ctx: PanelContext): Rates
   const doc = parent.ownerDocument;
   const element = el(doc, 'div');
   element.dataset['panel'] = 'rates';
-  element.append(el(doc, 'span', 'Rates'));
+  element.append(el(doc, 'h2', 'Budget allocation'));
 
   const inputs = new Map<RateField['key'], HTMLInputElement>();
   for (const field of RATE_FIELDS) {
@@ -452,12 +466,12 @@ export const mountRatesControl = (parent: HTMLElement, ctx: PanelContext): Rates
     // rule is stated in terms of. They are a form hint, not the rule: nothing here sums the three,
     // and a triple typed past them is still the engine's to accept or refuse.
     input.min = '0';
-    input.max = String(RATE_TOTAL);
-    input.step = '1';
+    input.max = String(RATE_TOTAL * 10);
+    input.step = '10';
     input.setAttribute('aria-label', field.name);
     input.value = '0';
     inputs.set(field.key, input);
-    label.append(field.label, input);
+    label.append(`${field.label} %`, input);
     element.append(label);
   }
 
@@ -476,14 +490,17 @@ export const mountRatesControl = (parent: HTMLElement, ctx: PanelContext): Rates
   /** The state's rates as last seen, so a change that came from the engine re-seeds the draft. */
   let seeded = '';
 
-  const read = (key: RateField['key']): number => rateFromInput(inputs.get(key));
+  const read = (key: RateField['key']): number => rateFromInput(inputs.get(key)) / 10;
 
   const update = (): void => {
     const verdict = ratesVerdict(ctx.api.state(), ctx.api.ruleset, ctx.api.playerId(), draft);
     // M10: a finished game refuses *every* command, so the control is closed with the engine's own
     // verdict rather than beside it — the keystone property with one more rule behind it.
     button.disabled = !verdict.acceptable || commandsClosed(ctx.api);
-    notice.textContent = verdict.note;
+    notice.textContent = verdict.acceptable
+      ? 'Budget ready to apply.'
+      : budgetProblemText(verdict.note);
+    notice.dataset['valid'] = String(verdict.acceptable);
   };
 
   const onEdit = (): void => {
@@ -515,7 +532,7 @@ export const mountRatesControl = (parent: HTMLElement, ctx: PanelContext): Rates
       // An unreadable draft leaves the field empty rather than writing `NaN` into it: the number
       // input would drop that text anyway, and the engine's verdict already says what is wrong.
       const value = draft[field.key];
-      const text = Number.isFinite(value) ? String(value) : '';
+      const text = Number.isFinite(value) ? String(value * 10) : '';
       if (input.value !== text) input.value = text;
     }
     update();
@@ -635,7 +652,10 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
     for (const fact of statusFacts(state, playerId)) {
       const node = statusElements.get(fact.name);
       if (node === undefined) continue;
-      node.textContent = fact.text;
+      node.replaceChildren(
+        el(doc, 'span', `${fact.name} `),
+        el(doc, 'strong', fact.text.replace(`${fact.name} `, '')),
+      );
       node.title = fact.title;
     }
 
@@ -690,6 +710,8 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
     },
     log,
     elements: {
+      rates: rates.element,
+      diplomacy: diplomacy.element,
       statusbar,
       units: units.element,
       unitActions: units.actions,

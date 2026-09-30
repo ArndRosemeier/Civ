@@ -435,6 +435,24 @@ test('adversarial keystone — offered: no control on the page dispatches a comm
     // refuses it), the offered/reachable sweeps above, and the queried-setters pass below
     // ("enablement agrees with the engine"). What is gained is that this pass now reaches the
     // whole page instead of its first ten controls.
+    for (const view of ['Empire', 'Diplomacy']) {
+      await page.getByRole('tab', { name: view, exact: true }).click();
+      const viewButtons = page.getByRole('tabpanel').getByRole('button');
+      const count = await viewButtons.count();
+      for (let index = 0; index < count; index += 1) {
+        const control = viewButtons.nth(index);
+        if (!(await control.isEnabled())) continue;
+        await clickAndJudge(
+          page,
+          control,
+          `seed ${String(seed)} ${view} button ${String(index)}`,
+          findings,
+          records,
+          await listedNow(page),
+        );
+      }
+    }
+    await page.getByRole('tab', { name: 'Overview', exact: true }).click();
     let skippedDisabled = 0;
     await closeDialogs(page);
     let index = 0;
@@ -787,6 +805,7 @@ test('adversarial keystone — the queried setters: every setter the engine acce
       'the engine refused a legal rates triple, so nothing below would prove anything',
     ).toBe(true);
 
+    await page.getByRole('tab', { name: 'Empire', exact: true }).click();
     const ratesButton = page.getByRole('button', { name: /^Set rates/i });
     const rateControls = await ratesButton.count();
     expect(
@@ -895,9 +914,12 @@ const ARITHMETIC = /[\w)\]]\s*[+\-*/%]\s*[\w([{]/;
  * than trusting review.
  */
 const allowedBecause = (file: string, line: string): string | undefined => {
+  file = file.replaceAll('\\', '/');
   const base = file.slice(file.lastIndexOf('/') + 1);
   if (/^\s*(\*|\/\/|\/\*)/.test(line)) return 'comment';
   if (/^\s*(import\b|\} from|export \{)/.test(line.trim())) return 'module list';
+  if (file === 'main.ts' && /sum \+ Math\.max\(0, unit\.movementLeft\)/.test(line))
+    return 'read existing movement for goto progress detection';
   // A label that PRINTS engine figures and joins them with `+`: the operands are string literals
   // and engine calls, and the values come from the engine (`eventLines` is the log's only author).
   if (
@@ -1061,6 +1083,7 @@ test('the UI cannot diverge: after a command the panels, the log text and the dr
 
   // One more command, issued by the control a player presses, whose events the engine also renders
   // here — so the log is checked against the engine's own prose rather than against the DOM.
+  await page.getByRole('tab', { name: 'History', exact: true }).click();
   const linesBefore = (await eventLog(page).getByRole('listitem').allInnerTexts()).map((line) =>
     line.trim(),
   );
@@ -1085,6 +1108,7 @@ test('the UI cannot diverge: after a command the panels, the log text and the dr
   await expect(scienceIndicator(page)).toContainText(String(player.beakers));
   await expect(luxuryIndicator(page)).toContainText(String(player.luxuries));
 
+  await page.getByRole('tab', { name: 'Diplomacy', exact: true }).click();
   const rows = await scoreboard(page).locator('tbody tr').allInnerTexts();
   expect(rows.length, 'the scoreboard lost a player').toBe(after.players.length);
   for (const other of after.players) {
@@ -1101,6 +1125,7 @@ test('the UI cannot diverge: after a command the panels, the log text and the dr
     }
   }
 
+  await page.getByRole('tab', { name: 'Overview', exact: true }).click();
   const cityRows = await page
     .getByRole('list', { name: 'Cities' })
     .getByRole('button')
@@ -1120,6 +1145,7 @@ test('the UI cannot diverge: after a command the panels, the log text and the dr
     }
   }
 
+  await openPanel(page, /^Debug$/);
   const hashShown = await stateHashIndicator(page).innerText();
   if (!hashShown.includes(hashOf(applied.value.state))) {
     findings.push(
@@ -1130,6 +1156,7 @@ test('the UI cannot diverge: after a command the panels, the log text and the dr
 
   /* --- the event log, against the engine's own rendering of the same events --- */
 
+  await page.getByRole('tab', { name: 'History', exact: true }).click();
   const logLines = (await eventLog(page).getByRole('listitem').allInnerTexts()).map((line) =>
     line.trim(),
   );

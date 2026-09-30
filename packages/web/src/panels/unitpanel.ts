@@ -327,7 +327,8 @@ export const mountUnitPanel = (parent: HTMLElement, ctx: PanelContext): UnitPane
   const detail = el(doc, 'div');
   const actions = el(doc, 'div');
   actions.setAttribute('role', 'group');
-  element.append(el(doc, 'h2', 'Units'), list, detail);
+  detail.dataset['role'] = 'unit-inspector';
+  element.append(el(doc, 'h2', 'Units'), detail, list);
   parent.append(element, actions);
 
   const refresh = (): void => {
@@ -341,6 +342,14 @@ export const mountUnitPanel = (parent: HTMLElement, ctx: PanelContext): UnitPane
     for (const row of rows) {
       const item = el(doc, 'li');
       const button = el(doc, 'button', row.label);
+      button.setAttribute('aria-label', row.label);
+      const activity = el(
+        doc,
+        'span',
+        row.work ?? (row.fortified ? 'Fortified' : `${String(row.movementLeft)} moves`),
+      );
+      activity.dataset['role'] = 'unit-activity';
+      button.append(activity);
       button.type = 'button';
       if (row.id === selected) button.setAttribute('aria-current', 'true');
       button.addEventListener('click', () => {
@@ -360,16 +369,28 @@ export const mountUnitPanel = (parent: HTMLElement, ctx: PanelContext): UnitPane
       return;
     }
 
-    detail.append(
-      el(
-        doc,
-        'p',
-        `${row.label} at ${row.tileText} — ${row.hitPoints}, ${String(row.movementLeft)} movement left` +
-          (row.fortified ? ', fortified' : '') +
-          (row.experience > 0 ? `, level ${String(row.experience)}` : '') +
-          (row.work === undefined ? '' : `, ${row.work}`),
-      ),
+    const selectedUnit = unitById(state, row.id);
+    const art =
+      selectedUnit === undefined ? undefined : ctx.api.unitArtworkUrl?.(selectedUnit.type);
+    if (art !== undefined) {
+      const image = doc.createElement('img');
+      image.src = art;
+      image.alt = '';
+      detail.append(image);
+    }
+    const info = el(doc, 'div');
+    info.append(el(doc, 'h3', row.label), el(doc, 'p', `Position ${row.tileText}`));
+    const stats = el(doc, 'div');
+    stats.dataset['role'] = 'unit-stats';
+    stats.append(
+      el(doc, 'span', row.hitPoints),
+      el(doc, 'span', `${String(row.movementLeft)} movement left`),
     );
+    info.append(stats);
+    if (row.work !== undefined) info.append(el(doc, 'p', row.work));
+    if (row.fortified) info.append(el(doc, 'p', 'Fortified'));
+    if (row.experience > 0) info.append(el(doc, 'p', `Experience level ${String(row.experience)}`));
+    detail.append(info);
 
     actions.setAttribute('aria-label', `Actions for unit ${String(row.id)}`);
     // M10: a finished game refuses every command (`game-over`), so the group's controls are

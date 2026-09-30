@@ -1,874 +1,723 @@
-/*
- * The app's stylesheet.
- *
- * Presentation only — no rule, no cost and no legality is decided here, and nothing below is read
- * by a test: the e2e suite targets roles and accessible names, so a restyle cannot break it (that
- * is the contract's stated reason for freezing the names). This file exists so the panels are
- * readable next to the map rather than stacked in one narrow column, and so the map keeps its own
- * fixed box: the camera clamps against that box, and a fluid one would make "which tile is under
- * this point?" depend on the window size at the moment of the click.
- *
- * ## Two columns: the map, and everything that is not a direct unit action
- *
- * `[data-layout='map-column']` holds the map and **nothing else**; `section[aria-label='Panels']`
- * is the strip that holds everything else — the status strip, the lists, the scoreboard, the event
- * log, the save and debug controls, and (in `[data-layout='dock']`, at its foot) the dialogs the
- * panels open. That is the owner's design for this phase, stated in `docs/UI-OVERHAUL.md` §7.6:
- * *"the map should be a square, covering the left side of the screen and the leftover sidebar hosts
- * everything that is not a direct unit action."* The unit's orders are not in either column — they
- * are the popup float over the map, beside the unit they belong to.
- *
- * ## The dock used to be under the map, and moving it is what stopped the map from moving
- *
- * The dialogs were docked in the map column, under the map, taking up to 40 % of the column's
- * height. Two things were wrong with that. The obvious one: the column then had two claimants, so
- * the map gave up height whenever a panel opened — measured at 900×1000, where the map region fell
- * from 915 px to 546 px (a 450 px canvas became a 450 px canvas in a squeezed region) the moment the
- * debug panel opened — and the map's box is the box the camera clamps against and the click
- * hit-test inverts. A window that re-lays-out the map when a panel opens is a window where a tile's
- * screen point can change between the moment a test computes it and the moment it clicks. The less
- * obvious one: the dock's 40 % was a holding position, not a design, and a side screen deserved
- * either the whole strip or a stated share of it.
- *
- * In the sidebar the two regions *share* the strip instead: the stack of panels keeps a minimum
- * share (40 %), the dock may take the rest (60 %), and neither can take the other's. The map column
- * has one claimant and its box never changes.
- *
- * ## An opened panel is DOCKED — it never floats over the game
- *
- * An opened panel used to be laid out in the document flow, which put it *below the fold*: a
- * `<dialog>` opened with `show()` is `position: absolute` from the UA stylesheet with no block
- * offsets, so it lands at its static position — far down a page whose panel column is taller than
- * the window — and a player on a 900 px-tall window saw a title and a Close button and nothing
- * else. That is an A1 failure: a human could not play.
- *
- * Floating it back over the game is not the fix either, and that was measured rather than assumed:
- * centring the dialogs with `position: fixed` turned three green e2e tests red, because a panel
- * over the middle of the page intercepts the pointer the game needs — `debug.spec.ts` plays on
- * (found a city, end a turn) while the debug panel is open, and `keystone.spec.ts` measures the
- * wheel-zoom gesture while a city screen is open, so a dialog over the map swallows both.
- *
- * So a dialog is docked **inside the sidebar**, bounded by it (`max-height`, `overflow: auto`), and
- * neither the map nor the panels above it is covered: the panels keep their share of the strip and
- * the map keeps all of its own box. `main.ts` states the same rule where the move happens.
- *
- * To make that stable, the *document* never grows: the app is exactly one window tall, the strip
- * never scrolls as a whole (its panel stack does, when the content genuinely cannot fit), and the
- * map's box — the box the camera clamps against and the hit-test inverts — is in the same place
- * whatever is open. A scrolling page would move the canvas out from under a pointer between the
- * moment a test computes a tile's screen point and the moment it clicks it, and would make the
- * dock's position depend on how far the page happened to be scrolled.
- *
- * ## The strip fits what it holds, and that took more than a rule about overflow
- *
- * A measured defect of the previous arrangement (`docs/UI-OVERHAUL.md` §9, phase 3): at 1280×900
- * the sidebar's content was **1219 px in an 823 px box** once the event log filled, so it scrolled;
- * the scoreboard was cut off mid-row at the bottom edge, and the table was **530 px wide inside a
- * 378 px panel**, which cut its right-hand columns — including M10's `Score` — off entirely. The
- * strip's own scrolling is not a fix for either, because a scrollbar does not tell a player that the
- * row they are looking at is half of a row. So the panels are **densified** (tighter padding,
- * margins and gaps), the three unbounded lists get a bounded body that scrolls **inside its own
- * panel**, the scoreboard's type is sized to fit the strip, and the save and debug rows put their
- * controls on one line. The result is measured in `panel-usability.spec.ts`: with a full log, a
- * founded city and a live opponent, the sidebar's content is smaller than its box, and every panel
- * — and every scoreboard row — is entirely on screen.
- */
-
 :root {
-  --bg: #12161c;
-  --panel: #1b2129;
-  --ink: #e8e6df;
-  --muted: #9aa3ad;
-  --accent: #d8c37a;
+  color-scheme: dark;
+  --bg: #0d171b;
+  --panel: #17262b;
+  --ink: #edf0e8;
+  --muted: #9eafb1;
+  --accent: #d9b96f;
+  --line: #2b4147;
 }
-
+th:first-child,
+td:first-child {
+  padding-right: 10px;
+}
+[data-role='save-status'] {
+  color: var(--muted);
+  font-size: 11px;
+  max-width: 30%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-role='state-hash'] {
+  color: var(--muted);
+  font: 11px/1.6 monospace;
+  overflow-wrap: anywhere;
+  margin-bottom: 14px;
+}
 * {
   box-sizing: border-box;
 }
-
+[hidden],
+dialog:not([open]) {
+  display: none !important;
+}
 html,
 body {
   height: 100%;
 }
-
 body {
   margin: 0;
   overflow: hidden;
   background: var(--bg);
   color: var(--ink);
   font:
-    14px/1.45 system-ui,
-    'Segoe UI',
+    14px/1.5 'Segoe UI',
+    system-ui,
     sans-serif;
 }
-
 #civts-app {
+  height: 100dvh;
   display: flex;
   flex-direction: column;
-  height: 100vh;
 }
-
 #civts-app > header {
-  flex: 0 0 auto;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 16px;
-  padding: 8px 16px;
-  background: var(--panel);
-  border-bottom: 1px solid #2b333d;
+  min-height: 76px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: #142126;
 }
-
-#civts-app > header h1 {
-  font-size: 18px;
+h1 {
   margin: 0;
+  color: var(--accent);
+  font:
+    700 24px Georgia,
+    serif;
   letter-spacing: 0.04em;
 }
-
-/*
- * The order channel: the header's `status` named `Order` (Phase 4). It says what the engine said
- * about the last order — a refusal, a goto under way, a goto cancelled — and it lives in the header
- * because a message that covers the map is a message that hides the thing it is about.
- *
- * **It is one line, always, and that is a layout rule rather than a taste.** The header is
- * `flex: 0 0 auto`, so anything that makes it taller takes height off `main`, and the map's box is
- * the box the camera clamps against and the click hit-test inverts — a status line that wrapped
- * would move the map *while a test is computing a tile's screen point*, which is the defect Phase 3
- * removed from the dock. So the line never wraps (`white-space: nowrap`), it is allowed to shrink
- * (`min-width: 0`), and what does not fit is ellipsised; `main.ts` puts the whole sentence in the
- * element's `title` so nothing is lost, and the accessible name and text stay complete for a test
- * and for a screen reader (`overflow: hidden` clips pixels, not text).
- *
- * The two buttons keep their own width for the same reason — the message may not squeeze them out of
- * existence — and the empty line is zero-height rather than a gap, so a game with nothing to report
- * lays out exactly as it did before this element existed.
- */
-#civts-app > header > p[data-role='order'] {
-  flex: 1 1 auto;
-  min-width: 0;
-  margin: 0;
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+h2 {
+  font-size: 17px;
+  margin: 0 0 14px;
+  font-weight: 600;
 }
-
-#civts-app > header > p[data-role='order']:empty {
-  flex: 0 1 0;
-  padding: 0;
+h3 {
+  font-size: 15px;
+  margin: 0 0 6px;
 }
-
-#civts-app > header > button {
-  flex: 0 0 auto;
+p {
+  margin: 8px 0;
 }
-
-main {
-  flex: 1 1 auto;
-  min-height: 0;
+button,
+input,
+select {
+  font: inherit;
+}
+button {
+  color: var(--ink);
+  background: #22363c;
+  border: 1px solid #3a5056;
+  border-radius: 7px;
+  padding: 9px 13px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+button:hover:not(:disabled) {
+  background: #304951;
+  border-color: #70908f;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+input,
+select {
+  background: #0f1c21;
+  border: 1px solid #456069;
+  border-radius: 6px;
+  color: var(--ink);
+  padding: 8px;
+  max-width: 100%;
+}
+input[type='checkbox'] {
+  accent-color: var(--accent);
+}
+[data-panel='status'] {
   display: flex;
-  align-items: stretch;
+  gap: 25px;
+  margin-left: auto;
+}
+[data-panel='status'] > [role='status'] {
+  display: flex;
+  flex-direction: column;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+[data-panel='status'] strong {
+  color: var(--ink);
+  font-size: 16px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+[data-layout='global-tools'] {
+  display: flex;
+  gap: 6px;
+}
+main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
   gap: 16px;
   padding: 16px;
-  overflow: hidden;
 }
-
-/* The map column: the map, and nothing else. It has one claimant, so the map's box never changes
-   when a panel opens — see the module note. `display: flex` is what lets the region below stretch. */
 [data-layout='map-column'] {
-  /* The map takes the room the sidebar leaves. It used to be `0 0 auto`, sized by its contents —
-     a fixed 720 px canvas. Now the layout owns the width and the canvas fits itself inside it. */
-  flex: 1 1 0;
+  flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 10px;
 }
-
-/*
- * The map region fills the whole column: the map takes every pixel the sidebar does not.
- *
- * There is no square and no `aspect-ratio` here. The owner's first design made the map a square, but
- * that wasted the slack whenever the column was wider than tall — a tall window left real map area
- * unused. The design that replaced it: the map should fill all available space not used by the
- * sidebar. The canvas is `100% × 100%` of the region, so the region and the map are the same
- * rectangle, and `padding: 0` removes the panel's usual inset for the same reason.
- *
- * `overflow: hidden` guarantees the region can never be grown by a child that overshoots. The canvas
- * is sized by the layout and read back by `main.ts`'s `measureCanvas`; a non-square box is fine
- * there, because the camera clamp, the renderer and the hit-test each take a width and a height and
- * none of them ever assumed the two were equal.
- */
 [data-panel='map'] {
-  flex: 1 1 0;
-  /* Resizing the backing bitmap must not feed its intrinsic size back into flex layout. */
+  flex: 1;
   contain: size;
   min-height: 0;
   overflow: hidden;
-  padding: 0;
-  border: 1px solid #2b333d;
-  background: #0d1116;
-  line-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #10191f;
 }
-
 [data-panel='map'] canvas {
   width: 100%;
   height: 100%;
   cursor: crosshair;
 }
-
-/*
- * The unit action popup: the unit panel's `Actions for unit <id>` group, moved over the map beside
- * the unit it belongs to. The shell places it (see `placeUnitActions`); this is what it looks like.
- *
- * `position: fixed` because the shell positions it from the canvas's own rectangle — the map region
- * is a padded, centred, size-contained box, and absolute positioning inside it would mean undoing
- * that box's padding and border before canvas coordinates meant anything.
- *
- * `line-height` is set back to a readable value deliberately: the map region sets `line-height: 0`
- * to close the inline gap under the canvas, and this element is a child of that region, so without
- * this rule every button label would be squashed flat. `[hidden]` needs its own rule for the same
- * class of reason — `display: flex` below would otherwise defeat the `hidden` attribute the shell
- * sets when nothing is selected.
- */
-[data-floating='unit-actions'] {
-  position: fixed;
-  z-index: 5;
-  /*
-   * The map keeps its gestures underneath the popup, and only the buttons take the pointer.
-   *
-   * Floating a menu over an interactive map has one unavoidable cost — whatever the menu covers
-   * cannot be clicked — and this reduces it to the part that is *correct*: a press on a button is
-   * meant for the button, and a press anywhere else in the popup is meant for the map below it.
-   * Without this rule the popup's own padding and gaps swallow map clicks, which was measured:
-   * a sweep that clicked a destination tile under the popup's background issued nothing at all.
-   */
-  pointer-events: none;
+[data-layout='map-tools'] {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  max-width: 16rem;
-  padding: 6px 8px;
-  line-height: 1.45;
-  background: var(--panel);
-  border: 1px solid #3a4652;
-  border-radius: 4px;
-  box-shadow: 0 6px 18px rgb(0 0 0 / 45%);
+  gap: 8px;
+  align-items: center;
+  height: 36px;
 }
-
-[data-floating='unit-actions'][hidden] {
-  display: none;
-}
-
-[data-floating='unit-actions'] > button {
-  pointer-events: auto;
-}
-
-/*
- * The tile readout: the hover layer (phase 6), and it obeys the rule above rather than repeating it.
- *
- * **`pointer-events: none`, and there is nothing in it that needs `auto`.** The unit action popup
- * had to give its buttons the pointer back because a menu is a thing you press; this is a thing you
- * read, so the whole element is transparent to the pointer. That is what keeps phase 2's measured
- * finding true — a box floating over the map that can be hit is a box that swallows the clicks aimed
- * at the tiles under it — and it is why `panel-usability.spec.ts` can go on asserting that the
- * browser's own hit test at the middle of the map answers `CANVAS`: `elementFromPoint` skips an
- * element that cannot be hit at all.
- *
- * `position: fixed` for the reason the popup gives (the shell positions it from the pointer's client
- * coordinates and the canvas's own rectangle, so the region's padding and border never enter the
- * arithmetic), `max-width` so a long sentence wraps in a column rather than running across the map,
- * and `line-height` set back to a readable value because the map region sets `line-height: 0` to
- * close the inline gap under the canvas and this element is a child of that region.
- *
- * The type is small and the colours are the panel palette: information, not chrome — the plan's
- * §2.E rule 5 asks for it on hover precisely so that it does not compete with the game for room.
- */
-[data-floating='tile-readout'] {
-  position: fixed;
-  z-index: 4;
-  pointer-events: none;
-  max-width: 20rem;
-  margin: 0;
-  padding: 4px 7px;
-  line-height: 1.45;
+[data-layout='map-tools'] button {
+  padding: 5px 12px;
   font-size: 12px;
-  color: var(--ink);
-  background: var(--panel);
-  border: 1px solid #3a4652;
-  border-radius: 4px;
-  box-shadow: 0 4px 14px rgb(0 0 0 / 45%);
 }
-
-[data-floating='tile-readout'][hidden] {
-  display: none;
+[data-role='order'] {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-
-/*
- * The map is in the tab order (phase 5), so it must say so when it has the focus — a keyboard user
- * who cannot see where the focus is has been given a key that does nothing visible. `:focus-visible`
- * rather than `:focus`, so a *pointer* press on the map does not paint a ring around it: the ring is
- * for the keyboard, which is the only user who needs it. `outline` is used rather than a border
- * because it is drawn outside the box and cannot change the size the camera clamps against.
- */
-[data-panel='map']:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/*
- * The keyboard help panel (phase 5). It inherits the docked dialog layout like every other panel;
- * this only makes a two-column list of key/meaning pairs readable inside a 380px strip — the keys
- * are short and must not be squeezed by the sentences beside them.
- */
-/*
- * The help panel: a scrolling body and a Close control that never scrolls away.
- *
- * Measured at 1280×900 with the panel open: its content is 514 px against the 488 px the dock may
- * take (60 % of the 823 px strip, `styles.css` above), so the panel as a whole scrolled — and the
- * last thing in it is its own `Close`. That is the below-the-fold defect this stylesheet already
- * records for the city and tech screens, pointed the other way. `overflow: hidden` on the dialog
- * with one scrollable child puts the way out outside the scrolling, so the control a player needs is
- * always on screen and the bindings scroll behind it.
- *
- * The `[open]` on the selector is **load-bearing, and it was measured rather than reasoned about.**
- * `dialog:not([open]) { display: none }` is a USER-AGENT rule, so any author `display` on the
- * element defeats it: with a bare `[data-panel='keyboard']` selector the *closed* help panel was
- * rendered, took 355 px of the sidebar's dock at load, dropped the panel stack from 817 px to
- * 462 px, and made `getByRole('dialog')` match a dialog nobody had opened.
- * `panel-usability.spec.ts` caught it — *"the panel stack holds 277 px more content than it can
- * show, so the panels at its bottom are below the fold"* — and so did the keyboard spec's own
- * `closeDialogs`. The rule now applies only while the panel is open, which is when it means
- * anything.
- */
-[data-panel='keyboard'][open] {
+section[aria-label='Panels'] {
+  position: relative;
+  width: 410px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
   overflow: hidden;
 }
-
-/*
- * The body scrolls, and **its bottom edge says so**.
- *
- * The measurement behind this rule: nine bindings and their two notes are 454 px in the 295 px box
- * a docked panel gets at 1280×900, so the panel cannot show them all and the body is a scroll
- * container. What the first visual review saw was not the scrolling, it was the *cut*: a row sliced
- * along its baseline flush against the panel's own edge, which reads as a rendering mistake rather
- * than as "there is more below". The browser does not help — measured on this element, an
- * `overflow: auto` box reports `offsetWidth / clientWidth = 362 / 362`, an overlay scrollbar laid
- * out as nothing, and thirty lines of `::-webkit-scrollbar` styling painted no bar and reserved no
- * space either (both measured, both reverted rather than left in as decoration). `scrollbar-gutter:
- * stable` does reserve 8 px, but this browser still paints no bar into it at rest, so it buys
- * nothing a player can see and costs the sentences 8 px of width.
- *
- * So the cue is drawn: the last 16 px fade out, which is the one affordance that does not depend on
- * a scrollbar being painted. It marks the cut whether or not the list is at its end, and that is the
- * direction to err in for a help panel whose purpose is to be read to the end.
- */
-[data-panel='keyboard'] [data-role='keys'] {
-  overflow-y: auto;
-  min-height: 0;
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent 100%);
-}
-
-[data-panel='keyboard'] dl {
-  grid-template-columns: 4.5em 1fr;
-  align-items: baseline;
-}
-
-[data-panel='keyboard'] dt {
-  font-family: ui-monospace, monospace;
+[data-layout='sidebar-heading'] {
+  padding: 18px 20px 12px;
+  font:
+    19px Georgia,
+    serif;
   color: var(--accent);
 }
-
-[data-panel='keyboard'] section + section {
-  margin-top: 6px;
-}
-
-[data-panel='keyboard'] h3 {
-  margin: 0 0 2px;
-}
-
-/*
- * The sidebar: a strip that holds everything which is not a direct unit action, and that never
- * overflows.
- *
- * `overflow: hidden` is the phase's whole point rather than a tidy-up. This element used to be
- * `overflow-y: auto` over **1219 px of content in an 823 px box** at 1280×900 (measured with the
- * event log full and the opponent live), which cut the scoreboard off mid-row and left the save and
- * debug panels entirely below the fold. A scrollbar is not a fix for that: a panel the player has to
- * scroll to find may as well not be there, and half a scoreboard row says nothing at all. So the
- * strip itself never scrolls, and the one region inside it that may is the panel stack below.
- *
- * A strip, not a competitor, for the width: `1 1 380px` let the sidebar grow alongside the map and
- * the two split the leftover; the owner's design is a square map covering the left and the sidebar
- * hosting everything that is not a direct unit action, so the sidebar states its width and the map
- * takes what remains. It may still shrink to `min-width` on a narrow window rather than pushing the
- * map off-screen. The width is a number the owner is still deciding (§7.7.5) and Phase 3 does not
- * settle it.
- */
-main > section[aria-label='Panels'] {
-  flex: 0 1 380px;
-  min-width: 340px;
-  min-height: 0;
-  overflow: hidden;
+[role='tablist'] {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
 }
-
-/*
- * The panel stack: the nine panels in the order the panels mount them, and the ONE part of the
- * sidebar that may scroll.
- *
- * It scrolls only when it has to, and that is a claim the suite measures rather than assumes: with
- * no dialog open at 1280×900 the stack's content is smaller than its box, so nothing in it is cut
- * off and the scrollbar does not appear. It is a scroll container at all so that the two cases
- * where the content genuinely cannot fit still show every panel instead of hiding some — a window
- * shorter than the panels (1600×700 holds 623 px of sidebar for ~790 px of panels) and a dialog
- * sharing the strip (where the stack keeps the 40 % below).
- *
- * `overflow-x: hidden` is deliberate: the stack must never gain a horizontal scrollbar, because the
- * one thing that used to overflow sideways was the scoreboard's table, and its columns are made to
- * fit the strip by the table rules further down. A horizontal scrollbar in a 380 px column would
- * hide the right-hand columns of the one table a player reads at a glance.
- */
-[data-layout='panel-stack'] {
-  flex: 1 1 auto;
-  min-height: 40%;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  overflow-y: auto;
-  overflow-x: hidden;
-}
-
-/*
- * A panel keeps its own height: the stack scrolls before a panel is squeezed.
- *
- * `flex: 0 0 auto` is not decoration. A flex item's automatic minimum size is its content's, but
- * only while its `overflow` is `visible` — and two of these panels need their own `overflow` (the
- * scoreboard bounds its body, the bounded lists are inside panels). Measured without this rule at
- * 1600×700: the stack overflowed by 147 px and the browser resolved it by shrinking the scoreboard
- * panel from 106 px to 10 px, i.e. by cutting the table off rather than scrolling — the very defect
- * this phase exists to remove, moved one level down. With it, the panels keep their heights and the
- * stack scrolls, so a panel is either whole on screen or whole below it, never half.
- */
-[data-layout='panel-stack'] > * {
-  flex: 0 0 auto;
-}
-
-/*
- * The dock: the dialogs, docked at the foot of the sidebar. It is a flex column so two panels
- * opened at once share it, and it never overlaps the map (it is not in the map's column at all) or
- * the panels above it.
- *
- * **The 60 % is the answer to the phase-3 question about the old 40 % cap, and it is a share rather
- * than a limit.** The old cap bounded the dock by the *window*; this bounds the two regions by each
- * other, so a side screen can never take the strip the panels need to stay reachable. That is not
- * hypothetical: `panel-usability.spec.ts` opens the debug panel and then opens the technology panel
- * from the button between the panels, so a dialog that covered the stack outright would break a
- * player's way back to the controls, not merely a test. `max-height` is `60% - 6px` because the
- * flex `gap` between the two regions is part of the strip too, and 40 + 60 + a gap would overflow
- * the box the strip declares it never overflows.
- *
- * `contain: inline-size` is load-bearing rather than decorative. Without it the dock's width — and
- * with it the whole sidebar's, which is a flex item whose automatic minimum is its min-content
- * width — comes from what is docked inside, and a city screen's max-content width runs to thousands
- * of pixels (a `<fieldset>` of twenty-one worked-tile labels laid out on a single line). Measured
- * under the old arrangement: the column grew to 3114 px and pushed the panel column off the right
- * of a 1280 px window. Size containment makes the dock's inline size independent of its contents,
- * so a panel is exactly as wide as the strip — with its own scrollbar when its content needs one,
- * which is what `dialog`'s `overflow: auto` below provides.
- */
-[data-layout='dock'] {
-  flex: 0 1 auto;
-  max-height: calc(60% - 6px);
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  overflow: hidden;
-  contain: inline-size;
-}
-
-/*
- * The panels, densified. Every number below was chosen by measuring the strip, not by taste: with
- * the event log full at 1280×900 the sidebar held 1219 px of content in an 823 px box, and 396 px
- * of it had nowhere to go. Padding, heading margins and the gap between panels are what a column of
- * nine panels spends that space on, so those are what this block tightens — nothing is hidden and
- * no panel loses a control.
- */
-[data-panel] {
-  background: var(--panel);
-  border: 1px solid #2b333d;
-  border-radius: 4px;
-  padding: 4px 8px;
-}
-
-[data-panel] h2,
-[data-panel] h3 {
+[role='tab'] {
+  flex: 1;
+  padding: 12px 4px;
   font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: var(--muted);
-  margin: 0 0 4px;
+  border-bottom: 2px solid transparent;
 }
-
-/*
- * The status strip, and the two rows that set the economy inside it.
- *
- * These sit *in* the strip rather than in the column's flow (see `mountPanels`): the numbers a
- * player reads and the numbers a player sets are one region. Each row is a wrapping flex line and
- * each of its own lines costs a whole row of the strip, so the fields are sized to keep a row to
- * as few lines as the controls allow — the three rate inputs are as wide as three digits and a
- * spinner, not four ems.
- */
-[data-panel='status'] {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 10px;
-  font-variant-numeric: tabular-nums;
+[role='tab'][aria-selected='true'] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: #203238;
 }
-
-/*
- * The body of a panel that grows with the world: the unit list, the city list and the event log.
- *
- * These three are the only panels whose height is a function of how much game there is, so they are
- * the only ones that give space back. `max-height` bounds the panel and `overflow: auto` keeps the
- * rest reachable *inside that panel* — which is the difference between a list that scrolls and a
- * list that walks off the bottom of the strip and takes the scoreboard with it. The numbers are a
- * few rows each: enough to see that the list is a list, and never enough to push a panel below the
- * fold.
- */
-[data-panel='units'] > ul,
-[data-panel='cities'] > ul {
-  max-height: 58px;
+[data-layout='panel-stack'] {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+  padding: 20px;
+  scrollbar-gutter: stable;
 }
-
-/*
- * The save and debug panels: one row of controls, with the engine's line beneath.
- *
- * Each of them is a heading, a button and a one-line status, which stacked reads as three rows for
- * two facts. Laid out as a wrapping flex line the heading and the button share a row, and the
- * status — the state hash, the save's outcome — takes a full row of its own so a long hash cannot
- * push the button off the edge.
- */
-[data-panel='save'],
-[data-panel='debug'] {
+[role='tabpanel'] > [data-panel] + [data-panel] {
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+[data-layout='sidebar-footer'] {
+  flex-shrink: 0;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--line);
+  background: #142328;
+}
+[data-layout='sidebar-footer'] > p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+[data-panel='technology'] > button {
+  width: 100%;
+  text-align: left;
+}
+[data-layout='turn-actions'] {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 8px;
+  gap: 8px;
+  margin-top: 12px;
 }
-
-[data-panel='save'] h2,
-[data-panel='debug'] h2 {
+[data-layout='turn-actions'] > button {
+  flex: 1;
+}
+button[data-command='EndTurn'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #172126;
+  font-weight: 700;
+}
+button[data-command='EndTurn']:hover:not(:disabled) {
+  background: #edcf88;
+}
+[data-layout='dock'] {
+  display: none;
+  position: absolute;
+  top: 100px;
+  bottom: 157px;
+  left: 0;
+  right: 0;
+  background: var(--panel);
+  z-index: 3;
+}
+[data-layout='dock']:has(dialog[open]) {
+  display: block;
+}
+dialog[open] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-height: none;
   margin: 0;
-}
-
-[data-panel='save'] [role='status'],
-[data-panel='debug'] [role='status'] {
-  flex: 1 1 100%;
-}
-
-/*
- * The outcome wrapper: `Show outcome` exists only once the game is over (`victory.ts` hides it
- * while the game runs), and while it is hidden the wrapper is an empty box with a border, a
- * background and 8 px of padding — a visible nothing in the strip for the whole of a running game.
- * `display: contents` removes the box and leaves the button as a direct item of the stack, which is
- * what it is: a control, not a panel with a body. Nothing else lives in this element.
- */
-[data-panel='outcome'] {
-  display: contents;
-}
-
-button {
-  font: inherit;
+  padding: 20px;
+  overflow: auto;
   color: var(--ink);
-  background: #262e38;
-  border: 1px solid #3a4550;
-  border-radius: 3px;
-  padding: 3px 8px;
-  cursor: pointer;
+  background: var(--panel);
+  border: 0;
 }
-
-button:hover:not(:disabled) {
-  background: #303a46;
+dialog > h2 {
+  padding-right: 75px;
+  min-height: 35px;
+  font:
+    22px Georgia,
+    serif;
+  color: var(--accent);
 }
-
-button:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
+dialog > button:first-of-type {
+  position: sticky;
+  top: 0;
+  float: right;
+  margin-top: -48px;
+  z-index: 2;
 }
-
-ul,
-ol {
-  margin: 2px 0;
-  padding-left: 18px;
+dialog fieldset,
+dialog section {
+  margin: 20px 0 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #142328;
 }
-
-/* The default `p` margin is 1em of line box above and below — 28 px for a two-line status line in
-   a 380 px strip, which is space this column does not have. */
-p {
-  margin: 2px 0;
+legend {
+  color: var(--accent);
+  padding: 0 6px;
 }
-
+fieldset label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+fieldset button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin: 6px 0;
+}
 dl {
   display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 2px 10px;
-  margin: 2px 0;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 16px;
+  margin: 14px 0;
 }
-
 dt {
   color: var(--muted);
 }
-
 dd {
   margin: 0;
-  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
-
-[role='group'] {
+ul,
+ol {
+  padding: 0;
+  margin: 12px 0;
+  list-style: none;
+}
+[data-panel='units'] > ul,
+[data-panel='cities'] > ul {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+[data-panel='units'] > ul button,
+[data-panel='cities'] > ul button {
+  width: 100%;
+  text-align: left;
+}
+button[aria-pressed='true'],
+button[aria-current='true'] {
+  border-color: var(--accent);
+  background: #34433a;
+  color: #f0dca8;
+}
+[data-role='unit-inspector'] {
+  display: flex;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 10px;
+  background: #20343a;
+  margin-bottom: 16px;
+  border: 1px solid #365158;
+}
+[data-role='unit-inspector'] > img {
+  width: 66px;
+  height: 66px;
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+[data-role='unit-inspector'] p {
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+[data-role='unit-stats'] {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 8px 10px;
-  background: var(--panel);
-  border: 1px solid #2b333d;
+  margin-top: 8px;
+}
+[data-role='unit-stats'] > span {
+  padding: 3px 7px;
+  background: #13262c;
   border-radius: 4px;
+  font-size: 12px;
 }
-
-/*
- * A panel, docked at the foot of the sidebar (see the module note). `position: static` overrides the
- * UA stylesheet's `position: absolute`, which is what put an opened panel below the fold; `width`
- * and `max-height` are the dock's box, so the panel is fully visible inside the strip and its own
- * content scrolls rather than growing past it. Nothing here floats: the map column beside the strip
- * never shares a pixel with an open panel, so no gesture aimed at the game can land on a panel by
- * accident.
- */
-dialog {
-  position: static;
-  margin: 0;
-  width: 100%;
-  max-width: none;
-  max-height: 100%;
-  flex: 0 1 auto;
-  background: var(--panel);
-  color: var(--ink);
-  border: 1px solid #3a4550;
-  border-radius: 6px;
-  overflow: auto;
-}
-
-/* Non-modal panels have no backdrop (the panels are side screens; see `city.ts`); the rule is
- * kept because a future modal use must not paint a translucent sheet nothing else declares. */
-dialog::backdrop {
-  background: rgb(0 0 0 / 45%);
-}
-
-/*
- * The rates row: the editable half of the status strip (see `panels/index.ts`). It takes a row of
- * its own inside the strip, and the engine's own verdict is the text beside the control.
- */
-[data-panel='rates'] {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 8px;
-  width: 100%;
-  border: 1px solid #2b333d;
-  padding: 2px 0;
-}
-
-[data-panel='rates'] label {
+[data-role='empty-state'] {
   color: var(--muted);
-  /* Label and field on one line, so "Tax" and its spinner are one item of the wrapping row rather
-     than two — the difference between a row and a row and a half. */
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
+  padding: 12px;
+  border: 1px dashed #40565b;
+  border-radius: 8px;
 }
-
-[data-panel='rates'] input {
-  font: inherit;
-  /* Three digits and the spinner: the engine's own total is 10, so a wider field buys nothing but a
-     wrapped row. The bound is the same `RATE_TOTAL` the control already carries as `max`. */
-  width: 2.6em;
-  color: var(--ink);
-  background: #262e38;
-  border: 1px solid #3a4550;
-  border-radius: 3px;
-  padding: 1px 3px;
+[data-panel='rates'] {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
 }
-
-[data-panel='rates'] [role='status'] {
-  color: var(--accent);
-  font-size: 11px;
-  flex: 1 1 100%;
+[data-panel='rates'] > h2,
+[data-panel='rates'] > button,
+[data-panel='rates'] > [role='status'] {
+  grid-column: 1/-1;
 }
-
-/*
- * The government row (M9), beside the rates it caps: the same shape as the rates row, so the two
- * player-level setters read as one region rather than two unrelated controls.
- */
-[data-panel='government'] {
+[data-panel='rates'] label {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 8px;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+[data-panel='rates'] input {
   width: 100%;
-  border: 1px solid #2b333d;
-  padding: 2px 0;
 }
-
 [data-panel='government'] label {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
+  display: block;
+  margin: 10px 0;
 }
-
-[data-panel='government'] [role='status'] {
-  color: var(--accent);
-  font-size: 11px;
-  flex: 1 1 100%;
+[data-panel='government'] select {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
 }
-
-/*
- * The victory/defeat screen (M10). It is a `dialog` like the city, tech and debug panels, so it
- * inherits the docked layout above; this only makes the end of a game read as an end — a larger
- * heading with the summary line quiet beneath it. Nothing here is a rule: the words are
- * `victory.ts`', and the figure is the engine's.
- */
-[data-panel='outcome-dialog'] h2 {
-  margin: 0 0 4px;
-  font-size: 20px;
+[role='status'] {
+  overflow-wrap: anywhere;
 }
-
-[data-panel='outcome-dialog'] p {
-  margin: 0 0 8px;
+[data-panel='rates'] [role='status'],
+[data-panel='government'] [role='status'],
+[data-panel='save'] [role='status'] {
+  font-size: 12px;
+  color: var(--muted);
 }
-
-/*
- * The log's own list numbering has to fit inside the box, and so does the box.
- *
- * `padding-left` was 22px, which holds a one-digit marker and nothing wider: `overflow: auto` clips
- * a marker that reaches past the border box, so a two-digit line number lost its leading digit and
- * every line past the ninth read "?4." in the frame the advisory screenshots capture. A game emits
- * hundreds of lines, so the numbers are wrong for essentially the whole game. 36px holds the three
- * digits `EVENT_LOG_LIMIT` can reach. Presentation only: markers are not part of a line's text, so
- * nothing the engine emits and nothing a test reads changes.
- *
- * The height is the other half of that and it is the phase-3 number: 220px of log is 220px of a
- * strip that also has to hold eight other panels, and the log is the one panel whose content is
- * *expected* to be longer than its box — a history is read from the bottom, and the engine's own
- * `EVENT_LOG_LIMIT` truncates it at the top anyway. So the log carries the smallest bound of the
- * three lists: it scrolls internally, and the panels below it stay on screen.
- */
-[role='log'] {
-  max-height: 96px;
-  overflow: auto;
-  padding-left: 36px;
+[data-role='diplomatic-relation'] {
+  padding: 14px;
+  margin: 10px 0;
+  background: #203238;
+  border-radius: 8px;
 }
-
+[data-panel='diplomacy'] button {
+  margin: 8px 5px 0 0;
+}
 [role='log'] li {
-  color: var(--ink);
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+  color: #becdca;
 }
-
-[data-panel='save'] [role='status'],
-[data-panel='debug'] [role='status'] {
-  color: var(--accent);
-  font-family: ui-monospace, monospace;
-  font-size: 11px;
-  word-break: break-all;
-}
-
-/*
- * The scoreboard, sized to the strip.
- *
- * This is the second half of the defect the phase exists for, and it is the half a vertical fix
- * misses: at 1280×900 the table measured **530 px inside a 378 px panel**, so the strip clipped its
- * right-hand columns — M10's `Score` among them, the one column the score victory is read from —
- * and a player could only reach them by scrolling the whole strip sideways. Two rules fix it: the
- * type is one step down (11px of data, 10px of header, which is where the width actually goes —
- * the columns are as wide as their longest word) and the padding is 2px. Measured after the change:
- * 358 px, inside the 362 px the panel's content box offers.
- *
- * The first cell is allowed to break a word. Every other column is as wide as a header word like
- * `Population`, so the table's width is stable; the player's *name* is the one cell whose width is
- * data, and a long one — the barbarian row, or a name a catalog spells out — would otherwise push
- * the whole table past the panel again. Breaking it wraps the name onto a second line instead,
- * which costs a row rather than a column.
- */
 table {
   border-collapse: collapse;
   width: 100%;
+  font-size: 11px;
 }
-
 th,
 td {
-  text-align: left;
-  padding: 1px 2px 1px 0;
-  border-bottom: 1px solid #262e38;
-  white-space: nowrap;
-}
-
-/*
- * The scoreboard's body is bounded like the other lists, for the case the 900 px window does not
- * cover: the number of rows is the number of players, and a game seeded with sixteen civilizations
- * puts sixteen rows in a strip that has room for five. `display: block` on the table is what makes
- * `max-height` mean anything on it (a table box ignores it), and the internal table — an anonymous
- * box the browser builds — still fills the panel's width and still lays out its columns. The panel
- * itself becomes a flex column so the heading stays put while the body scrolls.
- *
- * With the shipped settings (four civilizations and the barbarians) nothing here scrolls: five rows
- * measure 106 px against a 132 px bound. It is a bound, not a redesign.
- */
-[data-panel='scoreboard'] {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  /*
-   * 8 px of side padding becomes 5 px, and **the 6 px it frees is the gap the label column needs.**
-   * The first visual review read the longest row as `Barbarians0`: measured, the label's cell ends
-   * at x 955 and the first value's cell begins at 955, with the 2 px cell padding the only thing
-   * between them. Widening that gap means widening the first column, and the table has *no* slack
-   * to widen into — measured `scrollWidth / clientWidth = 362 / 362`, because every other column is
-   * as wide as its own header word (`Population` is the widest) with `white-space: nowrap`. So the
-   * space comes from the panel's decoration rather than from the columns' rhythm, which is the one
-   * place in this panel where a pixel is not doing work.
-   */
-  padding-left: 5px;
-  padding-right: 5px;
-}
-
-[data-panel='scoreboard'] table {
-  font-size: 11px;
-  display: block;
-  max-height: 132px;
-  overflow: auto;
-}
-
-[data-panel='scoreboard'] th {
-  font-size: 10px;
-}
-
-/*
- * The label column: as wide as its own longest name (`Barbarians`), and 8 px clear of the first
- * value rather than the 2 px every other cell carries. It is the one column whose content is text
- * rather than a figure, so it is the one column where a tight gap reads as one word (`Barbarians0`).
- */
-[data-panel='scoreboard'] th:first-child,
-[data-panel='scoreboard'] td:first-child {
-  white-space: normal;
+  padding: 8px 3px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
   overflow-wrap: anywhere;
-  padding-right: 8px;
 }
-
-/* The table's accessible name is its caption's text, and the caption is a second visible
- * "Scoreboard" under the panel's own heading. The name is not lost with the box: the caption is
- * still the table's first child, so `getByRole('table', { name: 'Scoreboard' })` still matches it
- * (`panel-usability.spec.ts` and `panels.spec.ts` both ask for it by name). */
-[data-panel='scoreboard'] caption {
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+th:first-child,
+td:first-child {
+  text-align: left;
+}
+caption {
   display: none;
+}
+[data-panel='debug'] [role='status'] {
+  color: var(--muted);
+  font: 11px/1.6 monospace;
+}
+[data-panel='tech-dialog'] li,
+dialog[aria-label='Technology'] li {
+  margin: 8px 0;
+  padding: 12px;
+  background: #203238;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+button[data-state] {
+  width: 100%;
+  text-align: left;
+}
+button[data-state='known'] {
+  border-color: #638775;
+}
+[data-floating='unit-actions'] {
+  position: fixed;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-width: 17rem;
+  padding: 8px;
+  background: #14262ef2;
+  border: 1px solid #648080;
+  border-radius: 9px;
+  box-shadow: 0 8px 24px #0007;
+  pointer-events: none;
+}
+[data-floating='unit-actions'] > button {
+  pointer-events: auto;
+  font-size: 12px;
+  padding: 6px 9px;
+}
+[data-floating='tile-readout'] {
+  position: fixed;
+  z-index: 6;
+  pointer-events: none;
+  max-width: 320px;
+  background: #102229f2;
+  border: 1px solid #648080;
+  border-radius: 7px;
+  padding: 10px 14px;
+  color: var(--ink);
+  box-shadow: 0 8px 24px #0007;
+}
+[data-panel='new-game'] label {
+  display: block;
+  margin: 16px 0;
+}
+[data-panel='new-game'] input,
+[data-panel='new-game'] select {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+}
+[data-panel='keyboard'] dl {
+  grid-template-columns: 80px 1fr;
+}
+[data-panel='keyboard'] dd {
+  text-align: left;
+}
+@media (max-width: 1100px) {
+  section[aria-label='Panels'] {
+    width: 350px;
+  }
+  [data-panel='status'] {
+    gap: 12px;
+  }
+  #civts-app > header {
+    gap: 10px;
+    padding: 10px 14px;
+  }
+}
+@media (max-width: 760px) {
+  #civts-app > header {
+    flex-wrap: wrap;
+    min-height: 100px;
+  }
+  [data-panel='status'] {
+    order: 3;
+    width: 100%;
+    justify-content: space-between;
+  }
+  [data-layout='global-tools'] {
+    margin-left: auto;
+  }
+  main {
+    gap: 8px;
+    padding: 8px;
+  }
+  section[aria-label='Panels'] {
+    width: 300px;
+  }
+  [data-layout='panel-stack'] {
+    padding: 14px;
+  }
+  [data-layout='sidebar-heading'] {
+    padding-left: 14px;
+  }
+}
+@media (max-width: 560px) {
+  main {
+    flex-direction: column;
+  }
+  [data-layout='map-column'] {
+    min-height: 38%;
+  }
+  section[aria-label='Panels'] {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+  }
+  [data-layout='sidebar-heading'] {
+    display: none;
+  }
+  [data-layout='sidebar-footer'] {
+    padding: 8px 14px;
+  }
+  [data-layout='sidebar-footer'] > p {
+    display: none;
+  }
+  [data-panel='technology'] {
+    display: inline-block;
+    width: 34%;
+  }
+  [data-layout='turn-actions'] {
+    display: inline-flex;
+    width: 64%;
+    margin: 0;
+    padding-left: 6px;
+  }
+  [data-layout='dock'] {
+    top: 46px;
+    bottom: 59px;
+  }
+}
+[data-role='research-summary'] {
+  color: #d1ded5;
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+[data-panel='cities'] li > span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 5px 12px;
+}
+dialog[aria-label='Technology'] li > span {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  padding-top: 6px;
+}
+[data-layout='sidebar-body'] {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+[data-layout='sidebar-body'] > [data-layout='panel-stack'],
+[data-layout='sidebar-body'] > [data-layout='dock'] {
+  grid-area: 1/1;
+}
+[data-layout='sidebar-body'] > [data-layout='dock'] {
+  position: relative;
+  inset: auto;
+  min-height: 0;
+}
+[data-panel='units'] > ul button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+[data-role='unit-activity'] {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+  max-width: 65%;
+}
+[data-role='technology-state'] {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 8px;
+}
+[data-role='technology-state'][data-state='known'] {
+  color: #9dc4a8;
+}
+button[data-state]:disabled {
+  opacity: 0.7;
+}
+[data-panel='outcome-dialog'] > button:first-of-type {
+  position: static;
+  float: none;
+  margin: 16px 0 0;
+}
+[data-panel='government'] [role='status'] {
+  display: block;
+  margin-top: 10px;
+}
+[data-panel='new-game'] input[type='checkbox'] {
+  display: inline-block;
+  width: auto;
+  margin: 0 0 0 10px;
+}
+[data-panel='new-game'] > button:first-of-type {
+  padding: 8px;
+  font-size: 12px;
+}
+[data-panel='new-game'] label {
+  color: var(--muted);
+}
+[data-panel='new-game'] label:last-of-type {
+  display: flex;
+  align-items: center;
+}
+[data-panel='new-game'] [data-command],
+[data-panel='new-game'] > div > button {
+  width: 100%;
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
 }
