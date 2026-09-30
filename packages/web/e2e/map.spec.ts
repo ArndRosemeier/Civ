@@ -503,6 +503,10 @@ test('hit-testing: a click opens the tile the same projection says is under the 
   // Clicking it opens that city's screen — and the click is resolved, not snapped: the tile
   // next door opens nothing.
   await clickTile(page, camera, cx, cy);
+  await page
+    .getByRole('region', { name: 'Tile options' })
+    .getByRole('button', { name: `Open city ${city.name}`, exact: true })
+    .click();
   await expect(cityDialog(page, city.name)).toBeVisible();
 
   // Closed the way a player closes it, through the dialog's own control.

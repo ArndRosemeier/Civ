@@ -51,7 +51,6 @@ import {
   applyCommand,
   asPlayerId,
   asTileIndex,
-  asUnitId,
   indexToX,
   indexToY,
   isExplored,
@@ -62,7 +61,6 @@ import {
   newGame,
   opponentModeOf,
   parseSettings,
-  unitActions,
   unitDef,
   visibleTiles,
   type Command,
@@ -116,8 +114,10 @@ import { createMapAnimation } from './animation.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
 import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
-import { tileNamedBy, unitNamedBy } from './ui/schema.js';
+import { unitNamedBy } from './ui/schema.js';
 import { nextGotoStep, startGoto, type GotoIntent } from './ui/goto.js';
+import { mountMapContext } from './ui/map-context.js';
+import { nextStackStep, startStack, type StackIntent } from './ui/stack.js';
 import { problemText } from './ui/problem.js';
 import { nextUnitNeedingOrders, unitsNeedingOrders } from './ui/nextunit.js';
 import { KEY_HELP, mapActionFor, sessionActionFor, type KeyContext } from './ui/keys.js';
@@ -259,6 +259,7 @@ const unitMarkers = (
   selected: UnitId | undefined,
   viewer: PlayerId,
   ruleset: Ruleset,
+  selectedGroup?: readonly UnitId[],
 ): readonly UnitMarker[] => {
   const visible = new Set<number>(visibleTiles(state, viewer).map((tile) => Number(tile)));
   return state.units
@@ -268,7 +269,8 @@ const unitMarkers = (
       tile: unit.tile,
       type: unit.type,
       colour: colourOfPlayer(state, unit.owner),
-      selected: unit.id === selected,
+      selected:
+        selectedGroup === undefined ? unit.id === selected : selectedGroup.includes(unit.id),
       hitPoints: hitPointsLeftOf(unit),
       maxHitPoints: maxHitPointsOf(unitDef(ruleset, unit.type), hitPointsLeftOf(unit)),
       fortified: unit.fortified === true,
@@ -721,6 +723,7 @@ const start = async (): Promise<void> => {
     },
   });
 
+  const mapSelection: { read?: () => readonly UnitId[]; onChange?: () => void } = {};
   const draw = (): FrameTrace => {
     // Measured at the top of the only function that paints, so the rectangle the renderer walks and
     // the box the hit-test inverts come from one layout read. A size cached at start would be stale
@@ -749,7 +752,7 @@ const start = async (): Promise<void> => {
       viewer,
       camera,
       viewport: size,
-      units: unitMarkers(state, panels.selection().unitId, viewer, ruleset),
+      units: unitMarkers(state, panels.selection().unitId, viewer, ruleset, mapSelection.read?.()),
       cities: cityMarkers(state, viewer),
       // The ONE colour lookup for a player, shared with the markers above and with the territory
       // tint the renderer draws: a player is one colour all over the canvas (M9's borders).
@@ -860,7 +863,11 @@ const start = async (): Promise<void> => {
     return dispatchCommand(command, seat).outcome;
   };
 
+  let choosingOnMap = false;
   const panelsApi: PanelsApi = {
+    onSelectionChange: () => {
+      mapSelection.onChange?.();
+    },
     unitArtworkUrl,
     document: doc,
     ruleset,
@@ -874,12 +881,13 @@ const start = async (): Promise<void> => {
     dispatch: (action) => armDispatch(action),
     replaceState: (next) => {
       state = next;
-      draw();
+      forgetGoto();
+      panels.refresh();
+      redraw();
     },
     stateHash: () => hashValue(state),
   };
-  // (The panels' `replaceState` above is the Load path's first half; the seam's is the second. Both
-  // land on the same three lines below.)
+  // Both the visible Load control and the test seam reset navigation intents.
 
   const panels: PanelsHandle = mountPanels(shell.panelStack, panelsApi);
 
@@ -920,6 +928,55 @@ const start = async (): Promise<void> => {
    */
   shell.mapRegion.append(panels.elements.unitActions);
   panels.elements.unitActions.dataset['floating'] = 'unit-actions';
+  const mapContext = mountMapContext(shell.mapRegion, panels.elements.unitActions, {
+    state: () => state,
+    ruleset,
+    player: () => humanSeatOf(state),
+    selected: () => panels.selection().unitId,
+    select: (id) => {
+      choosingOnMap = true;
+      try {
+        panels.selectUnit(id);
+      } finally {
+        choosingOnMap = false;
+      }
+      redraw();
+    },
+    dispatch: (command) => {
+      armDispatch(command);
+    },
+    city: (id) => {
+      panels.openCity(id);
+    },
+    move: (ids, to) => {
+      pendingGoto = undefined;
+      pendingStack = undefined;
+      if (ids.length === 1 && ids[0] !== undefined) {
+        const started = startGoto(state, ruleset, ids[0], to);
+        if (started.kind === 'no-route') {
+          setOrderMessage(started.reason);
+          return;
+        }
+        pendingGoto = started.intent;
+        advanceGoto();
+      } else {
+        const started = startStack(state, ruleset, ids, to);
+        if (typeof started === 'string') {
+          setOrderMessage(started);
+          return;
+        }
+        pendingStack = started;
+        advanceStack();
+      }
+    },
+  });
+  mapSelection.read = mapContext.ids;
+  mapSelection.onChange = () => {
+    if (!choosingOnMap) {
+      mapContext.reset();
+      queueMicrotask(redraw);
+    }
+  };
   arrangeWorkspace(shell.root, shell.panelsRoot, shell.panelStack, shell.dock, panels.elements, {
     endTurn: shell.endTurn,
     nextUnit: shell.nextUnit,
@@ -964,7 +1021,15 @@ const start = async (): Promise<void> => {
    * whatever it started on (see the map region's `pointerdown`).
    */
   const placeUnitActions = (): void => {
+    if (mapContext.isOpen()) {
+      mapContext.refresh();
+      return;
+    }
     const popup = panels.elements.unitActions;
+    if (mapContext.ids().length !== 1) {
+      popup.hidden = true;
+      return;
+    }
     const unitId = panels.selection().unitId;
     const unit = unitId === undefined ? undefined : state.units.find((one) => one.id === unitId);
     const box = canvas.getBoundingClientRect();
@@ -1145,6 +1210,8 @@ const start = async (): Promise<void> => {
    * `determinism.spec.ts`, where that is stated where it is relied on.
    */
   let pendingGoto: GotoIntent | undefined;
+  let pendingStack: StackIntent | undefined;
+  let advancingStack = false;
   /**
    * Whether an advance is already running. The loop dispatches through `armDispatch`, which reaches
    * `dispatchCommand`, which is also what cancels a goto when the player gives that unit another
@@ -1197,6 +1264,9 @@ const start = async (): Promise<void> => {
     if (!advancingGoto && pendingGoto !== undefined) {
       if (unitNamedBy(command) === pendingGoto.unitId) pendingGoto = undefined;
     }
+    const orderedUnit = unitNamedBy(command);
+    if (!advancingStack && orderedUnit !== undefined && pendingStack?.units.includes(orderedUnit))
+      pendingStack = undefined;
 
     // Clear first: the buffer belongs to the call about to happen, so a refusal cannot leave the
     // previous command's events for the panels' dispatch to render again.
@@ -1297,7 +1367,49 @@ const start = async (): Promise<void> => {
    * a goto to be about, and a message about the old game's journey would be a claim about the new
    * one.
    */
+  function advanceStack(): void {
+    if (advancingStack) return;
+    advancingStack = true;
+    try {
+      while (pendingStack !== undefined) {
+        if (isGameOver(state, ruleset)) {
+          pendingStack = undefined;
+          break;
+        }
+        const decision = nextStackStep(state, ruleset, pendingStack);
+        if (decision.kind === 'waiting') {
+          setOrderMessage(
+            `${String(pendingStack.units.length)} units heading for ${tileText(pendingStack.destination)} · waiting for the slowest unit`,
+          );
+          break;
+        }
+        if (decision.kind === 'cancelled') {
+          pendingStack = undefined;
+          setOrderMessage(decision.reason);
+          break;
+        }
+        if (decision.kind === 'arrived') {
+          pendingStack = undefined;
+          setOrderMessage('');
+          break;
+        }
+        for (const command of decision.commands) {
+          if (armDispatch(command) !== 'ok') {
+            pendingStack = undefined;
+            break;
+          }
+        }
+        if (pendingStack === undefined) break;
+        pendingStack = decision.intent;
+      }
+    } finally {
+      advancingStack = false;
+    }
+  }
+
   const forgetGoto = (): void => {
+    mapContext.reset();
+    pendingStack = undefined;
     pendingGoto = undefined;
     setOrderMessage('');
   };
@@ -1405,6 +1517,7 @@ const start = async (): Promise<void> => {
    * gestures that continue or end something already running belong to the region holding both.
    */
   canvas.addEventListener('pointerdown', (event) => {
+    mapContext.close();
     dragging = true;
     travelled = 0;
     lastX = event.clientX;
@@ -1505,6 +1618,7 @@ const start = async (): Promise<void> => {
   shell.mapRegion.addEventListener(
     'wheel',
     (event) => {
+      mapContext.close();
       // The page must not scroll under a wheel aimed at the map: the gesture is zoom, and a
       // scrolled page would move the canvas out from under the pointer the wheel anchored on.
       event.preventDefault();
@@ -1614,6 +1728,16 @@ const start = async (): Promise<void> => {
    * and cancelling it is not an order the engine has any part in.
    */
   const cancelGoto = (): void => {
+    if (mapContext.isOpen()) {
+      mapContext.close();
+      placeUnitActions();
+      return;
+    }
+    if (pendingStack !== undefined) {
+      pendingStack = undefined;
+      setOrderMessage('Stack movement cancelled.');
+      return;
+    }
     if (pendingGoto === undefined) return;
     setOrderMessage(`the goto to tile ${tileText(pendingGoto.destination)} is cancelled`);
     pendingGoto = undefined;
@@ -1671,8 +1795,20 @@ const start = async (): Promise<void> => {
   shell.keyboard.open.addEventListener('click', () => {
     shell.keyboard.dialog.show();
   });
+  doc.addEventListener('pointerdown', (event) => {
+    if (event.target instanceof Node && !shell.mapRegion.contains(event.target)) {
+      mapContext.close();
+      placeUnitActions();
+    }
+  });
 
   doc.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && mapContext.isOpen()) {
+      event.preventDefault();
+      mapContext.close();
+      placeUnitActions();
+      return;
+    }
     // Native button activation takes priority over session shortcuts.
     if (
       (event.key === 'Enter' || event.key === ' ') &&
@@ -1703,34 +1839,7 @@ const start = async (): Promise<void> => {
     cancelGoto();
   });
 
-  /**
-   * A click on the map, ordered through the engine's own list.
-   *
-   * The click is resolved against `unitActions(state, ruleset, selectedUnitId)` — the engine's
-   * answer for that unit — so this handler cannot invent a destination:
-   *
-   * 1. a tile one of the unit's own `MoveUnit`/`AttackUnit` commands names is **dispatched**
-   *    (through the real applier, as everything is);
-   * 2. a tile holding one of your own cities opens its screen — checked **before** the unit pass,
-   *    because a city is a landmark and a unit standing in it is not what a player means by
-   *    clicking it (the unit is still reachable from the `Units` region, and the map still
-   *    selects any unit on a tile that has no city);
-   * 3. a tile holding one of your own units selects it;
-   * 4. **a tile further away than one step starts a goto** (Phase 4, `docs/UI-OVERHAUL.md` §7.6):
-   *    the engine's route query (`@civts/core`'s `planRoute`) is asked, and if it finds a route the
-   *    destination is held as UI intent and the unit starts walking it, one engine-offered step at a
-   *    time, resuming after each `End turn`. When the query finds **no** route, the click falls
-   *    through to the bare `MoveUnit` below rather than becoming a silent no-op;
-   * 5. an empty tile with nothing to route to is still dispatched as a `MoveUnit`, and the engine
-   *    refuses it — which the order channel now *shows*, in the engine's own words, where §1.4
-   *    measured that nothing was shown at all. A refusal leaves the state untouched;
-   * 6. a tile outside the map, or one held by somebody else with nothing to attack, leaves the
-   *    state alone rather than asking the engine a question whose answer is already known.
-   *
-   * What is deliberately **not** here: goto-then-attack. §8 decision 2 settles that a distant enemy
-   * does nothing, so a goto's destination is always ground the unit may stand on, and an
-   * enemy-occupied tile is refused by the route query like any other unenterable tile.
-   */
+  // A tile click opens choices; only an explicit action issues an order.
   canvas.addEventListener('click', (event) => {
     // M10: an ended game issues no orders. A map click is a command like any other, so it stops
     // here rather than being dispatched and refused — the map is still there to be looked at, and
@@ -1744,80 +1853,7 @@ const start = async (): Promise<void> => {
     const tile = tileAt(localPoint(event));
     if (tile === undefined) return;
     const index = tile.y * state.map.width + tile.x;
-    const seat = humanSeatOf(state);
-    const selection = panels.selection();
-    const selected = selection.unitId;
-    // M10: the engine refuses every command once a game has ended, so the two branches below that
-    // would ISSUE an order are skipped. The two that only LOOK — opening one of your own cities and
-    // selecting one of your own units — still run: a final position is a position a player is
-    // entitled to inspect, and neither of them dispatches anything.
-    const over = isGameOver(state, ruleset);
-
-    // One of the seat's own cities: the click opens that city's screen, whether or not the
-    // selected unit could also walk onto the tile. `orders.spec.ts` states the rule the whole
-    // suit is built on — "clicking a tile that holds a unit or a city selects that unit or opens
-    // that city, which is what a player expects" — and the order that shares the tile is not
-    // hidden by this: the unit's own action group lists it as a `Move to x,y` control, which is
-    // where the keystone sweep's reachability direction finds it.
-    const cityHere = state.cities.find(
-      (candidate) => candidate.tile === index && candidate.owner === seat,
-    );
-    if (cityHere !== undefined) {
-      panels.openCity(cityHere.id);
-      return;
-    }
-
-    // The unit's own action list decides whether this click is an order. `unitActions` is the
-    // engine's answer, so a destination that appears here is one `applyCommand` accepts.
-    if (!over && selected !== undefined) {
-      const ordered = unitActions(state, ruleset, selected).find(
-        (command) => tileNamedBy(command) === index,
-      );
-      if (ordered !== undefined) {
-        armDispatch(ordered);
-        return;
-      }
-    }
-
-    const own = state.units.find((unit) => unit.tile === index && unit.owner === seat);
-    if (own !== undefined) {
-      panels.selectUnit(own.id);
-      placeUnitActions();
-      redraw();
-      return;
-    }
-
-    const occupied =
-      state.units.some((unit) => unit.tile === index) ||
-      state.cities.some((candidate) => candidate.tile === index);
-    if (occupied || over) return;
-
-    // **A far tile: the goto.** The engine's own route query decides whether this is a journey it
-    // can make, and the destination is then held here as intent — `advanceGoto` walks it, one step
-    // per turn, through the seam like any other control. `no-route` deliberately falls through to
-    // the bare `MoveUnit` below: the engine's refusal is the player's answer, and nothing about
-    // goto may turn a click that reaches nowhere into a click that says nothing. (`over` is not
-    // re-checked: the `occupied || over` guard above has already returned for a finished game.)
-    if (selected !== undefined) {
-      const began = startGoto(state, ruleset, selected, asTileIndex(index));
-      if (began.kind === 'started') {
-        pendingGoto = began.intent;
-        advanceGoto();
-        return;
-      }
-    }
-
-    // An empty tile the unit's own list did not name and the route query could not reach: the
-    // command is issued anyway so the engine can refuse it out loud. The index is inside the map —
-    // `screenToTile` returned it — and `asTileIndex` is the engine's own constructor for the branded
-    // id rather than an escape from the type system. When the seat owns no unit at all the sentinel
-    // id is refused as `unknown-unit`: a refusal either way, never a silent no-op dressed up as
-    // success.
-    armDispatch({
-      type: 'MoveUnit',
-      unitId: selected ?? asUnitId(-1),
-      to: asTileIndex(index),
-    });
+    mapContext.open(asTileIndex(index), event.clientX, event.clientY);
   });
 
   /**
@@ -1878,6 +1914,7 @@ const start = async (): Promise<void> => {
     // move has closed cancels here, with the message the channel carries — which is the case §8
     // decision 4 is about, and the one a player meets most often.
     advanceGoto();
+    advanceStack();
   });
 
   /* --------------------------- the new-game surface ---------------------- */

@@ -256,9 +256,7 @@ test('keystone UI adds no rules: every command the engine accepts for a unit is 
   ).toBe(true);
 });
 
-test('the map ALONE can issue every map order the engine offers — no control is clicked', async ({
-  page,
-}) => {
+test('the map context can issue every map order the engine offers', async ({ page }) => {
   // WHY THIS TEST EXISTS, and why the reachability test above cannot cover it.
   //
   // That test reaches a map command by trying the click, and then falling back to a control named
@@ -301,6 +299,10 @@ test('the map ALONE can issue every map order the engine offers — no control i
     const camera = await cameraOf(page);
     await clearDispatchLog(page);
     await clickTile(page, camera, tileX(state, tile), tileY(state, tile));
+    await page
+      .getByRole('region', { name: 'Tile options' })
+      .getByRole('button', { name: type === 'MoveUnit' ? 'Move here' : 'Attack here', exact: true })
+      .click();
 
     const log = await dispatchLog(page);
     const issued = log.some(

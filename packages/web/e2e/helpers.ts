@@ -828,6 +828,8 @@ export const clickTile = async (
   y: number,
 ): Promise<void> => {
   await bringCanvasIntoView(page);
+  if (await page.getByRole('region', { name: 'Tile options' }).isVisible())
+    await page.keyboard.press('Escape');
   const box = await canvasBox(page);
   const point = await tilePagePoint(page, camera, x, y);
   const inside =
@@ -1581,7 +1583,13 @@ export const openCity = async (
   if ((await dialog.count()) === 0) {
     const entry = cityList(page).getByRole('button', { name: city.name, exact: true });
     if ((await entry.count()) > 0) await entry.first().click();
-    else await clickTile(page, camera, tileX(state, city.tile), tileY(state, city.tile));
+    else {
+      await clickTile(page, camera, tileX(state, city.tile), tileY(state, city.tile));
+      await page
+        .getByRole('region', { name: 'Tile options' })
+        .getByRole('button', { name: `Open city ${city.name}`, exact: true })
+        .click();
+    }
   }
   if ((await dialog.count()) === 0) {
     const entry = cityList(page).getByRole('button', { name: city.name, exact: true });
@@ -1667,6 +1675,12 @@ export const clickTileOrder = async (
 ): Promise<boolean> => {
   await clearDispatchLog(page);
   await clickTile(page, camera, tile % mapWidth, Math.floor(tile / mapWidth));
+  const tileOptions = page.getByRole('region', { name: 'Tile options' });
+  const order = tileOptions.getByRole('button', {
+    name: wanted === 'MoveUnit' ? 'Move here' : 'Attack here',
+    exact: true,
+  });
+  if (await order.isVisible()) await order.click();
   const dispatched = async (): Promise<boolean> =>
     (await dispatchLog(page)).some((entry) => {
       if (!isRecord(entry.action)) return false;

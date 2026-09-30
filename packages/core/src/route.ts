@@ -181,6 +181,8 @@ const noRoute = (from: number, to: number): string =>
  * `invalid-argument` (the engine's member for "this argument is not acceptable")
  * only when the destination is a tile the unit may stand on and simply cannot
  * reach. A unit already standing on `to` is `ok` with no steps.
+ * Optional companions restrict the search to steps legal for every member of a
+ * co-located, same-owner stack, each with its own full movement budget.
  *
  * Asking about a unit the state does not hold is an error rather than an empty
  * route, unlike `unitActions`' empty list: "nothing can happen" and "there is no
@@ -192,9 +194,23 @@ export const planRoute = (
   ruleset: RulesetView,
   unitId: UnitId,
   to: TileIndex,
+  companions: readonly UnitId[] = [],
 ): Result<RoutePlan, GameError> => {
   const unit = unitById(state, unitId);
   if (unit === undefined) return err({ kind: 'unknown-unit', unitId });
+  const members: Unit[] = [unit];
+  for (const id of new Set(companions)) {
+    if (id === unitId) continue;
+    const member = unitById(state, id);
+    if (member === undefined) return err({ kind: 'unknown-unit', unitId: id });
+    if (member.owner !== unit.owner || member.tile !== unit.tile) {
+      return err({
+        kind: 'invalid-argument',
+        detail: 'A moving stack must belong to one player and stand on one tile.',
+      });
+    }
+    members.push(member);
+  }
   // The same actor rule `planMove`'s four-argument form applies: a per-unit query
   // acts as the unit's own owner, and a state whose owner is missing from `players`
   // has no legal actor at all.
@@ -243,7 +259,9 @@ export const planRoute = (
   const probe = (here: TileIndex): GameState => ({
     ...state,
     units: state.units.map((each) =>
-      each.id === unit.id ? { ...each, tile: here, movementLeft: def.movement } : each,
+      members.some((member) => member.id === each.id)
+        ? { ...each, tile: here, movementLeft: unitDef(ruleset, each.type)?.movement ?? 0 }
+        : each,
     ),
   });
 
@@ -276,14 +294,16 @@ export const planRoute = (
   if (neighbourOfDestination === undefined) {
     return err({ kind: 'invalid-argument', detail: noRoute(unit.tile, destination) });
   }
-  const ontoDestination = planMove(
-    probe(neighbourOfDestination),
-    ruleset,
-    unit.owner,
-    unit.id,
-    destination,
-  );
-  if (!ontoDestination.ok) return err(ontoDestination.error);
+  for (const member of members) {
+    const ontoDestination = planMove(
+      probe(neighbourOfDestination),
+      ruleset,
+      unit.owner,
+      member.id,
+      destination,
+    );
+    if (!ontoDestination.ok) return err(ontoDestination.error);
+  }
 
   const distance = new Int32Array(size).fill(UNSET);
 
@@ -311,7 +331,8 @@ export const planRoute = (
       if (distance[index] !== UNSET) continue;
       // The one place this module decides anything, and it decides nothing: the
       // engine's own evaluator, asked about the destination tile.
-      if (!planMove(from, ruleset, unit.owner, unit.id, step).ok) continue;
+      if (!members.every((member) => planMove(from, ruleset, unit.owner, member.id, step).ok))
+        continue;
       distance[index] = settled + 1;
       onward[index] = at;
       queue[tail] = index;

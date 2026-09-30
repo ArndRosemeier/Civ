@@ -132,6 +132,10 @@ const clickMapTile = async (page: Page, to: TileIndex): Promise<void> => {
   const camera = await cameraOf(page);
   const state = await readState(page);
   await clickTile(page, camera, tileX(state, Number(to)), tileY(state, Number(to)));
+  const move = page
+    .getByRole('region', { name: 'Tile options' })
+    .getByRole('button', { name: 'Move here', exact: true });
+  if (await move.isVisible()) await move.click();
 };
 
 test('a click on a far tile walks the unit there, one engine-offered step at a time', async ({
@@ -384,7 +388,7 @@ test('a far tile with no route says so, in the engine\u2019s words, and nothing 
 
   await clickMapTile(page, tileOf(sea));
 
-  const message = await textOf(page);
+  const message = await page.getByRole('region', { name: 'Tile options' }).innerText();
   expect(message, 'a click that could not be honoured said nothing').not.toBe('');
   expect(
     message,

@@ -416,6 +416,22 @@ const withoutHuts = (state: GameState): GameState => ({
  * ------------------------------------------------------------------ */
 
 describe('planRoute: a route is a sequence of engine-accepted single steps', () => {
+  it('uses only terrain affordable to every stack member, taking a shared detour', () => {
+    const stack = plus(BASE, 2, WARRIOR, 0, LEFT);
+    expect(planRoute(stack, RULESET, SETTLER_ID, RIGHT).ok).toBe(true);
+    expect(planRoute(stack, RULESET, SETTLER_ID, RIGHT, [asUnitId(2)]).ok).toBe(false);
+    const terrain = [...stack.map.terrain];
+    const opening = tile(4, 0);
+    terrain[Number(opening)] = asTerrainId('grassland');
+    const alternative = { ...stack, map: { ...stack.map, terrain } };
+    const hash = hashValue(alternative);
+    const route = planRoute(alternative, RULESET, SETTLER_ID, RIGHT, [asUnitId(2)]);
+    expect(route.ok).toBe(true);
+    if (!route.ok) throw new Error('No shared route');
+    expect(route.value.steps).toContain(opening);
+    expect(route.value.steps).not.toContain(GAP);
+    expect(hashValue(alternative)).toBe(hash);
+  });
   it('walks the settler through the one gap in the wall, and the direct command cannot', () => {
     // Non-vacuity for the whole file: the command layer really cannot do this.
     const direct = applyCommand(
