@@ -1241,6 +1241,7 @@ export const CATALOG: Catalog = {
       hitPoints: 1,
       movement: 2,
       cost: 3,
+      populationCost: 2,
       domain: 'land',
       provenance: placeholder(
         'tuned baseline; slower and far more expensive in Civ 3 (unverified)',
@@ -1255,6 +1256,7 @@ export const CATALOG: Catalog = {
       hitPoints: 1,
       movement: 2,
       cost: 2,
+      populationCost: 1,
       domain: 'land',
       provenance: placeholder('tuned baseline; terrain improvement arrives in M4'),
     },
@@ -1417,6 +1419,48 @@ export const CATALOG: Catalog = {
           'hull rather than a claim about Civ 3 transports',
       ),
     },
+    {
+      id: asUnitTypeId('pikeman'),
+      role: 'military',
+      name: 'Pikeman',
+      attack: 1,
+      defense: 5,
+      hitPoints: 4,
+      movement: 1,
+      cost: 6,
+      domain: 'land',
+      requiresTech: asTechId('feudalism'),
+      requiresResource: asResourceId('iron'),
+      provenance: placeholder('medieval progression; tuned combat values'),
+    },
+    {
+      id: asUnitTypeId('medieval-infantry'),
+      role: 'military',
+      name: 'Medieval Infantry',
+      attack: 4,
+      defense: 3,
+      hitPoints: 4,
+      movement: 1,
+      cost: 7,
+      domain: 'land',
+      requiresTech: asTechId('feudalism'),
+      requiresResource: asResourceId('iron'),
+      provenance: placeholder('medieval progression; tuned combat values'),
+    },
+    {
+      id: asUnitTypeId('knight'),
+      role: 'military',
+      name: 'Knight',
+      attack: 5,
+      defense: 3,
+      hitPoints: 4,
+      movement: 2,
+      cost: 9,
+      domain: 'land',
+      requiresTech: asTechId('feudalism'),
+      requiresResource: asResourceId('horses'),
+      provenance: placeholder('medieval progression; tuned combat values'),
+    },
   ],
   /**
    * Building rows — all PLACEHOLDER, and the numbers are *ours*, not Civ 3's.
@@ -1451,16 +1495,12 @@ export const CATALOG: Catalog = {
   buildings: [
     {
       id: asBuildingId('granary'),
+      requiresTech: asTechId('pottery'),
       name: 'Granary',
       cost: 10,
       maintenance: 0,
       effects: [{ kind: 'growth-food', amount: 1 }],
-      // Deliberately **ungated**, and it is the one building where that is load-bearing:
-      // this is the cheapest row in the table (10 shields), so it is what the played
-      // golden's fixed script builds and what a player's first city can afford. Putting
-      // a technology in front of it would move the *earliest* building in the game
-      // behind a research step, which is a playability decision M6 does not make — the
-      // gated building below is a later, larger investment instead.
+      // Pottery unlocks this early growth investment.
       // M9: no culture and no contentment — a granary is about food, and this row says
       // so with the two zeros rather than by omitting the fields.
       culturePerTurn: 0,
@@ -1472,6 +1512,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asBuildingId('barracks'),
+      requiresTech: asTechId('bronze-working'),
       name: 'Barracks',
       cost: 12,
       maintenance: 1,
@@ -1489,6 +1530,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asBuildingId('walls'),
+      requiresTech: asTechId('masonry'),
       name: 'City Walls',
       cost: 15,
       maintenance: 1,
@@ -1542,27 +1584,24 @@ export const CATALOG: Catalog = {
     },
     {
       id: asBuildingId('library'),
+      requiresTech: asTechId('alphabet'),
       name: 'Library',
       cost: 20,
       maintenance: 1,
       effects: [{ kind: 'beaker-multiplier', pct: 50 }],
-      // Deliberately **ungated** (the gate M6 adds is on the temple, below): the M4c
-      // building-effects scenario builds a library on a hand-built, tech-free board to
-      // measure its 50% beaker multiplier, so a technology in front of it would turn that
-      // scenario into a test of the tech gate instead of a test of the multiplier.
-      // M9: a library is a *culture* building here as well as a science one — that is a
-      // shape choice (knowledge makes a city's influence grow) and a placeholder, not a
-      // Civ 3 claim; Civ 3's library gives no culture.
+      // Alphabet unlocks the library.
+      // A library produces science and culture; these magnitudes are tuned.
       culturePerTurn: 1,
       happiness: 0,
       provenance: placeholder(
         'unsourced: this cost, the 1 gold maintenance, the 50% beaker multiplier and the 1 culture per turn are ' +
           "ours, chosen to be playable; M5 gave the beakers something to do, and M9 adds the culture — Civ 3's " +
-          "library produces no culture, so that pairing is this engine's shape and not a claim",
+          'library produces culture; these magnitudes are tuned rather than sourced',
       ),
     },
     {
       id: asBuildingId('marketplace'),
+      requiresTech: asTechId('currency'),
       name: 'Marketplace',
       cost: 12,
       maintenance: 1,
@@ -1578,6 +1617,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asBuildingId('factory'),
+      requiresTech: asTechId('steam-power'),
       name: 'Factory',
       cost: 25,
       maintenance: 3,
@@ -1595,6 +1635,7 @@ export const CATALOG: Catalog = {
     },
     {
       id: asBuildingId('pyramids'),
+      requiresTech: asTechId('masonry'),
       name: 'Pyramids',
       cost: 30,
       maintenance: 2,
@@ -2446,6 +2487,7 @@ const checkUnit = (u: UnitSpec): readonly RulesetError[] => {
     ['defense', u.defense],
     ['movement', u.movement],
     ['cost', u.cost],
+    ...(u.populationCost === undefined ? [] : [['populationCost', u.populationCost] as const]),
   ];
   for (const [field, value] of stats) {
     if (typeof value !== 'number' || !Number.isInteger(value)) {

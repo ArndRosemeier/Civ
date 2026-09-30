@@ -15,6 +15,7 @@ import {
   asBuildingId,
   asCityId,
   asPlayerId,
+  asTechId,
   asUnitId,
   asUnitTypeId,
   cityById,
@@ -60,7 +61,12 @@ const founded = applyCommand(
   RULESET,
 );
 if (!founded.ok) throw new Error('founding the first city was refused');
-const STATE: GameState = founded.value.state;
+const STATE: GameState = {
+  ...founded.value.state,
+  players: founded.value.state.players.map((player) =>
+    player.id === P0 ? { ...player, techs: [asTechId('pottery')] } : player,
+  ),
+};
 
 describe('cityListEntries', () => {
   it("lists the acting player's cities only, in state order", () => {

@@ -371,48 +371,60 @@ const walk = (seed: number, policy: Policy, turns: number, audit: boolean): Walk
 
   for (let step = 0; step < turns; step += 1) {
     for (const player of civPlayers(state)) {
-      const ctx: PolicyContext = {
-        state,
-        playerId: player.id,
-        ruleset: RULESET,
-        rng: policyRngFor(seed, player.id, state.turn),
-      };
+      const maxBatches =
+        1 +
+        state.units
+          .filter((unit) => unit.owner === player.id)
+          .reduce((sum, unit) => sum + unit.movementLeft, 0);
+      for (let batch = 0; batch < maxBatches; batch += 1) {
+        let randomEvent = false;
+        const ctx: PolicyContext = {
+          state,
+          playerId: player.id,
+          ruleset: RULESET,
+          rng: policyRngFor(seed, player.id, state.turn),
+        };
 
-      for (const command of policy.chooseCommands(ctx)) {
-        proposed += 1;
-        // The runner owns the turn boundary and drops a policy's `EndTurn` (runner.ts,
-        // decision 3). This driver does the same, and counts the drop so it is visible.
-        if (command.type === 'EndTurn') {
-          endTurns += 1;
-          continue;
-        }
+        for (const command of policy.chooseCommands(ctx)) {
+          proposed += 1;
+          // The runner owns the turn boundary and drops a policy's `EndTurn` (runner.ts,
+          // decision 3). This driver does the same, and counts the drop so it is visible.
+          if (command.type === 'EndTurn') {
+            endTurns += 1;
+            continue;
+          }
 
-        if (audit) {
-          const advertised = new Set(
-            [...legalActions(state, RULESET, player.id)].map((action) => canonicalize(action)),
-          );
-          if (!advertised.has(canonicalize(command))) {
-            const planner = plannerVerdict(state, player.id, command);
-            if (planner === undefined) {
-              unadvertised.push(`${command.type}: not advertised, and no planner owns it`);
-            } else if (!planner.ok) {
-              unadvertised.push(
-                `${command.type}: advertised nowhere, planner refused (${planner.kind})`,
-              );
-            } else {
-              plannerOnly.set(command.type, (plannerOnly.get(command.type) ?? 0) + 1);
+          if (audit) {
+            const advertised = new Set(
+              [...legalActions(state, RULESET, player.id)].map((action) => canonicalize(action)),
+            );
+            if (!advertised.has(canonicalize(command))) {
+              const planner = plannerVerdict(state, player.id, command);
+              if (planner === undefined) {
+                unadvertised.push(`${command.type}: not advertised, and no planner owns it`);
+              } else if (!planner.ok) {
+                unadvertised.push(
+                  `${command.type}: advertised nowhere, planner refused (${planner.kind})`,
+                );
+              } else {
+                plannerOnly.set(command.type, (plannerOnly.get(command.type) ?? 0) + 1);
+              }
             }
           }
-        }
 
-        const outcome = applyCommand(state, player.id, command, RULESET);
-        if (!outcome.ok) {
-          refusals.push(`${command.type} refused: ${canonicalize(outcome.error)}`);
-          continue;
+          const outcome = applyCommand(state, player.id, command, RULESET);
+          if (!outcome.ok) {
+            refusals.push(`${command.type} refused: ${canonicalize(outcome.error)}`);
+            continue;
+          }
+          state = outcome.value.state;
+          randomEvent ||= outcome.value.events.some(
+            (event) => event.type === 'CombatResolved' || event.type === 'HutEntered',
+          );
+          events.push(...outcome.value.events);
+          applied += 1;
         }
-        state = outcome.value.state;
-        events.push(...outcome.value.events);
-        applied += 1;
+        if (!policy.replanAfterRandomEvent || !randomEvent) break;
       }
     }
 
@@ -1011,6 +1023,7 @@ const withAdvancedWorld = (state: GameState, draws: number): GameState => {
  */
 const scrambled = (inner: Policy, salt: number, worldDraws: number): Policy => ({
   name: `${inner.name}+scrambled`,
+  replanAfterRandomEvent: inner.replanAfterRandomEvent ?? false,
   chooseCommands: (ctx: PolicyContext): readonly Command[] =>
     inner.chooseCommands({
       state: withAdvancedWorld(ctx.state, worldDraws),

@@ -33,6 +33,7 @@ import {
   RATE_TOTAL,
   applyCommand,
   asCityId,
+  asBuildingId,
   asGovernmentId,
   asImprovementId,
   asPlayerId,
@@ -665,7 +666,14 @@ describe('the registry on real play', () => {
     // The setup is hand-made because no honest policy plays this badly on purpose, but
     // the **transition is a real `EndTurn`**: the invariants read a transition, and this
     // one is produced by the engine.
-    let state = buildUp(3, 30);
+    const played = buildUp(3, 30);
+    let state: GameState = {
+      ...played,
+      cities: played.cities.map((city) => ({
+        ...city,
+        buildings: [...new Set([...city.buildings, asBuildingId('factory')])].sort(),
+      })),
+    };
     const citiesWithMaintenance = state.cities.filter((city) =>
       city.buildings.some((id) => BILLING_BUILDINGS.some((row) => row.id === id)),
     );

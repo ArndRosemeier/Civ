@@ -1398,16 +1398,15 @@ test('A4 map render: the camera and the drawn tiles agree with the projection at
  * answers about a unit, and therefore the only one that can tell the two rules apart from the
  * outside. It was found by asking the engine, not by looking at the canvas: a headless mirror of
  * the app's own turn loop (the human seat ends its turn, `SMART_POLICY` plays the rival) over seeds
- * 1..30 on a `duel` map with 2 civilizations produced that configuration on **28 of 30 seeds**;
- * seed 12 reaches it at turn 23 and holds it for five turns, so the scene is a property of ordinary
- * play rather than a coincidence of one seed. `docs/UI-OVERHAUL.md` §7.8 records the measurement.
+ * 1..20 on a `duel` map with 2 civilizations finds a suitable current scene at seed 6, turn 41.
+ * The historical measurement in `docs/UI-OVERHAUL.md` §7.8 predates the gameplay repair.
  *
  * `endTurns` clicks `End turn` `FOG_TURNS` times, which leaves the app's own counter at
  * `FOG_TURNS + 1` turns played — the assertion below states the turn it actually landed on rather
  * than assuming the convention.
  */
-const FOG_SEED = 12;
-const FOG_TURNS = 22;
+const FOG_SEED = 6;
+const FOG_TURNS = 40;
 
 test('fog: a rival the player cannot see is not painted, one it can see is, and one that walks out of sight stops being painted', async ({
   page,
@@ -1598,7 +1597,7 @@ test('fog: a rival the player cannot see is not painted, one it can see is, and 
     droppedOut.length,
     'founding the settler’s city did not take any rival unit out of the player’s sight while ' +
       'leaving its tile explored, so the rule this test exists for was not exercised — the scene ' +
-      'premise (seed 12, turn 23) has moved',
+      `premise (seed ${String(FOG_SEED)}, turn ${String(FOG_TURNS + 1)}) has moved`,
   ).toBeGreaterThan(0);
 
   const gone = await reachable(droppedOut);

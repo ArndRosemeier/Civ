@@ -17,19 +17,12 @@
  *   entry, and one completion per city per turn is what keeps `CityProduced`
  *   events and the state in step. Leftover shields stay in the pool and are
  *   spent next turn.
- * - **A unit is placed where the city is.** The centre is the natural tile (M2
- *   allows a player's own units to stack, so a city that already holds one can
- *   still produce another). If another player's unit holds the centre — a state
- *   the command layer cannot reach, since a moving unit may not enter an enemy
- *   tile — the unit appears on the first adjacent tile, in ascending index order,
- *   that holds no unit of another player; if there is no such tile at all the item
- *   is *not* completed and the shields stay banked for next turn. Two readings are
- *   stated rather than left to the reader: "free" means "holds no unit of another
- *   player" because stacking one's own units is legal in M2, so a friendly stack is
- *   somewhere the produced unit may legally stand; and the fallback consults
- *   neither terrain nor unit domain, because half a placement rule would put a
- *   galley on grass and claim a mechanism nothing else in the engine has (M4 owns
- *   domains). The branch exists so the pass is total on hand-built states and saves.
+ * - Units spawn on the city centre or the lowest-index suitable adjacent tile.
+ *   Land units require passable land, ships require water, and foreign units block
+ *   placement. With no suitable tile, production waits and retains its shields.
+ * - Population-cost units leave at least one citizen behind. Completion deducts
+ *   citizens, trims worked tiles and clamps the food box to the smaller city's
+ *   growth threshold. The event records the departure for conservation checks.
  * - **A building that is already built is not completed twice.** `SetProduction`
  *   refuses such an item (a `GameError`, per the contract), so this only arises
  *   from a hand-built state or a queue that names the same building twice. The
@@ -94,13 +87,14 @@ import {
 // and a one-way edge — `buildings.ts` imports `City`/`BuildingDef` from `cities.ts`
 // type-only — so the production pass keeps one implementation of the rule instead
 // of a second copy of it here.
-import { mayStartBuilding } from './buildings.js';
+import { mayStartBuilding, cityGrowthTarget } from './buildings.js';
+import { foodBoxSize } from './growth.js';
 import type { GameEvent } from './commands.js';
 // M9: a wonder's one-off culture on completion. The read and the write are one call, so
 // this pass cannot apply an amount it did not read from the row it just completed.
 import { applyCompletionBonus } from './culture.js';
 import type { CityId, TileIndex } from './ids.js';
-import { neighbors8, type RulesetView } from './map.js';
+import { isWaterRole, neighbors8, type RulesetView } from './map.js';
 // M5: the availability gate, asked here and in `actions.ts`' menu so the two cannot
 // disagree about what a city may build. A value import from `resources.ts`, which is
 // a leaf of the reachability graph: it imports `buildings.ts`, `improvements.ts`,
@@ -108,7 +102,7 @@ import { neighbors8, type RulesetView } from './map.js';
 // one-way. `resources.ts` also imports `cities.ts` *type-only* for the same reason.
 import { productionGate } from './resources.js';
 import type { GameState } from './state.js';
-import { spawnUnit, unitDef, unitsOnTile } from './units.js';
+import { spawnUnit, unitDef, unitPopulationCost, unitsOnTile, type UnitDef } from './units.js';
 
 /**
  * What `item` costs in shields, or `undefined` when this ruleset cannot build it.
@@ -162,17 +156,30 @@ const withCity = (state: GameState, city: City): GameState => ({
  * `undefined` means there is nowhere to put it, and the caller leaves the item
  * unfinished rather than placing a unit inside an enemy stack.
  */
-const placementTile = (state: GameState, city: City): TileIndex | undefined => {
+export const productionPlacement = (
+  state: GameState,
+  ruleset: RulesetView,
+  city: City,
+  def: UnitDef,
+): TileIndex | undefined => {
   const blocked = (tile: TileIndex): boolean =>
     unitsOnTile(state, tile).some((unit) => unit.owner !== city.owner);
-
-  if (!blocked(city.tile)) return city.tile;
+  const suitable = (tile: TileIndex): boolean => {
+    const terrain = ruleset.terrains.find((row) => row.id === state.map.terrain[tile]);
+    return (
+      terrain !== undefined &&
+      (def.domain === 'sea'
+        ? isWaterRole(terrain.role)
+        : !terrain.impassable && !isWaterRole(terrain.role))
+    );
+  };
+  if (!blocked(city.tile) && suitable(city.tile)) return city.tile;
 
   // Sorted rather than relying on the order `neighbors8` happens to emit: the
   // chosen tile is part of the state (and of the `CityProduced` event), so the
   // guarantee is stated here instead of inferred from another module's loop.
   const neighbours = [...neighbors8(state.map, city.tile)].sort((a, b) => a - b);
-  return neighbours.find((tile) => !blocked(tile));
+  return neighbours.find((tile) => !blocked(tile) && suitable(tile));
 };
 
 /**
@@ -332,17 +339,35 @@ export const applyProduction = (state: GameState, ruleset: RulesetView): Product
     }
 
     const def = unitDef(ruleset, item.id);
-    const tile = def === undefined ? undefined : placementTile(current, city);
-    if (def === undefined || tile === undefined) {
-      // Unreachable through the command layer (the cost resolved, so the type
-      // exists; and a city centre is only blocked by an enemy unit, which cannot
-      // stand on it). Kept total: the item waits, the shields stay banked.
+    const tile = def === undefined ? undefined : productionPlacement(current, ruleset, city, def);
+    const populationCost = def === undefined ? 0 : unitPopulationCost(def);
+    if (def === undefined || tile === undefined || city.population <= populationCost) {
+      // A blocked placement or insufficient population delays completion.
       current = withCity(current, { ...city, shields });
       continue;
     }
 
     const spawned = spawnUnit(current, def, city.owner, tile);
-    current = withCity(spawned.state, promote(city, { shields: shields - cost }));
+    const population = city.population - populationCost;
+    current = withCity(
+      spawned.state,
+      promote(city, {
+        shields: shields - cost,
+        population,
+        foodBox:
+          populationCost > 0
+            ? Math.min(
+                city.foodBox,
+                cityGrowthTarget(
+                  buildingCatalog(ruleset),
+                  { ...city, population },
+                  foodBoxSize(population),
+                ) - 1,
+              )
+            : city.foodBox,
+        workedTiles: city.workedTiles.slice(0, population),
+      }),
+    );
     events.push({
       type: 'CityProduced',
       cityId,
@@ -351,6 +376,16 @@ export const applyProduction = (state: GameState, ruleset: RulesetView): Product
       shields: shields - cost,
       unitId: spawned.unit.id,
       tile,
+      ...(populationCost > 0
+        ? {
+            emigration: {
+              citizens: populationCost,
+              populationBefore: city.population,
+              foodBoxBefore: city.foodBox,
+              workedTilesBefore: city.workedTiles,
+            },
+          }
+        : {}),
     });
   }
 

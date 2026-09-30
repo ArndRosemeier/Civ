@@ -45,6 +45,8 @@ import {
   planSetWorkedTiles,
   playerCulture,
   wholeCulture,
+  unitDef,
+  unitPopulationCost,
   type CityId,
   type GameState,
   type PlayerId,
@@ -427,6 +429,19 @@ export const mountCityPanel = (parent: HTMLElement, ctx: PanelContext): CityPane
     // Two labelled parts, because the state has two fields: what is being built now, and what is
     // queued behind it. Merging them would render a queue the engine does not have.
     const building = buildingEntry(state, ruleset, cityId);
+    if (building?.item.kind === 'unit') {
+      const def = unitDef(ruleset, building.item.id);
+      const citizens = def === undefined ? 0 : unitPopulationCost(def);
+      if (citizens > 0) {
+        production.append(
+          el(
+            doc,
+            'p',
+            `${building.label} consumes ${String(citizens)} citizen${citizens === 1 ? '' : 's'} on completion. ${city.population <= citizens ? `Waiting for population ${String(citizens + 1)}; stored shields are retained.` : 'At least one citizen stays in the city.'}`,
+          ),
+        );
+      }
+    }
     const entries = queueEntries(state, ruleset, cityId);
     const queueNodes: readonly HTMLElement[] = [
       el(doc, 'h3', 'Building now'),

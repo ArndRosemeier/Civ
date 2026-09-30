@@ -595,6 +595,49 @@ const stateProblem = (value: unknown): SaveError | undefined => {
   const playersField = listAt(state, 'players', 'state.players');
   if (isSaveError(playersField)) return playersField;
   const players = playersField.list;
+  if (state['diplomacy'] !== undefined) {
+    const relations = asArray(state['diplomacy']);
+    if (relations === undefined) return wrongType('state.diplomacy', 'a list');
+    let lastPair = -1;
+    for (const relation of relations) {
+      if (!isRecord(relation)) return wrongType('state.diplomacy', 'a list of relations');
+      const a = relation['a'];
+      const b = relation['b'];
+      if (
+        typeof a !== 'number' ||
+        typeof b !== 'number' ||
+        !Number.isInteger(a) ||
+        !Number.isInteger(b) ||
+        a < 0 ||
+        b >= players.length ||
+        a >= b
+      )
+        return outOfRange('state.diplomacy', 'relation requires ordered, distinct player ids');
+      const first = players[a];
+      const second = players[b];
+      if (
+        !isRecord(first) ||
+        !isRecord(second) ||
+        first['kind'] !== 'civ' ||
+        second['kind'] !== 'civ'
+      )
+        return outOfRange('state.diplomacy', 'relations require two civilizations');
+      if (relation['status'] !== 'war' && relation['status'] !== 'peace')
+        return wrongType('state.diplomacy.status', 'war or peace');
+      if (a * players.length + b <= lastPair)
+        return outOfRange('state.diplomacy', 'relations must be sorted and unique');
+      lastPair = a * players.length + b;
+      const offer = relation['offer'];
+      if (offer !== undefined && (relation['status'] !== 'war' || (offer !== a && offer !== b)))
+        return outOfRange('state.diplomacy.offer', 'a warring participant');
+      const truce = relation['truceUntil'];
+      if (
+        truce !== undefined &&
+        (typeof truce !== 'number' || !Number.isInteger(truce) || truce < 0)
+      )
+        return outOfRange('state.diplomacy.truceUntil', 'a nonnegative turn');
+    }
+  }
   if (players.length === 0) {
     return outOfRange('state.players', 'a game with no players has no player to act as');
   }

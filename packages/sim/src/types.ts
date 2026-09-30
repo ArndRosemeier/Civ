@@ -146,6 +146,8 @@ export interface Violation {
  * the same seed under different ones.
  */
 export interface Policy {
+  /** Repoll after a resolved battle or hut, allowing batches that never predict future dice. */
+  readonly replanAfterRandomEvent?: boolean;
   readonly name: string;
   readonly chooseCommands: (ctx: PolicyContext) => readonly Command[];
 }

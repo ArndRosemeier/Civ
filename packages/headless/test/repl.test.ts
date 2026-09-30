@@ -76,6 +76,7 @@ import {
   playerIncome,
   playerUpkeep,
   rateCapsOf,
+  requiresTechOf,
   seedRng,
   tileIndex,
   unitDef,
@@ -458,7 +459,7 @@ const moneyLines = (label: string, units: number, free: number, gold = 0): reado
   `ok: ${label} collected ${String(gold)} gold, 0 beakers and 0 luxuries from its cities at ` +
     'its rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
     'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-    'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+    'tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   `ok: ${label} paid 0 gold of upkeep (0 building maintenance + 0 unit support for ` +
     `${String(units)} unit(s), ${String(free)} of them free)`,
 ];
@@ -675,7 +676,7 @@ const EXPECTED_TRANSCRIPT = [
   'you are Player 1 (p0); every view below is drawn from your fog of war',
   'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 cities',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
-  '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
+  '  luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | load <path> | replay <path> | help | quit',
@@ -692,7 +693,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
@@ -712,7 +713,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 1 1',
@@ -730,7 +731,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 2 2',
@@ -748,7 +749,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> move 0 9 9',
@@ -766,7 +767,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> wibble',
@@ -785,13 +786,13 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (1/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
@@ -807,7 +808,7 @@ const EXPECTED_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @1,1 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> quit',
@@ -844,7 +845,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'you are Player 1 (p0); every view below is drawn from your fog of war',
   'economy: 10 gold, 0 beakers, 0 luxuries, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 cities',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
-  '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
+  '  luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  "rates <tax> <science> <luxury>" moves the sliders (they must sum to 10); gold pays upkeep, and a treasury that cannot pay disbands units.',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'commands: move <unitId> <x> <y> | attack <unitId> <x> <y> | fortify <unitId> | found <unitId> | cities | city <cityId> | work <cityId> <x> <y> ... | build <cityId> <unit|building>:<id> | work <unitId> <improvementId> | cancel <unitId> | rates <tax> <science> <luxury> | research <techId> | tech | government [<governmentId>] | culture | happiness | outcome | end | units | state | save <path> | load <path> | replay <path> | help | quit',
@@ -861,7 +862,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
@@ -882,7 +883,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> work 2 mine',
@@ -901,14 +902,14 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> state',
   'state: seed=7 turn=1 revision=1 schema=9 map=tiny(4x4) civs=2',
   'economy: 10 gold, rates tax 6 / science 4 / luxury 0 (sum 10 of 10), 0 beakers, 0 luxuries',
   '  beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
-  '  luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
+  '  luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
   '  gold pays upkeep, and a treasury that cannot pay is paid for by disbanding units',
   '  (highest id first) rather than by going negative.',
   'economy: at these rates this state collects 0 gold, 0 beakers and 0 luxuries a turn',
@@ -935,13 +936,13 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp mining, 3 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) mining, 3 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 2 begins; every unit refilled its movement',
   '  revision 2',
@@ -958,7 +959,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp mining, 2 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp) mining, 2 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> cancel 2',
@@ -976,7 +977,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> work 2 road',
@@ -995,13 +996,13 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp building a road, 2 turns left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (0/2 movement, 1/1 hp) building a road, 2 turns left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 3 begins; every unit refilled its movement',
   '  revision 5',
@@ -1018,14 +1019,14 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'work: 2 p0 Worker@2,2 1/1 hp building a road, 1 turn left',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp) building a road, 1 turn left',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> end',
   'ok: unit 2 finished improvement "Road" (2 turns) on (2,2); the tile is improved',
-  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 1 (p0) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 2 unit(s), 4 of them free)',
-  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its rates - beakers now buy tech: they are banked toward the tech you selected and spent on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for 1 unit(s), 4 of them free)',
   'ok: turn 4 begins; every unit refilled its movement',
   '  revision 6',
@@ -1041,7 +1042,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> units',
@@ -1062,7 +1063,7 @@ const EXPECTED_WORKER_TRANSCRIPT = [
   'starts: 0=Player 1@0,0  1=Player 2@0,1',
   'units: *0 p0 Settler @0,0 (2/2 movement, 1/1 hp)   1 p1 Settler @0,1 (2/2 movement, 1/1 hp)  *2 p0 Worker @2,2 (2/2 movement, 1/1 hp)',
   'cities: none',
-  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+  'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, 0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
   '  2 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
   'research: nothing being researched - 0 beakers banked ("research <techId>"; "tech" lists the tree)',
   'p0> quit',
@@ -1178,12 +1179,12 @@ describe('the REPL transcript', () => {
     // above records. 1ca22df3412b4ceb -> 854c8039fe812a82.
     //
     // Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9), the same bump: `PlayerState.government`
-    // and `GameState.tileOwner`. 854c8039fe812a82 -> 2a2db6d2ef998dcc. **The transcript did
+    // and `GameState.tileOwner`. 854c8039fe812a82 -> c6652bc9942e939c. **The transcript did
     // not move for this one alone** — the two lines that did move are the `commands:` summary
     // and the luxury sentence, and both moved because M9 added verbs and made luxuries
     // readable, not because of the hash. The state pin and the text pin are separate
     // assertions so that a future wave can tell which of the two a change moved.
-    expect(hashValue(capture.session.state)).toBe('2a2db6d2ef998dcc');
+    expect(hashValue(capture.session.state)).toBe('c6652bc9942e939c');
     // The `end` in this script banked a turn of a *cityless* economy: no city, so no
     // commerce and no income — the treasury is exactly the starting 10. A money loop
     // that invented income for a player with nothing built would move this.
@@ -1497,7 +1498,17 @@ describe('the city verbs', () => {
   });
 
   it('sets production from an explicit unit or building id, and from an unambiguous one', () => {
-    const capture = open();
+    const base = syntheticState();
+    const capture = open({
+      state: {
+        ...base,
+        players: base.players.map((player) =>
+          player.id === asPlayerId(0)
+            ? { ...player, techs: [asTechId('bronze-working'), asTechId('pottery')] }
+            : player,
+        ),
+      },
+    });
     capture.session.run('found 0');
     capture.clear();
 
@@ -1662,7 +1673,17 @@ describe('the city verbs', () => {
   });
 
   it('teaches what was legal, from the engine’s own evaluators', () => {
-    const capture = open();
+    const base = syntheticState();
+    const capture = open({
+      state: {
+        ...base,
+        players: base.players.map((player) =>
+          player.id === asPlayerId(0)
+            ? { ...player, techs: [asTechId('bronze-working'), asTechId('pottery')] }
+            : player,
+        ),
+      },
+    });
     capture.session.run('found 0');
 
     // A tile the city may not work: the lesson is the tiles it *may* work, which
@@ -2111,16 +2132,13 @@ describe('a build the tech gate holds back', () => {
       .split('\n')
       .find((line) => line.includes('legal: locked behind a tech you have not researched:'))
       ?.trim();
-    expect(locked).toBe(
-      'legal: locked behind a tech you have not researched: unit "Archer" needs ' +
-        '"Warrior Code" (warrior-code) ("research warrior-code"); unit "Spearman" needs ' +
-        '"Warrior Code" (warrior-code) ("research warrior-code"); unit "Horseman" needs ' +
-        '"Horseback Riding" (horseback-riding) ("research horseback-riding"); unit ' +
-        '"Transport" needs "Map Making" (map-making) ("research map-making"); unit ' +
-        '"Legionary" needs "Iron Working" (iron-working) ("research iron-working"); ' +
-        'building "Temple" needs "Ceremonial Burial" (ceremonial-burial) ' +
-        '("research ceremonial-burial").',
-    );
+    for (const row of [...RULESET.units, ...(RULESET.buildings ?? [])]) {
+      const required = requiresTechOf(row);
+      if (required !== undefined && required !== asTechId('iron-working')) {
+        expect(locked).toContain(row.name);
+        expect(locked).toContain(String(required));
+      }
+    }
     // The menu above that line is the engine's own (`cityProductionOptions`, which
     // asks `productionGate`), so the gated unit is *not* in the "may be set to build"
     // list — the two lines are two halves of the same verdict, and neither is this
@@ -2198,6 +2216,7 @@ describe('buildings and wonders, as the reader meets them', () => {
     });
     const state: GameState = {
       ...base,
+      players: base.players.map((player) => ({ ...player, techs: [asTechId('masonry')] })),
       nextCityId: 2,
       // M9: the materialised ownership layer. `[]` is the honest value for a
       // state nobody has run a turn on: `withOwnership` fills it from the cities the
@@ -2448,7 +2467,7 @@ describe('event rendering', () => {
       'ok: Player 1 (p0) collected 2 gold, 0 beakers and 0 luxuries from its cities at its ' +
         'rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
         'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-        'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+        'tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(block[2]).toBe(
       'ok: Player 1 (p0) paid 0 gold of upkeep (0 building maintenance + 0 unit support for ' +
@@ -2458,7 +2477,7 @@ describe('event rendering', () => {
       'ok: Player 2 (p1) collected 0 gold, 0 beakers and 0 luxuries from its cities at its ' +
         'rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
         'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-        'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+        'tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(block[4]).toBe(
       'ok: Player 2 (p1) paid 0 gold of upkeep (0 building maintenance + 0 unit support for ' +
@@ -2527,7 +2546,7 @@ describe('event rendering', () => {
       'ok: Player 1 (p0) collected 1 gold, 0 beakers and 0 luxuries from its cities at its ' +
         'rates - beakers now buy tech: they are banked toward the tech you selected and spent ' +
         'on the turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the ' +
-        'tree); luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+        'tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(capture.session.state.players[0]?.treasury).toBe(11);
   });
@@ -2676,7 +2695,7 @@ describe('event rendering', () => {
         `${String(income.luxuries)} ${income.luxuries === 1 ? 'luxury' : 'luxuries'} from its ` +
         'cities at its rates - beakers now buy tech: they are banked toward the tech you ' +
         'selected and spent on the turn the pool covers its cost ("research <techId>" chooses ' +
-        'one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 banked content ' +
+        'one, "tech" shows the tree); luxuries CONTENT CITIZENS: every 2 spent by this city each turn content ' +
         'one, and each luxury resource you have connected contents 1 more; a city whose ' +
         'unhappy citizens outnumber its happy ones is in disorder and produces no shields, ' +
         'beakers or gold',
@@ -3370,9 +3389,9 @@ describe('the worker verbs', () => {
     // `state` view's `schema=8`.
     // Rehashed for M9+M10 (SCHEMA_VERSION 8 -> 9): `PlayerState.government` and
     // `GameState.tileOwner`, the same bump the pins above record. 9787f054e1c300ea ->
-    // b8a0218a7031e90c. The transcript moved with it in every line that names a unit —
+    // ac330b1b93449d20. The transcript moved with it in every line that names a unit —
     // hit points, as above — and in the `state` view's `schema=9`.
-    expect(hashValue(first.session.state)).toBe('b8a0218a7031e90c');
+    expect(hashValue(first.session.state)).toBe('ac330b1b93449d20');
   });
 
   it('documents the worker verbs in help and in the command summary', () => {
@@ -3885,7 +3904,7 @@ describe('the economy the reader is shown', () => {
         'turn the pool covers its cost ("research <techId>" chooses one, "tech" shows the tree).',
     );
     expect(banner).toContain(
-      'luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
+      'luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
     );
     expect(banner).toContain('"rates <tax> <science> <luxury>" moves the sliders');
 
@@ -3911,7 +3930,7 @@ describe('the economy the reader is shown', () => {
     expect(economyLines).toHaveLength(1);
     expect(economyLines[0]).toBe(
       'economy: 10 gold, rates 6/4/0 (tax/science/luxury, sum 10 of 10), 0 beakers, ' +
-        '0 luxuries - luxuries CONTENT CITIZENS: every 2 banked content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
+        '0 luxuries - luxuries CONTENT CITIZENS: every 2 spent by this city each turn content one, and each luxury resource you have connected contents 1 more; a city whose unhappy citizens outnumber its happy ones is in disorder and produces no shields, beakers or gold',
     );
     expect(capture.text()).toContain(
       '1 unit(s) against 4 supported free (0 billable at 0 gold); upkeep is what empties a treasury',
@@ -3944,7 +3963,7 @@ describe('the economy the reader is shown', () => {
     // them: a balance sweep that re-runged `luxuriesPerHappyCitizen` would move both
     // the line and this expectation together.
     expect(text).toContain(
-      `luxuries CONTENT CITIZENS: every ${String(luxuryRules.luxuriesPerHappyCitizen)} banked ` +
+      `luxuries CONTENT CITIZENS: every ${String(luxuryRules.luxuriesPerHappyCitizen)} spent by this city each turn ` +
         'content one, and each luxury resource you have connected contents ' +
         `${String(luxuryRules.happyPerLuxuryResource)} more; a city whose unhappy citizens ` +
         'outnumber its happy ones is in disorder and produces no shields, beakers or gold.',
@@ -4461,9 +4480,7 @@ describe('the play command', () => {
     const lines = [
       `found ${String(settler.id)}`,
       'build 0 unit:worker',
-      'end',
-      'end',
-      'end',
+      ...Array.from({ length: 20 }, () => 'end'),
       'units',
       `work ${workerId} road`,
       'state',
@@ -5228,7 +5245,7 @@ describe('an attack that does not apply', () => {
     // (0,1) holds player 1's settler and (1,2) its warrior: the two enemy units this
     // warrior stands beside. (0,2) holds *two* enemies, which is refused; (2,2) holds
     // nothing; (0,0) holds player 0's own settler; (1,0) is impassable mountains.
-    expect(accepted).toEqual(['0,1', '1,2']);
+    expect(accepted).toEqual(['0,1', '0,2', '1,2']);
 
     const capture = open({ state: combatState() });
     capture.clear();
@@ -5239,32 +5256,22 @@ describe('an attack that does not apply', () => {
         .split('\n')
         .find((line) => line.includes('can attack ')) ?? '';
     expect(lesson).toContain('legal: unit 2 (Warrior at 1,1');
-    expect(lesson).toContain('can attack (0,1) (1,2) - each is adjacent and holds one');
+    expect(lesson).toContain(
+      'can attack (0,1) (0,2) (1,2) - each is adjacent and holds enemy units',
+    );
     // …and neither of the two tiles it leaves out appears on the line.
-    expect(lesson).not.toContain('(0,2)');
+    expect(lesson).toContain('(0,2)');
     expect(lesson).not.toContain('(2,2)');
   });
 
-  it('refuses a stacked target rather than choosing a defender', () => {
+  it('attacks a stack and leaves the unchosen defender intact', () => {
     const capture = open({ state: combatState() });
-    capture.clear();
-
+    const before = capture.session.state.units.find((unit) => Number(unit.id) === 6);
     const outcome = capture.session.run('attack 2 0 2');
-    const error = refusal(outcome);
-    expect(error.kind).toBe('target-stacked');
-    if (error.kind !== 'target-stacked') throw new Error('unreachable');
-    expect(error.defenders).toBe(2);
-
-    const text = capture.text();
-    expect(text).toContain('error: target-stacked - (0,2) holds 2 enemy units,');
-    expect(text).toContain('rule this engine does not have (M2 lets units stack)');
-    // Both defenders are untouched: a refused attack is inert.
-    expect(capture.session.state.revision).toBe(0);
-    for (const id of [5, 6]) {
-      expect(
-        capture.session.state.units.find((unit) => Number(unit.id) === id)?.hitPointsLeft,
-      ).toBe(3);
-    }
+    expect(outcome.kind).toBe('applied');
+    expect(capture.text()).toContain('fought');
+    expect(capture.session.state.revision).toBe(1);
+    expect(capture.session.state.units.find((unit) => Number(unit.id) === 6)).toEqual(before);
   });
 
   it('refuses a target that is not adjacent, an unknown unit and a malformed line', () => {

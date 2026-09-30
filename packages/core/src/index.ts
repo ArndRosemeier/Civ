@@ -73,6 +73,7 @@ export * from './units.js';
 // call it, never the other way round.
 export * from './combat.js';
 export * from './commands.js';
+export * from './diplomacy.js';
 // The route query — `docs/UI-OVERHAUL.md` §7.4's shape (b): a route query in the engine, the
 // destination held as UI intent. It sits AFTER `commands.js` because every answer it gives is
 // `planMove`'s: it states no movement rule of its own, it asks the one this package already has,

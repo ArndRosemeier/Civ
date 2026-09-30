@@ -361,7 +361,7 @@ describe('1. derived-value agreement — the ownership layer against the cities�
     // city has 0 culture and therefore radius 1 — so this drives a *patched* threshold
     // down to a value a short game reaches, and checks the boundary in both readings.
     const ruleset = patched({ culture: { borderRadius2Culture: 4, borderRadius3Culture: 40 } });
-    const snapshots = playTurns(7, 20, ruleset);
+    const snapshots = playTurns(7, 80, ruleset);
     const border = cultureRulesOf(ruleset);
 
     const sawRadius2 = snapshots.some((state) =>
@@ -756,17 +756,26 @@ describe('2. boundaries — every new threshold, at the value and one step below
     const city = cityOf(state);
     const owner = city.owner;
 
-    const withLuxuries = (luxuries: number): number =>
-      happinessOf(
-        {
-          ...state,
-          players: state.players.map((player) =>
-            player.id === owner ? { ...player, luxuries } : player,
-          ),
-        },
-        ruleset,
-        city,
-      ).happy;
+    const withLuxuries = (luxuries: number): number => {
+      const populated = { ...city, population: 3, workedTiles: [] };
+      const current = {
+        ...state,
+        cities: state.cities.map((row) => (row.id === city.id ? populated : row)),
+        players: state.players.map((player) =>
+          player.id === owner
+            ? { ...player, rates: { tax: 0, science: 0, luxury: 10 }, luxuries: 999 }
+            : player,
+        ),
+      };
+      const spendingRules = {
+        ...ruleset,
+        terrains: ruleset.terrains.map((row) => ({
+          ...row,
+          yields: { ...row.yields, commerce: luxuries },
+        })),
+      };
+      return happinessOf(current, spendingRules, populated).happy;
+    };
 
     expect(withLuxuries(0)).toBe(0);
     expect(withLuxuries(1)).toBe(0);

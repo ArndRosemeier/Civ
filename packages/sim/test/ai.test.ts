@@ -548,20 +548,20 @@ describe('M7b — the planner got cheap without moving a decision', () => {
     // legal commands in them. The digest below is the new measured one; the old was
     // `91f3c655297e0fcb`.
     const trail = commandTrail(3, 30, smartPolicy());
-    expect(trail.length).toBe(594);
-    expect(fnv1a64(trail.join('\n'))).toBe('5fb0401516c68a64');
+    expect(trail.length).toBe(224);
+    expect(fnv1a64(trail.join('\n'))).toBe('6eeccb5f6dcffc01');
     // The head of it verbatim, so a failure reports *what* moved rather than only that
     // something did: a digest can only ever say "somewhere in these 607 commands".
     expect(trail.slice(0, 12)).toEqual([
-      't1 p0 SetResearch {"tech":"ceremonial-burial","type":"SetResearch"}',
-      't1 p0 SetRates {"rates":{"luxury":0,"science":8,"tax":2},"type":"SetRates"}',
+      't1 p0 SetResearch {"tech":"pottery","type":"SetResearch"}',
+      't1 p0 SetRates {"rates":{"luxury":2,"science":8,"tax":0},"type":"SetRates"}',
       't1 p0 FoundCity {"type":"FoundCity","unitId":0}',
       't1 p0 StartWork {"kind":"irrigation","type":"StartWork","unitId":1}',
-      't1 p1 SetResearch {"tech":"ceremonial-burial","type":"SetResearch"}',
-      't1 p1 SetRates {"rates":{"luxury":0,"science":8,"tax":2},"type":"SetRates"}',
+      't1 p1 SetResearch {"tech":"pottery","type":"SetResearch"}',
+      't1 p1 SetRates {"rates":{"luxury":2,"science":8,"tax":0},"type":"SetRates"}',
       't1 p1 FoundCity {"type":"FoundCity","unitId":2}',
       't1 p1 StartWork {"kind":"irrigation","type":"StartWork","unitId":3}',
-      't2 p0 SetProduction {"cityId":0,"item":{"id":"galley","kind":"unit"},"type":"SetProduction"}',
+      't2 p0 SetProduction {"cityId":0,"item":{"id":"warrior","kind":"unit"},"type":"SetProduction"}',
       't2 p1 SetProduction {"cityId":1,"item":{"id":"galley","kind":"unit"},"type":"SetProduction"}',
       't3 p0 SetWorkedTiles {"cityId":0,"tiles":[684],"type":"SetWorkedTiles"}',
       't3 p0 SetProduction {"cityId":0,"item":{"id":"settler","kind":"unit"},"type":"SetProduction"}',
@@ -1609,24 +1609,36 @@ const playSiege = (start: GameState, turns: number, ruleset: Ruleset = RULESET):
       // The context is built here rather than through `ctxFor` because a siege may be played
       // on a *patched* ruleset (the walls sweep below), and a context that quietly used the
       // shipped one would measure the wrong engine.
-      const commandsThisTurn = policy.chooseCommands({
-        state,
-        playerId: player.id,
-        ruleset,
-        rng: policyRngFor(5, player.id, state.turn),
-      });
-      for (const command of commandsThisTurn) {
-        const before = state;
-        const outcome = applyCommand(state, player.id, command, ruleset);
-        if (!outcome.ok) continue;
-        commands.push(command);
-        events.push(...outcome.value.events);
-        state = outcome.value.state;
-        const taken = outcome.value.events.find(
-          (event): event is Extract<GameEvent, { readonly type: 'CityCaptured' }> =>
-            event.type === 'CityCaptured',
-        );
-        if (taken !== undefined) capture = { event: taken, before, after: state };
+      const maxBatches =
+        1 +
+        state.units
+          .filter((unit) => unit.owner === player.id)
+          .reduce((sum, unit) => sum + unit.movementLeft, 0);
+      for (let batch = 0; batch < maxBatches; batch += 1) {
+        let randomEvent = false;
+        const commandsThisTurn = policy.chooseCommands({
+          state,
+          playerId: player.id,
+          ruleset,
+          rng: policyRngFor(5, player.id, state.turn),
+        });
+        for (const command of commandsThisTurn) {
+          const before = state;
+          const outcome = applyCommand(state, player.id, command, ruleset);
+          if (!outcome.ok) continue;
+          commands.push(command);
+          events.push(...outcome.value.events);
+          state = outcome.value.state;
+          randomEvent ||= outcome.value.events.some(
+            (event) => event.type === 'CombatResolved' || event.type === 'HutEntered',
+          );
+          const taken = outcome.value.events.find(
+            (event): event is Extract<GameEvent, { readonly type: 'CityCaptured' }> =>
+              event.type === 'CityCaptured',
+          );
+          if (taken !== undefined) capture = { event: taken, before, after: state };
+        }
+        if (!policy.replanAfterRandomEvent || !randomEvent) break;
       }
     }
     state = advanceTurn(state, RULESET).state;

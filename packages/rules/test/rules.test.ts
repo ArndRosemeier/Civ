@@ -731,7 +731,13 @@ describe('unit catalog', () => {
     // shipped unit requires anything" while the engine still claims to gate.
     const gated = UNITS.filter((u) => u.requiresResource !== undefined);
     // In catalog order, which is the order the table declares them.
-    expect(gated.map((u) => u.id)).toEqual([asUnitTypeId('horseman'), asUnitTypeId('swordsman')]);
+    expect(gated.map((u) => u.id)).toEqual([
+      'horseman',
+      'swordsman',
+      'pikeman',
+      'medieval-infantry',
+      'knight',
+    ]);
     // Every requirement names a real strategic resource: a gate on a bonus or a luxury
     // would be a gate M4c's `resourceGate` cannot satisfy, since those are never
     // "connected" as strategic resources are.
@@ -818,14 +824,14 @@ describe('unit catalog', () => {
     }
   });
 
-  it('keeps the cheapest building ungated, so the first thing a city can build always can be', () => {
+  it('unlocks the cheapest building through the opening Pottery technology', () => {
     // The played golden sets its city to produce the cheapest building in the catalog on a
     // board with no technologies, and a *player* in the same position would be stuck with an
     // empty production list if the cheapest row were gated. Pinned by value: the cheapest
     // row is the granary and it requires nothing.
     const cheapest = [...BUILDINGS].sort((a, b) => a.cost - b.cost)[0];
     expect(cheapest?.id).toBe(asBuildingId('granary'));
-    expect(cheapest?.requiresTech).toBeUndefined();
+    expect(cheapest?.requiresTech).toBe(asTechId('pottery'));
 
     // …and the gated building is strictly more expensive, so the gate cannot be the only
     // reason it is not built first.

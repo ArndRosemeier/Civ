@@ -117,6 +117,7 @@ import {
   asImprovementId,
   asTechId,
   asUnitId,
+  asPlayerId,
   asUnitTypeId,
   buildingCatalog,
   buildingDef,
@@ -308,7 +309,10 @@ export const PLAY_USAGE = `usage: civts play [--seed <int>] [--map-size <size>] 
   --god               render the whole map, ignoring fog (debugging only)
 
 Commands inside a session (also documented by "help"):
-  move <unitId> <x> <y>      attack <unitId> <x> <y>     fortify <unitId>
+  move <unitId> <x> <y>      attack <unitId> <x> <y>     war <playerId>         declare war on another civilization.
+  peace <playerId>       offer peace; the offer must be accepted to end the war.
+  accept <playerId>      accept that civilization's peace offer.
+  fortify <unitId>
   found <unitId>      cities      city <cityId>
   work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
   work <unitId> <improve>    cancel <unitId>
@@ -699,13 +703,13 @@ const legalAttackLines = (context: ErrorContext, unitId: UnitId): readonly strin
   if (targets.length === 0) {
     return [
       `  legal: ${label} has nothing it can attack this turn - an attack needs an adjacent`,
-      '  tile holding exactly one enemy unit or an undefended enemy city, and movement left',
+      '  tile holding enemy units or an undefended enemy city, and movement left',
       '  to spend ("end" refills movement).',
     ];
   }
   return [
     `  legal: ${label} can attack ${tileList(context.state.map, targets, '(none)')} - each is ` +
-      'adjacent and holds one enemy unit or an undefended enemy city.',
+      'adjacent and holds enemy units or an undefended enemy city.',
   ];
 };
 
@@ -1592,7 +1596,7 @@ const playerStateOf = (state: GameState, id: PlayerId): PlayerState | undefined 
 const luxuryCaveat = (ruleset: RulesetView): string => {
   const rules = happinessRulesOf(ruleset);
   return (
-    `luxuries CONTENT CITIZENS: every ${String(rules.luxuriesPerHappyCitizen)} banked ` +
+    `luxuries CONTENT CITIZENS: every ${String(rules.luxuriesPerHappyCitizen)} spent by this city each turn ` +
     `content one, and each luxury resource you have connected contents ` +
     `${String(rules.happyPerLuxuryResource)} more; a city whose unhappy citizens outnumber ` +
     'its happy ones is in disorder and produces no shields, beakers or gold'
@@ -2906,6 +2910,8 @@ const outcomeText = (
   const rules = combatRulesOf(ruleset);
   const lines = outcome.events.map((event): string => {
     switch (event.type) {
+      case 'DiplomacyChanged':
+        return event.order + ': ' + String(event.from) + ' -> ' + String(event.to);
       case 'UnitMoved':
         return (
           `ok: unit ${String(event.unitId)} moved to ${eventPlace(outcome, event.to)}, ` +
@@ -3220,6 +3226,10 @@ const appliedCommandText = (
   playerId: PlayerId,
 ): string | undefined => {
   switch (command.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return command.type + ' ' + String(command.targetPlayer);
     case 'MoveUnit':
     case 'EndTurn':
     case 'FoundCity':
@@ -3776,6 +3786,18 @@ export const createSession = (options: SessionOptions): ReplSession => {
           return malformed(`"end" takes no arguments (got "${args.join(' ')}")`, 'usage: end');
         }
         return applied({ type: 'EndTurn' });
+
+      case 'war':
+      case 'peace':
+      case 'accept': {
+        const target = intOf(args[0]);
+        if (args.length !== 1 || target === undefined || target < 0) {
+          return malformed(`"${word}" needs a civilization player id`, `usage: ${word} <playerId>`);
+        }
+        const type =
+          word === 'war' ? 'DeclareWar' : word === 'peace' ? 'OfferPeace' : 'AcceptPeace';
+        return applied({ type, targetPlayer: asPlayerId(target) });
+      }
 
       /* ---------------- M3: founding, one city, the list ---------------- */
 

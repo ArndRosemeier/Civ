@@ -35,6 +35,7 @@ import { CATALOG, validateRuleset } from '@civts/rules';
 
 import {
   asBuildingId,
+  asPlayerId,
   asCityId,
   asGovernmentId,
   asImprovementId,
@@ -60,6 +61,9 @@ const RULESET = (() => {
 
 /** One valid action per member of the engine's command union. */
 const SAMPLES: Readonly<Record<Command['type'], Command>> = {
+  DeclareWar: { type: 'DeclareWar', targetPlayer: asPlayerId(1) },
+  OfferPeace: { type: 'OfferPeace', targetPlayer: asPlayerId(1) },
+  AcceptPeace: { type: 'AcceptPeace', targetPlayer: asPlayerId(1) },
   EndTurn: { type: 'EndTurn' },
   MoveUnit: { type: 'MoveUnit', unitId: asUnitId(1), to: asTileIndex(7) },
   FoundCity: { type: 'FoundCity', unitId: asUnitId(1) },

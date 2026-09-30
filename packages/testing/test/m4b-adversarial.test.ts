@@ -291,6 +291,10 @@ const recorder = (): Recorder => {
  */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'EndTurn':
       return 'EndTurn';
     case 'MoveUnit':
@@ -2157,7 +2161,8 @@ describe('5. rates', () => {
       const built = builder
         .setTreasury(0, 200)
         .addCity(0, [8, 8], {
-          population: 1,
+          population: 3,
+          foodBox: 4,
           workedTiles: [],
           // M9: a city's accumulated culture. `borders.ts` derives a city's claim radius
           // from this and `computeTileOwner` reads it, so a hand-built city states a number

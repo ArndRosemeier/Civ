@@ -139,7 +139,7 @@ const combatBoard = (): {
   if (free === undefined) throw new Error('the fixture settler has no empty neighbour');
   const defender = spawnUnit(warrior.state, defOf('warrior'), RIVAL, free);
   return {
-    state: defender.state,
+    state: apply(defender.state, SEAT, { type: 'DeclareWar', targetPlayer: RIVAL }),
     archer: archer.unit.id,
     warrior: warrior.unit.id,
     defender: defender.unit.id,

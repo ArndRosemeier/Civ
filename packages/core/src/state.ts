@@ -269,8 +269,8 @@ export interface PlayerState {
    */
   readonly beakers: number;
   /**
-   * M4b: luxuries banked so far. **Inert in M4b** — nothing reads them until M9
-   * (happiness). Same reasoning as `beakers`.
+   * Luxury spending collected during the latest turn. This is a statistic, not a
+   * banked pool: each city's happiness uses its current commerce and luxury rate.
    */
   readonly luxuries: number;
   /**
@@ -335,6 +335,8 @@ export interface PlayerState {
 }
 
 export interface GameState {
+  /** Optional for backwards-compatible loading of older, universally hostile games. */
+  readonly diplomacy?: readonly import('./diplomacy.js').DiplomaticRelation[];
   readonly schemaVersion: number;
   readonly revision: number; // 0 at newGame; increments on every applied command (M2+)
   readonly turn: number; // 1 at newGame
@@ -852,6 +854,9 @@ export const newGame = (
   // so `visibleTiles` answers "nothing" for it and its row stays blank — an
   // all-false row is a player that has seen nothing, which is true.
   const seeded: GameState = {
+    diplomacy: civs.flatMap((a, index) =>
+      civs.slice(index + 1).map((b) => ({ a: a.id, b: b.id, status: 'peace' as const })),
+    ),
     schemaVersion: SCHEMA_VERSION,
     revision: 0,
     turn: 1,

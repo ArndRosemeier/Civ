@@ -148,7 +148,10 @@ import { applyResearch } from './tech.js';
 // M9: the victory *rule*, asked before the first step so that a finished game cannot
 // advance. `victory.ts` imports `turn.ts` not at all, so the edge is one-way.
 import { gameOutcomeOf } from './victory.js';
-import { unitDef, withoutWork, type Unit } from './units.js';
+import { healUnit, maxHitPointsOf, unitDef, withoutWork, type Unit } from './units.js';
+import { cityAt } from './cities.js';
+import { asBuildingId } from './ids.js';
+import { foreignOwnerAt } from './borders.js';
 
 /** The state after a turn, and everything that happened during it. */
 export interface TurnOutcome {
@@ -358,7 +361,40 @@ export const advanceTurn = (state: GameState, ruleset: RulesetView): TurnOutcome
   // is this turn's, and the band is refilled at the end of it like every other unit).
   // Moving this call changes outcomes in both directions — `turn.test.ts` pins both.
   const barbarians = advanceBarbarians(paid.state, ruleset);
-  const refilled = refillMovement(barbarians.state, ruleset);
+  const combatants = new Set(
+    barbarians.events.flatMap((event) =>
+      event.type === 'CombatResolved' ? [event.attackerId, event.defenderId] : [],
+    ),
+  );
+  // Only units already present at the boundary and resting throughout the turn heal.
+  const rested = {
+    ...barbarians.state,
+    units: barbarians.state.units.map((unit) => {
+      const before = state.units.find((candidate) => candidate.id === unit.id);
+      const def = unitDef(ruleset, unit.type);
+      if (
+        before === undefined ||
+        def === undefined ||
+        before.work !== undefined ||
+        combatants.has(unit.id) ||
+        before.tile !== unit.tile ||
+        before.movementLeft !== def.movement ||
+        unit.movementLeft !== before.movementLeft ||
+        before.hitPointsLeft !== unit.hitPointsLeft ||
+        foreignOwnerAt(barbarians.state, unit.tile, unit.owner) !== undefined
+      )
+        return unit;
+      const city = cityAt(barbarians.state, unit.tile);
+      return healUnit(
+        unit,
+        def,
+        city?.owner === unit.owner && city.buildings.includes(asBuildingId('barracks'))
+          ? maxHitPointsOf(def, 1)
+          : 1,
+      );
+    }),
+  };
+  const refilled = refillMovement(rested, ruleset);
   // M9, step 8: the ownership layer, recomputed from the cities and their culture —
   // which are exactly what the culture step above just moved. It runs *after* the
   // barbarian step so that a city a barbarian captured this turn transfers its claim on

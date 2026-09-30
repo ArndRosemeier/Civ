@@ -284,6 +284,15 @@ const findAttackScene = (
     const player = asPlayerId(0);
     const script: unknown[] = [];
     let state = started.value;
+    const war = applyCommand(
+      state,
+      player,
+      { type: 'DeclareWar', targetPlayer: asPlayerId(1) },
+      RULESET,
+    );
+    if (!war.ok) continue;
+    state = war.value.state;
+    script.push({ type: 'DeclareWar', targetPlayer: 1 });
 
     const settler = state.units.find(
       (unit) => unit.owner === player && unit.type.includes('settler'),

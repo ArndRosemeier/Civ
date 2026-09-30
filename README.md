@@ -3,27 +3,33 @@
 A Civilization III–shaped 4X strategy game in TypeScript, built to be played and
 debugged by an autonomous agent as well as by a human.
 
-**Status: pre-alpha, at the alpha boundary.** M0–M10 have landed; the commit this
-document was written against is `d4e7f72` ("M9+M10: culture, borders, governments,
-happiness, victory and score"), with M11 (save/load/replay + the alpha audit) being
-written in the working tree at the same time. `PLAN.md` §16 defines alpha and lists
-the exit criteria A1–A7; `docs/KNOWN-ISSUES.md` lists what is deliberately not in it.
+**Status: playable prototype, with simplified rules and placeholder balance.** The
+browser offers game setup, a live AI opponent, research, cities, combat, government,
+culture, victory conditions, save/load and replay. It is still a small 4X game rather
+than a complete Civilization III recreation.
 
-**One headline limit, stated here rather than buried.** The victory system is real and
-four conditions are implemented, but only two of them (`cultural` and `score`) have ever
-ended a game the AI played: `conquest` has ended an AI-played game only with the AI in
-one seat against a do-nothing opponent (**0 of 100** self-play games), and `domination`
-has ended **no** AI-played game at all (**0 of 100**) — it is demonstrated only on
-hand-built boards with patched thresholds. A3's literal requirement ("at least one
-victory condition demonstrated ending a real game") is met; **"every victory condition
-works in practice" would be an overstatement**. The counts, and the command that
-reproduces each, are in `docs/GDD.md` §5.1, `docs/BALANCE.md` §8 and
-`docs/KNOWN-ISSUES.md` §3.7.
+The September 2026 gameplay repair adds citizen costs (settlers: two, workers: one),
+legal coastal ship placement, deterministic selection of the strongest defender in a
+stack, idle healing, city-local luxury spending, building research requirements, and
+three medieval units. New games start at peace; the Diplomacy panel supports war
+declarations, peace offers and acceptance. The AI accepts peace and observes a
+20-turn treaty window before considering another war. Humans may break peace sooner.
+Old saves without diplomacy keep their existing state of war.
 
-Every number quoted below was measured in one session on this machine
-(2026-09-13, 18:14–18:44 UTC, an eight-core box that other workspaces were also
-using — load average 3.0–13.1). Where a figure is a reading rather than a promise it
-says so, with the time it was taken.
+Idle units heal one hit point per turn outside foreign territory; an owned city with
+barracks restores them fully. Moving, working or fighting prevents healing that turn.
+Population-cost production waits until at least one citizen can remain, retaining
+its shields. Luxury spending is recalculated from each city's current commerce and
+the luxury rate; the player's displayed luxury total is the latest turn's statistic.
+
+Important remaining limits: naval transport and overseas campaigns, diplomatic
+trade and alliances, a complete Civ III technology/unit/building catalog, polished
+city management, balance, and final artwork. Rules magnitudes are tuned placeholders.
+The earlier milestone documents record historical behavior and measurements; the
+current source and tests describe the repaired rules.
+
+The timing and hash measurements in the sections below are historical readings
+from September 13, 2026. Current gameplay changes intentionally alter saved-state hashes.
 
 ## Requirements
 
@@ -74,31 +80,19 @@ run — there is no server-side game state and no second copy of the rules. A
 production build is `pnpm --filter @civts/web build` followed by
 `pnpm --filter @civts/web preview` (same host and port).
 
-What you can do in the app: play the game a page load starts on — a fixed default
+What you can do in the app: play the game a page load starts on — a default
 seed 1, map size `tiny`, 2 civilizations — pan and zoom the map, select units and give
 orders, open the city screen
 (growth, production queue, worked tiles, culture, happiness), open the technology
-tree and pick research, open the government selector, switch panels, watch the event
+tree and pick research, open the government selector, negotiate peace or declare war, switch panels, watch the event
 log, read the scoreboard, and play on until a victory/defeat screen names the
 condition and the winner. Screenshots the suite produced live in
 `packages/web/artifacts/` (for example `played-game.png`).
 
-**The browser app has no AI opponent.** It hosts the engine and dispatches *your*
-commands; the other civilizations do nothing unless somebody moves them. The AI lives in
-`@civts/sim` and plays in the headless tournaments and the evidence scripts, which is
-where every win/loss figure in these documents comes from. That split is deliberate — it
-is the same engine in both places — but "there is an AI" and "the app has an opponent"
-are different claims, and only the first one is true.
-
-**Nor does the app offer game setup.** A fresh page has 20 buttons and not one of them
-chooses a seed, a map size or a civ count, and a finished game is terminal (22 buttons at
-the end, none of which starts another game) — A1's "choose settings" half is met by the
-CLI and by `window.__CIVTS__.seed(seed, options)`, which is the test seam rather than a
-player control. This sentence used to claim the app could "start a new game with settings
-(seed, map size, civ count)"; the audit O4 measured that there is no such control
-(`ALPHA-AUDIT.md` §A1, "the single loudest defect"), and R2 re-measured it on this tree
-with `pnpm --filter @civts/web exec playwright test --config playwright.config.ts
-alpha-audit-a1`, whose annotations print the page's whole button inventory.
+The **New game** dialog lets you choose seed, map size, civilization count and AI
+opponents. On **End turn**, opponents issue commands through the same engine as the
+human player. The AI replans after actual random events rather than using simulated
+future combat outcomes to choose subsequent commands.
 
 ### In a terminal (the way an agent plays)
 
@@ -115,6 +109,7 @@ lists them:
 ```
 move <unitId> <x> <y>      attack <unitId> <x> <y>     fortify <unitId>
 found <unitId>             cities                       city <cityId>
+war <playerId>             peace <playerId>              accept <playerId>
 work <cityId> <x> <y> ...  build <cityId> <unit|building>:<id>
 work <unitId> <improvementId>   cancel <unitId>
 rates <tax> <science> <luxury>  research <techId>      tech

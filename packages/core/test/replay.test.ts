@@ -24,6 +24,7 @@ import {
   DEFAULT_SETTINGS,
   REPLAY_VERSION,
   asBuildingId,
+  asTechId,
   applyCommand,
   asPlayerId,
   commandFrom,
@@ -77,9 +78,19 @@ const recordGame = (turns: number): ReplayRecorder => {
       if (settler === undefined) throw new Error('the opening board has no settler');
       const founded = session.apply(P0, { type: 'FoundCity', unitId: settler.id });
       if (!founded.ok) throw new Error(`founding a city was refused: ${founded.error.kind}`);
+      const research = session.apply(P0, { type: 'SetResearch', tech: asTechId('pottery') });
+      if (!research.ok) throw new Error('selecting pottery was refused');
+    }
+    const city = session.state.cities[0];
+    if (
+      city !== undefined &&
+      city.production === undefined &&
+      !city.buildings.includes(asBuildingId('granary')) &&
+      session.state.players[0]?.techs.includes(asTechId('pottery'))
+    ) {
       const chosen = session.apply(P0, {
         type: 'SetProduction',
-        cityId: founded.value.state.cities[0]?.id ?? (0 as never),
+        cityId: city.id,
         item: { kind: 'building', id: asBuildingId('granary') },
       });
       if (!chosen.ok) throw new Error(`setting production was refused: ${chosen.error.kind}`);
@@ -376,6 +387,9 @@ describe('commandFrom reads every member of the union, and nothing else', () => 
     { type: 'SetRates', rates: { tax: 6, science: 4, luxury: 0 } },
     { type: 'SetResearch', tech: 'pottery' as never },
     { type: 'SetGovernment', government: 'despotism' as never },
+    { type: 'DeclareWar', targetPlayer: asPlayerId(1) },
+    { type: 'OfferPeace', targetPlayer: asPlayerId(1) },
+    { type: 'AcceptPeace', targetPlayer: asPlayerId(1) },
   ];
 
   it('accepts every command, and reads it back unchanged through JSON', () => {
@@ -387,12 +401,15 @@ describe('commandFrom reads every member of the union, and nothing else', () => 
     // One case per member of the union, **named**: a member added to `Command` without a case
     // here fails this assertion, and a `commandFrom` that silently dropped one fails it too.
     expect([...new Set(COMMANDS.map((command) => command.type))].sort()).toEqual([
+      'AcceptPeace',
       'AttackUnit',
       'CancelWork',
+      'DeclareWar',
       'EndTurn',
       'FortifyUnit',
       'FoundCity',
       'MoveUnit',
+      'OfferPeace',
       'SetGovernment',
       'SetProduction',
       'SetRates',

@@ -804,6 +804,6 @@ describe('hut.ts — the reward unit is a canonical pick, not a row position', (
     // The old rule, on the same two catalogs: the warrior, then the swordsman. So the
     // canonical pick preserved shipped behaviour and removed a dependence on order.
     expect(firstRowWouldBe(shipped.value)).toBe('warrior');
-    expect(firstRowWouldBe(reversed.value)).toBe('swordsman');
+    expect(firstRowWouldBe(reversed.value)).toBe('knight');
   });
 });

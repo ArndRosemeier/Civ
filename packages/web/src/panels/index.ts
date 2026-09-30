@@ -132,6 +132,7 @@ import { mountCityPanel, type CityPanelHandle } from './city.js';
 import { mountDebugPanel, type DebugPanelHandle } from './debug.js';
 import { mountEventLog, type EventLogHandle } from './eventlog.js';
 import { mountGovernmentControl, type GovernmentControlHandle } from './government.js';
+import { mountDiplomacy } from './diplomacy.js';
 import { mountSavePanel, type SavePanelHandle } from './save.js';
 import { mountScoreboard, type ScoreboardHandle } from './scoreboard.js';
 import { mountTechPanel, type TechPanelHandle } from './techtree.js';
@@ -578,6 +579,7 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
   // refused, so the control that chooses the government and the control that sets the rates read
   // as one region rather than two places a player has to connect for themselves.
   const government: GovernmentControlHandle = mountGovernmentControl(statusbar, context());
+  const diplomacy = mountDiplomacy(statusbar, context());
 
   const log: EventLogHandle = mountEventLog(root);
   const units: UnitPanelHandle = mountUnitPanel(root, context());
@@ -642,6 +644,7 @@ export const mountPanels = (root: HTMLElement, api: PanelsApi): PanelsHandle => 
     // triple's. The government row beside it follows the same rule.
     rates.refresh();
     government.refresh();
+    diplomacy.refresh();
 
     // The selection is *resolved* here rather than only displayed, so `selection()` and the
     // unit panel's own default cannot disagree: the panel falls back to this player's first

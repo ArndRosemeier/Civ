@@ -760,6 +760,10 @@ const assertEveryUnitActionApplies = (state: GameState, ruleset: RulesetView): n
  */
 const commandKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'MoveUnit':
       return `MoveUnit:${String(Number(cmd.unitId))}:${String(Number(cmd.to))}`;
     case 'EndTurn':

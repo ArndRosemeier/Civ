@@ -539,6 +539,7 @@ describe('adversarial: determinism', () => {
     // `newGame` builds. A missing field here would be a type error, not a
     // silently different hash.
     const reordered: GameState = {
+      ...state,
       explored: state.explored,
       units: state.units,
       nextUnitId: state.nextUnitId,

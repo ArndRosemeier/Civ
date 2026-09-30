@@ -385,6 +385,9 @@ export interface SmartWeights {
    * `combat.ts`' odds formula — see `ai/smart.ts`' `battleWinPctOf`.
    */
   readonly military: {
+    /** Placeholder buildup before starting a war after contact. */
+    readonly earliestWarTurn: number;
+    readonly minimumWarArmy: number;
     /**
      * The overall battle win chance, in whole percent, below which the AI will not
      * start a fight it does not have to. **PLACEHOLDER: unsourced, chosen to be
@@ -581,6 +584,8 @@ export const SMART_WEIGHTS: SmartWeights = {
     surplusSettlerAllowance: 0,
   },
   military: {
+    earliestWarTurn: 30,
+    minimumWarArmy: 3,
     attackWinFloorPct: 55,
     attackWinFloorVsCityPct: 50,
     attackWinFloorVsWalledCityPct: 65,
@@ -736,6 +741,8 @@ export const mergeSmartWeights = (patch: SmartWeightsPatch = {}): SmartWeights =
         patch.economy?.surplusSettlerAllowance ?? base.economy.surplusSettlerAllowance,
     },
     military: {
+      earliestWarTurn: patch.military?.earliestWarTurn ?? base.military.earliestWarTurn,
+      minimumWarArmy: patch.military?.minimumWarArmy ?? base.military.minimumWarArmy,
       attackWinFloorPct: patch.military?.attackWinFloorPct ?? base.military.attackWinFloorPct,
       attackWinFloorVsCityPct:
         patch.military?.attackWinFloorVsCityPct ?? base.military.attackWinFloorVsCityPct,

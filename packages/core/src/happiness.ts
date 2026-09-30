@@ -39,7 +39,7 @@
  * | magnitude | catalog | read by |
  * |---|---|---|
  * | unhappy citizens from size | `CultureSpec.unhappyThresholds` | `baseUnhappy` |
- * | contentment from luxuries **banked** | `CultureSpec.luxuriesPerHappyCitizen` | `happinessOf` |
+ * | contentment from current city luxury spending | `CultureSpec.luxuriesPerHappyCitizen` | `happinessOf` |
  * | contentment from luxury **resources** connected | `CultureSpec.happyPerLuxuryResource` | `happinessOf` |
  * | contentment from buildings | `BuildingSpec.effects` (`city-happiness`) | `cityBuildingEffects` |
  * | the government's own modifier | `GovernmentSpec.happinessModifier` | `governments.ts` |
@@ -61,7 +61,8 @@
  */
 
 import { cityBuildingEffects } from './buildings.js';
-import { buildingCatalog, cityById, type City } from './cities.js';
+import { buildingCatalog, cityById, cityYieldsIgnoringDisorder, type City } from './cities.js';
+import { splitCommerce, ratesOf } from './economy.js';
 import { governmentHappiness } from './governments.js';
 import type { CityId, PlayerId, ResourceId } from './ids.js';
 import { resourceDef, type RulesetView } from './map.js';
@@ -341,18 +342,28 @@ export const happinessOf = (
   // luxury spending, rather than as an exception: `unit-owner-exists` and its
   // `city` sibling in `@civts/sim` are what *report* such a state.
   const modifier = owner === undefined ? 0 : governmentHappiness(ruleset, owner);
-  const luxuries = owner === undefined ? 0 : owner.luxuries;
+  const luxuries =
+    owner === undefined
+      ? 0
+      : splitCommerce(cityYieldsIgnoringDisorder(state, ruleset, city.id).commerce, ratesOf(owner))
+          .luxuries;
   const resources =
     luxuryResources ?? (owner === undefined ? 0 : connectedLuxuries(state, ruleset, city.owner));
 
   const fromBuildings = cityBuildingEffects(buildingCatalog(ruleset), city).happiness;
 
-  const unhappy = Math.max(
-    0,
-    unhappyFromSize(rules.unhappyThresholds, city.population) + modifier - fromBuildings,
-  );
-  const happy = luxuryHappyCitizens(rules, luxuries) + rules.happyPerLuxuryResource * resources;
   const population = Number.isInteger(city.population) ? Math.max(0, city.population) : 0;
+  const happy = Math.min(
+    population,
+    luxuryHappyCitizens(rules, luxuries) + rules.happyPerLuxuryResource * resources,
+  );
+  const unhappy = Math.min(
+    population - happy,
+    Math.max(
+      0,
+      unhappyFromSize(rules.unhappyThresholds, city.population) + modifier - fromBuildings,
+    ),
+  );
   const content = Math.max(0, population - unhappy - happy);
 
   return { unhappy, happy, content, disordered: unhappy > happy };

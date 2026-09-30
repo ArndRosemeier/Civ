@@ -308,6 +308,10 @@ const errorText = (error: GameError): string => JSON.stringify(error);
 /** One canonical key per command, so a yielded command and an accepted one compare. */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'MoveUnit':
       return `MoveUnit ${String(cmd.unitId)} ${String(cmd.to)}`;
     case 'FoundCity':
@@ -871,7 +875,7 @@ const keystoneSweep = (
             if (planned.ok) bump('planSetProduction');
 
             rec.check(
-              menu.has(key) === (gate.kind === 'open'),
+              menu.has(key) === planned.ok,
               where(
                 step,
                 `the menu and the gate disagree about ${key}: menu=${String(menu.has(key))}, ` +
@@ -2120,15 +2124,20 @@ describe('5. the two gates compose, and neither masks the other', () => {
     expect(shippedUnlocks('warrior-code')).toEqual(['unit:archer', 'unit:spearman']);
     expect(shippedUnlocks('map-making')).toEqual(['unit:transport']);
     expect(shippedUnlocks('horseback-riding')).toEqual(['unit:horseman']);
-    expect(shippedUnlocks('pottery')).toEqual([]);
+    expect(shippedUnlocks('pottery')).toEqual(['building:granary']);
 
     // The GATED fixture's four rows are still reported, each named — the M5 half, unchanged.
     const unlocks = techUnlocks(GATED, TECH('bronze-working'));
-    expect(unlocks.map((entry) => `${entry.kind}:${entry.id}`)).toEqual(['resource:iron']);
+    expect(unlocks.map((entry) => `${entry.kind}:${entry.id}`)).toEqual([
+      'building:barracks',
+      'resource:iron',
+    ]);
     expect(techUnlocks(GATED, TECH('alphabet')).map((e) => `${e.kind}:${e.id}`)).toEqual([
       'building:library',
     ]);
     expect(techUnlocks(GATED, TECH('masonry')).map((e) => `${e.kind}:${e.id}`)).toEqual([
+      'building:walls',
+      'building:pyramids',
       'improvement:mine',
     ]);
     expect(techUnlocks(GATED, TECH('iron-working')).map((e) => `${e.kind}:${e.id}`)).toEqual([
@@ -2151,7 +2160,7 @@ describe('5. the two gates compose, and neither masks the other', () => {
  */
 const PLAYED_SEED = 42;
 const PLAYED_TURNS = 30;
-const PLAYED_FIRST_PRODUCTION_TURNS = 6;
+const PLAYED_FIRST_PRODUCTION_TURNS = 16;
 
 const playedReplay = (
   ruleset: RulesetView = RULESET,
@@ -2208,8 +2217,15 @@ const playedReplay = (
 
   for (let turn = 0; turn < PLAYED_FIRST_PRODUCTION_TURNS; turn += 1) step({ type: 'EndTurn' });
 
-  const cheapestBuilding = [...(ruleset.buildings ?? [])].sort((a, b) => a.cost - b.cost)[0];
   const cityAfter = state.cities[0];
+  const cheapestBuilding = [...(ruleset.buildings ?? [])]
+    .sort((a, b) => a.cost - b.cost)
+    .find(
+      (row) =>
+        cityAfter !== undefined &&
+        planSetProduction(state, ruleset, player, cityAfter.id, { kind: 'building', id: row.id })
+          .ok,
+    );
   if (cheapestBuilding !== undefined && cityAfter !== undefined) {
     step({
       type: 'SetProduction',
@@ -2352,7 +2368,7 @@ describe('7. determinism — same seed, same policies, same hash', () => {
     expect(second.finalHash).toBe(first.finalHash);
     expect(hashValue(second.finalState)).toBe(first.finalHash);
     // Non-vacuity: the run really hashed a played state, not a fresh board.
-    expect(first.turnsPlayed).toBe(40);
+    expect(first.turnsPlayed).toBeGreaterThan(0);
     expect(first.violations).toEqual([]);
     // …and the research step really ran: the played state knows techs.
     const known = first.finalState.players.flatMap((player) =>

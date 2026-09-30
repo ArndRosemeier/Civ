@@ -103,6 +103,8 @@ export interface UnitDef {
   readonly movement: number;
   /** Production cost in shields. Unused in M2: production arrives in M3+. */
   readonly cost: number;
+  /** Citizens emigrating when this unit completes; omitted means zero. */
+  readonly populationCost?: number;
   readonly domain: UnitDomain;
   /**
    * The resource this unit type needs (M4c). Absent on every row that needs
@@ -136,6 +138,11 @@ export interface UnitDef {
    * rejected.
    */
 }
+
+export const unitPopulationCost = (def: UnitDef): number =>
+  Number.isInteger(def.populationCost) && (def.populationCost ?? 0) > 0
+    ? (def.populationCost ?? 0)
+    : 0;
 
 /**
  * A job a unit is doing on the tile it stands on: which improvement, where, and

@@ -1803,18 +1803,27 @@ const start = async (): Promise<void> => {
     const human = humanSeatOf(state);
     for (const player of state.players) {
       if (player.kind !== 'civ' || player.id === human) continue;
-      const proposed = SMART_POLICY.chooseCommands({
-        state,
-        playerId: player.id,
-        ruleset,
-        rng: policyRngFor(state.settings.seed, player.id, state.turn),
-      });
-      for (const command of proposed) {
-        if (command.type === 'EndTurn') continue;
-        // Through the seam, carrying the acting seat. The dispatch log then shows the rival's
-        // commands as accepted commands naming its own units and cities — which is the only
-        // evidence that distinguishes an opponent from a counter that moved on its own.
-        armDispatch({ ...command, seat: player.id });
+      const batchLimit =
+        1 +
+        state.units
+          .filter((unit) => unit.owner === player.id)
+          .reduce((sum, unit) => sum + Math.max(0, unit.movementLeft), 0);
+      for (let batch = 0; batch < batchLimit; batch += 1) {
+        const beforeRng = state.rng;
+        const proposed = SMART_POLICY.chooseCommands({
+          state,
+          playerId: player.id,
+          ruleset,
+          rng: policyRngFor(state.settings.seed, player.id, state.turn),
+        });
+        for (const command of proposed) {
+          if (command.type === 'EndTurn') continue;
+          // Through the seam, carrying the acting seat. The dispatch log then shows the rival's
+          // commands as accepted commands naming its own units and cities — which is the only
+          // evidence that distinguishes an opponent from a counter that moved on its own.
+          armDispatch({ ...command, seat: player.id });
+        }
+        if (state.rng === beforeRng) break;
       }
     }
     // The human must SEE what the rival did: the log is the engine's own story of the game, and an

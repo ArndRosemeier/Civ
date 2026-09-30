@@ -54,6 +54,9 @@ const P0 = asPlayerId(0);
  * the same trick).
  */
 const COMMANDS: { readonly [K in Command['type']]: Extract<Command, { readonly type: K }> } = {
+  DeclareWar: { type: 'DeclareWar', targetPlayer: asPlayerId(1) },
+  OfferPeace: { type: 'OfferPeace', targetPlayer: asPlayerId(1) },
+  AcceptPeace: { type: 'AcceptPeace', targetPlayer: asPlayerId(1) },
   MoveUnit: { type: 'MoveUnit', unitId: asUnitId(0), to: asTileIndex(0) },
   EndTurn: { type: 'EndTurn' },
   FoundCity: { type: 'FoundCity', unitId: asUnitId(0) },

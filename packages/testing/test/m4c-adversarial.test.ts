@@ -163,6 +163,7 @@ import {
   asBuildingId,
   asCityId,
   asPlayerId,
+  asTechId,
   asTileIndex,
   asUnitTypeId,
   availableBuildings,
@@ -412,6 +413,10 @@ const isHashable = (state: GameState): boolean => {
  */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'EndTurn':
       return 'EndTurn';
     case 'MoveUnit':
@@ -508,7 +513,9 @@ const spawnUnitAt = (state: GameState, type: UnitTypeId, owner: PlayerId, tile: 
 const twoCivs = (): ScenarioBuilder =>
   createScenarioBuilder(RULESET, { mapSize: 'duel', civCount: 2, seed: 5 })
     .addPlayer('A')
-    .addPlayer('B');
+    .addPlayer('B')
+    .grantTech(0, asTechId('masonry'))
+    .grantTech(1, asTechId('masonry'));
 
 /** A board whose two capitals stand far apart, on open grassland. */
 const capitals = (): ScenarioBuilder =>
@@ -3121,8 +3128,7 @@ const maintenanceSweep = (board: GameState, turns: number, label: string): Maint
         where(`the treasury is ${String(after.treasury)}`),
       );
       rec.check(
-        after.beakers === player.beakers + income.beakers &&
-          after.luxuries === player.luxuries + income.luxuries,
+        after.beakers === player.beakers + income.beakers && after.luxuries === income.luxuries,
         where('the inert pools did not take the split'),
       );
 
@@ -3598,7 +3604,7 @@ describe('8. goldens: still a real gate, and what covers what', () => {
     // rather than the three hashes below: this file cannot recompute it (it holds neither
     // the played script nor a battle board), so it is pinned by name, and the three fresh
     // worlds are still compared value for value against the same three values.
-    expect(computed).toEqual(['781d15e49cf79357', '782fe5306476b5d5', '717543ac9b22ed91']);
+    expect(computed).toEqual(['7f1d870824e4bfff', '46d2f72ef8fa08ad', '859feb3ee5727a49']);
     const newGameEntries = stored.entries.filter((entry) => entry.name.startsWith('tiny-civs2-'));
     expect(newGameEntries.map((entry) => entry.hash)).toEqual(computed);
     expect(stored.entries.map((entry) => entry.name)).toEqual([

@@ -379,6 +379,10 @@ const errorText = (error: GameError): string => `${error.kind} (${JSON.stringify
 /** A command's identity as a string, so two generators can be compared by set. */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'MoveUnit':
       return `MoveUnit ${String(cmd.unitId)} -> ${String(cmd.to)}`;
     case 'EndTurn':
@@ -667,7 +671,19 @@ describe('1. the keystone invariant, both directions, with combat as the eighth 
     // An *empty* adjacent tile: the plain board's enemy is on the target tile, so the
     // refusal case has to be a tile nobody is standing on.
     expect(attack(board('plain'), at(10, 11)).kind).toBe('nothing-to-attack');
-    expect(attack(board('stacked'), at(DEFENDER_AT.x, DEFENDER_AT.y)).kind).toBe('target-stacked');
+    const stacked = board('stacked');
+    expect(
+      applyCommand(
+        stacked.state,
+        asPlayerId(0),
+        {
+          type: 'AttackUnit',
+          unitId: attackerOf(stacked).id,
+          target: at(DEFENDER_AT.x, DEFENDER_AT.y),
+        },
+        RULESET,
+      ).ok,
+    ).toBe(true);
     expect(attack(board('friend'), at(DEFENDER_AT.x, DEFENDER_AT.y)).kind).toBe(
       'nothing-to-attack',
     );

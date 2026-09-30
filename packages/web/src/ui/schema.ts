@@ -101,6 +101,9 @@ export interface Placement {
  * the unit you have selected, *five* are choice boards, and *one* is the turn.
  */
 export const COMMAND_PLACEMENT = {
+  DeclareWar: { surface: 'workspace', enumeratedIn: [] },
+  OfferPeace: { surface: 'workspace', enumeratedIn: [] },
+  AcceptPeace: { surface: 'workspace', enumeratedIn: [] },
   // The two commands that name a map tile. These are the whole of "map-centric": the map is not a
   // place where the game is displayed and then narrated by buttons, it is where these two are
   // issued. `main.ts` resolves a tile click against exactly this pair, through `tileNamedBy` below.
@@ -184,6 +187,9 @@ export const tileNamedBy = (command: Command): TileIndex | undefined => {
     case 'SetWorkedTiles':
     case 'SetResearch':
     case 'SetRates':
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
     case 'SetGovernment':
       return undefined;
   }
@@ -219,6 +225,9 @@ export const unitNamedBy = (command: Command): UnitId | undefined => {
     case 'SetWorkedTiles':
     case 'SetResearch':
     case 'SetRates':
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
     case 'SetGovernment':
       return undefined;
   }

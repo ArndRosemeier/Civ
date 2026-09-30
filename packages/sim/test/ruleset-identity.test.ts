@@ -243,7 +243,7 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     expect(hashOf(CATALOG, 'the shipped catalog again')).toBe(SHIPPED_HASH);
   });
 
-  it('is 732414efe2080f75, and the arrangement hash with resources and units reversed', () => {
+  it('is a2db024523d36331, and the arrangement hash with resources and units reversed', () => {
     // These two numbers are the requirement's own measured fact, and pinning them is
     // what ties the property below to the real catalog. **If this assertion fails, the
     // catalog's content or order moved**: that is either an intentional content change
@@ -318,14 +318,14 @@ describe('the shipped ruleset identity, as the standing requirement quotes it', 
     // permanently unable to produce the temple that would have contented it (the
     // measurement is in `@civts/rules`' `culture` doc comment). That is a retune, not a
     // relocation, and it is why the played goldens moved twice in this wave.
-    expect(SHIPPED_HASH).toBe('732414efe2080f75');
+    expect(SHIPPED_HASH).toBe('a2db024523d36331');
     const reversedUnits = arranged(CATALOG, 'units', reverseOrder(CATALOG.units.length));
     const reversedBoth = arranged(
       reversedUnits,
       'resources',
       reverseOrder(CATALOG.resources.length),
     );
-    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('a5bb89fdba634f85');
+    expect(hashOf(reversedBoth, 'resources and units reversed')).toBe('c92f30bd709e83e9');
   });
 });
 

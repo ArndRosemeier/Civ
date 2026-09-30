@@ -1704,7 +1704,7 @@ describe('the tournament report names the condition, the winner and the seat', (
    */
   const DECIDED: readonly string[] = [
     '--seeds',
-    '1..2',
+    '2,19',
     '--turns',
     '80',
     '--seats',

@@ -351,7 +351,7 @@ import {
   type TerrainDef,
   type TerrainRole,
 } from './map.js';
-import { itemCostOf } from './production.js';
+import { itemCostOf, productionPlacement } from './production.js';
 // Runtime import of the resource *rule* and of M5's tech gate, not of a second copy of
 // either: `SetProduction` must ask the one implementation of "is this resource
 // connected for this player?" (`resources.ts`) and refuse with the answer. A connection
@@ -375,6 +375,7 @@ import type { GameState, PlayerState, Rates } from './state.js';
 // `GameEvent` **type-only**, so the edge is one-way at runtime.
 import { researchProblem, unmetTechRequirement, withResearching } from './tech.js';
 import { advanceTurn } from './turn.js';
+import { atWar, changeDiplomacy } from './diplomacy.js';
 // M9: the victory *rule*, asked once per command by the gate at the top of
 // `applyCommand`. Value imports, not types: the gate has to run the rule, and the
 // contract is explicit that it is "a DERIVED value on the result/state read" rather than
@@ -406,6 +407,9 @@ import {
  * is added.
  */
 export type Command =
+  | { readonly type: 'DeclareWar'; readonly targetPlayer: PlayerId }
+  | { readonly type: 'OfferPeace'; readonly targetPlayer: PlayerId }
+  | { readonly type: 'AcceptPeace'; readonly targetPlayer: PlayerId }
   | { readonly type: 'MoveUnit'; readonly unitId: UnitId; readonly to: TileIndex }
   | { readonly type: 'EndTurn' }
   | { readonly type: 'FoundCity'; readonly unitId: UnitId }
@@ -924,6 +928,12 @@ export type GameError =
  */
 export type GameEvent =
   | {
+      readonly type: 'DiplomacyChanged';
+      readonly from: PlayerId;
+      readonly to: PlayerId;
+      readonly order: 'DeclareWar' | 'OfferPeace' | 'AcceptPeace';
+    }
+  | {
       readonly type: 'UnitMoved';
       readonly unitId: UnitId;
       readonly from: TileIndex;
@@ -970,6 +980,12 @@ export type GameEvent =
       readonly shields: number;
       readonly unitId?: UnitId;
       readonly tile?: TileIndex;
+      readonly emigration?: {
+        readonly citizens: number;
+        readonly populationBefore: number;
+        readonly foodBoxBefore: number;
+        readonly workedTilesBefore: readonly TileIndex[];
+      };
     }
   /**
    * A goody hut was consumed: `unitId` (owned by `owner`) stepped onto it at
@@ -1479,7 +1495,14 @@ const planMoveFor = (
       detail: `the ruleset defines no terrain for the destination tile ${String(to)}`,
     });
   }
-  if (terrain.impassable) return err({ kind: 'impassable', unitId, to });
+  const definition = unitDef(ruleset, unit.type);
+  if (
+    definition?.domain === 'sea'
+      ? !isWaterRole(terrain.role)
+      : terrain.impassable || isWaterRole(terrain.role)
+  ) {
+    return err({ kind: 'impassable', unitId, to });
+  }
 
   // Any unit of another player blocks the tile: an enemy tile is not enterable, and
   // M2 must not half-implement an attack — `AttackUnit` is the way to take it.
@@ -1497,6 +1520,14 @@ const planMoveFor = (
   const cityThere = cityAt(state, to);
   if (cityThere !== undefined && cityThere.owner !== unit.owner) {
     return err({ kind: 'occupied-by-enemy', unitId, to });
+  }
+
+  const territoryOwner = foreignOwnerAt(state, to, unit.owner);
+  if (territoryOwner !== undefined && !atWar(state, unit.owner, territoryOwner)) {
+    return err({
+      kind: 'invalid-argument',
+      detail: 'Foreign borders are closed during peace. Declare war before entering.',
+    });
   }
 
   // `validateRuleset` guarantees an integer `moveCost >= 1` on passable terrain;
@@ -1974,6 +2005,16 @@ export const planSetProduction = (
       item,
       resource: gate.resource,
     });
+  }
+
+  if (item.kind === 'unit') {
+    const def = unitDef(ruleset, item.id);
+    if (def?.domain === 'sea' && productionPlacement(state, ruleset, city, def) === undefined) {
+      return err({
+        kind: 'invalid-argument',
+        detail: 'Naval units need an unoccupied, passable water tile beside this city.',
+      });
+    }
   }
 
   // M4c's building rule, asked of `buildings.ts` rather than restated: a row this
@@ -2548,7 +2589,7 @@ export type AttackPlan =
       readonly kind: 'battle';
       readonly unit: Unit;
       readonly target: TileIndex;
-      /** The single enemy unit on the target tile: the defender. */
+      /** The strongest defender on the target tile, with unit id breaking ties. */
       readonly defender: Unit;
     }
   | {
@@ -2577,11 +2618,10 @@ export type AttackPlan =
  *    can hand over `1.5` or `NaN`;
  * 4. `target` is **adjacent** (`invalid-argument`, exactly the message `planMove`
  *    uses for a non-adjacent step: path movement is not in the engine);
- * 5. the target holds **at most one** enemy unit (`target-stacked` when it holds
- *    more) — M6's "exactly one enemy-occupied thing", and this is the half of it that
- *    refuses rather than guesses;
- * 6. what is there: one enemy unit ⇒ a battle; otherwise an enemy city ⇒ a capture;
- *    otherwise `nothing-to-attack`;
+ * 5. the target belongs to a civilization at war with the actor (barbarians are
+ *    always hostile); peace must be ended explicitly before attacking;
+ * 6. enemy units yield a battle against the strongest defender, with lower unit id
+ *    breaking ties; otherwise an enemy city yields capture, or nothing-to-attack;
  * 7. the unit has movement left to spend (`not-enough-movement`, `needed: 1`) —
  *    affordability last, as `planMove` and `planStartWork` both do, so the reason
  *    reported is about the target rather than about the turn's movement when both are
@@ -2657,12 +2697,38 @@ export const planAttackUnit = (
   // unit of the attacker's own player is not an enemy and is not counted: stacking
   // one's own units is legal (M2), and a stack of friendly units on the target tile
   // does not make the enemy standing there harder to reach.
-  const enemies = unitsOnTile(state, target).filter((other) => other.owner !== unit.owner);
-  if (enemies.length > 1) {
-    return err({ kind: 'target-stacked', unitId, target, defenders: enemies.length });
-  }
+  const cityOnTarget = cityAt(state, target);
+  const rules = combatRulesOf(ruleset);
+  const strength = (other: Unit): number => {
+    const inCity = cityOnTarget?.owner === other.owner;
+    return (
+      combatStat(unitDef(ruleset, other.type)?.defense) *
+      (100 +
+        defenderBonusPct(rules, {
+          terrainBonusPct: terrainDefenseBonus(terrainDefAt(state, ruleset, target) ?? {}),
+          fortified: isFortified(other),
+          inCity,
+          walls: inCity && cityOnTarget.buildings.includes(WALLS_BUILDING),
+        })) *
+      hitPointsLeftOf(other)
+    );
+  };
+  const enemies = unitsOnTile(state, target)
+    .filter((other) => other.owner !== unit.owner)
+    .sort((a, b) => strength(b) - strength(a) || Number(a.id) - Number(b.id));
 
   const defender = enemies[0];
+  const targetOwner = defender?.owner ?? cityOnTarget?.owner;
+  if (
+    targetOwner !== undefined &&
+    targetOwner !== unit.owner &&
+    !atWar(state, unit.owner, targetOwner)
+  ) {
+    return err({
+      kind: 'invalid-argument',
+      detail: 'You must declare war before attacking this civilization.',
+    });
+  }
   if (defender !== undefined) {
     // Affordability is checked *after* the target, so the reported reason is about the
     // target when both are wrong (see the order note above).
@@ -3121,6 +3187,18 @@ export const applyCommand = (
   }
 
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace': {
+      const changed = changeDiplomacy(state, playerId, cmd.targetPlayer, cmd.type);
+      if (!changed.ok) return err({ kind: 'invalid-argument', detail: changed.error });
+      return ok({
+        state: { ...changed.value, revision: state.revision + 1 },
+        events: [
+          { type: 'DiplomacyChanged', from: playerId, to: cmd.targetPlayer, order: cmd.type },
+        ],
+      });
+    }
     case 'MoveUnit': {
       const plan = planMove(state, ruleset, playerId, cmd.unitId, cmd.to);
       if (!plan.ok) return err(plan.error);

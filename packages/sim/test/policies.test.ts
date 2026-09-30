@@ -636,7 +636,6 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
       'MoveUnit',
       'SetProduction',
       'SetResearch',
-      'SetWorkedTiles',
       'StartWork',
     ]);
   });
@@ -832,7 +831,7 @@ describe('FINDING C — the catalog’s ROW ORDER is not an input to the AI', ()
       return row === undefined ? undefined : String(row.id);
     };
     expect(firstMilitaryLand(RULESET)).toBe('warrior');
-    expect(firstMilitaryLand(reversedSets)).toBe('swordsman');
+    expect(firstMilitaryLand(reversedSets)).toBe('knight');
     expect(hashValue(reversedSets)).not.toBe(hashValue(RULESET));
 
     // ...and nothing else about the outcome moved: the hut was consumed, the RNG

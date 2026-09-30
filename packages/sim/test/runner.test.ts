@@ -238,7 +238,7 @@ describe('runSimulation — determinism', () => {
     // from the run's own `invariantChecks` (F2), not derived from the horizon. An earlier
     // version of this file could not make that claim: the figure the reports printed was
     // `turnsPlayed × count`, computed beside the loop rather than by it.
-    expect(defaulted.invariantChecks).toBe(50 * CORE_INVARIANTS.length);
+    expect(defaulted.invariantChecks).toBe(defaulted.turnsPlayed * CORE_INVARIANTS.length);
 
     // ...and an explicitly empty registry really does run nothing: the option is
     // `??`-defaulted, so `[]` means "check nothing" rather than "use the default".
@@ -1279,7 +1279,7 @@ describe('the outcome a run reports — decided, or honestly absent', () => {
     // `smart` against the do-nothing control: conquest on seed 1 at turn 35, measured. The
     // cheapest *decided* game a gate can afford, and a real one — the real engine, the real AI,
     // one seat a policy that does nothing.
-    const decided = runSimulation(optionsFor(1, [smartPolicy(), DO_NOTHING_POLICY], 80));
+    const decided = runSimulation(optionsFor(2, [smartPolicy(), DO_NOTHING_POLICY], 80));
     const outcome = decided.outcome;
     if (outcome === undefined) throw new Error('this fixture must decide its game');
 

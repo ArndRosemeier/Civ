@@ -1192,7 +1192,7 @@ describe('the outcome distribution counts endings, not averages', () => {
  * conquest condition firing in a real game, and nothing about two real AIs playing each other.
  */
 const ENDING_FIXTURE: Fixture = {
-  seeds: [1, 2],
+  seeds: [2, 19],
   policies: [SMART_POLICY, DO_NOTHING_POLICY],
   maxTurns: 80,
 };
@@ -1381,7 +1381,7 @@ describe('the outcome census — what ended each game, read from the engine', ()
     // Asserted on a fixture whose games really end, because a distribution of zeros is
     // order-independent for reasons that have nothing to do with the code under test.
     const forwards = tournamentOf(ENDING_FIXTURE);
-    const backwards = tournamentOf({ ...ENDING_FIXTURE, seeds: [2, 1] });
+    const backwards = tournamentOf({ ...ENDING_FIXTURE, seeds: [19, 2] });
 
     expect(backwards.totals.outcomes).toStrictEqual(forwards.totals.outcomes);
     expect(forwards.totals.outcomes.endedGames).toBe(2);

@@ -650,10 +650,7 @@ describe('M6 — a barbarian attack is the applier’s attack', () => {
     expect(first.state.rng).not.toStrictEqual(seedRng(99));
   });
 
-  it('does not attack a stack — the applier refuses `target-stacked` for everyone', () => {
-    // Two units of the other civilization on one tile is exactly the case M6 excludes
-    // ("exactly one enemy-occupied thing"), and `barbarianAttackTarget` is `planAttackUnit`:
-    // the barbarian is bound by the same rule a civilization is, and walks around instead.
+  it('attacks a stacked target through the same planner as a civilization', () => {
     const state = board({
       map: mapOf('...', '...', '...'),
       cities: [city(0, 0, 8)],
@@ -664,15 +661,15 @@ describe('M6 — a barbarian attack is the applier’s attack', () => {
     expect(band).toBeDefined();
     if (band === undefined) return;
 
-    expect(barbarianAttackTarget(state, RULESET, band)).toBeUndefined();
+    expect(barbarianAttackTarget(state, RULESET, band)).toBe(asTileIndex(4));
 
     const outcome = advanceTurn(state, RULESET);
 
-    expect(eventTypes(outcome.events)).not.toContain('CombatResolved');
-    // Tile 4 is one step closer to the city at tile 8, and it cannot enter an enemy-held
-    // tile — so it takes the next-closest step, tile 5, and the stack is untouched.
-    expect(moves(outcome.events)).toStrictEqual([{ from: 1, to: 5, cost: 1 }]);
-    expect(unitsOf(outcome.state, P1)).toHaveLength(2);
+    expect(eventTypes(outcome.events)).toContain('CombatResolved');
+    expect(moves(outcome.events)).toEqual([]);
+    expect(outcome.state.units.find((unit) => unit.id === asUnitId(2))).toEqual(
+      state.units.find((unit) => unit.id === asUnitId(2)),
+    );
   });
 
   it('does not attack when its own type cannot attack, and walks on instead', () => {

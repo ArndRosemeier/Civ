@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyCommand,
   asBuildingId,
+  asPlayerId,
   asCityId,
   asGovernmentId,
   asImprovementId,
@@ -53,6 +54,9 @@ const RULESET: RulesetView = validated.value;
 
 /** One valid action per member of the engine's command union. */
 const SAMPLES: Readonly<Record<Command['type'], Command>> = {
+  DeclareWar: { type: 'DeclareWar', targetPlayer: asPlayerId(1) },
+  OfferPeace: { type: 'OfferPeace', targetPlayer: asPlayerId(1) },
+  AcceptPeace: { type: 'AcceptPeace', targetPlayer: asPlayerId(1) },
   EndTurn: { type: 'EndTurn' },
   MoveUnit: { type: 'MoveUnit', unitId: asUnitId(1), to: asTileIndex(7) },
   FoundCity: { type: 'FoundCity', unitId: asUnitId(1) },
@@ -82,7 +86,7 @@ describe('the UI schema', () => {
     // The engine's union is exactly these twelve (packages/core/src/commands.ts:408-517). Asserting
     // the count is the cheap half: if a member were added, `SAMPLES` above would not compile, and if
     // the *engine* were the thing that shrank, this catches a stale web-side belief.
-    expect(EVERY_COMMAND).toHaveLength(12);
+    expect(EVERY_COMMAND).toHaveLength(15);
     expect(Object.keys(COMMAND_PLACEMENT).sort()).toEqual(Object.keys(SAMPLES).sort());
   });
 
@@ -90,7 +94,7 @@ describe('the UI schema', () => {
     // The headline claim of docs/UI-OVERHAUL.md §2.C, re-derived rather than restated. If a future
     // change moves a command into `ambient`, this fails and the claim gets re-argued rather than
     // quietly becoming false.
-    expect(surfaceCounts()).toEqual({ map: 2, cluster: 4, workspace: 5, ambient: 1 });
+    expect(surfaceCounts()).toEqual({ map: 2, cluster: 4, workspace: 8, ambient: 1 });
     expect(surfaceOf('EndTurn')).toBe('ambient');
   });
 
@@ -127,7 +131,16 @@ describe('the UI schema', () => {
     // be written in, which is not a claim about the schema at all and would fail the moment someone
     // reordered that object for readability.
     expect(never).toEqual(
-      ['FortifyUnit', 'SetWorkedTiles', 'SetResearch', 'SetRates', 'SetGovernment'].sort(),
+      [
+        'FortifyUnit',
+        'SetWorkedTiles',
+        'SetResearch',
+        'SetRates',
+        'SetGovernment',
+        'DeclareWar',
+        'OfferPeace',
+        'AcceptPeace',
+      ].sort(),
     );
 
     // The two commands the map issues are both enumerated *for a unit*, which is what lets a map

@@ -46,6 +46,12 @@ const STATE: GameState = started.value;
  * a missing member is a type error here (see the file note).
  */
 const SAMPLES: { readonly [K in GameEvent['type']]: Extract<GameEvent, { readonly type: K }> } = {
+  DiplomacyChanged: {
+    type: 'DiplomacyChanged',
+    from: asPlayerId(0),
+    to: asPlayerId(1),
+    order: 'DeclareWar',
+  },
   UnitMoved: {
     type: 'UnitMoved',
     unitId: asUnitId(0),

@@ -97,6 +97,9 @@ import {
   autoAssignWorkedTiles,
   buildingCatalog,
   buildingDef,
+  atWar,
+  relationOf,
+  isDisordered,
   citiesOf,
   cityAt,
   cityById,
@@ -110,6 +113,7 @@ import {
   indexToX,
   indexToY,
   isExplored,
+  visibleTiles,
   isFortified,
   itemCost,
   knownTechs,
@@ -856,16 +860,27 @@ interface EmpireRead {
  */
 interface TurnCacheSlot<T> {
   state: GameState | undefined;
+  playerId?: PlayerId;
+  weights?: SmartWeights;
   revision: number;
   value: T | undefined;
 }
 
-const cachedForTurn = <T>(slot: TurnCacheSlot<T>, state: GameState, compute: () => T): T => {
-  if (slot.state === state && slot.revision === state.revision && slot.value !== undefined) {
+const cachedForTurn = <T>(slot: TurnCacheSlot<T>, engine: Engine, compute: () => T): T => {
+  const state = engine.state;
+  if (
+    slot.state === state &&
+    slot.revision === state.revision &&
+    slot.playerId === engine.playerId &&
+    slot.weights === engine.weights &&
+    slot.value !== undefined
+  ) {
     return slot.value;
   }
   const value = compute();
   slot.state = state;
+  slot.playerId = engine.playerId;
+  slot.weights = engine.weights;
   slot.revision = state.revision;
   slot.value = value;
   // `state.revision` is typed `number`, so a value is always stored; the `undefined` in the
@@ -881,13 +896,19 @@ const hostileTilesSlot: TurnCacheSlot<readonly TileIndex[]> = {
 
 /** Where this player can see an enemy — every rival unit and every rival city it has seen. */
 const hostileTiles = (engine: Engine): readonly TileIndex[] =>
-  cachedForTurn(hostileTilesSlot, engine.state, () => {
+  cachedForTurn(hostileTilesSlot, engine, () => {
     const indices = new Set<number>();
+    const visible = new Set(visibleTiles(engine.state, engine.playerId));
     for (const unit of engine.state.units) {
-      if (unit.owner !== engine.playerId) indices.add(Number(unit.tile));
+      if (atWar(engine.state, unit.owner, engine.playerId) && visible.has(unit.tile))
+        indices.add(Number(unit.tile));
     }
     for (const city of engine.state.cities) {
-      if (city.owner !== engine.playerId) indices.add(Number(city.tile));
+      if (
+        atWar(engine.state, city.owner, engine.playerId) &&
+        (isExplored(engine.state, engine.playerId, city.tile) || visible.has(city.tile))
+      )
+        indices.add(Number(city.tile));
     }
     return [...indices].sort((a, b) => a - b).map((index) => asTile(engine.state, index));
   });
@@ -910,7 +931,7 @@ const empireSlot: TurnCacheSlot<EmpireRead> = {
 
 /** The empire-wide counts a single city's decision needs. */
 const readEmpire = (engine: Engine): EmpireRead =>
-  cachedForTurn(empireSlot, engine.state, () => {
+  cachedForTurn(empireSlot, engine, () => {
     const support = unitSupport(engine.state, engine.ruleset, engine.playerId);
     const owned = citiesOf(engine.state, engine.playerId);
     return {
@@ -1336,17 +1357,25 @@ const incomeAt = (
   playerId: PlayerId,
   tax: number,
   science: number,
-): { readonly gold: number; readonly beakers: number } => {
+): { readonly gold: number; readonly beakers: number; readonly disordered: number } => {
   const rates = { tax, science, luxury: RATE_TOTAL - tax - science };
+  const projected: GameState = {
+    ...state,
+    players: state.players.map((player) =>
+      player.id === playerId ? { ...player, rates } : player,
+    ),
+  };
   let gold = 0;
   let beakers = 0;
+  let disordered = 0;
   for (const city of state.cities) {
     if (city.owner !== playerId) continue;
-    const split = splitCommerce(cityYieldsIn(state, ruleset, city.id).commerce, rates);
+    if (isDisordered(projected, ruleset, city.id)) disordered += 1;
+    const split = splitCommerce(cityYields(projected, ruleset, city.id).commerce, rates);
     gold += split.gold;
     beakers += split.beakers;
   }
-  return { gold, beakers };
+  return { gold, beakers, disordered };
 };
 
 /**
@@ -1377,7 +1406,7 @@ const rateRank = (engine: Engine, tax: number, science: number, upkeep: number):
   const runway = Math.max(0, weights.runwayTurns);
   const projected = treasury + (read.gold - upkeep) * horizon;
   const covered = projected >= Math.max(0, upkeep) * runway ? 1 : 0;
-  return [covered, read.beakers, science, -tax];
+  return [-read.disordered, covered, read.beakers, science, -tax];
 };
 
 /**
@@ -1401,7 +1430,7 @@ const chooseRates = (
 ): { readonly tax: number; readonly science: number; readonly luxury: number } | undefined => {
   const player = playerOf(engine);
   if (player === undefined) return undefined;
-  const ceiling = Math.max(0, Math.min(RATE_TOTAL, engine.weights.economy.luxuryShareWhenRich));
+  const ceiling = RATE_TOTAL;
 
   let best:
     | {
@@ -2030,9 +2059,7 @@ const readAssault = (
       event.type === 'CombatResolved',
   );
   const capture = outcome.value.events.some((event) => event.type === 'CityCaptured');
-  const defender = unitsOnTile(engine.state, command.target).find(
-    (other) => other.owner !== engine.playerId,
-  );
+  const defender = resolved === undefined ? undefined : unitById(engine.state, resolved.defenderId);
   const perRoundPct = resolved?.attackerWinPct ?? 0;
 
   return {
@@ -2258,7 +2285,14 @@ const nearestHostile = (engine: Engine, unit: Unit): TileIndex | undefined => {
 const nearestKnownEnemyCity = (engine: Engine, unit: Unit): TileIndex | undefined => {
   let best: { readonly tile: TileIndex; readonly distance: number } | undefined;
   for (const city of engine.state.cities) {
-    if (city.owner === engine.playerId) continue;
+    if (
+      !atWar(engine.state, city.owner, engine.playerId) ||
+      !(
+        isExplored(engine.state, engine.playerId, city.tile) ||
+        visibleTiles(engine.state, engine.playerId).includes(city.tile)
+      )
+    )
+      continue;
     const distance = tileDistance(engine.state, unit.tile, city.tile);
     if (best === undefined || distance < best.distance) best = { tile: city.tile, distance };
   }
@@ -2347,11 +2381,18 @@ const siegeForceSlot: TurnCacheSlot<readonly City[]> = {
  * Cached per turn, because every military unit asks the same question on the same state.
  */
 const besiegeableCities = (engine: Engine): readonly City[] =>
-  cachedForTurn(siegeForceSlot, engine.state, () => {
+  cachedForTurn(siegeForceSlot, engine, () => {
     const ratio = engine.weights.military.siegeForceRatioPct;
     const qualified: City[] = [];
     for (const city of engine.state.cities) {
-      if (city.owner === engine.playerId) continue;
+      if (
+        !atWar(engine.state, city.owner, engine.playerId) ||
+        !(
+          isExplored(engine.state, engine.playerId, city.tile) ||
+          visibleTiles(engine.state, engine.playerId).includes(city.tile)
+        )
+      )
+        continue;
       const force = assaultHitPoints(engine, city);
       if (force <= 0) continue;
       if (force * 100 < garrisonHitPoints(engine, city) * ratio) continue;
@@ -2415,7 +2456,7 @@ const stormSlot: TurnCacheSlot<ReadonlySet<number>> = {
  * next soldier decides — the group is not committed to a decision the battle has overtaken.
  */
 const stormedCities = (engine: Engine): ReadonlySet<number> =>
-  cachedForTurn(stormSlot, engine.state, () => {
+  cachedForTurn(stormSlot, engine, () => {
     const floor = engine.weights.military.siegeAssaultFloorPct;
     const stormed = new Set<number>();
     for (const city of besiegeableCities(engine)) {
@@ -3319,6 +3360,7 @@ const planTurn = (
   // planning unit 7".
   let phase: PlannerPhase = 'assembly';
   let detail = 'the turn';
+  let randomBoundary = false;
 
   const engine = (): Engine => ({
     state,
@@ -3336,14 +3378,46 @@ const planTurn = (
    * leave this function: `planned` only ever receives commands that applied.
    */
   const attempt = (command: Command): boolean => {
+    if (randomBoundary) return false;
     const outcome = applyCommand(state, ctx.playerId, command, ctx.ruleset);
     if (!outcome.ok) return false;
     state = outcome.value.state;
     planned.push(command);
+    // Resume planning only once the real engine has resolved this random outcome.
+    randomBoundary = outcome.value.events.some(
+      (event) => event.type === 'CombatResolved' || event.type === 'HutEntered',
+    );
     return true;
   };
 
   try {
+    // Accept negotiated peace; otherwise consider war only after a buildup and contact.
+    for (const rival of state.players) {
+      if (rival.kind !== 'civ' || rival.id === ctx.playerId) continue;
+      const relation = relationOf(state, ctx.playerId, rival.id);
+      if (relation.status === 'war' && relation.offer === rival.id) {
+        attempt({ type: 'AcceptPeace', targetPlayer: rival.id });
+      } else if (
+        relation.status === 'peace' &&
+        state.turn >= weights.military.earliestWarTurn &&
+        state.turn >= (relation.truceUntil ?? 0) &&
+        state.settings.ai.aggression > 0
+      ) {
+        const military = state.units.filter(
+          (unit) =>
+            unit.owner === ctx.playerId && (unitDef(ctx.ruleset, unit.type)?.attack ?? 0) > 0,
+        );
+        const visible = new Set(visibleTiles(state, ctx.playerId));
+        const contact =
+          state.cities.some(
+            (city) =>
+              city.owner === rival.id &&
+              (isExplored(state, ctx.playerId, city.tile) || visible.has(city.tile)),
+          ) || state.units.some((unit) => unit.owner === rival.id && visible.has(unit.tile));
+        if (military.length >= weights.military.minimumWarArmy && contact)
+          attempt({ type: 'DeclareWar', targetPlayer: rival.id });
+      }
+    }
     phase = 'cities';
     // Pass 1 — cities, in city-id order: worked tiles, then production.
     for (const cityId of citiesOf(state, ctx.playerId).map((city) => city.id)) {
@@ -3441,6 +3515,7 @@ export const smartPolicy = (patch: SmartWeightsPatch = {}): DiagnosedPolicy => {
   let failureCount = 0;
   return {
     name: SMART_POLICY_NAME,
+    replanAfterRandomEvent: true,
     chooseCommands: (ctx) =>
       planTurn(ctx, weights, (failure) => {
         failureCount += 1;

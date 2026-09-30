@@ -3620,10 +3620,12 @@ describe('applyCommand — M3 goody huts', () => {
       units: [unit(0, GALLEY, 0, 5, GALLEY.movement), ...HUT_STATE.units.slice(1)],
     };
 
-    const sailed = mustOk(apply(atSea, P0, move(0, HUT_TILE), NAVAL));
-    expect(sailed.events.map((event) => event.type)).toEqual(['UnitMoved']);
-    expect(sailed.state.map.huts).toEqual([asTileIndex(HUT_TILE)]);
-    expect(sailed.state.rng).toStrictEqual(HUT_STATE.rng);
+    expect(apply(atSea, P0, move(0, HUT_TILE), NAVAL)).toMatchObject({
+      ok: false,
+      error: { kind: 'impassable' },
+    });
+    expect(atSea.map.huts).toEqual([asTileIndex(HUT_TILE)]);
+    expect(atSea.rng).toStrictEqual(HUT_STATE.rng);
 
     // A city on the hut tile consumes it permanently instead: the tile can still
     // be walked into, and still gives nothing.
@@ -4610,22 +4612,16 @@ describe('applyCommand — AttackUnit refusals, each named', () => {
     );
   });
 
-  it('refuses a tile holding two enemy units rather than choosing a victim', () => {
-    // Two enemy units on one tile is legal stacking (M2 sets no stacking limit), and M6's
-    // rule is "exactly one enemy-occupied thing" — so this refuses with the count found
-    // rather than inventing "attack the lowest id", which would decide every stacked
-    // battle in the game invisibly.
-    expect(
-      refusedAs(
-        apply(battleBoard({ roll: 0, extraEnemy: true }), P0, attack(ATTACKER, 6), M6_RULESET),
-        'target-stacked',
-      ),
-    ).toEqual({
-      kind: 'target-stacked',
-      unitId: asUnitId(ATTACKER),
-      target: asTileIndex(6),
-      defenders: 2,
-    });
+  it('accepts attacks on a tile holding two enemy units', () => {
+    const outcome = apply(
+      battleBoard({ roll: 0, extraEnemy: true }),
+      P0,
+      attack(ATTACKER, 6),
+      M6_RULESET,
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok)
+      expect(outcome.value.events.map((event) => event.type)).toContain('CombatResolved');
   });
 
   it('refuses a non-adjacent target, an off-map one and one that is not a tile', () => {

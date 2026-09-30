@@ -105,12 +105,13 @@ import {
   hitPointsLeftOf,
   itemCost,
   maxHitPointsOf,
-  neighbors8,
   rateCapsOf,
   unitById,
   unitDef,
+  unitPopulationCost,
+  productionPlacement,
+  productionGate,
   unitSupportCost,
-  unitsOnTile,
   type BuildingDef,
   type BuildingId,
   type City,
@@ -1792,6 +1793,20 @@ const goldConservation = (ctx: InvariantContext): readonly string[] => {
  * still run in both cases, and the "one tile per citizen" shape invariant covers the
  * trim.
  */
+const beforeEmigration = (ctx: InvariantContext, city: City): City => {
+  const event = producedEvents(ctx.events).find(
+    (entry) => entry.cityId === city.id && entry.emigration !== undefined,
+  );
+  const migration = event?.emigration;
+  if (migration === undefined) return city;
+  return {
+    ...city,
+    population: migration.populationBefore,
+    foodBox: migration.foodBoxBefore,
+    workedTiles: migration.workedTilesBefore,
+  };
+};
+
 const cityFoodConservation = (ctx: InvariantContext): readonly string[] => {
   const previous = ctx.previous;
   if (previous === undefined) return [];
@@ -1801,7 +1816,9 @@ const cityFoodConservation = (ctx: InvariantContext): readonly string[] => {
 
   for (const cityBefore of previous.cities) {
     const id: CityId = cityBefore.id;
-    const cityAfter = ctx.state.cities.find((city) => city.id === id);
+    const persistedCity = ctx.state.cities.find((city) => city.id === id);
+    const cityAfter =
+      persistedCity === undefined ? undefined : beforeEmigration(ctx, persistedCity);
     if (cityAfter === undefined) {
       problems.push(
         `city ${String(id)} (${cityBefore.name}) was in the world at the start of the turn and is ` +
@@ -1811,6 +1828,48 @@ const cityFoodConservation = (ctx: InvariantContext): readonly string[] => {
     }
 
     const label = `city ${String(id)} (${cityAfter.name})`;
+    const production = producedEvents(ctx.events).find((entry) => entry.cityId === id);
+    if (production !== undefined) {
+      const def =
+        production.item.kind === 'unit' ? unitDef(ctx.rulesetView, production.item.id) : undefined;
+      const cost = def === undefined ? 0 : unitPopulationCost(def);
+      const migration = production.emigration;
+      if (cost > 0 && (migration === undefined || migration.citizens !== cost)) {
+        problems.push(
+          `${label}: production must account for its ${String(cost)} departing citizens`,
+        );
+      }
+      if (migration !== undefined) {
+        if (
+          cost === 0 ||
+          migration.citizens !== cost ||
+          !Number.isInteger(migration.populationBefore) ||
+          migration.populationBefore <= cost
+        ) {
+          problems.push(`${label}: invalid production emigration`);
+        }
+        const captured = ctx.events.some(
+          (event) => event.type === 'CityCaptured' && event.cityId === id,
+        );
+        if (!captured && persistedCity !== undefined) {
+          const threshold = growthRequirement(
+            ctx.rulesetView,
+            { ...persistedCity, buildings: cityBefore.buildings },
+            persistedCity.population,
+          );
+          if (
+            persistedCity.population !== migration.populationBefore - cost ||
+            persistedCity.foodBox !== Math.min(migration.foodBoxBefore, threshold - 1) ||
+            JSON.stringify(persistedCity.workedTiles) !==
+              JSON.stringify(migration.workedTilesBefore.slice(0, persistedCity.population))
+          ) {
+            problems.push(
+              `${label}: production emigration disagrees with population, food box or worked tiles`,
+            );
+          }
+        }
+      }
+    }
     const popBefore = cityBefore.population;
     const boxBefore = cityBefore.foodBox;
     const popAfter = cityAfter.population;
@@ -1971,7 +2030,12 @@ const cityFoodConservation = (ctx: InvariantContext): readonly string[] => {
 
     const requirement = (population: number): number =>
       growthRequirement(ctx.rulesetView, cityAfter, population);
-    const readings = surplusReadings(ctx, cityBefore, cityAfter, requirement);
+    const readings = surplusReadings(
+      { ...ctx, state: withCity(ctx.state, cityAfter) },
+      cityBefore,
+      cityAfter,
+      requirement,
+    );
     const reconciled = readings.some(
       (reading) =>
         reading.step.population === popAfter &&
@@ -2040,7 +2104,9 @@ const cityShieldConservation = (ctx: InvariantContext): readonly string[] => {
 
   for (const cityBefore of previous.cities) {
     const id: CityId = cityBefore.id;
-    const cityAfter = ctx.state.cities.find((city) => city.id === id);
+    const persistedCity = ctx.state.cities.find((city) => city.id === id);
+    const cityAfter =
+      persistedCity === undefined ? undefined : beforeEmigration(ctx, persistedCity);
     if (cityAfter === undefined) continue; // `city-food-conservation` reports the loss.
 
     const label = `city ${String(id)} (${cityAfter.name})`;
@@ -2093,7 +2159,7 @@ const cityShieldConservation = (ctx: InvariantContext): readonly string[] => {
       (event) => event.playerId === cityAfter.owner,
     );
 
-    const asIs = cityYields(ctx.state, ctx.rulesetView, id).shields;
+    const asIs = cityYields(withCity(ctx.state, cityAfter), ctx.rulesetView, id).shields;
     const completedBuilding =
       completion !== undefined && completion.item.kind === 'building'
         ? completion.item.id
@@ -2317,6 +2383,7 @@ const unfinishedProduction = (
 
   const cost = itemCost(ctx.rulesetView, head);
   if (cost <= 0 || poolLow < cost) return [];
+  if (productionGate(ctx.state, ctx.rulesetView, cityAfter.owner, head).kind !== 'open') return [];
 
   if (head.kind === 'building') {
     if (cityAfter.buildings.includes(head.id)) return [];
@@ -2333,7 +2400,11 @@ const unfinishedProduction = (
     ctx.state.cities.some((city) => city.buildings.some((id) => isWonderRow(ctx.rulesetView, id)));
   if (droppable) return [];
 
-  if (head.kind === 'unit' && placementBlocked(ctx.state, cityAfter)) return [];
+  if (head.kind === 'unit') {
+    const def = unitDef(ctx.rulesetView, head.id);
+    if (def === undefined || cityAfter.population <= unitPopulationCost(def)) return [];
+    if (productionPlacement(ctx.state, ctx.rulesetView, cityAfter, def) === undefined) return [];
+  }
 
   return [
     `${label} had at least ${String(poolLow)} shields against a cost of ${String(cost)} for ` +
@@ -2348,12 +2419,6 @@ const unfinishedProduction = (
  * leaves the item unfinished when every one of those tiles is blocked. This mirrors
  * that rule so the check does not claim a completion the rules never owed.
  */
-const placementBlocked = (state: GameState, city: City): boolean => {
-  const blocked = (tile: TileIndex): boolean =>
-    unitsOnTile(state, tile).some((unit) => unit.owner !== city.owner);
-  if (!blocked(city.tile)) return false;
-  return neighbors8(state.map, city.tile).every(blocked);
-};
 
 /* ------------------------------------------------------------------ *
  * M9+M10: borders, governments, happiness, culture, victory

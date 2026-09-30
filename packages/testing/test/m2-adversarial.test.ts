@@ -303,6 +303,10 @@ const deepFrozenCopy = <T>(value: T): T => {
  */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'EndTurn':
       return 'EndTurn';
     case 'MoveUnit':

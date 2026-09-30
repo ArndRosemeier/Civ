@@ -405,7 +405,7 @@ const playerById = (state: GameState, playerId: PlayerId): PlayerState | undefin
 const wholeNumber = (value: number): number => (Number.isInteger(value) ? value : 0);
 
 /** The rates to split at: the player's own, or the defaults for a state without them. */
-const ratesOf = (player: PlayerState | undefined): Rates => player?.rates ?? DEFAULT_RATES;
+export const ratesOf = (player: PlayerState | undefined): Rates => player?.rates ?? DEFAULT_RATES;
 
 /**
  * Every unit owned by `playerId`, in `state.units` order (sorted by id). Empty for
@@ -731,7 +731,7 @@ export const applyEconomy = (state: GameState, ruleset: RulesetView): EconomyOut
       current = withMoney(current, player.id, {
         treasury: settled,
         beakers: wholeNumber(player.beakers) + income.beakers,
-        luxuries: wholeNumber(player.luxuries) + income.luxuries,
+        luxuries: income.luxuries,
       });
       continue;
     }
@@ -774,7 +774,7 @@ export const applyEconomy = (state: GameState, ruleset: RulesetView): EconomyOut
     current = withMoney(current, player.id, {
       treasury: 0,
       beakers: wholeNumber(player.beakers) + income.beakers,
-      luxuries: wholeNumber(player.luxuries) + income.luxuries,
+      luxuries: income.luxuries,
     });
 
     const unpaid = shortfall - covered;

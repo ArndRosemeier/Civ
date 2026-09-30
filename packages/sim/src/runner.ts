@@ -730,18 +730,31 @@ export const runSimulation = (options: SimulationOptions): SimulationResult => {
       // difference between the two is what makes the record this seat's: `latestFailures` is shared
       // by every seat the instance serves, so a list read after the poll holds other seats' records
       // too — reading it whole is H2-1, and `plannerRecordsBeforePoll` is the fix.
-      const recordsBeforePoll = plannerRecordsBeforePoll(policy);
-      const proposed = policy.chooseCommands(ctx);
-      collectPlannerFailures(plannerFailures, Number(player.id), policy, recordsBeforePoll);
-
-      for (const command of proposed) {
-        // The runner owns the turn boundary — see the module note.
-        if (command.type === 'EndTurn') continue;
-        const outcome = applyCommand(state, player.id, command, rulesetView);
-        if (!outcome.ok) continue;
-        state = outcome.value.state;
-        events.push(...outcome.value.events);
-        appliedCommands += 1;
+      // Each repoll must follow a random event that spent movement. This bound also
+      // terminates a foreign policy which repeatedly issues redundant commands.
+      const batchLimit =
+        1 +
+        state.units
+          .filter((unit) => unit.owner === player.id)
+          .reduce((sum, unit) => sum + Math.max(0, unit.movementLeft), 0);
+      for (let batch = 0; batch < batchLimit; batch += 1) {
+        const recordsBeforePoll = plannerRecordsBeforePoll(policy);
+        const proposed = policy.chooseCommands({ ...ctx, state });
+        collectPlannerFailures(plannerFailures, Number(player.id), policy, recordsBeforePoll);
+        let randomEvent = false;
+        for (const command of proposed) {
+          // The runner owns the turn boundary — see the module note.
+          if (command.type === 'EndTurn') continue;
+          const outcome = applyCommand(state, player.id, command, rulesetView);
+          if (!outcome.ok) continue;
+          state = outcome.value.state;
+          events.push(...outcome.value.events);
+          randomEvent ||= outcome.value.events.some(
+            (event) => event.type === 'CombatResolved' || event.type === 'HutEntered',
+          );
+          appliedCommands += 1;
+        }
+        if (!policy.replanAfterRandomEvent || !randomEvent) break;
       }
     }
 

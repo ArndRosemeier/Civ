@@ -1409,7 +1409,8 @@ const productionScenario = defineScenario({
       .addUnit(0, WARRIOR, [30, 30]) // Rome's starting tile, far from the city
       .addUnit(1, WARRIOR, [20, 20])
       .addCity(0, [5, 5], {
-        population: 1,
+        population: 3,
+        foodBox: 4,
         // A grassland centre plus one grassland tile: 4 food (a surplus of 2, so
         // growth is 10 turns away) and 2 shields.
         workedTiles: [at(4, 3)],
@@ -1913,6 +1914,12 @@ describe('M3 scenario: production', () => {
         shields: 1,
         unitId: asUnitId(2),
         tile: PRODUCTION_CITY,
+        emigration: {
+          citizens: 2,
+          populationBefore: 3,
+          foodBoxBefore: 0,
+          workedTilesBefore: [at(4, 3)],
+        },
       },
       incomeEvent(ROME, 2, 0, 0),
       upkeepEvent(ROME, 0, 0, 0, 2, 6),
@@ -1959,6 +1966,7 @@ describe('M3 scenario: production', () => {
       .fillTerrain('grassland')
       .addUnit(0, WARRIOR, [30, 30])
       .addUnit(1, WARRIOR, [20, 20])
+      .grantTech(0, asTechId('pottery'))
       .addCity(0, [5, 5], { population: 1, shields: 3, workedTiles: [at(4, 3)] })
       .build();
     if (!built.ok)
@@ -4520,7 +4528,7 @@ const conservationScenario = defineScenario({
         `Rome ends with exactly 0 gold: 2 + 120 income - 125 upkeep + 3 covered by disbands = 0, and at 6/4/0 its 1 commerce a turn never fills the beaker or luxury pool (got ${JSON.stringify(rome)})`,
       ),
       check(
-        carthage.treasury === 60 && carthage.beakers === 438 && carthage.luxuries === 438,
+        carthage.treasury === 60 && carthage.beakers === 438 && carthage.luxuries === 5,
         `Carthage ends with exactly 60 gold, 438 beakers and 438 luxuries — the accumulation of its 0/5/5 split over 120 turns, with the two pools equal because their rates are (got ${JSON.stringify(carthage)})`,
       ),
       check(
@@ -4741,7 +4749,7 @@ describe('M4b scenario: treasury conservation over 120 turns', () => {
 
     expect(after.turn).toBe(CONSERVATION_TURNS + 1);
     expect(moneyOf(after, ROME)).toEqual({ treasury: 0, beakers: 0, luxuries: 0 });
-    expect(moneyOf(after, CARTHAGE)).toEqual({ treasury: 60, beakers: 438, luxuries: 438 });
+    expect(moneyOf(after, CARTHAGE)).toEqual({ treasury: 60, beakers: 438, luxuries: 5 });
   });
 
   it('accounts for every gold piece of every turn, from the run’s own event stream', () => {
@@ -4777,7 +4785,7 @@ describe('M4b scenario: treasury conservation over 120 turns', () => {
       for (const playerId of [ROME, CARTHAGE]) {
         const key = Number(playerId);
         const ledger = ledgerOf(events, playerId);
-        const [beforeBeakers, beforeLuxuries] = pools.get(key) ?? [0, 0];
+        const [beforeBeakers] = pools.get(key) ?? [0, 0];
         const before = gold.get(key) ?? -1;
 
         // The identity the contract states, in the engine's own terms: income
@@ -4788,7 +4796,7 @@ describe('M4b scenario: treasury conservation over 120 turns', () => {
         expect(gold.get(key)).toBeGreaterThanOrEqual(0);
 
         // The two inert pools take exactly their own channel of the split.
-        pools.set(key, [beforeBeakers + ledger.beakers, beforeLuxuries + ledger.luxuries]);
+        pools.set(key, [beforeBeakers + ledger.beakers, ledger.luxuries]);
         expect(ledger.beakers).toBeGreaterThanOrEqual(0);
         expect(ledger.luxuries).toBeGreaterThanOrEqual(0);
       }
@@ -4811,7 +4819,7 @@ describe('M4b scenario: treasury conservation over 120 turns', () => {
     expect(gold.get(Number(ROME))).toBe(0);
     expect(gold.get(Number(CARTHAGE))).toBe(60);
     expect(pools.get(Number(ROME))).toEqual([0, 0]);
-    expect(pools.get(Number(CARTHAGE))).toEqual([438, 438]);
+    expect(pools.get(Number(CARTHAGE))).toEqual([438, 5]);
 
     // The exact shape of Rome's decline: the bill starts at 4, the disbands bring
     // it down to 1 over the first three turns, and it never moves again.
@@ -4865,7 +4873,7 @@ describe('M4b scenario: treasury conservation over 120 turns', () => {
         );
         // (2) the pools take their own channel, and nothing else.
         expect(ending.beakers - starting.beakers).toBe(ledger.beakers);
-        expect(ending.luxuries - starting.luxuries).toBe(ledger.luxuries);
+        expect(ending.luxuries).toBe(ledger.luxuries);
         // (3) never negative, in any state of any turn.
         expect(ending.treasury).toBeGreaterThanOrEqual(0);
         // (4) the split divides the commerce that was really there: the three
@@ -5517,6 +5525,11 @@ const effectSetup = (b: ScenarioBuilder): ScenarioBuilder =>
   b
     .addPlayer('Rome')
     .addPlayer('Carthage')
+    .grantTech(0, asTechId('currency'))
+    .grantTech(0, asTechId('alphabet'))
+    .grantTech(0, asTechId('bronze-working'))
+    .grantTech(0, asTechId('masonry'))
+    .grantTech(0, asTechId('steam-power'))
     .fillTerrain('grassland')
     .setTile(6, 5, 'plains')
     .setTile(5, 6, 'plains')
@@ -5955,6 +5968,9 @@ const wonderSetup =
     const world = b
       .addPlayer('Rome')
       .addPlayer('Carthage')
+      .grantTech(0, asTechId('masonry'))
+      .grantTech(1, asTechId('masonry'))
+      .grantTech(1, asTechId('pottery'))
       .fillTerrain('grassland')
       .setTile(5, 6, 'hills')
       .setTreasury(0, treasury)
@@ -7551,13 +7567,13 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
 
       return [
         check(
-          keys === 'unit:legion,improvement:prospecting',
+          keys === 'unit:legion,building:barracks,improvement:prospecting',
           'bronze-working unlocks exactly the legion and the prospecting row, in the kind ' +
             `vocabulary's order (got [${keys}])`,
         ),
         check(
-          unlocked.length === 2,
-          `and the set holds exactly two rows, counted rather than inferred (got ` +
+          unlocked.length === 3,
+          `and the set holds exactly three rows, counted rather than inferred (got ` +
             `${String(unlocked.length)})`,
         ),
         check(
@@ -7807,6 +7823,7 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
         .addPlayer('Rome')
         .addPlayer('Carthage')
         .fillTerrain('grassland')
+        .setTile(GATING_CITY[0], GATING_CITY[1] - 1, 'coast')
         .setTile(GATING_WORKER[0], GATING_WORKER[1], 'hills')
         .addImprovement(GATING_WORKER[0], GATING_WORKER[1], asImprovementId('road'))
         .addImprovement(GATING_WORKER[0], GATING_WORKER[1], asImprovementId('mine'))
@@ -8357,7 +8374,7 @@ describe('the M4c scenario assertions discriminate (they are not decoration)', (
       expect(result.passed).toBe(false);
       const text = failures(result.assertions).join('\n');
       expect(text).toMatch(/bronze-working unlocks exactly the legion and the prospecting row/);
-      expect(text).toMatch(/and the set holds exactly two rows, counted rather than inferred/);
+      expect(text).toMatch(/and the set holds exactly three rows, counted rather than inferred/);
       // The observatory really is unlocked now, so its own assertion fails too — while the grant
       // still selects nothing.
       expect(text).not.toMatch(/and granting knowledge selects nothing/);

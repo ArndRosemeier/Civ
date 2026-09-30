@@ -667,6 +667,7 @@ const mergeUnit = (
     movement: patch.movement ?? row.movement,
     cost: patch.cost ?? row.cost,
     domain: patch.domain ?? row.domain,
+    ...(row.populationCost === undefined ? {} : { populationCost: row.populationCost }),
     // M6's combat statistics are part of the row, not a fixture of the combat module:
     // dropping `hitPoints` here would reset every unit's health to the reader's
     // fallback, and dropping `requiresTech` would silently un-gate a gated row.

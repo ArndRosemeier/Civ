@@ -295,6 +295,14 @@ export const commandFrom = (raw: unknown): Result<Command, string> => {
         ? err('needs a string "government"')
         : ok({ type: 'SetGovernment', government: asGovernmentId(government) });
     }
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace': {
+      const target = numberAt(raw, 'targetPlayer');
+      return target === undefined || !Number.isInteger(target) || target < 0
+        ? err('needs an integer "targetPlayer"')
+        : ok({ type, targetPlayer: asPlayerId(target) });
+    }
     default:
       return err(`"${type ?? 'undefined'}" is not a command in this engine`);
   }

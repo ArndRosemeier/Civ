@@ -13,7 +13,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
   applyCommand,
-  asBuildingId,
+  asUnitTypeId,
   asCityId,
   asPlayerId,
   asUnitId,
@@ -37,11 +37,11 @@ const P0 = asPlayerId(0);
 /** A *played* state, so the round trip covers entities rather than only the opening board. */
 const played = applyCommand(started.value, P0, { type: 'FoundCity', unitId: asUnitId(0) }, RULESET);
 if (!played.ok) throw new Error('founding the first city was refused');
-const granary: ProductionItem = { kind: 'building', id: asBuildingId('granary') };
+const warrior: ProductionItem = { kind: 'unit', id: asUnitTypeId('warrior') };
 const queued = applyCommand(
   played.value.state,
   P0,
-  { type: 'SetProduction', cityId: asCityId(0), item: granary },
+  { type: 'SetProduction', cityId: asCityId(0), item: warrior },
   RULESET,
 );
 if (!queued.ok) throw new Error('setting production was refused');

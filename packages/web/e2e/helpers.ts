@@ -1931,6 +1931,23 @@ export const driveScript = async (page: Page, script: readonly unknown[]): Promi
         await closeDialogs(page);
         break;
       }
+      case 'DeclareWar':
+      case 'OfferPeace':
+      case 'AcceptPeace': {
+        const target = (await readState(page)).players.find(
+          (player) => player.id === command.targetPlayer,
+        );
+        if (target === undefined) throw new Error('missing diplomatic target');
+        const label = {
+          DeclareWar: 'Declare war',
+          OfferPeace: 'Offer peace',
+          AcceptPeace: 'Accept peace',
+        }[command.type];
+        await page
+          .getByRole('button', { name: `${label} with ${target.name}`, exact: true })
+          .click();
+        break;
+      }
       default: {
         throw new Error(`the UI drive has no control for ${JSON.stringify(raw)}`);
       }
@@ -2094,6 +2111,10 @@ export const toCommand = (raw: unknown): Command => {
     asTileIndex(asNumber(raw[what], what));
 
   switch (type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return { type, targetPlayer: asPlayerId(asNumber(raw['targetPlayer'], 'targetPlayer')) };
     case 'MoveUnit':
       return { type: 'MoveUnit', unitId: unit('unitId'), to: tile('to') };
     case 'EndTurn':

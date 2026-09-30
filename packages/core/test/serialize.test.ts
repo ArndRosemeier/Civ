@@ -25,7 +25,7 @@ import {
   DEFAULT_SETTINGS,
   SCHEMA_VERSION,
   applyCommand,
-  asBuildingId,
+  asUnitTypeId,
   asCityId,
   asPlayerId,
   asUnitId,
@@ -97,7 +97,7 @@ const playSomeTurns = (seed: number, turns: number): GameState => {
         {
           type: 'SetProduction',
           cityId: asCityId(0),
-          item: { kind: 'building', id: asBuildingId('granary') },
+          item: { kind: 'unit', id: asUnitTypeId('warrior') },
         },
         RULESET,
       );
@@ -201,9 +201,9 @@ describe('serialize / deserialize — the round trip', () => {
     // "over every golden" became "over some states of the same shape". The numbers are the
     // golden file's own, so regenerating it fails here — which is the point.
     const GOLDENS: readonly (readonly [number, string])[] = [
-      [1, '781d15e49cf79357'],
-      [42, '782fe5306476b5d5'],
-      [1337, '717543ac9b22ed91'],
+      [1, '7f1d870824e4bfff'],
+      [42, '46d2f72ef8fa08ad'],
+      [1337, '859feb3ee5727a49'],
     ];
     for (const [seed, hash] of GOLDENS) {
       const state = freshGame(seed);

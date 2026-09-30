@@ -207,6 +207,12 @@ export const unitPanelCommands = (
  */
 export const actionLabel = (command: Command, state: GameState, ruleset: RulesetView): string => {
   switch (command.type) {
+    case 'DeclareWar':
+      return 'Declare war';
+    case 'OfferPeace':
+      return 'Offer peace';
+    case 'AcceptPeace':
+      return 'Accept peace';
     case 'MoveUnit':
       return `Move to ${tileLabel(state, command.to)}`;
     case 'EndTurn':

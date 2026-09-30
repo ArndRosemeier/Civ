@@ -202,6 +202,9 @@ import {
   unitActions,
   unitById,
   unitDef,
+  unitPopulationCost,
+  productionPlacement,
+  productionGate,
   unitMoveOptions,
   // M6: the engine's own verdict on the third gating dimension, so the long economy
   // sweep below can name the *tech* refusal it now legitimately meets (shipped content
@@ -311,6 +314,10 @@ const deepFreeze = (value: unknown): void => {
  */
 const cmdKey = (cmd: Command): string => {
   switch (cmd.type) {
+    case 'DeclareWar':
+    case 'OfferPeace':
+    case 'AcceptPeace':
+      return cmd.type + ':' + String(cmd.targetPlayer);
     case 'EndTurn':
       return 'EndTurn';
     case 'MoveUnit':
@@ -1303,10 +1310,16 @@ describe('hut honesty — consumed once, drawn exactly once, never on water or u
       { type: 'MoveUnit', unitId: galley.id, to: asTileIndex(HUT_TILE) },
       RULESET,
     );
-    if (!moved.ok)
-      throw new Error(
-        `the galley could not step onto the hut tile: ${JSON.stringify(moved.error)}`,
-      );
+    expect(moved).toMatchObject({ ok: false, error: { kind: 'impassable' } });
+    const standing = {
+      ...state,
+      units: state.units.map((unit) =>
+        unit.id === galley.id ? { ...unit, tile: asTileIndex(HUT_TILE) } : unit,
+      ),
+    };
+    expect(resolveHutEntry(standing, RULESET, galley.id)).toBeUndefined();
+    expect(hashValue(state.rng)).toBe(hashValue(rngBefore));
+    if (!moved.ok) return;
 
     rec.check(hutEntriesOf(moved.value.events).length === 0, 'a sea unit triggered a hut');
     rec.check(hutAt(moved.value.state, HUT_TILE), 'a sea unit consumed the hut');
@@ -1963,10 +1976,20 @@ const checkTurn = (
       }
     }
 
+    const departure = completions.find((event) => event.cityId === id);
+    const populationCost =
+      departure?.item.kind === 'unit'
+        ? unitPopulationCost(unitDef(RULESET, departure.item.id)!)
+        : 0;
+    const finalPopulation = population - populationCost;
+    const finalFoodBox =
+      populationCost > 0
+        ? Math.min(foodBox, growthRequirement(cityBefore, finalPopulation) - 1)
+        : foodBox;
     rec.check(
-      cityAfter.population === population && cityAfter.foodBox === foodBox,
-      `${label}: city ${String(id)} food bookkeeping: expected pop ${String(population)} box ` +
-        `${String(foodBox)}, got pop ${String(cityAfter.population)} box ${String(cityAfter.foodBox)} ` +
+      cityAfter.population === finalPopulation && cityAfter.foodBox === finalFoodBox,
+      `${label}: city ${String(id)} food bookkeeping: expected pop ${String(finalPopulation)} box ` +
+        `${String(finalFoodBox)}, got pop ${String(cityAfter.population)} box ${String(cityAfter.foodBox)} ` +
         `(before pop ${String(cityBefore.population)} box ${String(cityBefore.foodBox)}, surplus ${String(yields.foodSurplus)})`,
     );
 
@@ -2078,6 +2101,21 @@ const checkTurn = (
     }
 
     const cost = itemCost(RULESET, item);
+    const unitDefinition = item.kind === 'unit' ? unitDef(RULESET, item.id) : undefined;
+    const waiting =
+      productionGate(grown.state, RULESET, grownCity.owner, item).kind !== 'open' ||
+      (unitDefinition !== undefined &&
+        (grownCity.population <= unitPopulationCost(unitDefinition) ||
+          productionPlacement(grown.state, RULESET, grownCity, unitDefinition) === undefined));
+    if (waiting) {
+      rec.check(cityAfter.shields === pool, `${label}: waiting production lost shields`);
+      rec.check(
+        sameJson(cityAfter.production, item) && sameJson(cityAfter.queue, grownCity.queue),
+        `${label}: waiting production lost its queue`,
+      );
+      rec.check(completion === undefined, `${label}: waiting production completed`);
+      continue;
+    }
     const redundant = item.kind === 'building' && grownCity.buildings.includes(item.id);
     // M4c (INTERFACES.md, "Wonders v1"): a wonder is **globally unique**, so a queued
     // wonder that some other city has finished is no longer startable and the completion
@@ -2289,7 +2327,15 @@ const checkTurn = (
  * deficit restarts the box at 0" are exercised rather than assumed.
  */
 const longRun = (rec: Recorder, seed: number, turns: number): RunTotals => {
-  let state = generatedFor(seed);
+  const initial = generatedFor(seed);
+  let state: GameState = {
+    ...initial,
+    players: initial.players.map((player) => ({
+      ...player,
+      techs: [...new Set([...player.techs, ...CATALOG.techs.map((row) => row.id)])].sort(),
+    })),
+  };
+
   const prng = makePrng(seed);
   const civs = civPlayers(state).map((player) => player.id);
   const totals = {
@@ -3017,9 +3063,9 @@ const runGoldenHarness = (corrupt: boolean): GoldenHarnessRun => {
  * comparing the file against itself.
  */
 const PINNED_GOLDENS: readonly { readonly name: string; readonly hash: string }[] = [
-  { name: 'tiny-civs2-seed1', hash: '781d15e49cf79357' },
-  { name: 'tiny-civs2-seed42', hash: '782fe5306476b5d5' },
-  { name: 'tiny-civs2-seed1337', hash: '717543ac9b22ed91' },
+  { name: 'tiny-civs2-seed1', hash: '7f1d870824e4bfff' },
+  { name: 'tiny-civs2-seed42', hash: '46d2f72ef8fa08ad' },
+  { name: 'tiny-civs2-seed1337', hash: '859feb3ee5727a49' },
 ];
 
 describe('goldens — still a gate, still refusing to auto-write', () => {

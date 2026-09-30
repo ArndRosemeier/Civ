@@ -93,6 +93,7 @@ import {
   hitPointsLeftOf,
   newGame,
   planSetResearch,
+  planSetProduction,
   scoreHorizon,
   spawnUnit,
   unitById,
@@ -175,7 +176,7 @@ const VICTORY_ENTRY_NAME = `${PLAYED_ENTRY_NAME}-victory`;
 const PLAYED_TURNS = 30;
 
 /** The turns between founding and the second production order (see `playedGame`). */
-const PLAYED_FIRST_PRODUCTION_TURNS = 6;
+const PLAYED_FIRST_PRODUCTION_TURNS = 16;
 
 const GOLDEN_NOTE =
   'State hashes for packages/testing/test/golden.test.ts ' +
@@ -411,8 +412,15 @@ const playedGame = (): PlayedGame => {
   }
 
   // 5. Then the cheapest building, so the played state carries both production kinds.
-  const cheapestBuilding = [...RULESET.buildings].sort((a, b) => a.cost - b.cost)[0];
   const cityAfter = state.cities[0];
+  const cheapestBuilding = [...RULESET.buildings]
+    .sort((a, b) => a.cost - b.cost)
+    .find(
+      (row) =>
+        cityAfter !== undefined &&
+        planSetProduction(state, RULESET, playerId, cityAfter.id, { kind: 'building', id: row.id })
+          .ok,
+    );
   if (cheapestBuilding !== undefined && cityAfter !== undefined) {
     state = step(
       state,
@@ -520,7 +528,14 @@ const combatGame = (): CombatGame => {
     );
   }
   const defenderSpawn = spawnUnit(attackerSpawn.state, defenderDef, defenderSide.id, target);
-  const board = defenderSpawn.state;
+  const declaration = applyCommand(
+    defenderSpawn.state,
+    attackerSide.id,
+    { type: 'DeclareWar', targetPlayer: defenderSide.id },
+    RULESET,
+  );
+  if (!declaration.ok) throw new Error('combat golden could not declare war');
+  const board = declaration.value.state;
   const attacker = attackerSpawn.unit;
   const defender = defenderSpawn.unit;
 

@@ -223,6 +223,18 @@ const renderEvent = (event: GameEvent, ctx: EventContext): string => {
   const map = state.map;
 
   switch (event.type) {
+    case 'DiplomacyChanged':
+      return (
+        playerLabel(state, event.from) +
+        ' ' +
+        {
+          DeclareWar: 'declared war on',
+          OfferPeace: 'offered peace to',
+          AcceptPeace: 'accepted peace with',
+        }[event.order] +
+        ' ' +
+        playerLabel(state, event.to)
+      );
     case 'UnitMoved':
       return `${unitLabel(state, ruleset, event.unitId)} moved ${tileLabel(map, event.from)} → ${tileLabel(map, event.to)} (cost ${String(event.cost)}, ${String(event.movementLeft)} movement left)`;
     case 'TurnEnded':
