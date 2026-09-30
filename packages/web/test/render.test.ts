@@ -18,6 +18,9 @@ import {
   DEFAULT_SETTINGS,
   applyCommand,
   asTileIndex,
+  asUnitId,
+  asImprovementId,
+  asResourceId,
   indexToX,
   indexToY,
   newGame,
@@ -64,8 +67,15 @@ interface Fill {
 }
 
 /** A 2D context that paints nothing and records every fill with the style in force at the time. */
-const recordingContext = (): { readonly ctx: Canvas2D; readonly fills: Fill[] } => {
+const recordingContext = (): {
+  readonly ctx: Canvas2D;
+  readonly fills: Fill[];
+  readonly images: CanvasImageSource[];
+  readonly texts: string[];
+} => {
   const fills: Fill[] = [];
+  const images: CanvasImageSource[] = [];
+  const texts: string[] = [];
   const paint = { fill: '#000000', stroke: '#000000' };
   const ctx: Canvas2D = {
     get fillStyle(): string {
@@ -86,7 +96,12 @@ const recordingContext = (): { readonly ctx: Canvas2D; readonly fills: Fill[] } 
       fills.push({ colour: paint.fill, x, y, width, height });
     },
     strokeRect(): void {},
-    drawImage(): void {},
+    drawImage(image): void {
+      images.push(image);
+    },
+    fillText(text): void {
+      texts.push(text);
+    },
     beginPath(): void {},
     moveTo(): void {},
     lineTo(): void {},
@@ -101,7 +116,7 @@ const recordingContext = (): { readonly ctx: Canvas2D; readonly fills: Fill[] } 
     setTransform(): void {},
     clearRect(): void {},
   };
-  return { ctx, fills };
+  return { ctx, fills, images, texts };
 };
 
 /** A frame centred on the city, so the tiles it owns are the tiles the frame walks. */
@@ -210,5 +225,72 @@ describe('drawFrame — the border layer', () => {
     const second = drawCityFrame();
     expect(JSON.stringify(second.trace)).toBe(JSON.stringify(first.trace));
     expect(JSON.stringify(second.fills)).toBe(JSON.stringify(first.fills));
+  });
+});
+
+describe('map objects and unit stacks', () => {
+  it('draws map objects only on explored tiles, including roads and improvements', () => {
+    const first = CITY.tile;
+    const hidden = asTileIndex(Number(first) + 1);
+    const sprite = {} as CanvasImageSource;
+    const recorder = recordingContext();
+    const trace = drawFrame(recorder.ctx, {
+      state: {
+        ...STATE,
+        explored: STATE.players.map(() => STATE.map.terrain.map((_, i) => i === Number(first))),
+        improvements: [
+          { tile: first, kind: asImprovementId('road') },
+          { tile: first, kind: asImprovementId('mine') },
+          { tile: hidden, kind: asImprovementId('irrigation') },
+        ],
+        map: {
+          ...STATE.map,
+          huts: [hidden],
+          resources: [{ tile: hidden, resource: asResourceId('iron') }],
+        },
+      },
+      viewer: Number(P0),
+      camera: cityCamera(),
+      viewport: VIEWPORT,
+      units: [],
+      cities: [],
+      ownerColour: colourOf,
+      cursor: null,
+      mapSprites: { mine: sprite, irrigation: sprite, hut: sprite, iron: sprite },
+    });
+    expect(trace.tiles.find((entry) => entry.tile === first)?.features).toEqual(['road', 'mine']);
+    expect(trace.tiles.find((entry) => entry.tile === hidden)?.features).toEqual([]);
+    expect(recorder.images).toEqual([sprite]);
+  });
+
+  it('keeps the selected unit visible on a stack, with its health and the stack count', () => {
+    const selectedArt = {} as CanvasImageSource;
+    const otherArt = {} as CanvasImageSource;
+    const recorder = recordingContext();
+    drawFrame(recorder.ctx, {
+      state: STATE,
+      viewer: Number(P0),
+      camera: cityCamera(),
+      viewport: VIEWPORT,
+      cities: [],
+      ownerColour: colourOf,
+      cursor: null,
+      units: [
+        {
+          id: asUnitId(0),
+          tile: CITY.tile,
+          type: 'warrior',
+          colour: '#ff0000',
+          selected: true,
+          hitPoints: 1,
+          maxHitPoints: 3,
+        },
+        { id: asUnitId(1), tile: CITY.tile, type: 'worker', colour: '#ff0000', selected: false },
+      ],
+      unitSprites: { warrior: selectedArt, worker: otherArt },
+    });
+    expect(recorder.images).toEqual([selectedArt]);
+    expect(recorder.texts).toContain('2');
+    expect(recorder.fills.some((fill) => fill.colour === '#dd7355')).toBe(true);
   });
 });

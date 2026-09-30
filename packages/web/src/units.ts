@@ -1,7 +1,7 @@
 /**
  * Unit sprites — presentation assets for the Canvas map markers.
  *
- * Each shipped unit type id has one transparent PNG. The renderer paints it on the
+ * Each shipped unit type id has one transparent PNG or SVG. The renderer paints it on the
  * unit's tile with a small owner-colour badge; missing types fall back to the old
  * triangle marker.
  */
@@ -16,8 +16,11 @@ import swordsmanUrl from '../assets/units/unit-swordsman.png';
 import transportUrl from '../assets/units/unit-transport.png';
 import warriorUrl from '../assets/units/unit-warrior.png';
 import workerUrl from '../assets/units/unit-worker.png';
+import pikemanUrl from '../assets/units/unit-pikeman.svg';
+import medievalInfantryUrl from '../assets/units/unit-medieval-infantry.svg';
+import knightUrl from '../assets/units/unit-knight.svg';
 
-/** The ten unit type ids the shipped ruleset paints. */
+/** The thirteen unit type ids the shipped ruleset paints. */
 export const UNIT_SPRITE_IDS = [
   'settler',
   'worker',
@@ -29,6 +32,9 @@ export const UNIT_SPRITE_IDS = [
   'horseman',
   'swordsman',
   'transport',
+  'pikeman',
+  'medieval-infantry',
+  'knight',
 ] as const;
 
 export type UnitSpriteId = (typeof UNIT_SPRITE_IDS)[number];
@@ -47,6 +53,9 @@ const UNIT_URLS: Readonly<Record<UnitSpriteId, string>> = {
   horseman: horsemanUrl,
   swordsman: swordsmanUrl,
   transport: transportUrl,
+  pikeman: pikemanUrl,
+  'medieval-infantry': medievalInfantryUrl,
+  knight: knightUrl,
 };
 
 /** Decode one PNG URL into an `HTMLImageElement` that is ready to paint. */

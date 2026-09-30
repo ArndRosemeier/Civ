@@ -735,6 +735,15 @@ test('X1 fold: with a dialog open the scoreboard’s body is below the stack’s
   const help = page.getByRole('button', { name: 'Keyboard' });
   await help.click();
   await expect(page.getByRole('dialog', { name: 'Keyboard' })).toBeVisible();
+  // Additional panels (including Diplomacy) change where the scoreboard starts. Arrange the
+  // clipping case this test inspects by scrolling its heading into view; do not depend on a
+  // historical number of panels above it. The table's dimensions are still asserted unchanged.
+  await page.locator("[data-layout='panel-stack']").evaluate((stack) => {
+    const heading = stack.querySelector("[data-panel='scoreboard'] h2");
+    if (heading === null) throw new Error('No scoreboard heading');
+    const delta = heading.getBoundingClientRect().bottom - stack.getBoundingClientRect().bottom;
+    if (delta > 0) stack.scrollTop += Math.ceil(delta);
+  });
   const after = await boxes();
 
   const stackBottom = after.stack.y + after.stack.height;

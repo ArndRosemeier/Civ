@@ -16,6 +16,16 @@ declarations, peace offers and acceptance. The AI accepts peace and observes a
 20-turn treaty window before considering another war. Humans may break peace sooner.
 Old saves without diplomacy keep their existing state of war.
 
+The map now composites terrain from the explored eight-neighbour neighbourhood:
+land textures blend, coasts have curved beaches and surf, and the default view has
+no heavy tile grid. The **Grid** button restores the tactical grid. All six shipped
+resources, huts, mines, irrigation and connected roads are visible; cities have
+three settlement sizes, names and population badges. Every shipped unit has artwork,
+including the medieval additions; stacks keep the selected unit on top and show
+their count, with health bars and a fortification marker. Unexplored neighbours
+never contribute to terrain transitions. The renderer retains the current square
+projection; new terrain types, rivers and a full isometric art set remain future work.
+
 Idle units heal one hit point per turn outside foreign territory; an owned city with
 barracks restores them fully. Moving, working or fighting prevents healing that turn.
 Population-cost production waits until at least one citizen can remain, retaining

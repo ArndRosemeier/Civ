@@ -1,87 +1,12 @@
 /**
- * The map renderer and its palette — the presentation half, with no game rules in it.
- * See docs/INTERFACES.md, M8 ("Rendering, and how it is tested (§16.2)").
+ * Canvas map presentation, without game rules or RNG reads.
  *
- * ## What this module decides, and what it refuses to decide
- *
- * It decides **presentation**: which rectangle a tile occupies (`view.ts`'s projection, called,
- * never re-derived), which colour or sprite a terrain id is painted with, where a unit marker
- * sits, and how a tile nobody has explored is dimmed. It decides **nothing** about the game: it
- * never asks whether a move is legal, never computes a cost, a yield or an outcome, and never
- * reads the RNG. The two facts it takes from the state — each tile's terrain id and the exploring
- * player's `explored` row — are copied verbatim into the frame, and the visible-tile walk is the
- * projection's own `visibleTileBounds`, so a tile outside the viewport is never drawn and a tile
- * inside it always is.
- *
- * ## The palette is the app's own statement of what it paints
- *
- * `TERRAIN_COLOURS` is exported as a plain record of `#rrggbb` strings, which is what the e2e
- * suite's palette probe reads (`e2e/helpers.ts`' `paletteOf`, source 2): a pixel sample is then
- * checked against the colour the **renderer** documents, rather than against a swatch the test
- * invented. The six ids are the shipped ruleset's own terrain catalog; `FALLBACK_TERRAIN_COLOUR`
- * covers a ruleset that ships a row this build has never heard of, so the renderer stays total (a
- * tile with an unknown terrain is painted, not skipped) without pretending to know it.
- *
- * **These values are measured from the art, not invented, and they are the *mean* of what each
- * terrain paints.** When tiles were flat fills a terrain had exactly one colour and a sample
- * either was that colour or the renderer was wrong; the textures changed that, because a tile's
- * centre is now a blend of the texture that also moves with the tile's sub-pixel offset and with
- * the zoom level. So the documented colour is the centre of the spread rather than the value, and
- * what it promises is "the middle of this terrain's range" — `TERRAIN_CENTRE_TOLERANCE` in
- * `e2e/helpers.ts` carries the width of that range and the evidence for it. `lock_centre` in
- * `assets/tiles/process_tiles.py` locks the *file's* centre pixel and cannot deliver this: the
- * test samples the *canvas*, after scaling has blended that pixel away.
- *
- * `e2e/terrain-palette-probe.spec.ts` re-derives the table from the canvas
- * (`CIVTS_PALETTE_PROBE=1`), so a re-graded tile can be checked against these numbers rather than
- * trusted to match them.
- *
- * **These are not exact, and should not be chased.** A mean over a finite sweep of seeds moves by
- * a point in each channel when the sweep grows — it moved three times while this table was being
- * derived, and every time it did the tests still passed, because `TERRAIN_CENTRE_TOLERANCE` is 44
- * and a point is nothing beside it. What the record has to keep straight is the *evidence*, not
- * the last digit: the sweep, its size, and the fact that the numbers came from it.
- *
- * That default is deliberately a colour no shipped terrain uses: an unknown row is visible as
- * "something this build does not paint", which is the honest reading, rather than a plausible
- * green that would make a missing palette entry look like grassland.
- *
- * ## Unexplored tiles
- *
- * Fog is the engine's memory (`state.explored`), and it arrives here as a plain boolean per tile.
- * An unexplored tile is painted in one flat `FOG_COLOUR`: terrain is not masked out of the draw
- * trace — the trace is a claim about what the frame drew, and the frame genuinely walked that
- * tile — but no terrain colour reaches the canvas for a tile the player has never seen, so
- * reading the pixels cannot reveal terrain the player has not explored. That is a presentation
- * decision and it is stated here rather than implied.
- *
- * ## Borders (M9)
- *
- * The ownership layer (`state.tileOwner`) is drawn as a **per-player tint along the edges where
- * ownership changes**. Three things about that are decisions rather than details:
- *
- * - **Ownership is read, never derived.** `ownerAt` is `borders.ts`' own read of the layer, so the
- *   tile the map paints as mine is the tile `planSetWorkedTiles` refuses to a rival — one
- *   statement of who owns what, asked from the presentation layer rather than written again here.
- * - **The colour is the app's, not this module's.** `FrameInput.ownerColour` is the *same*
- *   `colourOfPlayer` lookup the unit and city markers already use, so a player is one colour
- *   everywhere on the canvas instead of one colour per layer.
- * - **A border is drawn only on an explored tile.** Fog is the engine's memory (`state.explored`),
- *   and painting a rival's territory the player has never seen would reveal through the border
- *   exactly what the flat fog colour refuses to reveal through the terrain. So an unexplored tile
- *   never carries a tint even when the layer says it is owned; the draw trace still reports the
- *   ownership the layer holds, and `border` says whether a band was painted.
- *
- * The band is `fillRect` rather than a stroke: an integer-aligned fill of a known thickness lands
- * on whole pixels, so the e2e suite can sample inside a border and read the owner's own colour
- * rather than whatever a stroked path anti-aliased into.
- *
- * ## Determinism
- *
- * Integer arithmetic, comparisons and `Math.floor`/`Math.round`/`Math.min`/`Math.max` only. No
- * clock, no randomness, no transcendentals: the frame is a pure function of
- * `(state, camera, viewport)`, so two runs of the same game draw the same pixels and the same
- * draw trace.
+ * Terrain artwork blends decoded textures using explored neighbours only. The compositing
+ * cache lives in terrain-art.ts; this module draws its results with view.ts's shared projection.
+ * Unexplored tiles stay opaque. Objects and roads are separate overlays, followed by territory,
+ * settlements and unit stacks. The caller filters city/unit markers using the engine's visibility.
+ * TERRAIN_COLOURS documents the graded terrain centres for clear-tile pixel probes; objects,
+ * borders and the optional grid deliberately do not form part of that palette.
  */
 
 import {
@@ -95,6 +20,8 @@ import {
   type UnitId,
 } from '@civts/core';
 import { tileRect, visibleTileBounds, type Camera, type ScreenPoint } from './view.js';
+import { terrainNeighbourhood, type TerrainArtwork } from './terrain-art.js';
+import type { MapSprites } from './map-art.js';
 
 /* ------------------------------------------------------------------ *
  * Palette
@@ -109,12 +36,12 @@ import { tileRect, visibleTileBounds, type Camera, type ScreenPoint } from './vi
  * The exact numbers are presentation and nothing else — no rule, no yield and no hash reads them.
  */
 export const TERRAIN_COLOURS: Readonly<Record<string, string>> = {
-  grassland: '#5a9138',
-  plains: '#c1993c',
+  grassland: '#5b8a39',
+  plains: '#b49245',
   hills: '#7d6b47',
   mountains: '#7d7e7f',
   ocean: '#29578d',
-  coast: '#47cad0',
+  coast: '#378d9f',
 };
 
 /** Painted for a terrain id this build has no colour for — never a colour a shipped terrain uses. */
@@ -167,6 +94,8 @@ export interface DrawEntry {
    * nobody, or is off the map) — see the module note on fog and on the edges of the world.
    */
   readonly border: boolean;
+  /** Visible map objects actually painted on this tile, without unexplored information. */
+  readonly features?: readonly string[];
 }
 
 /**
@@ -195,6 +124,9 @@ export interface Canvas2D {
   strokeStyle: string;
   lineWidth: number;
   imageSmoothingEnabled: boolean;
+  font?: string;
+  textAlign?: CanvasTextAlign;
+  fillText?(text: string, x: number, y: number, maxWidth?: number): void;
   fillRect(x: number, y: number, width: number, height: number): void;
   strokeRect(x: number, y: number, width: number, height: number): void;
   drawImage(image: CanvasImageSource, dx: number, dy: number, dw: number, dh: number): void;
@@ -227,12 +159,17 @@ export interface UnitMarker {
   readonly type: string;
   readonly colour: string;
   readonly selected: boolean;
+  readonly hitPoints?: number;
+  readonly maxHitPoints?: number;
+  readonly fortified?: boolean;
 }
 
 /** A city marker: its tile, and the colour of its owner. */
 export interface CityMarker {
   readonly tile: TileIndex;
   readonly colour: string;
+  readonly name?: string;
+  readonly population?: number;
 }
 
 /**
@@ -280,6 +217,10 @@ export interface FrameInput {
   readonly sprites?: TerrainSpriteMap;
   /** Preloaded unit sprites from `units.ts`; omit to keep the triangle fallback. */
   readonly unitSprites?: UnitSpriteMap;
+  readonly terrainArtwork?: TerrainArtwork;
+  readonly mapSprites?: MapSprites;
+  /** Optional tactical grid; terrain is continuous by default. */
+  readonly showGrid?: boolean;
 }
 
 /** The `#rrggbb` colour parsed into three 0-255 channels. */
@@ -370,7 +311,7 @@ interface Territory {
  * `view.ts`'s `tileRect` — the *same* rectangle the hit-test inverts. A tile's terrain id comes
  * from `state.map.terrain` (an engine read), its explored flag from `state.explored[viewer]`
  * (also an engine read), and its owner from `borders.ts`' `ownerAt` over `state.tileOwner` — the
- * M9 ownership layer, read rather than recomputed. Nothing else on the tile is inspected.
+ * M9 ownership layer, read rather than recomputed. Resources, huts and improvements are read directly from their stored layers.
  *
  * Draw order is terrain, then territory, then cities, then units: a border band is drawn along the
  * tiles' outer edges and both kinds of marker are corner-anchored, so a marker drawn last is never
@@ -394,6 +335,7 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
   ctx.fillRect(0, 0, viewport.width, viewport.height);
 
   const tiles: DrawEntry[] = [];
+  const renderedFeatures = new Map<number, string[]>();
   const territories: Territory[] = [];
   for (let y = bounds.y0; y <= bounds.y1; y += 1) {
     for (let x = bounds.x0; x <= bounds.x1; x += 1) {
@@ -408,17 +350,21 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
       const rect = tileRect(camera, x, y);
       const explored = exploredRow?.[tile] === true;
       const owner = ownerOn(state, x, y);
+      const blended = explored
+        ? input.terrainArtwork?.tile(terrainNeighbourhood(state, input.viewer, x, y), x, y)
+        : undefined;
       const sprite = explored ? sprites?.[terrainId] : undefined;
-      if (sprite !== undefined) {
+      if (blended !== undefined) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(blended, rect.x, rect.y, rect.width, rect.height);
+      } else if (sprite !== undefined) {
         paintTerrainSprite(ctx, sprite, x, y, rect, size);
       } else {
         ctx.fillStyle = rgbCss(explored ? terrainColour(terrainId) : FOG_COLOUR);
         ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
       }
-      // A one-pixel grid line, drawn inside the tile so neighbouring fills never land on a
-      // sampled centre. It is presentation and it is cheap; it makes the tile grid readable at
-      // every zoom level, which the screenshots are reviewed for.
-      if (rect.size >= 8) {
+      // The tactical grid is opt-in; continuous terrain is the default view.
+      if (input.showGrid === true && rect.size >= 8) {
         ctx.strokeStyle = rgbCss(GRID_COLOUR);
         ctx.lineWidth = 1;
         ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
@@ -438,6 +384,8 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
       // The index is a real one: the walk is inside the map's own bounds, and the terrain lookup
       // above is what proved it. `asTileIndex` is the engine's own constructor for the branded id
       // — a widening, not an escape hatch.
+      const features: string[] = [];
+      renderedFeatures.set(tile, features);
       tiles.push({
         tile: asTileIndex(tile),
         x,
@@ -445,8 +393,43 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
         terrain: terrainId,
         owner: owner === UNOWNED ? null : owner,
         border: edges !== undefined && (edges.left || edges.right || edges.up || edges.down),
+        features,
       });
     }
+  }
+
+  // Roads and objects are drawn after ALL terrain, so tile draw order cannot erase a connection.
+  const improvements = new Map<number, Set<string>>();
+  for (const improvement of state.improvements) {
+    const kinds = improvements.get(Number(improvement.tile)) ?? new Set<string>();
+    kinds.add(improvement.kind);
+    improvements.set(Number(improvement.tile), kinds);
+  }
+  const resources = new Map(
+    state.map.resources.map((resource) => [Number(resource.tile), resource.resource]),
+  );
+  const huts = new Set<number>(state.map.huts);
+  const cityTiles = new Set<number>(input.cities.map((city) => Number(city.tile)));
+  for (const entry of tiles) {
+    if (exploredRow?.[entry.tile] !== true) continue;
+    const rect = tileRect(camera, entry.x, entry.y);
+    const kinds = improvements.get(Number(entry.tile));
+    if (kinds?.has('road') === true || cityTiles.has(Number(entry.tile))) {
+      paintRoads(ctx, input, entry.x, entry.y, rect, improvements, cityTiles);
+      renderedFeatures.get(Number(entry.tile))?.push('road');
+    }
+    const feature = (id: string, dx: number, dy: number, fraction: number): void => {
+      const art = input.mapSprites?.[id];
+      if (art === undefined) return;
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(art, rect.x + size * dx, rect.y + size * dy, size * fraction, size * fraction);
+      renderedFeatures.get(Number(entry.tile))?.push(id);
+    };
+    if (kinds?.has('irrigation') === true) feature('irrigation', 0.04, 0.08, 0.42);
+    if (kinds?.has('mine') === true) feature('mine', 0.53, 0.52, 0.43);
+    if (huts.has(Number(entry.tile))) feature('hut', 0.03, 0.03, 0.46);
+    const resource = resources.get(Number(entry.tile));
+    if (resource !== undefined) feature(resource, 0.57, 0.04, 0.38);
   }
 
   // The ownership tint: one band per edge where ownership changes, in the owner's own colour.
@@ -459,23 +442,57 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
     if (edges.down) ctx.fillRect(x, y + size - band, size, band);
   }
 
-  // Markers, deliberately small and corner-anchored: the pixel tests sample a tile's CENTRE, and
-  // a marker that covered the centre would make "the colour of grassland" depend on what was
-  // standing there. A marker therefore never reaches the middle of a tile.
+  // Settlements overlay their tile; terrain probes sample tiles without cities or units.
   for (const city of input.cities) {
     const rect = tileRect(camera, indexToX(state.map, city.tile), indexToY(state.map, city.tile));
     if (!onScreen(rect.x, rect.y, viewport)) continue;
-    const r = Math.max(2, size / 6);
-    ctx.fillStyle = rgbCss(CITY_COLOUR);
-    ctx.beginPath();
-    ctx.arc(rect.x + size / 4, rect.y + size / 4, r, 0, 2 * Math.PI);
-    ctx.fill();
+    const population = city.population ?? 1;
+    const art =
+      input.mapSprites?.[
+        population >= 8 ? 'city-capital' : population >= 4 ? 'city-town' : 'city-village'
+      ];
+    if (art !== undefined) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(art, rect.x + size * 0.05, rect.y, size * 0.9, size * 0.9);
+      // A small ivory population badge also stays legible at the strategic zoom levels.
+      const badge = Math.max(4, size * 0.22);
+      ctx.fillStyle = rgbCss(CITY_COLOUR);
+      ctx.fillRect(rect.x + size - badge - 2, rect.y + size - badge - 2, badge, badge);
+      if (size >= 32 && ctx.fillText !== undefined) {
+        ctx.font = `bold ${String(Math.max(10, Math.round(size / 5)))}px system-ui`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#243028';
+        ctx.fillText(String(population), rect.x + size - badge / 2 - 2, rect.y + size - 4, badge);
+        if (city.name !== undefined) {
+          ctx.fillStyle = '#17231ee6';
+          ctx.fillRect(rect.x + 2, rect.y + size - 16, size - badge - 5, 14);
+          ctx.fillStyle = '#f2e6c8';
+          ctx.font = '11px system-ui';
+          ctx.fillText(city.name, rect.x + (size - badge) / 2, rect.y + size - 5, size - badge - 8);
+        }
+      }
+    } else {
+      const r = Math.max(2, size / 6);
+      ctx.fillStyle = rgbCss(CITY_COLOUR);
+      ctx.beginPath();
+      ctx.arc(rect.x + size / 4, rect.y + size / 4, r, 0, 2 * Math.PI);
+      ctx.fill();
+    }
     ctx.strokeStyle = rgbCss(city.colour);
     ctx.lineWidth = Math.max(1, size / 16);
     ctx.strokeRect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
   }
 
+  const stacks = new Map<number, UnitMarker[]>();
   for (const unit of input.units) {
+    const stack = stacks.get(Number(unit.tile)) ?? [];
+    stack.push(unit);
+    stacks.set(Number(unit.tile), stack);
+  }
+  for (const stack of stacks.values()) {
+    // Keep the selected unit on top instead of allowing a later array entry to cover it.
+    const unit = stack.find((marker) => marker.selected) ?? stack[0];
+    if (unit === undefined) continue;
     const rect = tileRect(camera, indexToX(state.map, unit.tile), indexToY(state.map, unit.tile));
     if (!onScreen(rect.x, rect.y, viewport)) continue;
     const sprite = input.unitSprites?.[unit.type];
@@ -497,6 +514,34 @@ export const drawFrame = (ctx: Canvas2D, input: FrameInput): FrameTrace => {
       ctx.lineWidth = 2;
       ctx.strokeRect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
     }
+    if (size >= 24) {
+      const hp = unit.hitPoints ?? 1;
+      const maximum = Math.max(1, unit.maxHitPoints ?? hp);
+      const length = size * 0.5;
+      ctx.fillStyle = '#19261d';
+      ctx.fillRect(rect.x + size * 0.25 - 1, rect.y + 3, length + 2, 5);
+      ctx.fillStyle = hp * 3 <= maximum ? '#dd7355' : hp * 3 <= maximum * 2 ? '#e0c466' : '#a8c879';
+      ctx.fillRect(rect.x + size * 0.25, rect.y + 4, length * Math.min(1, hp / maximum), 3);
+      if (stack.length > 1 || unit.fortified === true) {
+        ctx.fillStyle = '#17231ee6';
+        ctx.fillRect(rect.x + size - 17, rect.y + size - 17, 15, 15);
+        ctx.fillStyle = '#f2e6c8';
+        ctx.font = 'bold 11px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText?.(
+          stack.length > 1 ? String(stack.length) : 'F',
+          rect.x + size - 9,
+          rect.y + size - 5,
+        );
+      }
+    }
+  }
+
+  if (input.cursor !== null) {
+    const rect = tileRect(camera, input.cursor.x, input.cursor.y);
+    ctx.strokeStyle = '#f2e6c880';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
   }
 
   return { tiles, cursor: input.cursor };
@@ -527,6 +572,63 @@ const paintUnitSprite = (
   ctx.strokeStyle = rgbCss(GRID_COLOUR);
   ctx.lineWidth = 1;
   ctx.strokeRect(bx + 0.5, by + 0.5, badge - 1, badge - 1);
+};
+
+/** Eight-way road segments meet at identical edge/corner coordinates on neighbouring tiles. */
+const paintRoads = (
+  ctx: Canvas2D,
+  input: FrameInput,
+  x: number,
+  y: number,
+  rect: { readonly x: number; readonly y: number; readonly size: number },
+  improvements: ReadonlyMap<number, ReadonlySet<string>>,
+  cities: ReadonlySet<number>,
+): void => {
+  const paths: readonly [number, number][] = [
+    [-1, -1],
+    [0, -1],
+    [1, -1],
+    [-1, 0],
+    [1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+  ];
+  const connected = paths.filter(([dx, dy]) => {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (nx < 0 || ny < 0 || nx >= input.state.map.width || ny >= input.state.map.height)
+      return false;
+    const tile = ny * input.state.map.width + nx;
+    return (
+      input.state.explored[input.viewer]?.[tile] === true &&
+      (improvements.get(tile)?.has('road') === true || cities.has(tile))
+    );
+  });
+  // A newly built isolated road still gets a short track rather than an invisible point.
+  const segments =
+    connected.length > 0
+      ? connected
+      : [
+          [-0.45, 0.2],
+          [0.45, -0.2],
+        ];
+  for (const [colour, width] of [
+    ['#514835', Math.max(2, rect.size / 14)],
+    ['#d5bc87', Math.max(1, rect.size / 28)],
+  ] as const) {
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    for (const [dx, dy] of segments) {
+      ctx.moveTo(rect.x + rect.size / 2, rect.y + rect.size / 2);
+      ctx.lineTo(
+        rect.x + (rect.size * (1 + (dx ?? 0))) / 2,
+        rect.y + (rect.size * (1 + (dy ?? 0))) / 2,
+      );
+    }
+    ctx.stroke();
+  }
 };
 
 /** Is this tile's top-left corner inside the canvas (with one tile of slack for the edges)? */

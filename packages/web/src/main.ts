@@ -57,11 +57,14 @@ import {
   indexToY,
   isExplored,
   isGameOver,
+  hitPointsLeftOf,
+  maxHitPointsOf,
   mergeSettings,
   newGame,
   opponentModeOf,
   parseSettings,
   unitActions,
+  unitDef,
   visibleTiles,
   type Command,
   type GameEvent,
@@ -107,6 +110,8 @@ import {
 } from './render.js';
 import { loadTerrainSprites, type TerrainSprites } from './tiles.js';
 import { loadUnitSprites, type UnitSprites } from './units.js';
+import { createTerrainArtwork } from './terrain-art.js';
+import { loadMapSprites } from './map-art.js';
 import { eventLines } from './events.js';
 import { mountPanels, type PanelsApi, type PanelsHandle } from './panels/index.js';
 import { humanSeatOf, installTestApi, seamDispatch, splitSeat, toCommand } from './testapi.js';
@@ -252,6 +257,7 @@ const unitMarkers = (
   state: GameState,
   selected: UnitId | undefined,
   viewer: PlayerId,
+  ruleset: Ruleset,
 ): readonly UnitMarker[] => {
   const visible = new Set<number>(visibleTiles(state, viewer).map((tile) => Number(tile)));
   return state.units
@@ -262,6 +268,9 @@ const unitMarkers = (
       type: unit.type,
       colour: colourOfPlayer(state, unit.owner),
       selected: unit.id === selected,
+      hitPoints: hitPointsLeftOf(unit),
+      maxHitPoints: maxHitPointsOf(unitDef(ruleset, unit.type), hitPointsLeftOf(unit)),
+      fortified: unit.fortified === true,
     }));
 };
 
@@ -276,7 +285,12 @@ const unitMarkers = (
 const cityMarkers = (state: GameState, viewer: PlayerId): readonly CityMarker[] =>
   state.cities
     .filter((city) => isExplored(state, viewer, city.tile))
-    .map((city) => ({ tile: city.tile, colour: colourOfPlayer(state, city.owner) }));
+    .map((city) => ({
+      tile: city.tile,
+      colour: colourOfPlayer(state, city.owner),
+      name: city.name,
+      population: city.population,
+    }));
 
 /**
  * Which tile a map order names is the schema's question, not this file's.
@@ -302,6 +316,7 @@ interface Shell {
    */
   readonly mapRegion: HTMLElement;
   readonly endTurn: HTMLButtonElement;
+  readonly grid: HTMLButtonElement;
   /**
    * The **order channel**: the one place this app says what the engine said about an order.
    *
@@ -520,6 +535,10 @@ const buildShell = (doc: Document): Shell => {
   const nextUnit = el(doc, 'button', 'Next unit');
   nextUnit.type = 'button';
   nextUnit.dataset['role'] = 'next-unit';
+  const grid = el(doc, 'button', 'Grid');
+  grid.type = 'button';
+  grid.setAttribute('aria-pressed', 'false');
+  grid.title = 'Show or hide the tactical tile grid';
   const keyboard = buildKeyboardHelp(doc);
   const newGame = buildNewGame(doc);
   // The order channel — see `Shell.orderStatus` for what it carries and why its name is what it is.
@@ -531,7 +550,7 @@ const buildShell = (doc: Document): Shell => {
   orderStatus.setAttribute('role', 'status');
   orderStatus.setAttribute('aria-label', 'Order');
   orderStatus.dataset['role'] = 'order';
-  header.append(title, newGame.open, endTurn, nextUnit, keyboard.open, orderStatus);
+  header.append(title, newGame.open, endTurn, nextUnit, grid, keyboard.open, orderStatus);
 
   const main = el(doc, 'main');
 
@@ -606,6 +625,7 @@ const buildShell = (doc: Document): Shell => {
     canvas,
     mapRegion,
     endTurn,
+    grid,
     nextUnit,
     keyboard,
     orderStatus,
@@ -635,6 +655,8 @@ const start = async (): Promise<void> => {
   const window_ = doc.defaultView;
   const sprites: TerrainSprites = await loadTerrainSprites();
   const unitSprites: UnitSprites = await loadUnitSprites();
+  const terrainArtwork = createTerrainArtwork(sprites);
+  const mapSprites = await loadMapSprites();
 
   /* -------------------------------- state -------------------------------- */
 
@@ -643,6 +665,7 @@ const start = async (): Promise<void> => {
   let cursor: { readonly x: number; readonly y: number } | null = null;
   let trace: FrameTrace = { tiles: [], cursor: null };
   let frames = 0;
+  let showGrid = false;
   let ready = false;
 
   const initialSettings = (): Settings => {
@@ -718,7 +741,7 @@ const start = async (): Promise<void> => {
       viewer,
       camera,
       viewport: size,
-      units: unitMarkers(state, panels.selection().unitId, viewer),
+      units: unitMarkers(state, panels.selection().unitId, viewer, ruleset),
       cities: cityMarkers(state, viewer),
       // The ONE colour lookup for a player, shared with the markers above and with the territory
       // tint the renderer draws: a player is one colour all over the canvas (M9's borders).
@@ -726,6 +749,9 @@ const start = async (): Promise<void> => {
       cursor,
       sprites,
       unitSprites,
+      terrainArtwork,
+      mapSprites,
+      showGrid,
     });
     trace = frame;
     frames += 1;
@@ -1917,6 +1943,12 @@ const start = async (): Promise<void> => {
   // Arm the controls against the seam that was just installed: from here on, every click reads
   // `window.__CIVTS__.dispatch` at the moment it fires, so a test's wrapper sees it.
   armDispatch = seamDispatch(seam.dispatch).arm(applyAction);
+
+  shell.grid.addEventListener('click', () => {
+    showGrid = !showGrid;
+    shell.grid.setAttribute('aria-pressed', String(showGrid));
+    draw();
+  });
 
   // The first frame, and then `ready` — the contract's `ready` means "the first frame is drawn",
   // so it is set by the draw itself rather than by a timer or by a load event.
