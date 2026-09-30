@@ -1747,6 +1747,23 @@ export const actionControlIndices = async (container: Locator): Promise<readonly
  * ------------------------------------------------------------------ */
 
 /**
+ * Select a sidebar view by its tab name.
+ *
+ * The September 2026 workspace redesign (`docs/UI-OVERHAUL.md`, "Workspace redesign")
+ * moved the panels behind five sidebar tabs, and `Overview` is active on load — so a
+ * control that lives in another view is not merely scrolled away, its tabpanel is
+ * `hidden`. Anything that drives such a control has to select the view first, or it
+ * waits for a control that is never rendered. Selecting a view also closes any open
+ * docked dialog (`workspace.ts`: `activate`), so this is safe to call before opening one.
+ */
+export const openView = async (page: Page, name: string): Promise<void> => {
+  const tab = page.getByRole('tab', { name, exact: true }).first();
+  if ((await tab.count()) === 0) return;
+  if ((await tab.getAttribute('aria-selected')) === 'true') return;
+  await tab.click();
+};
+
+/**
  * Open a dialog by clicking a control whose accessible name matches `pattern`.
  *
  * The frozen table names the DIALOGS (`City <name>`, `Technology`, `Debug`) and two
@@ -1757,7 +1774,7 @@ export const actionControlIndices = async (container: Locator): Promise<readonly
 export const openPanel = async (page: Page, pattern: RegExp): Promise<Locator> => {
   const existing = page.getByRole('dialog', { name: pattern });
   if ((await existing.count()) > 0) return existing.first();
-  if (pattern.test('Debug')) await page.getByRole('tab', { name: 'Game', exact: true }).click();
+  if (pattern.test('Debug')) await openView(page, 'Game');
   const opener = page.getByRole('button', { name: pattern }).first();
   if ((await opener.count()) === 0) {
     const names: string[] = [];
@@ -1884,10 +1901,19 @@ const orderByMapClick = async (
  */
 export const driveScript = async (page: Page, script: readonly unknown[]): Promise<number> => {
   await recordDispatches(page);
+  // The workspace redesign (`docs/UI-OVERHAUL.md`, "Workspace redesign") put the controls behind
+  // five sidebar views, and only one tabpanel is visible at a time. So each command is driven in
+  // the view that owns its controls: the diplomatic buttons live in `Diplomacy`, while the unit
+  // panel's `Actions for unit <id>` group and the city list both live in `Overview`.
+  const viewFor = (type: string): string =>
+    type === 'DeclareWar' || type === 'OfferPeace' || type === 'AcceptPeace'
+      ? 'Diplomacy'
+      : 'Overview';
   let issued = 0;
   for (const raw of script) {
     await clearDispatchLog(page);
     const command = toCommand(raw);
+    await openView(page, viewFor(command.type));
     switch (command.type) {
       case 'EndTurn': {
         await endTurnButton(page).click();
